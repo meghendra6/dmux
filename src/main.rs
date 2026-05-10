@@ -60,6 +60,21 @@ fn run() -> Result<(), String> {
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
+        cli::Command::CopyMode {
+            session,
+            mode,
+            search,
+        } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let body = send_request(
+                &socket,
+                &protocol::encode_copy_mode(&session, mode, search.as_deref()),
+                true,
+            )?;
+            print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
         cli::Command::ListBuffers => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;

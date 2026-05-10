@@ -264,6 +264,68 @@ fn save_buffer_can_copy_line_range_and_search_match() {
     assert_success(&dmux(&socket, &["kill-server"]));
 }
 
+#[test]
+fn copy_mode_prints_numbered_lines_and_search_matches() {
+    let socket = unique_socket("copy-mode");
+    let session = format!("copy-mode-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf first; printf '\\n'; printf needle-one; printf '\\n'; printf last; printf '\\n'; printf needle-two; printf '\\n'; sleep 30",
+        ],
+    ));
+    let captured = poll_capture(&socket, &session, "needle-two");
+    assert!(captured.contains("needle-one"), "{captured:?}");
+
+    let output = dmux(&socket, &["copy-mode", "-t", &session, "--screen"]);
+    assert_success(&output);
+    let output = String::from_utf8_lossy(&output.stdout);
+    assert!(output.contains("1\tfirst\n"), "{output:?}");
+    assert!(output.contains("4\tneedle-two\n"), "{output:?}");
+
+    let output = dmux(
+        &socket,
+        &[
+            "copy-mode",
+            "-t",
+            &session,
+            "--screen",
+            "--search",
+            "needle",
+        ],
+    );
+    assert_success(&output);
+    let output = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output, "2\tneedle-one\n4\tneedle-two\n");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn copy_mode_reports_missing_session() {
+    let socket = unique_socket("copy-mode-missing");
+    let output = dmux(&socket, &["copy-mode", "-t", "missing"]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("missing session"),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
 fn has_line(text: &str, needle: &str) -> bool {
     text.lines().any(|line| line == needle)
 }
