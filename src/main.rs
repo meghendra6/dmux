@@ -1,8 +1,8 @@
-mod client;
 mod cli;
+mod client;
 mod paths;
-mod pty;
 mod protocol;
+mod pty;
 mod server;
 
 fn main() {

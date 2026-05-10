@@ -122,11 +122,7 @@ fn handle_list(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::Result<
     Ok(())
 }
 
-fn handle_capture(
-    state: &Arc<ServerState>,
-    stream: &mut UnixStream,
-    name: &str,
-) -> io::Result<()> {
+fn handle_capture(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {
     let session = {
         let sessions = state.sessions.lock().unwrap();
         sessions.get(name).cloned()

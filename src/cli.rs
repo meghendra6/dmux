@@ -138,9 +138,10 @@ mod tests {
 
     #[test]
     fn parses_detached_new_session_with_command() {
-        let command =
-            parse_args(["dmux", "new", "-d", "-s", "dev", "--", "sh", "-c", "echo ok"])
-                .unwrap();
+        let command = parse_args([
+            "dmux", "new", "-d", "-s", "dev", "--", "sh", "-c", "echo ok",
+        ])
+        .unwrap();
 
         assert_eq!(
             command,

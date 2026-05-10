@@ -2,11 +2,20 @@ pub const ARG_SEPARATOR: char = '\u{1f}';
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    New { session: String, command: Vec<String> },
-    Attach { session: String },
+    New {
+        session: String,
+        command: Vec<String>,
+    },
+    Attach {
+        session: String,
+    },
     List,
-    Capture { session: String },
-    Kill { session: String },
+    Capture {
+        session: String,
+    },
+    Kill {
+        session: String,
+    },
     KillServer,
 }
 

@@ -14,10 +14,8 @@ fn unique_socket(name: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::path::PathBuf::from("/tmp").join(format!(
-        "dmux-{name}-{}-{nanos}.sock",
-        std::process::id()
-    ))
+    std::path::PathBuf::from("/tmp")
+        .join(format!("dmux-{name}-{}-{nanos}.sock", std::process::id()))
 }
 
 fn assert_success(output: &Output) {
