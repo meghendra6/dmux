@@ -78,19 +78,19 @@ Implemented Phase 2 groundwork:
 - attach-time basic copy-mode key handling for line copy
 - attach-time basic copy-mode mouse selection for line ranges
 - attach-time statusline snapshot rendering
-- attach-time split-pane snapshot rendering
+- attach-time split-pane layout snapshot rendering
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
 
-- multi-pane attach rendering is snapshot-only when multiple panes are visible and exits after rendering; live multi-pane attach, split-direction layout persistence, and live layout redraw are not implemented yet
-- zoomed panes are tracked server-side, but layout rendering is not implemented yet
+- multi-pane attach rendering is split-layout snapshot-only when multiple panes are visible and exits after rendering; live multi-pane attach and live layout redraw are not implemented yet
+- zoomed panes are tracked server-side and keep single-pane live attach behavior
 - attach-time statusline rendering is snapshot-only; live status redraw is not implemented yet
 - in-memory screen and scrollback only
 - copy-mode selection is line-based only
 - buffer contents are in-memory only
 - full terminal protocol support is incomplete
-- no layout or named-window support yet
+- no named layout or named-window support yet
 - Unix/macOS POSIX PTY support only
 
 Supported `send-keys` tokens are literal text plus `Enter`, `Space`, `Tab`,

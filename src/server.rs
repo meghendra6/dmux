@@ -1,4 +1,4 @@
-use crate::protocol::{self, BufferSelection, CaptureMode, Request};
+use crate::protocol::{self, BufferSelection, CaptureMode, Request, SplitDirection};
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::TerminalState;
 use std::collections::HashMap;
@@ -215,8 +215,8 @@ impl Session {
         self.windows.lock().unwrap().active_pane()
     }
 
-    fn add_pane(&self, pane: Arc<Pane>) {
-        self.windows.lock().unwrap().add_pane(pane);
+    fn add_pane(&self, direction: SplitDirection, pane: Arc<Pane>) {
+        self.windows.lock().unwrap().add_pane(direction, pane);
     }
 
     fn select_pane(&self, index: usize) -> bool {
@@ -262,17 +262,81 @@ impl Session {
     fn attach_panes(&self) -> Vec<IndexedPane> {
         self.windows.lock().unwrap().attach_panes()
     }
+
+    fn attach_layout_snapshot(&self) -> AttachLayoutSnapshot {
+        self.windows.lock().unwrap().attach_layout_snapshot()
+    }
 }
 
 struct Window {
     panes: PaneSet<Arc<Pane>>,
+    layout: LayoutNode,
     zoomed: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LayoutNode {
+    Pane(usize),
+    Split {
+        direction: SplitDirection,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    fn split_pane(&mut self, target: usize, direction: SplitDirection, new_index: usize) -> bool {
+        match self {
+            LayoutNode::Pane(index) if *index == target => {
+                *self = LayoutNode::Split {
+                    direction,
+                    first: Box::new(LayoutNode::Pane(target)),
+                    second: Box::new(LayoutNode::Pane(new_index)),
+                };
+                true
+            }
+            LayoutNode::Pane(_) => false,
+            LayoutNode::Split { first, second, .. } => {
+                first.split_pane(target, direction, new_index)
+                    || second.split_pane(target, direction, new_index)
+            }
+        }
+    }
+
+    fn remove_pane(&mut self, removed: usize) -> bool {
+        match self {
+            LayoutNode::Pane(index) if *index == removed => false,
+            LayoutNode::Pane(index) => {
+                if *index > removed {
+                    *index -= 1;
+                }
+                true
+            }
+            LayoutNode::Split { first, second, .. } => {
+                let keep_first = first.remove_pane(removed);
+                let keep_second = second.remove_pane(removed);
+                match (keep_first, keep_second) {
+                    (true, true) => true,
+                    (true, false) => {
+                        *self = (**first).clone();
+                        true
+                    }
+                    (false, true) => {
+                        *self = (**second).clone();
+                        true
+                    }
+                    (false, false) => false,
+                }
+            }
+        }
+    }
 }
 
 impl Window {
     fn new(pane: Arc<Pane>) -> Self {
         Self {
             panes: PaneSet::new(pane),
+            layout: LayoutNode::Pane(0),
             zoomed: None,
         }
     }
@@ -281,8 +345,11 @@ impl Window {
         self.panes.active()
     }
 
-    fn add_pane(&mut self, pane: Arc<Pane>) {
+    fn add_pane(&mut self, direction: SplitDirection, pane: Arc<Pane>) {
+        let split_index = self.panes.active_index();
+        let new_index = self.panes.len();
         self.panes.add(pane);
+        let _ = self.layout.split_pane(split_index, direction, new_index);
         if self.zoomed.is_some() {
             self.zoomed = Some(self.panes.active_index());
         }
@@ -304,6 +371,7 @@ impl Window {
             .expect("validated pane index must exist while session lock is held");
         pty::terminate(pane.child_pid).map_err(|err| err.to_string())?;
         self.panes.kill_at(index);
+        self.layout.remove_pane(index);
         self.adjust_zoom_after_pane_removal(index);
         Ok(())
     }
@@ -342,6 +410,33 @@ impl Window {
                     .map(|pane| IndexedPane { index, pane })
             })
             .collect()
+    }
+
+    fn attach_layout_snapshot(&self) -> AttachLayoutSnapshot {
+        if let Some(index) = self.zoomed {
+            let panes = self
+                .panes
+                .get(index)
+                .cloned()
+                .map(|pane| vec![IndexedPane { index, pane }])
+                .unwrap_or_default();
+            return AttachLayoutSnapshot {
+                layout: LayoutNode::Pane(index),
+                panes,
+            };
+        }
+
+        AttachLayoutSnapshot {
+            layout: self.layout.clone(),
+            panes: (0..self.panes.len())
+                .filter_map(|index| {
+                    self.panes
+                        .get(index)
+                        .cloned()
+                        .map(|pane| IndexedPane { index, pane })
+                })
+                .collect(),
+        }
     }
 
     fn active_pane_index(&self) -> usize {
@@ -426,9 +521,9 @@ impl WindowSet {
         self.active_window()?.active_pane()
     }
 
-    fn add_pane(&mut self, pane: Arc<Pane>) {
+    fn add_pane(&mut self, direction: SplitDirection, pane: Arc<Pane>) {
         if let Some(window) = self.active_window_mut() {
-            window.add_pane(pane);
+            window.add_pane(direction, pane);
         }
     }
 
@@ -458,6 +553,11 @@ impl WindowSet {
     fn attach_panes(&self) -> Vec<IndexedPane> {
         self.active_window()
             .map_or_else(Vec::new, Window::attach_panes)
+    }
+
+    fn attach_layout_snapshot(&self) -> AttachLayoutSnapshot {
+        self.active_window()
+            .map_or_else(AttachLayoutSnapshot::empty, Window::attach_layout_snapshot)
     }
 
     fn status_context(&self, session_name: &str) -> Option<StatusContext> {
@@ -513,6 +613,20 @@ struct PaneDescription {
 struct IndexedPane {
     index: usize,
     pane: Arc<Pane>,
+}
+
+struct AttachLayoutSnapshot {
+    layout: LayoutNode,
+    panes: Vec<IndexedPane>,
+}
+
+impl AttachLayoutSnapshot {
+    fn empty() -> Self {
+        Self {
+            layout: LayoutNode::Pane(0),
+            panes: Vec::new(),
+        }
+    }
 }
 
 struct PaneSnapshot {
@@ -668,9 +782,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::Send { session, bytes } => handle_send(&state, &mut stream, &session, &bytes),
         Request::Split {
             session,
-            direction: _,
+            direction,
             command,
-        } => handle_split(&state, &mut stream, &session, command),
+        } => handle_split(&state, &mut stream, &session, direction, command),
         Request::ListPanes { session, format } => {
             handle_list_panes(&state, &mut stream, &session, format.as_deref())
         }
@@ -1004,6 +1118,7 @@ fn handle_split(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     name: &str,
+    direction: SplitDirection,
     command: Vec<String>,
 ) -> io::Result<()> {
     let session = {
@@ -1023,7 +1138,7 @@ fn handle_split(
     let size = *active.size.lock().unwrap();
     let cwd = std::env::current_dir()?;
     let pane = spawn_pane(name.to_string(), command, cwd, size)?;
-    session.add_pane(pane);
+    session.add_pane(direction, pane);
     write_ok(stream)
 }
 
@@ -1431,12 +1546,13 @@ fn handle_attach_snapshot(
 }
 
 fn attach_pane_snapshot(session: &Session) -> Option<String> {
-    let panes = session.attach_panes();
-    if panes.len() <= 1 {
+    let snapshot = session.attach_layout_snapshot();
+    if snapshot.panes.len() <= 1 {
         return None;
     }
 
-    let snapshots = panes
+    let panes = snapshot
+        .panes
         .into_iter()
         .map(|pane| PaneSnapshot {
             index: pane.index,
@@ -1444,10 +1560,120 @@ fn attach_pane_snapshot(session: &Session) -> Option<String> {
         })
         .collect::<Vec<_>>();
 
-    Some(render_attach_pane_snapshot(&snapshots))
+    Some(render_attach_pane_snapshot(&snapshot.layout, &panes))
 }
 
-fn render_attach_pane_snapshot(panes: &[PaneSnapshot]) -> String {
+fn render_attach_pane_snapshot(layout: &LayoutNode, panes: &[PaneSnapshot]) -> String {
+    if !layout_matches_panes(layout, panes) {
+        return render_ordered_pane_sections(panes);
+    }
+
+    let screens = panes
+        .iter()
+        .map(|pane| (pane.index, pane.screen.as_str()))
+        .collect::<HashMap<_, _>>();
+
+    match render_layout_lines(layout, &screens) {
+        Some(lines) => render_client_lines(&lines),
+        None => render_ordered_pane_sections(panes),
+    }
+}
+
+fn layout_matches_panes(layout: &LayoutNode, panes: &[PaneSnapshot]) -> bool {
+    let mut layout_indexes = Vec::new();
+    collect_layout_pane_indexes(layout, &mut layout_indexes);
+    layout_indexes.sort_unstable();
+
+    let mut pane_indexes = panes.iter().map(|pane| pane.index).collect::<Vec<_>>();
+    pane_indexes.sort_unstable();
+
+    layout_indexes == pane_indexes
+}
+
+fn collect_layout_pane_indexes(layout: &LayoutNode, indexes: &mut Vec<usize>) {
+    match layout {
+        LayoutNode::Pane(index) => indexes.push(*index),
+        LayoutNode::Split { first, second, .. } => {
+            collect_layout_pane_indexes(first, indexes);
+            collect_layout_pane_indexes(second, indexes);
+        }
+    }
+}
+
+fn render_layout_lines(layout: &LayoutNode, screens: &HashMap<usize, &str>) -> Option<Vec<String>> {
+    match layout {
+        LayoutNode::Pane(index) => screens.get(index).map(|screen| screen_lines(screen)),
+        LayoutNode::Split {
+            direction,
+            first,
+            second,
+        } => {
+            let first = render_layout_lines(first, screens)?;
+            let second = render_layout_lines(second, screens)?;
+            Some(match direction {
+                SplitDirection::Horizontal => join_horizontal(first, second),
+                SplitDirection::Vertical => join_vertical(first, second),
+            })
+        }
+    }
+}
+
+fn screen_lines(screen: &str) -> Vec<String> {
+    let lines = screen.lines().map(str::to_string).collect::<Vec<_>>();
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+fn join_horizontal(left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    let width = max_line_width(&left);
+    let rows = left.len().max(right.len());
+    (0..rows)
+        .map(|index| {
+            let mut line = pad_to_width(left.get(index).map_or("", String::as_str), width);
+            line.push_str(" | ");
+            line.push_str(right.get(index).map_or("", String::as_str));
+            line
+        })
+        .collect()
+}
+
+fn join_vertical(mut top: Vec<String>, bottom: Vec<String>) -> Vec<String> {
+    let width = max_line_width(&top).max(max_line_width(&bottom)).max(1);
+    top.push("-".repeat(width));
+    top.extend(bottom);
+    top
+}
+
+fn max_line_width(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+fn pad_to_width(line: &str, width: usize) -> String {
+    let mut padded = line.to_string();
+    let len = line.chars().count();
+    if len < width {
+        padded.push_str(&" ".repeat(width - len));
+    }
+    padded
+}
+
+fn render_client_lines(lines: &[String]) -> String {
+    let mut output = String::new();
+    for line in lines {
+        output.push_str(line);
+        output.push_str("\r\n");
+    }
+    output
+}
+
+fn render_ordered_pane_sections(panes: &[PaneSnapshot]) -> String {
     let mut output = String::new();
     for pane in panes {
         output.push_str("\r\n-- pane ");
@@ -1533,6 +1759,120 @@ mod tests {
             Err("cannot kill last pane; use kill-session")
         );
         assert_eq!(panes.active(), Some("base"));
+    }
+
+    #[test]
+    fn layout_node_splits_active_leaf_horizontally() {
+        let mut layout = LayoutNode::Pane(0);
+
+        assert!(layout.split_pane(0, SplitDirection::Horizontal, 1));
+
+        assert_eq!(
+            layout,
+            LayoutNode::Split {
+                direction: SplitDirection::Horizontal,
+                first: Box::new(LayoutNode::Pane(0)),
+                second: Box::new(LayoutNode::Pane(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn layout_node_removes_pane_and_shifts_remaining_indexes() {
+        let mut layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Split {
+                direction: SplitDirection::Vertical,
+                first: Box::new(LayoutNode::Pane(1)),
+                second: Box::new(LayoutNode::Pane(2)),
+            }),
+        };
+
+        assert!(layout.remove_pane(1));
+
+        assert_eq!(
+            layout,
+            LayoutNode::Split {
+                direction: SplitDirection::Horizontal,
+                first: Box::new(LayoutNode::Pane(0)),
+                second: Box::new(LayoutNode::Pane(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_joins_horizontal_panes() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "base-ready\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "split-ready\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_pane_snapshot(&layout, &panes);
+
+        assert!(
+            rendered.contains("base-ready | split-ready\r\n"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_stacks_vertical_panes() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "base-ready\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "split-ready\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_pane_snapshot(&layout, &panes);
+
+        assert!(
+            rendered.contains("base-ready\r\n-----------\r\nsplit-ready\r\n"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_falls_back_when_layout_omits_visible_pane() {
+        let layout = LayoutNode::Pane(0);
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "base-ready\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "split-ready\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_pane_snapshot(&layout, &panes);
+
+        assert!(rendered.contains("-- pane 0 --"), "{rendered:?}");
+        assert!(rendered.contains("base-ready"), "{rendered:?}");
+        assert!(rendered.contains("-- pane 1 --"), "{rendered:?}");
+        assert!(rendered.contains("split-ready"), "{rendered:?}");
     }
 
     #[test]
