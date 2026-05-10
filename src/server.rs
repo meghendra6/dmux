@@ -1,4 +1,4 @@
-use crate::protocol::{self, Request};
+use crate::protocol::{self, CaptureMode, Request};
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::TerminalState;
 use std::collections::HashMap;
@@ -441,7 +441,7 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
     match request {
         Request::New { session, command } => handle_new(&state, &mut stream, session, command),
         Request::List => handle_list(&state, &mut stream),
-        Request::Capture { session } => handle_capture(&state, &mut stream, &session),
+        Request::Capture { session, mode } => handle_capture(&state, &mut stream, &session, mode),
         Request::Resize {
             session,
             cols,
@@ -550,7 +550,12 @@ fn handle_list(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::Result<
     Ok(())
 }
 
-fn handle_capture(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {
+fn handle_capture(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    mode: CaptureMode,
+) -> io::Result<()> {
     let session = {
         let sessions = state.sessions.lock().unwrap();
         sessions.get(name).cloned()
@@ -566,7 +571,14 @@ fn handle_capture(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str)
     };
 
     write_ok(stream)?;
-    let captured = pane.terminal.lock().unwrap().capture_text();
+    let captured = {
+        let terminal = pane.terminal.lock().unwrap();
+        match mode {
+            CaptureMode::Screen => terminal.capture_screen_text(),
+            CaptureMode::History => terminal.capture_history_text(),
+            CaptureMode::All => terminal.capture_text(),
+        }
+    };
     stream.write_all(captured.as_bytes())
 }
 

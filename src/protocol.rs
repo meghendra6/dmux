@@ -6,6 +6,13 @@ pub enum SplitDirection {
     Vertical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureMode {
+    Screen,
+    History,
+    All,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     New {
@@ -18,6 +25,7 @@ pub enum Request {
     List,
     Capture {
         session: String,
+        mode: CaptureMode,
     },
     Resize {
         session: String,
@@ -91,8 +99,8 @@ pub fn encode_list() -> &'static str {
     "LIST\n"
 }
 
-pub fn encode_capture(session: &str) -> String {
-    format!("CAPTURE\t{session}\n")
+pub fn encode_capture(session: &str, mode: CaptureMode) -> String {
+    format!("CAPTURE\t{session}\t{}\n", encode_capture_mode(mode))
 }
 
 pub fn encode_resize(session: &str, cols: u16, rows: u16) -> String {
@@ -213,6 +221,11 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["LIST"] => Ok(Request::List),
         ["CAPTURE", session] => Ok(Request::Capture {
             session: (*session).to_string(),
+            mode: CaptureMode::All,
+        }),
+        ["CAPTURE", session, mode] => Ok(Request::Capture {
+            session: (*session).to_string(),
+            mode: decode_capture_mode(mode)?,
         }),
         ["RESIZE", session, cols, rows] => Ok(Request::Resize {
             session: (*session).to_string(),
@@ -324,6 +337,23 @@ fn encode_split_direction(direction: SplitDirection) -> &'static str {
     }
 }
 
+fn encode_capture_mode(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::Screen => "screen",
+        CaptureMode::History => "history",
+        CaptureMode::All => "all",
+    }
+}
+
+fn decode_capture_mode(value: &str) -> Result<CaptureMode, String> {
+    match value {
+        "screen" => Ok(CaptureMode::Screen),
+        "history" => Ok(CaptureMode::History),
+        "all" => Ok(CaptureMode::All),
+        _ => Err("CAPTURE has invalid mode".to_string()),
+    }
+}
+
 fn decode_split_direction(value: &str) -> Result<SplitDirection, String> {
     match value {
         "h" => Ok(SplitDirection::Horizontal),
@@ -420,6 +450,41 @@ mod tests {
                 session: "dev".to_string(),
                 cols: 100,
                 rows: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_capture_screen_request() {
+        let line = encode_capture("dev", CaptureMode::Screen);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::Capture {
+                session: "dev".to_string(),
+                mode: CaptureMode::Screen,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_capture_history_request() {
+        let line = encode_capture("dev", CaptureMode::History);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::Capture {
+                session: "dev".to_string(),
+                mode: CaptureMode::History,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_legacy_capture_request_as_all() {
+        assert_eq!(
+            decode_request("CAPTURE\tdev\n").unwrap(),
+            Request::Capture {
+                session: "dev".to_string(),
+                mode: CaptureMode::All,
             }
         );
     }
