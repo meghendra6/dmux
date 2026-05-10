@@ -79,10 +79,7 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             cols,
             rows,
         } => handle_resize(&state, &mut stream, &session, cols, rows),
-        Request::Send { .. } => {
-            write_err(&mut stream, "send-keys is not implemented")?;
-            Ok(())
-        }
+        Request::Send { session, bytes } => handle_send(&state, &mut stream, &session, &bytes),
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
         Request::Attach { session } => handle_attach(&state, stream, &session),
@@ -187,6 +184,26 @@ fn handle_resize(
         .unwrap()
         .resize(size.cols as usize, size.rows as usize);
 
+    write_ok(stream)
+}
+
+fn handle_send(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    session.writer.lock().unwrap().write_all(bytes)?;
     write_ok(stream)
 }
 
