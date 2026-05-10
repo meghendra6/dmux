@@ -17,9 +17,10 @@ Implemented Phase 0/1 commands:
 - `dmux kill-window -t <name> [-w <index>]`
 - `dmux split-window -t <name> -h|-v [-- command...]`
 - `dmux split -t <name> -h|-v [-- command...]`
-- `dmux list-panes -t <name>`
+- `dmux list-panes -t <name> [-F <format>]`
 - `dmux select-pane -t <name> -p <index>`
 - `dmux kill-pane -t <name> [-p <index>]`
+- `dmux zoom-pane -t <name> [-p <index>]`
 - `dmux kill-session -t <name>`
 - `dmux kill-server`
 
@@ -38,11 +39,13 @@ Implemented Phase 2 groundwork:
 - split-pane sessions with a server-side active pane
 - active pane selection by pane index
 - pane removal while keeping the session alive
+- pane zoom state while keeping all panes alive
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
 
 - split panes are tracked server-side, but layout rendering is not implemented yet
+- zoomed panes are tracked server-side, but layout rendering is not implemented yet
 - in-memory screen and scrollback only
 - full terminal protocol support is incomplete
 - no layout or named-window support yet

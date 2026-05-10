@@ -30,6 +30,7 @@ pub enum Command {
     },
     ListPanes {
         session: String,
+        format: Option<String>,
     },
     SelectPane {
         session: String,
@@ -53,6 +54,10 @@ pub enum Command {
     KillWindow {
         session: String,
         window: Option<usize>,
+    },
+    ZoomPane {
+        session: String,
+        pane: Option<usize>,
     },
     KillSession {
         session: String,
@@ -97,6 +102,7 @@ where
         "list-windows" => parse_list_windows(args),
         "select-window" => parse_select_window(args),
         "kill-window" => parse_kill_window(args),
+        "zoom-pane" => parse_zoom_pane(args),
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
@@ -288,9 +294,34 @@ fn parse_split_window(args: Vec<String>) -> Result<Command, String> {
 }
 
 fn parse_list_panes(args: Vec<String>) -> Result<Command, String> {
-    let session = parse_target(args, "list-panes")?
-        .ok_or_else(|| "list-panes requires -t <session>".to_string())?;
-    Ok(Command::ListPanes { session })
+    let mut session = None;
+    let mut format = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "list-panes requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-F" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "list-panes requires a format after -F".to_string())?;
+                format = Some(value.clone());
+                i += 2;
+            }
+            value => return Err(format!("list-panes does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::ListPanes {
+        session: session.ok_or_else(|| "list-panes requires -t <session>".to_string())?,
+        format,
+    })
 }
 
 fn parse_select_pane(args: Vec<String>) -> Result<Command, String> {
@@ -470,6 +501,41 @@ fn parse_kill_window(args: Vec<String>) -> Result<Command, String> {
     })
 }
 
+fn parse_zoom_pane(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut pane = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "zoom-pane requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-p" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "zoom-pane requires a pane index after -p".to_string())?;
+                pane = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "zoom-pane -p must be a non-negative integer".to_string())?,
+                );
+                i += 2;
+            }
+            value => return Err(format!("zoom-pane does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::ZoomPane {
+        session: session.ok_or_else(|| "zoom-pane requires -t <session>".to_string())?,
+        pane,
+    })
+}
+
 fn set_split_direction(
     direction: &mut Option<SplitDirection>,
     value: SplitDirection,
@@ -599,7 +665,28 @@ mod tests {
         assert_eq!(
             command,
             Command::ListPanes {
-                session: "dev".to_string()
+                session: "dev".to_string(),
+                format: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_list_panes_format() {
+        let command = parse_args([
+            "dmux",
+            "list-panes",
+            "-t",
+            "dev",
+            "-F",
+            "#{pane.index}:#{pane.active}:#{pane.zoomed}",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::ListPanes {
+                session: "dev".to_string(),
+                format: Some("#{pane.index}:#{pane.active}:#{pane.zoomed}".to_string()),
             }
         );
     }
@@ -709,6 +796,30 @@ mod tests {
             Command::KillWindow {
                 session: "dev".to_string(),
                 window: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_zoom_pane_target_without_index() {
+        let command = parse_args(["dmux", "zoom-pane", "-t", "dev"]).unwrap();
+        assert_eq!(
+            command,
+            Command::ZoomPane {
+                session: "dev".to_string(),
+                pane: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_zoom_pane_target_and_index() {
+        let command = parse_args(["dmux", "zoom-pane", "-t", "dev", "-p", "0"]).unwrap();
+        assert_eq!(
+            command,
+            Command::ZoomPane {
+                session: "dev".to_string(),
+                pane: Some(0),
             }
         );
     }

@@ -71,8 +71,8 @@ impl Session {
         self.windows.lock().unwrap().kill_pane(target)
     }
 
-    fn pane_count(&self) -> usize {
-        self.windows.lock().unwrap().pane_count()
+    fn pane_descriptions(&self) -> Vec<PaneDescription> {
+        self.windows.lock().unwrap().pane_descriptions()
     }
 
     fn panes(&self) -> Vec<Arc<Pane>> {
@@ -94,16 +94,22 @@ impl Session {
     fn kill_window(&self, target: Option<usize>) -> Result<(), String> {
         self.windows.lock().unwrap().kill_window(target)
     }
+
+    fn zoom_pane(&self, target: Option<usize>) -> Result<(), String> {
+        self.windows.lock().unwrap().zoom_pane(target)
+    }
 }
 
 struct Window {
     panes: PaneSet<Arc<Pane>>,
+    zoomed: Option<usize>,
 }
 
 impl Window {
     fn new(pane: Arc<Pane>) -> Self {
         Self {
             panes: PaneSet::new(pane),
+            zoomed: None,
         }
     }
 
@@ -113,10 +119,17 @@ impl Window {
 
     fn add_pane(&mut self, pane: Arc<Pane>) {
         self.panes.add(pane);
+        if self.zoomed.is_some() {
+            self.zoomed = Some(self.panes.active_index());
+        }
     }
 
     fn select_pane(&mut self, index: usize) -> bool {
-        self.panes.select(index)
+        let selected = self.panes.select(index);
+        if selected && self.zoomed.is_some() {
+            self.zoomed = Some(index);
+        }
+        selected
     }
 
     fn kill_pane(&mut self, target: Option<usize>) -> Result<(), String> {
@@ -127,15 +140,48 @@ impl Window {
             .expect("validated pane index must exist while session lock is held");
         pty::terminate(pane.child_pid).map_err(|err| err.to_string())?;
         self.panes.kill_at(index);
+        self.adjust_zoom_after_pane_removal(index);
         Ok(())
-    }
-
-    fn pane_count(&self) -> usize {
-        self.panes.len()
     }
 
     fn panes(&self) -> Vec<Arc<Pane>> {
         self.panes.all()
+    }
+
+    fn pane_descriptions(&self) -> Vec<PaneDescription> {
+        let window_zoomed = self.zoomed.is_some();
+        (0..self.panes.len())
+            .map(|index| PaneDescription {
+                index,
+                active: index == self.panes.active_index(),
+                zoomed: self.zoomed == Some(index),
+                window_zoomed,
+            })
+            .collect()
+    }
+
+    fn zoom_pane(&mut self, target: Option<usize>) -> Result<(), String> {
+        let index = target.unwrap_or(self.panes.active_index());
+        if index >= self.panes.len() {
+            return Err("missing pane".to_string());
+        }
+
+        if self.zoomed == Some(index) {
+            self.zoomed = None;
+            return Ok(());
+        }
+
+        self.panes.select(index);
+        self.zoomed = Some(index);
+        Ok(())
+    }
+
+    fn adjust_zoom_after_pane_removal(&mut self, removed: usize) {
+        match self.zoomed {
+            Some(zoomed) if zoomed == removed => self.zoomed = None,
+            Some(zoomed) if zoomed > removed => self.zoomed = Some(zoomed - 1),
+            _ => {}
+        }
     }
 
     fn terminate_panes(&self) -> Result<(), String> {
@@ -201,15 +247,16 @@ impl WindowSet {
             .kill_pane(target)
     }
 
-    fn pane_count(&self) -> usize {
-        self.active_window().map_or(0, Window::pane_count)
-    }
-
     fn panes(&self) -> Vec<Arc<Pane>> {
         self.windows
             .iter()
             .flat_map(Window::panes)
             .collect::<Vec<_>>()
+    }
+
+    fn pane_descriptions(&self) -> Vec<PaneDescription> {
+        self.active_window()
+            .map_or_else(Vec::new, Window::pane_descriptions)
     }
 
     fn len(&self) -> usize {
@@ -235,6 +282,19 @@ impl WindowSet {
         }
         Ok(())
     }
+
+    fn zoom_pane(&mut self, target: Option<usize>) -> Result<(), String> {
+        self.active_window_mut()
+            .ok_or_else(|| "missing window".to_string())?
+            .zoom_pane(target)
+    }
+}
+
+struct PaneDescription {
+    index: usize,
+    active: bool,
+    zoomed: bool,
+    window_zoomed: bool,
 }
 
 struct PaneSet<T> {
@@ -296,6 +356,10 @@ impl<T> PaneSet<T> {
         self.panes.get(index)
     }
 
+    fn active_index(&self) -> usize {
+        self.active
+    }
+
     fn len(&self) -> usize {
         self.panes.len()
     }
@@ -352,7 +416,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             direction: _,
             command,
         } => handle_split(&state, &mut stream, &session, command),
-        Request::ListPanes { session } => handle_list_panes(&state, &mut stream, &session),
+        Request::ListPanes { session, format } => {
+            handle_list_panes(&state, &mut stream, &session, format.as_deref())
+        }
         Request::SelectPane { session, pane } => {
             handle_select_pane(&state, &mut stream, &session, pane)
         }
@@ -368,6 +434,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         }
         Request::KillWindow { session, window } => {
             handle_kill_window(&state, &mut stream, &session, window)
+        }
+        Request::ZoomPane { session, pane } => {
+            handle_zoom_pane(&state, &mut stream, &session, pane)
         }
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
@@ -554,6 +623,7 @@ fn handle_list_panes(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     name: &str,
+    _format: Option<&str>,
 ) -> io::Result<()> {
     let session = {
         let sessions = state.sessions.lock().unwrap();
@@ -566,10 +636,48 @@ fn handle_list_panes(
     };
 
     write_ok(stream)?;
-    for index in 0..session.pane_count() {
-        writeln!(stream, "{index}")?;
+    for pane in session.pane_descriptions() {
+        match _format {
+            Some(format) => writeln!(stream, "{}", format_pane_line(format, &pane))?,
+            None => writeln!(stream, "{}", pane.index)?,
+        }
     }
     Ok(())
+}
+
+fn format_pane_line(format: &str, pane: &PaneDescription) -> String {
+    format
+        .replace("#{pane.index}", &pane.index.to_string())
+        .replace("#{pane.active}", if pane.active { "1" } else { "0" })
+        .replace("#{pane.zoomed}", if pane.zoomed { "1" } else { "0" })
+        .replace(
+            "#{window.zoomed_flag}",
+            if pane.window_zoomed { "1" } else { "0" },
+        )
+}
+
+fn handle_zoom_pane(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    pane: Option<usize>,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    if let Err(message) = session.zoom_pane(pane) {
+        write_err(stream, &message)?;
+        return Ok(());
+    }
+
+    write_ok(stream)
 }
 
 fn handle_select_pane(

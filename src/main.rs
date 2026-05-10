@@ -79,10 +79,14 @@ fn run() -> Result<(), String> {
             )?;
             Ok(())
         }
-        cli::Command::ListPanes { session } => {
+        cli::Command::ListPanes { session, format } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            let body = send_request(&socket, &protocol::encode_list_panes(&session), true)?;
+            let body = send_request(
+                &socket,
+                &protocol::encode_list_panes(&session, format.as_deref()),
+                true,
+            )?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
@@ -133,6 +137,12 @@ fn run() -> Result<(), String> {
                 &protocol::encode_kill_window(&session, window),
                 true,
             )?;
+            Ok(())
+        }
+        cli::Command::ZoomPane { session, pane } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(&socket, &protocol::encode_zoom_pane(&session, pane), true)?;
             Ok(())
         }
         cli::Command::KillSession { session } => {
