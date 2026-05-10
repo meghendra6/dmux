@@ -17,6 +17,10 @@ pub enum Command {
         cols: u16,
         rows: u16,
     },
+    SendKeys {
+        session: String,
+        keys: Vec<String>,
+    },
     KillSession {
         session: String,
     },
@@ -51,6 +55,7 @@ where
         "ls" | "list-sessions" => Ok(Command::ListSessions),
         "capture-pane" => parse_capture(args),
         "resize-pane" => parse_resize_pane(args),
+        "send-keys" => parse_send_keys(args),
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
@@ -163,6 +168,40 @@ fn parse_resize_pane(args: Vec<String>) -> Result<Command, String> {
     })
 }
 
+fn parse_send_keys(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut keys = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "send-keys requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("send-keys does not support option {value:?}"));
+            }
+            _ => {
+                keys.extend(args[i..].iter().cloned());
+                break;
+            }
+        }
+    }
+
+    if keys.is_empty() {
+        return Err("send-keys requires at least one key".to_string());
+    }
+
+    Ok(Command::SendKeys {
+        session: session.ok_or_else(|| "send-keys requires -t <session>".to_string())?,
+        keys,
+    })
+}
+
 fn parse_target(args: Vec<String>, command: &str) -> Result<Option<String>, String> {
     let mut target = None;
     let mut i = 0;
@@ -234,6 +273,18 @@ mod tests {
                 session: "dev".to_string(),
                 cols: 100,
                 rows: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_send_keys_target_and_keys() {
+        let command = parse_args(["dmux", "send-keys", "-t", "dev", "echo hi", "Enter"]).unwrap();
+        assert_eq!(
+            command,
+            Command::SendKeys {
+                session: "dev".to_string(),
+                keys: vec!["echo hi".to_string(), "Enter".to_string()],
             }
         );
     }

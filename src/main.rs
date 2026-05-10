@@ -58,6 +58,13 @@ fn run() -> Result<(), String> {
             )?;
             Ok(())
         }
+        cli::Command::SendKeys { session, keys } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let bytes = encode_key_tokens(&keys)?;
+            send_request(&socket, &protocol::encode_send(&session, &bytes), true)?;
+            Ok(())
+        }
         cli::Command::KillSession { session } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
@@ -95,6 +102,21 @@ fn run() -> Result<(), String> {
             .map_err(|err| err.to_string())
         }
     }
+}
+
+fn encode_key_tokens(keys: &[String]) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    for key in keys {
+        match key.as_str() {
+            "Enter" => bytes.push(b'\r'),
+            "Space" => bytes.push(b' '),
+            "Tab" => bytes.push(b'\t'),
+            "Escape" => bytes.push(0x1b),
+            "C-c" => bytes.push(0x03),
+            literal => bytes.extend_from_slice(literal.as_bytes()),
+        }
+    }
+    Ok(bytes)
 }
 
 fn io_error(message: String) -> std::io::Error {
