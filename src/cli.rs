@@ -1,0 +1,171 @@
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    New {
+        session: String,
+        detach: bool,
+        command: Vec<String>,
+    },
+    Attach {
+        session: String,
+    },
+    ListSessions,
+    CapturePane {
+        session: String,
+    },
+    KillSession {
+        session: String,
+    },
+    KillServer,
+    Server,
+}
+
+pub fn parse_args<I, S>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    if args.is_empty() {
+        return Ok(Command::Attach {
+            session: "default".to_string(),
+        });
+    }
+
+    let program = args.remove(0);
+    let Some(subcommand) = args.first().cloned() else {
+        return Ok(Command::Attach {
+            session: "default".to_string(),
+        });
+    };
+    args.remove(0);
+
+    match subcommand.as_str() {
+        "__server" => Ok(Command::Server),
+        "new" | "new-session" => parse_new(args),
+        "attach" | "attach-session" => parse_attach(args),
+        "ls" | "list-sessions" => Ok(Command::ListSessions),
+        "capture-pane" => parse_capture(args),
+        "kill-session" => parse_kill_session(args),
+        "kill-server" => Ok(Command::KillServer),
+        _ => Err(format!("{program}: unknown command {subcommand:?}")),
+    }
+}
+
+fn parse_new(args: Vec<String>) -> Result<Command, String> {
+    let mut detach = false;
+    let mut session = None;
+    let mut command = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-d" => {
+                detach = true;
+                i += 1;
+            }
+            "-s" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "new requires a session name after -s".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "--" => {
+                command.extend(args[i + 1..].iter().cloned());
+                break;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("new does not support option {value:?}"));
+            }
+            _ => {
+                command.extend(args[i..].iter().cloned());
+                break;
+            }
+        }
+    }
+
+    Ok(Command::New {
+        session: session.unwrap_or_else(|| "default".to_string()),
+        detach,
+        command,
+    })
+}
+
+fn parse_attach(args: Vec<String>) -> Result<Command, String> {
+    Ok(Command::Attach {
+        session: parse_target(args, "attach")?.unwrap_or_else(|| "default".to_string()),
+    })
+}
+
+fn parse_capture(args: Vec<String>) -> Result<Command, String> {
+    let session = parse_target(args, "capture-pane")?
+        .ok_or_else(|| "capture-pane requires -t <session>".to_string())?;
+    Ok(Command::CapturePane { session })
+}
+
+fn parse_kill_session(args: Vec<String>) -> Result<Command, String> {
+    let session = parse_target(args, "kill-session")?
+        .ok_or_else(|| "kill-session requires -t <session>".to_string())?;
+    Ok(Command::KillSession { session })
+}
+
+fn parse_target(args: Vec<String>, command: &str) -> Result<Option<String>, String> {
+    let mut target = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command} requires a session name after -t"))?;
+                target = Some(value.clone());
+                i += 2;
+            }
+            "-p" if command == "capture-pane" => {
+                i += 1;
+            }
+            value => return Err(format!("{command} does not support argument {value:?}")),
+        }
+    }
+
+    Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_detached_new_session_with_command() {
+        let command =
+            parse_args(["dmux", "new", "-d", "-s", "dev", "--", "sh", "-c", "echo ok"])
+                .unwrap();
+
+        assert_eq!(
+            command,
+            Command::New {
+                session: "dev".to_string(),
+                detach: true,
+                command: vec!["sh".to_string(), "-c".to_string(), "echo ok".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_capture_pane_print() {
+        let command = parse_args(["dmux", "capture-pane", "-t", "dev", "-p"]).unwrap();
+        assert_eq!(
+            command,
+            Command::CapturePane {
+                session: "dev".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_session_target() {
+        let err = parse_args(["dmux", "kill-session"]).unwrap_err();
+        assert!(err.contains("-t"));
+    }
+}
