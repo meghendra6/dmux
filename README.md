@@ -78,11 +78,12 @@ Implemented Phase 2 groundwork:
 - attach-time basic copy-mode key handling for line copy
 - attach-time basic copy-mode mouse selection for line ranges
 - attach-time statusline snapshot rendering
+- attach-time split-pane snapshot rendering
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
 
-- split panes are tracked server-side, but layout rendering is not implemented yet
+- multi-pane attach rendering is snapshot-only when multiple panes are visible and exits after rendering; live multi-pane attach, split-direction layout persistence, and live layout redraw are not implemented yet
 - zoomed panes are tracked server-side, but layout rendering is not implemented yet
 - attach-time statusline rendering is snapshot-only; live status redraw is not implemented yet
 - in-memory screen and scrollback only

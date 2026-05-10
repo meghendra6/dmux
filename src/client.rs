@@ -10,6 +10,12 @@ static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
 const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachMode {
+    Live,
+    Snapshot,
+}
+
 pub fn attach<F>(
     socket: &Path,
     session: &str,
@@ -26,13 +32,14 @@ where
     if let Some(message) = response.strip_prefix("ERR ") {
         return Err(io::Error::other(message.trim_end().to_string()));
     }
-    if response != "OK\n" {
-        return Err(io::Error::other(format!(
-            "unexpected server response: {response:?}"
-        )));
-    }
+    let attach_mode = parse_attach_ok(&response)?;
 
     write_attach_status_line(socket, session)?;
+    if attach_mode == AttachMode::Snapshot {
+        write_attach_pane_snapshot(socket, session)?;
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Ok(());
+    }
 
     let _guard = RawModeGuard::enable();
     install_winch_handler();
@@ -84,6 +91,31 @@ fn write_attach_status_line(socket: &Path, session: &str) -> io::Result<()> {
 
     let mut stdout = io::stdout().lock();
     stdout.write_all(format!("{status}\r\n").as_bytes())?;
+    stdout.flush()
+}
+
+fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
+    if response == "OK\n" {
+        return Ok(AttachMode::Live);
+    }
+
+    if response == "OK\tSNAPSHOT\n" {
+        return Ok(AttachMode::Snapshot);
+    }
+
+    Err(io::Error::other(format!(
+        "unexpected server response: {response:?}"
+    )))
+}
+
+fn write_attach_pane_snapshot(socket: &Path, session: &str) -> io::Result<()> {
+    let body = send_control_request(socket, &protocol::encode_attach_snapshot(session))?;
+    if body.is_empty() {
+        return Ok(());
+    }
+
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&body)?;
     stdout.flush()
 }
 

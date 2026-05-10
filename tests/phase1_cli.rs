@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -600,6 +601,133 @@ fn attach_renders_status_line_snapshot() {
         !captured.contains(&format!("{session} [0] pane 0")),
         "{captured:?}"
     );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_renders_split_pane_snapshot() {
+    let socket = unique_socket("attach-pane-snapshot");
+    let session = format!("attach-pane-snapshot-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run attach");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("-- pane 0 --"), "{stdout:?}");
+    assert!(stdout.contains("base-ready"), "{stdout:?}");
+    assert!(stdout.contains("-- pane 1 --"), "{stdout:?}");
+    assert!(stdout.contains("split-ready"), "{stdout:?}");
+
+    let captured = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
+    assert_success(&captured);
+    let captured = String::from_utf8_lossy(&captured.stdout);
+    assert!(!captured.contains("-- pane 0 --"), "{captured:?}");
+    assert!(!captured.contains("-- pane 1 --"), "{captured:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_keeps_zoomed_split_pane_live() {
+    let socket = unique_socket("attach-zoomed-pane-live");
+    let session = format!("attach-zoomed-pane-live-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; echo live:$line; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session]));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"hello\n").expect("write attach input");
+        stdin.flush().expect("flush attach input");
+    }
+    let live = poll_capture(&socket, &session, "live:hello");
+    assert!(live.contains("live:hello"), "{live:?}");
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+    }
+
+    let output = child.wait_with_output().expect("wait attach");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("-- pane 0 --"), "{stdout:?}");
+    assert!(!stdout.contains("-- pane 1 --"), "{stdout:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

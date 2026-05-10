@@ -258,6 +258,10 @@ impl Session {
     fn status_context(&self, name: &str) -> Option<StatusContext> {
         self.windows.lock().unwrap().status_context(name)
     }
+
+    fn attach_panes(&self) -> Vec<IndexedPane> {
+        self.windows.lock().unwrap().attach_panes()
+    }
 }
 
 struct Window {
@@ -316,6 +320,26 @@ impl Window {
                 active: index == self.panes.active_index(),
                 zoomed: self.zoomed == Some(index),
                 window_zoomed,
+            })
+            .collect()
+    }
+
+    fn attach_panes(&self) -> Vec<IndexedPane> {
+        if let Some(index) = self.zoomed {
+            return self
+                .panes
+                .get(index)
+                .cloned()
+                .map(|pane| vec![IndexedPane { index, pane }])
+                .unwrap_or_default();
+        }
+
+        (0..self.panes.len())
+            .filter_map(|index| {
+                self.panes
+                    .get(index)
+                    .cloned()
+                    .map(|pane| IndexedPane { index, pane })
             })
             .collect()
     }
@@ -431,6 +455,11 @@ impl WindowSet {
             .map_or_else(Vec::new, Window::pane_descriptions)
     }
 
+    fn attach_panes(&self) -> Vec<IndexedPane> {
+        self.active_window()
+            .map_or_else(Vec::new, Window::attach_panes)
+    }
+
     fn status_context(&self, session_name: &str) -> Option<StatusContext> {
         let window = self.active_window()?;
         Some(StatusContext {
@@ -479,6 +508,16 @@ struct PaneDescription {
     active: bool,
     zoomed: bool,
     window_zoomed: bool,
+}
+
+struct IndexedPane {
+    index: usize,
+    pane: Arc<Pane>,
+}
+
+struct PaneSnapshot {
+    index: usize,
+    screen: String,
 }
 
 struct StatusContext {
@@ -663,6 +702,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
         Request::Attach { session } => handle_attach(&state, stream, &session),
+        Request::AttachSnapshot { session } => {
+            handle_attach_snapshot(&state, &mut stream, &session)
+        }
     }
 }
 
@@ -1334,6 +1376,11 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
         return Ok(());
     };
 
+    if has_attach_pane_snapshot(&session) {
+        write_attach_snapshot_ok(&mut stream)?;
+        return Ok(());
+    }
+
     write_ok(&mut stream)?;
     {
         let history = pane.raw_history.lock().unwrap();
@@ -1351,6 +1398,67 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
     }
 
     Ok(())
+}
+
+fn has_attach_pane_snapshot(session: &Session) -> bool {
+    session.attach_panes().len() > 1
+}
+
+fn write_attach_snapshot_ok(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_all(b"OK\tSNAPSHOT\n")
+}
+
+fn handle_attach_snapshot(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    if let Some(snapshot) = attach_pane_snapshot(&session) {
+        stream.write_all(snapshot.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn attach_pane_snapshot(session: &Session) -> Option<String> {
+    let panes = session.attach_panes();
+    if panes.len() <= 1 {
+        return None;
+    }
+
+    let snapshots = panes
+        .into_iter()
+        .map(|pane| PaneSnapshot {
+            index: pane.index,
+            screen: capture_pane_text(&pane.pane, CaptureMode::Screen),
+        })
+        .collect::<Vec<_>>();
+
+    Some(render_attach_pane_snapshot(&snapshots))
+}
+
+fn render_attach_pane_snapshot(panes: &[PaneSnapshot]) -> String {
+    let mut output = String::new();
+    for pane in panes {
+        output.push_str("\r\n-- pane ");
+        output.push_str(&pane.index.to_string());
+        output.push_str(" --\r\n");
+        for line in pane.screen.lines() {
+            output.push_str(line);
+            output.push_str("\r\n");
+        }
+    }
+    output
 }
 
 fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
