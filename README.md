@@ -21,6 +21,7 @@ Implemented Phase 2 groundwork:
 - carriage-return overwrite handling in captures
 - explicit PTY resize requests with screen-state resize
 - attach-time PTY resize to the current terminal size when available
+- attached clients request PTY resize on terminal `SIGWINCH`
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
