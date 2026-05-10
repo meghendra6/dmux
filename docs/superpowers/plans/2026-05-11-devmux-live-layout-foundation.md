@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `src/server.rs`
 
-- [ ] **Step 1: Write failing layout unit tests**
+- [x] **Step 1: Write failing layout unit tests**
 
 Add these tests to the existing `#[cfg(test)] mod tests` in `src/server.rs`:
 
@@ -61,7 +61,7 @@ fn layout_node_removes_pane_and_shifts_remaining_indexes() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify RED**
+- [x] **Step 2: Run test to verify RED**
 
 Run:
 
@@ -71,7 +71,7 @@ cargo test server::tests::layout_node_splits_active_leaf_horizontally server::te
 
 Expected: FAIL because `LayoutNode` and its methods do not exist yet.
 
-- [ ] **Step 3: Add the minimal layout tree implementation**
+- [x] **Step 3: Add the minimal layout tree implementation**
 
 Update the import at the top of `src/server.rs`:
 
@@ -146,7 +146,7 @@ impl LayoutNode {
 }
 ```
 
-- [ ] **Step 4: Run test to verify GREEN**
+- [x] **Step 4: Run test to verify GREEN**
 
 Run:
 

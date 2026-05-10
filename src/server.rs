@@ -1,4 +1,4 @@
-use crate::protocol::{self, BufferSelection, CaptureMode, Request};
+use crate::protocol::{self, BufferSelection, CaptureMode, Request, SplitDirection};
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::TerminalState;
 use std::collections::HashMap;
@@ -267,6 +267,69 @@ impl Session {
 struct Window {
     panes: PaneSet<Arc<Pane>>,
     zoomed: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LayoutNode {
+    Pane(usize),
+    Split {
+        direction: SplitDirection,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    fn split_pane(
+        &mut self,
+        target: usize,
+        direction: SplitDirection,
+        new_index: usize,
+    ) -> bool {
+        match self {
+            LayoutNode::Pane(index) if *index == target => {
+                *self = LayoutNode::Split {
+                    direction,
+                    first: Box::new(LayoutNode::Pane(target)),
+                    second: Box::new(LayoutNode::Pane(new_index)),
+                };
+                true
+            }
+            LayoutNode::Pane(_) => false,
+            LayoutNode::Split { first, second, .. } => {
+                first.split_pane(target, direction, new_index)
+                    || second.split_pane(target, direction, new_index)
+            }
+        }
+    }
+
+    fn remove_pane(&mut self, removed: usize) -> bool {
+        match self {
+            LayoutNode::Pane(index) if *index == removed => false,
+            LayoutNode::Pane(index) => {
+                if *index > removed {
+                    *index -= 1;
+                }
+                true
+            }
+            LayoutNode::Split { first, second, .. } => {
+                let keep_first = first.remove_pane(removed);
+                let keep_second = second.remove_pane(removed);
+                match (keep_first, keep_second) {
+                    (true, true) => true,
+                    (true, false) => {
+                        *self = (**first).clone();
+                        true
+                    }
+                    (false, true) => {
+                        *self = (**second).clone();
+                        true
+                    }
+                    (false, false) => false,
+                }
+            }
+        }
+    }
 }
 
 impl Window {
@@ -1533,6 +1596,46 @@ mod tests {
             Err("cannot kill last pane; use kill-session")
         );
         assert_eq!(panes.active(), Some("base"));
+    }
+
+    #[test]
+    fn layout_node_splits_active_leaf_horizontally() {
+        let mut layout = LayoutNode::Pane(0);
+
+        assert!(layout.split_pane(0, SplitDirection::Horizontal, 1));
+
+        assert_eq!(
+            layout,
+            LayoutNode::Split {
+                direction: SplitDirection::Horizontal,
+                first: Box::new(LayoutNode::Pane(0)),
+                second: Box::new(LayoutNode::Pane(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn layout_node_removes_pane_and_shifts_remaining_indexes() {
+        let mut layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Split {
+                direction: SplitDirection::Vertical,
+                first: Box::new(LayoutNode::Pane(1)),
+                second: Box::new(LayoutNode::Pane(2)),
+            }),
+        };
+
+        assert!(layout.remove_pane(1));
+
+        assert_eq!(
+            layout,
+            LayoutNode::Split {
+                direction: SplitDirection::Horizontal,
+                first: Box::new(LayoutNode::Pane(0)),
+                second: Box::new(LayoutNode::Pane(1)),
+            }
+        );
     }
 
     #[test]
