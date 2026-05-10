@@ -1,3 +1,4 @@
+mod client;
 mod cli;
 mod paths;
 mod pty;
@@ -56,8 +57,10 @@ fn run() -> Result<(), String> {
             send_request(&socket, protocol::encode_kill_server(), false)?;
             Ok(())
         }
-        cli::Command::Attach { session: _ } => {
-            Err("interactive attach is not implemented yet".to_string())
+        cli::Command::Attach { session } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            client::attach(&socket, &session).map_err(|err| err.to_string())
         }
     }
 }

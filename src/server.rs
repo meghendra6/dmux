@@ -183,6 +183,10 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
     };
 
     write_ok(&mut stream)?;
+    {
+        let history = session.history.lock().unwrap();
+        stream.write_all(&history)?;
+    }
     session.clients.lock().unwrap().push(stream.try_clone()?);
 
     let mut buf = [0_u8; 8192];

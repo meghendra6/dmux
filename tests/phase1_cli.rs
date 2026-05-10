@@ -94,3 +94,15 @@ fn list_sessions_reports_created_session() {
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
+
+#[test]
+fn attach_reports_missing_session() {
+    let socket = unique_socket("missing-attach");
+    let output = dmux(&socket, &["attach", "-t", "missing"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing session"), "{stderr:?}");
+
+    let _ = dmux(&socket, &["kill-server"]);
+}
