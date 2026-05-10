@@ -41,6 +41,11 @@ capture sources as `capture-pane`; default and `--all` are combined history plus
 screen. Use `--search` to show only matching lines while preserving their
 original line numbers.
 
+Attached clients can enter the current basic copy-mode view with `C-b [`.
+Inside copy-mode, `j`/`k` and `Ctrl-n`/`Ctrl-p` move the cursor, `y` or Enter
+saves the current line to a buffer, and `q` or Escape exits. Mouse selection is
+not implemented yet.
+
 `save-buffer` currently stores captured active-pane text in an in-memory buffer
 with a 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name
 the buffer, omit `-b` to create an automatic name, and omit `-b` on
@@ -69,6 +74,7 @@ Implemented Phase 2 groundwork:
 - in-memory buffers backed by pane capture and paste into active panes
 - command-driven line range and search selection for buffer saves
 - command-driven line-numbered copy-mode inspection with search filtering
+- attach-time basic copy-mode key handling for line copy
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
@@ -77,7 +83,7 @@ Current limits:
 - zoomed panes are tracked server-side, but layout rendering is not implemented yet
 - statusline format expansion is implemented, but attach-time statusline rendering is not implemented yet
 - in-memory screen and scrollback only
-- interactive vi/emacs and mouse selection are not implemented yet
+- copy-mode mouse selection is not implemented yet
 - buffer contents are in-memory only
 - full terminal protocol support is incomplete
 - no layout or named-window support yet
