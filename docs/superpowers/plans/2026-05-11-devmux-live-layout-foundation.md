@@ -722,7 +722,7 @@ Review the live layout foundation diff for correctness. Focus on layout tree inv
 
 Apply technically valid Critical or Important findings, rerun full verification, and update this plan's checkboxes.
 
-- [ ] **Step 4: Open PR**
+- [x] **Step 4: Open PR**
 
 Run:
 
