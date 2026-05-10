@@ -206,7 +206,10 @@ mod tests {
     fn parses_attach_size_override() {
         assert_eq!(
             parse_attach_size("120x40").unwrap(),
-            crate::pty::PtySize { cols: 120, rows: 40 }
+            crate::pty::PtySize {
+                cols: 120,
+                rows: 40
+            }
         );
         assert!(parse_attach_size("0x40").is_err());
         assert!(parse_attach_size("120").is_err());
@@ -216,7 +219,10 @@ mod tests {
     fn parses_stty_size_output_as_rows_then_cols() {
         assert_eq!(
             parse_stty_size("40 120\n").unwrap(),
-            crate::pty::PtySize { cols: 120, rows: 40 }
+            crate::pty::PtySize {
+                cols: 120,
+                rows: 40
+            }
         );
     }
 }
