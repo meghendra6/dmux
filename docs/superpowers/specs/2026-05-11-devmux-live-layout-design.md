@@ -54,7 +54,7 @@ Initial rendering is static and text-based:
 
 - horizontal splits place panes side by side
 - vertical splits stack panes
-- each pane region is clipped to its allocated rows and columns
+- each pane screen is rendered from current captured non-empty screen lines
 - horizontal joins pad the left region and insert ` | ` before the right region
 - vertical joins insert a separator row of `-` characters between regions
 - rendered layout bytes are written only to the attach client, never to PTYs or

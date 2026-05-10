@@ -1564,6 +1564,10 @@ fn attach_pane_snapshot(session: &Session) -> Option<String> {
 }
 
 fn render_attach_pane_snapshot(layout: &LayoutNode, panes: &[PaneSnapshot]) -> String {
+    if !layout_matches_panes(layout, panes) {
+        return render_ordered_pane_sections(panes);
+    }
+
     let screens = panes
         .iter()
         .map(|pane| (pane.index, pane.screen.as_str()))
@@ -1572,6 +1576,27 @@ fn render_attach_pane_snapshot(layout: &LayoutNode, panes: &[PaneSnapshot]) -> S
     match render_layout_lines(layout, &screens) {
         Some(lines) => render_client_lines(&lines),
         None => render_ordered_pane_sections(panes),
+    }
+}
+
+fn layout_matches_panes(layout: &LayoutNode, panes: &[PaneSnapshot]) -> bool {
+    let mut layout_indexes = Vec::new();
+    collect_layout_pane_indexes(layout, &mut layout_indexes);
+    layout_indexes.sort_unstable();
+
+    let mut pane_indexes = panes.iter().map(|pane| pane.index).collect::<Vec<_>>();
+    pane_indexes.sort_unstable();
+
+    layout_indexes == pane_indexes
+}
+
+fn collect_layout_pane_indexes(layout: &LayoutNode, indexes: &mut Vec<usize>) {
+    match layout {
+        LayoutNode::Pane(index) => indexes.push(*index),
+        LayoutNode::Split { first, second, .. } => {
+            collect_layout_pane_indexes(first, indexes);
+            collect_layout_pane_indexes(second, indexes);
+        }
     }
 }
 
@@ -1826,6 +1851,28 @@ mod tests {
             rendered.contains("base-ready\r\n-----------\r\nsplit-ready\r\n"),
             "{rendered:?}"
         );
+    }
+
+    #[test]
+    fn render_attach_layout_falls_back_when_layout_omits_visible_pane() {
+        let layout = LayoutNode::Pane(0);
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "base-ready\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "split-ready\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_pane_snapshot(&layout, &panes);
+
+        assert!(rendered.contains("-- pane 0 --"), "{rendered:?}");
+        assert!(rendered.contains("base-ready"), "{rendered:?}");
+        assert!(rendered.contains("-- pane 1 --"), "{rendered:?}");
+        assert!(rendered.contains("split-ready"), "{rendered:?}");
     }
 
     #[test]

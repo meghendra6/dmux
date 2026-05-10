@@ -66,7 +66,7 @@ fn layout_node_removes_pane_and_shifts_remaining_indexes() {
 Run:
 
 ```bash
-cargo test server::tests::layout_node_splits_active_leaf_horizontally server::tests::layout_node_removes_pane_and_shifts_remaining_indexes
+cargo test layout_node_
 ```
 
 Expected: FAIL because `LayoutNode` and its methods do not exist yet.
@@ -151,7 +151,7 @@ impl LayoutNode {
 Run:
 
 ```bash
-cargo test server::tests::layout_node_splits_active_leaf_horizontally server::tests::layout_node_removes_pane_and_shifts_remaining_indexes
+cargo test layout_node_
 ```
 
 Expected: PASS.
@@ -227,7 +227,7 @@ fn render_attach_layout_stacks_vertical_panes() {
 Run:
 
 ```bash
-cargo test server::tests::render_attach_layout_joins_horizontal_panes server::tests::render_attach_layout_stacks_vertical_panes
+cargo test render_attach_layout_
 ```
 
 Expected: FAIL because `render_attach_pane_snapshot` still accepts only a pane list and prints labeled sections.
@@ -345,7 +345,7 @@ fn render_ordered_pane_sections(panes: &[PaneSnapshot]) -> String {
 Run:
 
 ```bash
-cargo test server::tests::render_attach_layout_joins_horizontal_panes server::tests::render_attach_layout_stacks_vertical_panes
+cargo test render_attach_layout_
 ```
 
 Expected: PASS.
@@ -482,7 +482,8 @@ fn assert_vertical_layout(text: &str, top: &str, bottom: &str) {
 Run:
 
 ```bash
-cargo test --test phase1_cli attach_renders_split_pane_snapshot attach_renders_vertical_split_layout_snapshot
+cargo test --test phase1_cli attach_renders_split_pane_snapshot
+cargo test --test phase1_cli attach_renders_vertical_split_layout_snapshot
 ```
 
 Expected: FAIL because attach snapshots still use labeled sections and split direction is not stored in `Window`.
@@ -662,7 +663,9 @@ fn attach_pane_snapshot(session: &Session) -> Option<String> {
 Run:
 
 ```bash
-cargo test --test phase1_cli attach_renders_split_pane_snapshot attach_renders_vertical_split_layout_snapshot attach_keeps_zoomed_split_pane_live
+cargo test --test phase1_cli attach_renders_split_pane_snapshot
+cargo test --test phase1_cli attach_renders_vertical_split_layout_snapshot
+cargo test --test phase1_cli attach_keeps_zoomed_split_pane_live
 ```
 
 Expected: PASS.
@@ -684,25 +687,13 @@ git commit -m "feat: render split layout snapshots"
 
 - [x] **Step 1: Update README**
 
-Update implemented groundwork from:
-
-```text
-- attach-time split-pane snapshot rendering
-```
-
-to:
+Ensure implemented groundwork includes:
 
 ```text
 - attach-time split-pane layout snapshot rendering
 ```
 
-Update current limits from:
-
-```text
-- multi-pane attach rendering is snapshot-only when multiple panes are visible and exits after rendering; live multi-pane attach, split-direction layout persistence, and live layout redraw are not implemented yet
-```
-
-to:
+Ensure current limits include:
 
 ```text
 - multi-pane attach rendering is split-layout snapshot-only when multiple panes are visible and exits after rendering; live multi-pane attach and live layout redraw are not implemented yet
@@ -721,7 +712,7 @@ cargo test
 
 Expected: all commands exit 0; keyword scan prints no matches; unit and integration tests pass.
 
-- [ ] **Step 3: Request critical review**
+- [x] **Step 3: Request critical review**
 
 Dispatch a read-only review subagent against `git diff origin/main` with this brief:
 

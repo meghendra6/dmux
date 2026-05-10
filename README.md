@@ -90,7 +90,7 @@ Current limits:
 - copy-mode selection is line-based only
 - buffer contents are in-memory only
 - full terminal protocol support is incomplete
-- no layout or named-window support yet
+- no named layout or named-window support yet
 - Unix/macOS POSIX PTY support only
 
 Supported `send-keys` tokens are literal text plus `Enter`, `Space`, `Tab`,
