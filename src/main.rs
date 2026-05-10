@@ -125,6 +125,16 @@ fn run() -> Result<(), String> {
             )?;
             Ok(())
         }
+        cli::Command::KillWindow { session, window } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_kill_window(&session, window),
+                true,
+            )?;
+            Ok(())
+        }
         cli::Command::KillSession { session } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;

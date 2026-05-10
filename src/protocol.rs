@@ -55,6 +55,10 @@ pub enum Request {
         session: String,
         window: usize,
     },
+    KillWindow {
+        session: String,
+        window: Option<usize>,
+    },
     Kill {
         session: String,
     },
@@ -121,6 +125,13 @@ pub fn encode_list_windows(session: &str) -> String {
 
 pub fn encode_select_window(session: &str, window: usize) -> String {
     format!("SELECT_WINDOW\t{session}\t{window}\n")
+}
+
+pub fn encode_kill_window(session: &str, window: Option<usize>) -> String {
+    match window {
+        Some(window) => format!("KILL_WINDOW\t{session}\t{window}\n"),
+        None => format!("KILL_WINDOW\t{session}\tactive\n"),
+    }
 }
 
 pub fn encode_kill(session: &str) -> String {
@@ -230,6 +241,10 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 .parse::<usize>()
                 .map_err(|_| "SELECT_WINDOW has invalid window index".to_string())?,
         }),
+        ["KILL_WINDOW", session, window] => Ok(Request::KillWindow {
+            session: (*session).to_string(),
+            window: decode_optional_window(window)?,
+        }),
         ["KILL", session] => Ok(Request::Kill {
             session: (*session).to_string(),
         }),
@@ -254,13 +269,21 @@ fn decode_split_direction(value: &str) -> Result<SplitDirection, String> {
 }
 
 fn decode_optional_pane(value: &str) -> Result<Option<usize>, String> {
+    decode_optional_index(value, "KILL_PANE has invalid pane index")
+}
+
+fn decode_optional_window(value: &str) -> Result<Option<usize>, String> {
+    decode_optional_index(value, "KILL_WINDOW has invalid window index")
+}
+
+fn decode_optional_index(value: &str, invalid_message: &str) -> Result<Option<usize>, String> {
     if value == "active" {
         Ok(None)
     } else {
         value
             .parse::<usize>()
             .map(Some)
-            .map_err(|_| "KILL_PANE has invalid pane index".to_string())
+            .map_err(|_| invalid_message.to_string())
     }
 }
 
@@ -419,5 +442,41 @@ mod tests {
                 window: 1,
             }
         );
+    }
+
+    #[test]
+    fn round_trips_kill_window_request_with_index() {
+        let line = encode_kill_window("dev", Some(1));
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::KillWindow {
+                session: "dev".to_string(),
+                window: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_kill_window_request_for_active_window() {
+        let line = encode_kill_window("dev", None);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::KillWindow {
+                session: "dev".to_string(),
+                window: None,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_kill_pane_index_with_existing_message() {
+        let err = decode_request("KILL_PANE\tdev\tbad\n").unwrap_err();
+        assert_eq!(err, "KILL_PANE has invalid pane index");
+    }
+
+    #[test]
+    fn rejects_invalid_kill_window_index() {
+        let err = decode_request("KILL_WINDOW\tdev\tbad\n").unwrap_err();
+        assert_eq!(err, "KILL_WINDOW has invalid window index");
     }
 }
