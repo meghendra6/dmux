@@ -98,6 +98,33 @@ fn run() -> Result<(), String> {
             send_request(&socket, &protocol::encode_kill_pane(&session, pane), true)?;
             Ok(())
         }
+        cli::Command::NewWindow { session, command } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_new_window(&session, &command),
+                true,
+            )?;
+            Ok(())
+        }
+        cli::Command::ListWindows { session } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let body = send_request(&socket, &protocol::encode_list_windows(&session), true)?;
+            print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
+        cli::Command::SelectWindow { session, window } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_select_window(&session, window),
+                true,
+            )?;
+            Ok(())
+        }
         cli::Command::KillSession { session } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;

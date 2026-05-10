@@ -44,6 +44,17 @@ pub enum Request {
         session: String,
         pane: Option<usize>,
     },
+    NewWindow {
+        session: String,
+        command: Vec<String>,
+    },
+    ListWindows {
+        session: String,
+    },
+    SelectWindow {
+        session: String,
+        window: usize,
+    },
     Kill {
         session: String,
     },
@@ -97,6 +108,19 @@ pub fn encode_kill_pane(session: &str, pane: Option<usize>) -> String {
         Some(pane) => format!("KILL_PANE\t{session}\t{pane}\n"),
         None => format!("KILL_PANE\t{session}\tactive\n"),
     }
+}
+
+pub fn encode_new_window(session: &str, command: &[String]) -> String {
+    let joined = command.join(&ARG_SEPARATOR.to_string());
+    format!("NEW_WINDOW\t{session}\t{}\t{joined}\n", command.len())
+}
+
+pub fn encode_list_windows(session: &str) -> String {
+    format!("LIST_WINDOWS\t{session}\n")
+}
+
+pub fn encode_select_window(session: &str, window: usize) -> String {
+    format!("SELECT_WINDOW\t{session}\t{window}\n")
 }
 
 pub fn encode_kill(session: &str) -> String {
@@ -179,6 +203,32 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["KILL_PANE", session, pane] => Ok(Request::KillPane {
             session: (*session).to_string(),
             pane: decode_optional_pane(pane)?,
+        }),
+        ["NEW_WINDOW", session, argc, joined] => {
+            let argc = argc
+                .parse::<usize>()
+                .map_err(|_| "NEW_WINDOW has invalid argc".to_string())?;
+            let command = if *joined == "" {
+                Vec::new()
+            } else {
+                joined.split(ARG_SEPARATOR).map(str::to_string).collect()
+            };
+            if command.len() != argc {
+                return Err("NEW_WINDOW argc does not match command".to_string());
+            }
+            Ok(Request::NewWindow {
+                session: (*session).to_string(),
+                command,
+            })
+        }
+        ["LIST_WINDOWS", session] => Ok(Request::ListWindows {
+            session: (*session).to_string(),
+        }),
+        ["SELECT_WINDOW", session, window] => Ok(Request::SelectWindow {
+            session: (*session).to_string(),
+            window: window
+                .parse::<usize>()
+                .map_err(|_| "SELECT_WINDOW has invalid window index".to_string())?,
         }),
         ["KILL", session] => Ok(Request::Kill {
             session: (*session).to_string(),
@@ -338,6 +388,35 @@ mod tests {
             Request::KillPane {
                 session: "dev".to_string(),
                 pane: None,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_new_window_request() {
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo window".to_string(),
+        ];
+        let line = encode_new_window("dev", &command);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::NewWindow {
+                session: "dev".to_string(),
+                command,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_select_window_request() {
+        let line = encode_select_window("dev", 1);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::SelectWindow {
+                session: "dev".to_string(),
+                window: 1,
             }
         );
     }

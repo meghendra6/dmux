@@ -45,45 +45,164 @@ struct ServerState {
 }
 
 struct Session {
-    panes: Mutex<PaneSet<Arc<Pane>>>,
+    windows: Mutex<WindowSet>,
 }
 
 impl Session {
     fn new(pane: Arc<Pane>) -> Self {
         Self {
-            panes: Mutex::new(PaneSet::new(pane)),
+            windows: Mutex::new(WindowSet::new(Window::new(pane))),
         }
     }
 
     fn active_pane(&self) -> Option<Arc<Pane>> {
-        self.panes.lock().unwrap().active()
+        self.windows.lock().unwrap().active_pane()
     }
 
     fn add_pane(&self, pane: Arc<Pane>) {
-        self.panes.lock().unwrap().add(pane);
+        self.windows.lock().unwrap().add_pane(pane);
     }
 
     fn select_pane(&self, index: usize) -> bool {
-        self.panes.lock().unwrap().select(index)
+        self.windows.lock().unwrap().select_pane(index)
     }
 
     fn kill_pane(&self, target: Option<usize>) -> Result<(), String> {
-        let mut panes = self.panes.lock().unwrap();
-        let index = panes.kill_index(target).map_err(str::to_string)?;
-        let pane = panes
+        self.windows.lock().unwrap().kill_pane(target)
+    }
+
+    fn pane_count(&self) -> usize {
+        self.windows.lock().unwrap().pane_count()
+    }
+
+    fn panes(&self) -> Vec<Arc<Pane>> {
+        self.windows.lock().unwrap().panes()
+    }
+
+    fn add_window(&self, pane: Arc<Pane>) {
+        self.windows.lock().unwrap().add(Window::new(pane));
+    }
+
+    fn select_window(&self, index: usize) -> bool {
+        self.windows.lock().unwrap().select(index)
+    }
+
+    fn window_count(&self) -> usize {
+        self.windows.lock().unwrap().len()
+    }
+}
+
+struct Window {
+    panes: PaneSet<Arc<Pane>>,
+}
+
+impl Window {
+    fn new(pane: Arc<Pane>) -> Self {
+        Self {
+            panes: PaneSet::new(pane),
+        }
+    }
+
+    fn active_pane(&self) -> Option<Arc<Pane>> {
+        self.panes.active()
+    }
+
+    fn add_pane(&mut self, pane: Arc<Pane>) {
+        self.panes.add(pane);
+    }
+
+    fn select_pane(&mut self, index: usize) -> bool {
+        self.panes.select(index)
+    }
+
+    fn kill_pane(&mut self, target: Option<usize>) -> Result<(), String> {
+        let index = self.panes.kill_index(target).map_err(str::to_string)?;
+        let pane = self
+            .panes
             .get(index)
             .expect("validated pane index must exist while session lock is held");
         pty::terminate(pane.child_pid).map_err(|err| err.to_string())?;
-        panes.kill_at(index);
+        self.panes.kill_at(index);
         Ok(())
     }
 
     fn pane_count(&self) -> usize {
-        self.panes.lock().unwrap().len()
+        self.panes.len()
     }
 
     fn panes(&self) -> Vec<Arc<Pane>> {
-        self.panes.lock().unwrap().all()
+        self.panes.all()
+    }
+}
+
+struct WindowSet {
+    windows: Vec<Window>,
+    active: usize,
+}
+
+impl WindowSet {
+    fn new(window: Window) -> Self {
+        Self {
+            windows: vec![window],
+            active: 0,
+        }
+    }
+
+    fn add(&mut self, window: Window) {
+        self.windows.push(window);
+        self.active = self.windows.len() - 1;
+    }
+
+    fn select(&mut self, index: usize) -> bool {
+        if index >= self.windows.len() {
+            return false;
+        }
+        self.active = index;
+        true
+    }
+
+    fn active_window(&self) -> Option<&Window> {
+        self.windows.get(self.active)
+    }
+
+    fn active_window_mut(&mut self) -> Option<&mut Window> {
+        self.windows.get_mut(self.active)
+    }
+
+    fn active_pane(&self) -> Option<Arc<Pane>> {
+        self.active_window()?.active_pane()
+    }
+
+    fn add_pane(&mut self, pane: Arc<Pane>) {
+        if let Some(window) = self.active_window_mut() {
+            window.add_pane(pane);
+        }
+    }
+
+    fn select_pane(&mut self, index: usize) -> bool {
+        self.active_window_mut()
+            .is_some_and(|window| window.select_pane(index))
+    }
+
+    fn kill_pane(&mut self, target: Option<usize>) -> Result<(), String> {
+        self.active_window_mut()
+            .ok_or_else(|| "missing window".to_string())?
+            .kill_pane(target)
+    }
+
+    fn pane_count(&self) -> usize {
+        self.active_window().map_or(0, Window::pane_count)
+    }
+
+    fn panes(&self) -> Vec<Arc<Pane>> {
+        self.windows
+            .iter()
+            .flat_map(Window::panes)
+            .collect::<Vec<_>>()
+    }
+
+    fn len(&self) -> usize {
+        self.windows.len()
     }
 }
 
@@ -208,6 +327,13 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         }
         Request::KillPane { session, pane } => {
             handle_kill_pane(&state, &mut stream, &session, pane)
+        }
+        Request::NewWindow { session, command } => {
+            handle_new_window(&state, &mut stream, &session, command)
+        }
+        Request::ListWindows { session } => handle_list_windows(&state, &mut stream, &session),
+        Request::SelectWindow { session, window } => {
+            handle_select_window(&state, &mut stream, &session, window)
         }
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
@@ -459,6 +585,79 @@ fn handle_kill_pane(
             return Ok(());
         }
     };
+
+    write_ok(stream)
+}
+
+fn handle_new_window(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    command: Vec<String>,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+    let Some(active) = session.active_pane() else {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    };
+
+    let size = *active.size.lock().unwrap();
+    let cwd = std::env::current_dir()?;
+    let pane = spawn_pane(name.to_string(), command, cwd, size)?;
+    session.add_window(pane);
+    write_ok(stream)
+}
+
+fn handle_list_windows(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    for index in 0..session.window_count() {
+        writeln!(stream, "{index}")?;
+    }
+    Ok(())
+}
+
+fn handle_select_window(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    index: usize,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    if !session.select_window(index) {
+        write_err(stream, "missing window")?;
+        return Ok(());
+    }
 
     write_ok(stream)
 }
