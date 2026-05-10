@@ -86,6 +86,12 @@ fn run() -> Result<(), String> {
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
+        cli::Command::SelectPane { session, pane } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(&socket, &protocol::encode_select_pane(&session, pane), true)?;
+            Ok(())
+        }
         cli::Command::KillSession { session } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;

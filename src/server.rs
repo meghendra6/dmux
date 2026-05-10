@@ -69,6 +69,14 @@ impl Session {
         *active = panes.len() - 1;
     }
 
+    fn select_pane(&self, index: usize) -> bool {
+        if index >= self.panes.lock().unwrap().len() {
+            return false;
+        }
+        *self.active_pane.lock().unwrap() = index;
+        true
+    }
+
     fn pane_count(&self) -> usize {
         self.panes.lock().unwrap().len()
     }
@@ -120,6 +128,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             command,
         } => handle_split(&state, &mut stream, &session, command),
         Request::ListPanes { session } => handle_list_panes(&state, &mut stream, &session),
+        Request::SelectPane { session, pane } => {
+            handle_select_pane(&state, &mut stream, &session, pane)
+        }
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
         Request::Attach { session } => handle_attach(&state, stream, &session),
@@ -321,6 +332,30 @@ fn handle_list_panes(
         writeln!(stream, "{index}")?;
     }
     Ok(())
+}
+
+fn handle_select_pane(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    index: usize,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    if !session.select_pane(index) {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    }
+
+    write_ok(stream)
 }
 
 fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {

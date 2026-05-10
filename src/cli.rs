@@ -31,6 +31,10 @@ pub enum Command {
     ListPanes {
         session: String,
     },
+    SelectPane {
+        session: String,
+        pane: usize,
+    },
     KillSession {
         session: String,
     },
@@ -68,6 +72,7 @@ where
         "send-keys" => parse_send_keys(args),
         "split-window" | "split" => parse_split_window(args),
         "list-panes" => parse_list_panes(args),
+        "select-pane" => parse_select_pane(args),
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
@@ -264,6 +269,40 @@ fn parse_list_panes(args: Vec<String>) -> Result<Command, String> {
     Ok(Command::ListPanes { session })
 }
 
+fn parse_select_pane(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut pane = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "select-pane requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-p" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "select-pane requires a pane index after -p".to_string())?;
+                pane =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        "select-pane -p must be a non-negative integer".to_string()
+                    })?);
+                i += 2;
+            }
+            value => return Err(format!("select-pane does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::SelectPane {
+        session: session.ok_or_else(|| "select-pane requires -t <session>".to_string())?,
+        pane: pane.ok_or_else(|| "select-pane requires -p <index>".to_string())?,
+    })
+}
+
 fn set_split_direction(
     direction: &mut Option<SplitDirection>,
     value: SplitDirection,
@@ -394,6 +433,18 @@ mod tests {
             command,
             Command::ListPanes {
                 session: "dev".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_select_pane_target_and_index() {
+        let command = parse_args(["dmux", "select-pane", "-t", "dev", "-p", "1"]).unwrap();
+        assert_eq!(
+            command,
+            Command::SelectPane {
+                session: "dev".to_string(),
+                pane: 1,
             }
         );
     }
