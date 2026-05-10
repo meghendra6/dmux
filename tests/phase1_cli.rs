@@ -183,6 +183,87 @@ fn buffers_save_capture_list_paste_and_delete() {
     assert_success(&dmux(&socket, &["kill-server"]));
 }
 
+#[test]
+fn save_buffer_can_copy_line_range_and_search_match() {
+    let socket = unique_socket("copy-selection");
+    let source = format!("copy-source-{}", std::process::id());
+    let sink = format!("copy-sink-{}", std::process::id());
+    let file = unique_temp_file("copy-selection");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &source,
+            "--",
+            "sh",
+            "-c",
+            "printf first; printf '\\n'; printf keep-one; printf '\\n'; printf keep-two; printf '\\n'; printf last; printf '\\n'; sleep 30",
+        ],
+    ));
+    let captured = poll_capture(&socket, &source, "last");
+    assert!(captured.contains("keep-one"), "{captured:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "save-buffer",
+            "-t",
+            &source,
+            "-b",
+            "picked",
+            "--screen",
+            "--start-line",
+            "2",
+            "--end-line",
+            "3",
+        ],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "save-buffer",
+            "-t",
+            &source,
+            "-b",
+            "match",
+            "--screen",
+            "--search",
+            "last",
+        ],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &sink,
+            "--",
+            "sh",
+            "-c",
+            &format!("cat > {}; sleep 30", file.display()),
+        ],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &["paste-buffer", "-t", &sink, "-b", "picked"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["paste-buffer", "-t", &sink, "-b", "match"],
+    ));
+    assert!(poll_file_equals(&file, "keep-one\nkeep-two\nlast\n"));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &source]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &sink]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
 fn has_line(text: &str, needle: &str) -> bool {
     text.lines().any(|line| line == needle)
 }
@@ -208,6 +289,17 @@ fn poll_file_contains(path: &std::path::Path, needle: &str) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         if std::fs::read_to_string(path).is_ok_and(|text| text.contains(needle)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+fn poll_file_equals(path: &std::path::Path, expected: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(path).is_ok_and(|text| text == expected) {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));

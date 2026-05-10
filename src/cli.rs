@@ -1,4 +1,4 @@
-use crate::protocol::{CaptureMode, SplitDirection};
+use crate::protocol::{BufferSelection, CaptureMode, SplitDirection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -19,6 +19,7 @@ pub enum Command {
         session: String,
         buffer: Option<String>,
         mode: CaptureMode,
+        selection: BufferSelection,
     },
     ListBuffers,
     PasteBuffer {
@@ -234,6 +235,9 @@ fn parse_save_buffer(args: Vec<String>) -> Result<Command, String> {
     let mut session = None;
     let mut buffer = None;
     let mut mode = None;
+    let mut start_line = None;
+    let mut end_line = None;
+    let mut search = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -264,15 +268,63 @@ fn parse_save_buffer(args: Vec<String>) -> Result<Command, String> {
                 set_capture_mode(&mut mode, CaptureMode::All)?;
                 i += 1;
             }
+            "--start-line" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "save-buffer requires a line number after --start-line".to_string()
+                })?;
+                start_line = Some(parse_positive_usize(value, "save-buffer --start-line")?);
+                i += 2;
+            }
+            "--end-line" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "save-buffer requires a line number after --end-line".to_string()
+                })?;
+                end_line = Some(parse_positive_usize(value, "save-buffer --end-line")?);
+                i += 2;
+            }
+            "--search" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "save-buffer requires text after --search".to_string())?;
+                if value.is_empty() {
+                    return Err("save-buffer --search requires non-empty text".to_string());
+                }
+                search = Some(value.clone());
+                i += 2;
+            }
             value => return Err(format!("save-buffer does not support argument {value:?}")),
         }
     }
+
+    let selection = parse_buffer_selection(start_line, end_line, search)?;
 
     Ok(Command::SaveBuffer {
         session: session.ok_or_else(|| "save-buffer requires -t <session>".to_string())?,
         buffer,
         mode: mode.unwrap_or(CaptureMode::All),
+        selection,
     })
+}
+
+fn parse_buffer_selection(
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    search: Option<String>,
+) -> Result<BufferSelection, String> {
+    if search.is_some() && (start_line.is_some() || end_line.is_some()) {
+        return Err("save-buffer accepts either a line range or --search".to_string());
+    }
+
+    if let Some(search) = search {
+        return Ok(BufferSelection::Search(search));
+    }
+
+    match (start_line, end_line) {
+        (None, None) => Ok(BufferSelection::All),
+        (Some(start), Some(end)) if start <= end => Ok(BufferSelection::LineRange { start, end }),
+        (Some(_), Some(_)) => Err("save-buffer line range requires start <= end".to_string()),
+        _ => Err("save-buffer line range requires --start-line and --end-line".to_string()),
+    }
 }
 
 fn parse_list_buffers(args: Vec<String>) -> Result<Command, String> {
@@ -342,6 +394,14 @@ fn parse_buffer_name(value: &str, command: &str) -> Result<String, String> {
     } else {
         Ok(value.to_string())
     }
+}
+
+fn parse_positive_usize(value: &str, label: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{label} must be a positive integer"))
 }
 
 fn parse_kill_session(args: Vec<String>) -> Result<Command, String> {
@@ -921,8 +981,85 @@ mod tests {
                 session: "dev".to_string(),
                 buffer: Some("saved".to_string()),
                 mode: CaptureMode::Screen,
+                selection: BufferSelection::All,
             }
         );
+    }
+
+    #[test]
+    fn parses_save_buffer_line_range_selection() {
+        let command = parse_args([
+            "dmux",
+            "save-buffer",
+            "-t",
+            "dev",
+            "-b",
+            "picked",
+            "--screen",
+            "--start-line",
+            "2",
+            "--end-line",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::SaveBuffer {
+                session: "dev".to_string(),
+                buffer: Some("picked".to_string()),
+                mode: CaptureMode::Screen,
+                selection: BufferSelection::LineRange { start: 2, end: 3 },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_save_buffer_search_selection() {
+        let command = parse_args([
+            "dmux",
+            "save-buffer",
+            "-t",
+            "dev",
+            "-b",
+            "match",
+            "--search",
+            "needle",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::SaveBuffer {
+                session: "dev".to_string(),
+                buffer: Some("match".to_string()),
+                mode: CaptureMode::All,
+                selection: BufferSelection::Search("needle".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_save_buffer_search_with_line_range() {
+        let err = parse_args([
+            "dmux",
+            "save-buffer",
+            "-t",
+            "dev",
+            "--start-line",
+            "1",
+            "--end-line",
+            "2",
+            "--search",
+            "needle",
+        ])
+        .unwrap_err();
+        assert!(err.contains("either a line range or --search"), "{err}");
+    }
+
+    #[test]
+    fn rejects_save_buffer_partial_line_range() {
+        let err =
+            parse_args(["dmux", "save-buffer", "-t", "dev", "--start-line", "1"]).unwrap_err();
+        assert!(err.contains("--start-line and --end-line"), "{err}");
     }
 
     #[test]

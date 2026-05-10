@@ -1,4 +1,4 @@
-use crate::protocol::{self, CaptureMode, Request};
+use crate::protocol::{self, BufferSelection, CaptureMode, Request};
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::TerminalState;
 use std::collections::HashMap;
@@ -142,6 +142,49 @@ fn buffer_preview(text: &str) -> String {
         .chars()
         .take(40)
         .collect()
+}
+
+fn select_buffer_text(text: &str, selection: &BufferSelection) -> Result<String, String> {
+    match selection {
+        BufferSelection::All => Ok(text.to_string()),
+        BufferSelection::LineRange { start, end } => select_line_range(text, *start, *end),
+        BufferSelection::Search(needle) => select_search_match(text, needle),
+    }
+}
+
+fn select_line_range(text: &str, start: usize, end: usize) -> Result<String, String> {
+    if start == 0 || end == 0 || start > end {
+        return Err("invalid line range".to_string());
+    }
+
+    let lines = text.lines().collect::<Vec<_>>();
+    if end > lines.len() {
+        return Err("missing line".to_string());
+    }
+
+    Ok(join_selected_lines(&lines[start - 1..end]))
+}
+
+fn select_search_match(text: &str, needle: &str) -> Result<String, String> {
+    if needle.is_empty() {
+        return Err("search text cannot be empty".to_string());
+    }
+
+    let Some(line) = text.lines().find(|line| line.contains(needle)) else {
+        return Err("missing match".to_string());
+    };
+
+    Ok(join_selected_lines(&[line]))
+}
+
+fn join_selected_lines(lines: &[&str]) -> String {
+    if lines.is_empty() {
+        String::new()
+    } else {
+        let mut text = lines.join("\n");
+        text.push('\n');
+        text
+    }
 }
 
 struct Session {
@@ -546,7 +589,15 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             session,
             buffer,
             mode,
-        } => handle_save_buffer(&state, &mut stream, &session, buffer.as_deref(), mode),
+            selection,
+        } => handle_save_buffer(
+            &state,
+            &mut stream,
+            &session,
+            buffer.as_deref(),
+            mode,
+            &selection,
+        ),
         Request::ListBuffers => handle_list_buffers(&state, &mut stream),
         Request::PasteBuffer { session, buffer } => {
             handle_paste_buffer(&state, &mut stream, &session, buffer.as_deref())
@@ -700,6 +751,7 @@ fn handle_save_buffer(
     name: &str,
     buffer: Option<&str>,
     mode: CaptureMode,
+    selection: &BufferSelection,
 ) -> io::Result<()> {
     let session = {
         let sessions = state.sessions.lock().unwrap();
@@ -716,7 +768,14 @@ fn handle_save_buffer(
     };
 
     let captured = capture_pane_text(&pane, mode);
-    let saved_name = match state.buffers.lock().unwrap().save(buffer, captured) {
+    let selected = match select_buffer_text(&captured, selection) {
+        Ok(text) => text,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    let saved_name = match state.buffers.lock().unwrap().save(buffer, selected) {
         Ok(name) => name,
         Err(message) => {
             write_err(stream, &message)?;
@@ -1340,5 +1399,45 @@ mod tests {
                 .is_some()
         );
         assert_eq!(store.list().len(), MAX_BUFFERS);
+    }
+
+    #[test]
+    fn selected_buffer_text_returns_line_range() {
+        let text = select_buffer_text(
+            "first\nkeep-one\nkeep-two\nlast\n",
+            &BufferSelection::LineRange { start: 2, end: 3 },
+        )
+        .unwrap();
+        assert_eq!(text, "keep-one\nkeep-two\n");
+    }
+
+    #[test]
+    fn selected_buffer_text_returns_first_search_match() {
+        let text = select_buffer_text(
+            "first\nneedle-one\nneedle-two\n",
+            &BufferSelection::Search("needle".to_string()),
+        )
+        .unwrap();
+        assert_eq!(text, "needle-one\n");
+    }
+
+    #[test]
+    fn selected_buffer_text_rejects_missing_line_range() {
+        let err = select_buffer_text(
+            "first\nsecond\n",
+            &BufferSelection::LineRange { start: 2, end: 3 },
+        )
+        .unwrap_err();
+        assert_eq!(err, "missing line");
+    }
+
+    #[test]
+    fn selected_buffer_text_rejects_missing_search_match() {
+        let err = select_buffer_text(
+            "first\nsecond\n",
+            &BufferSelection::Search("needle".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(err, "missing match");
     }
 }

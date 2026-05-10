@@ -48,12 +48,13 @@ fn run() -> Result<(), String> {
             session,
             buffer,
             mode,
+            selection,
         } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
             let body = send_request(
                 &socket,
-                &protocol::encode_save_buffer(&session, buffer.as_deref(), mode),
+                &protocol::encode_save_buffer(&session, buffer.as_deref(), mode, selection),
                 true,
             )?;
             print!("{}", String::from_utf8_lossy(&body));

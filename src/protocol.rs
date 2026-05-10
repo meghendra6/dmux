@@ -14,6 +14,13 @@ pub enum CaptureMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BufferSelection {
+    All,
+    LineRange { start: usize, end: usize },
+    Search(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     New {
         session: String,
@@ -31,6 +38,7 @@ pub enum Request {
         session: String,
         buffer: Option<String>,
         mode: CaptureMode,
+        selection: BufferSelection,
     },
     ListBuffers,
     PasteBuffer {
@@ -116,12 +124,26 @@ pub fn encode_capture(session: &str, mode: CaptureMode) -> String {
     format!("CAPTURE\t{session}\t{}\n", encode_capture_mode(mode))
 }
 
-pub fn encode_save_buffer(session: &str, buffer: Option<&str>, mode: CaptureMode) -> String {
-    format!(
-        "SAVE_BUFFER\t{session}\t{}\t{}\n",
-        encode_capture_mode(mode),
-        encode_optional_text(buffer)
-    )
+pub fn encode_save_buffer(
+    session: &str,
+    buffer: Option<&str>,
+    mode: CaptureMode,
+    selection: BufferSelection,
+) -> String {
+    let mode = encode_capture_mode(mode);
+    let buffer = encode_optional_text(buffer);
+    match selection {
+        BufferSelection::All => format!("SAVE_BUFFER\t{session}\t{mode}\t{buffer}\n"),
+        BufferSelection::LineRange { start, end } => {
+            format!("SAVE_BUFFER_LINES\t{session}\t{mode}\t{buffer}\t{start}\t{end}\n")
+        }
+        BufferSelection::Search(needle) => {
+            format!(
+                "SAVE_BUFFER_SEARCH\t{session}\t{mode}\t{buffer}\t{}\n",
+                encode_hex(needle.as_bytes())
+            )
+        }
+    }
 }
 
 pub fn encode_list_buffers() -> &'static str {
@@ -267,6 +289,22 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
             buffer: decode_optional_text(buffer, "SAVE_BUFFER")?,
             mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::All,
+        }),
+        ["SAVE_BUFFER_LINES", session, mode, buffer, start, end] => Ok(Request::SaveBuffer {
+            session: (*session).to_string(),
+            buffer: decode_optional_text(buffer, "SAVE_BUFFER_LINES")?,
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::LineRange {
+                start: decode_positive_index(start, "SAVE_BUFFER_LINES has invalid start line")?,
+                end: decode_positive_index(end, "SAVE_BUFFER_LINES has invalid end line")?,
+            },
+        }),
+        ["SAVE_BUFFER_SEARCH", session, mode, buffer, needle] => Ok(Request::SaveBuffer {
+            session: (*session).to_string(),
+            buffer: decode_optional_text(buffer, "SAVE_BUFFER_SEARCH")?,
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::Search(decode_utf8_hex(needle, "SAVE_BUFFER_SEARCH")?),
         }),
         ["LIST_BUFFERS"] => Ok(Request::ListBuffers),
         ["PASTE_BUFFER", session, buffer] => Ok(Request::PasteBuffer {
@@ -434,6 +472,14 @@ fn decode_optional_index(value: &str, invalid_message: &str) -> Result<Option<us
     }
 }
 
+fn decode_positive_index(value: &str, invalid_message: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| invalid_message.to_string())
+}
+
 fn decode_utf8_hex(hex: &str, command: &str) -> Result<String, String> {
     String::from_utf8(decode_hex(hex)?).map_err(|_| format!("{command} has non-utf8 format"))
 }
@@ -554,13 +600,57 @@ mod tests {
 
     #[test]
     fn round_trips_save_buffer_request() {
-        let line = encode_save_buffer("dev", Some("saved"), CaptureMode::Screen);
+        let line = encode_save_buffer(
+            "dev",
+            Some("saved"),
+            CaptureMode::Screen,
+            BufferSelection::All,
+        );
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::SaveBuffer {
                 session: "dev".to_string(),
                 buffer: Some("saved".to_string()),
                 mode: CaptureMode::Screen,
+                selection: BufferSelection::All,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_save_buffer_line_range_request() {
+        let line = encode_save_buffer(
+            "dev",
+            Some("picked"),
+            CaptureMode::Screen,
+            BufferSelection::LineRange { start: 2, end: 3 },
+        );
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::SaveBuffer {
+                session: "dev".to_string(),
+                buffer: Some("picked".to_string()),
+                mode: CaptureMode::Screen,
+                selection: BufferSelection::LineRange { start: 2, end: 3 },
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_save_buffer_search_request() {
+        let line = encode_save_buffer(
+            "dev",
+            Some("match"),
+            CaptureMode::All,
+            BufferSelection::Search("needle".to_string()),
+        );
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::SaveBuffer {
+                session: "dev".to_string(),
+                buffer: Some("match".to_string()),
+                mode: CaptureMode::All,
+                selection: BufferSelection::Search("needle".to_string()),
             }
         );
     }
