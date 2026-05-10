@@ -11,6 +11,9 @@ Implemented Phase 0/1 commands:
 - `dmux capture-pane -t <name> -p`
 - `dmux resize-pane -t <name> -x <cols> -y <rows>`
 - `dmux send-keys -t <name> <keys...>`
+- `dmux new-window -t <name> [-- command...]`
+- `dmux list-windows -t <name>`
+- `dmux select-window -t <name> -w <index>`
 - `dmux split-window -t <name> -h|-v [-- command...]`
 - `dmux split -t <name> -h|-v [-- command...]`
 - `dmux list-panes -t <name>`
@@ -29,6 +32,7 @@ Implemented Phase 2 groundwork:
 - detached session input through `send-keys`
 - attach-time PTY resize to the current terminal size when available
 - attached clients request PTY resize on terminal `SIGWINCH`
+- minimal window tracking with active window selection
 - split-pane sessions with a server-side active pane
 - active pane selection by pane index
 - pane removal while keeping the session alive
@@ -39,7 +43,7 @@ Current limits:
 - split panes are tracked server-side, but layout rendering is not implemented yet
 - in-memory screen and scrollback only
 - full terminal protocol support is incomplete
-- no layout/window support yet
+- no layout or named-window support yet
 - Unix/macOS POSIX PTY support only
 
 Supported `send-keys` tokens are literal text plus `Enter`, `Space`, `Tab`,

@@ -39,6 +39,17 @@ pub enum Command {
         session: String,
         pane: Option<usize>,
     },
+    NewWindow {
+        session: String,
+        command: Vec<String>,
+    },
+    ListWindows {
+        session: String,
+    },
+    SelectWindow {
+        session: String,
+        window: usize,
+    },
     KillSession {
         session: String,
     },
@@ -78,6 +89,9 @@ where
         "list-panes" => parse_list_panes(args),
         "select-pane" => parse_select_pane(args),
         "kill-pane" => parse_kill_pane(args),
+        "new-window" => parse_new_window(args),
+        "list-windows" => parse_list_windows(args),
+        "select-window" => parse_select_window(args),
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
@@ -343,6 +357,80 @@ fn parse_kill_pane(args: Vec<String>) -> Result<Command, String> {
     })
 }
 
+fn parse_new_window(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut command = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "new-window requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "--" => {
+                command.extend(args[i + 1..].iter().cloned());
+                break;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("new-window does not support option {value:?}"));
+            }
+            _ => {
+                command.extend(args[i..].iter().cloned());
+                break;
+            }
+        }
+    }
+
+    Ok(Command::NewWindow {
+        session: session.ok_or_else(|| "new-window requires -t <session>".to_string())?,
+        command,
+    })
+}
+
+fn parse_list_windows(args: Vec<String>) -> Result<Command, String> {
+    let session = parse_target(args, "list-windows")?
+        .ok_or_else(|| "list-windows requires -t <session>".to_string())?;
+    Ok(Command::ListWindows { session })
+}
+
+fn parse_select_window(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut window = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "select-window requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-w" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "select-window requires a window index after -w".to_string())?;
+                window =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        "select-window -w must be a non-negative integer".to_string()
+                    })?);
+                i += 2;
+            }
+            value => return Err(format!("select-window does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::SelectWindow {
+        session: session.ok_or_else(|| "select-window requires -t <session>".to_string())?,
+        window: window.ok_or_else(|| "select-window requires -w <index>".to_string())?,
+    })
+}
+
 fn set_split_direction(
     direction: &mut Option<SplitDirection>,
     value: SplitDirection,
@@ -509,6 +597,55 @@ mod tests {
             Command::KillPane {
                 session: "dev".to_string(),
                 pane: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_new_window_target_and_command() {
+        let command = parse_args([
+            "dmux",
+            "new-window",
+            "-t",
+            "dev",
+            "--",
+            "sh",
+            "-c",
+            "echo window",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::NewWindow {
+                session: "dev".to_string(),
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "echo window".to_string()
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_list_windows_target() {
+        let command = parse_args(["dmux", "list-windows", "-t", "dev"]).unwrap();
+        assert_eq!(
+            command,
+            Command::ListWindows {
+                session: "dev".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_select_window_target_and_index() {
+        let command = parse_args(["dmux", "select-window", "-t", "dev", "-w", "1"]).unwrap();
+        assert_eq!(
+            command,
+            Command::SelectWindow {
+                session: "dev".to_string(),
+                window: 1,
             }
         );
     }
