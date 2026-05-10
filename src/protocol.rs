@@ -35,6 +35,7 @@ pub enum Request {
     },
     ListPanes {
         session: String,
+        format: Option<String>,
     },
     SelectPane {
         session: String,
@@ -58,6 +59,10 @@ pub enum Request {
     KillWindow {
         session: String,
         window: Option<usize>,
+    },
+    ZoomPane {
+        session: String,
+        pane: Option<usize>,
     },
     Kill {
         session: String,
@@ -99,8 +104,14 @@ pub fn encode_split(session: &str, direction: SplitDirection, command: &[String]
     )
 }
 
-pub fn encode_list_panes(session: &str) -> String {
-    format!("LIST_PANES\t{session}\n")
+pub fn encode_list_panes(session: &str, format: Option<&str>) -> String {
+    match format {
+        Some(format) => format!(
+            "LIST_PANES_FORMAT\t{session}\t{}\n",
+            encode_hex(format.as_bytes())
+        ),
+        None => format!("LIST_PANES\t{session}\n"),
+    }
 }
 
 pub fn encode_select_pane(session: &str, pane: usize) -> String {
@@ -131,6 +142,13 @@ pub fn encode_kill_window(session: &str, window: Option<usize>) -> String {
     match window {
         Some(window) => format!("KILL_WINDOW\t{session}\t{window}\n"),
         None => format!("KILL_WINDOW\t{session}\tactive\n"),
+    }
+}
+
+pub fn encode_zoom_pane(session: &str, pane: Option<usize>) -> String {
+    match pane {
+        Some(pane) => format!("ZOOM_PANE\t{session}\t{pane}\n"),
+        None => format!("ZOOM_PANE\t{session}\tactive\n"),
     }
 }
 
@@ -204,6 +222,11 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         }
         ["LIST_PANES", session] => Ok(Request::ListPanes {
             session: (*session).to_string(),
+            format: None,
+        }),
+        ["LIST_PANES_FORMAT", session, format] => Ok(Request::ListPanes {
+            session: (*session).to_string(),
+            format: Some(decode_utf8_hex(format, "LIST_PANES_FORMAT")?),
         }),
         ["SELECT_PANE", session, pane] => Ok(Request::SelectPane {
             session: (*session).to_string(),
@@ -245,6 +268,10 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
             window: decode_optional_window(window)?,
         }),
+        ["ZOOM_PANE", session, pane] => Ok(Request::ZoomPane {
+            session: (*session).to_string(),
+            pane: decode_optional_zoom_pane(pane)?,
+        }),
         ["KILL", session] => Ok(Request::Kill {
             session: (*session).to_string(),
         }),
@@ -272,6 +299,10 @@ fn decode_optional_pane(value: &str) -> Result<Option<usize>, String> {
     decode_optional_index(value, "KILL_PANE has invalid pane index")
 }
 
+fn decode_optional_zoom_pane(value: &str) -> Result<Option<usize>, String> {
+    decode_optional_index(value, "ZOOM_PANE has invalid pane index")
+}
+
 fn decode_optional_window(value: &str) -> Result<Option<usize>, String> {
     decode_optional_index(value, "KILL_WINDOW has invalid window index")
 }
@@ -285,6 +316,10 @@ fn decode_optional_index(value: &str, invalid_message: &str) -> Result<Option<us
             .map(Some)
             .map_err(|_| invalid_message.to_string())
     }
+}
+
+fn decode_utf8_hex(hex: &str, command: &str) -> Result<String, String> {
+    String::from_utf8(decode_hex(hex)?).map_err(|_| format!("{command} has non-utf8 format"))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -469,6 +504,42 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_zoom_pane_request_for_active_pane() {
+        let line = encode_zoom_pane("dev", None);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::ZoomPane {
+                session: "dev".to_string(),
+                pane: None,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_zoom_pane_request_with_index() {
+        let line = encode_zoom_pane("dev", Some(0));
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::ZoomPane {
+                session: "dev".to_string(),
+                pane: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_list_panes_format_request() {
+        let line = encode_list_panes("dev", Some("#{pane.index}:#{pane.zoomed}"));
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::ListPanes {
+                session: "dev".to_string(),
+                format: Some("#{pane.index}:#{pane.zoomed}".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn rejects_invalid_kill_pane_index_with_existing_message() {
         let err = decode_request("KILL_PANE\tdev\tbad\n").unwrap_err();
         assert_eq!(err, "KILL_PANE has invalid pane index");
@@ -478,5 +549,11 @@ mod tests {
     fn rejects_invalid_kill_window_index() {
         let err = decode_request("KILL_WINDOW\tdev\tbad\n").unwrap_err();
         assert_eq!(err, "KILL_WINDOW has invalid window index");
+    }
+
+    #[test]
+    fn rejects_invalid_zoom_pane_index() {
+        let err = decode_request("ZOOM_PANE\tdev\tbad\n").unwrap_err();
+        assert_eq!(err, "ZOOM_PANE has invalid pane index");
     }
 }

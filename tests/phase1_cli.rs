@@ -922,3 +922,281 @@ fn kill_window_rejects_last_window_and_keeps_session_usable() {
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
+
+#[test]
+fn zoom_pane_marks_active_pane_and_toggles_back() {
+    let socket = unique_socket("zoom-pane");
+    let session = format!("zoom-pane-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session]));
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.index}:#{pane.active}:#{pane.zoomed}:#{window.zoomed_flag}",
+        ],
+    );
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(
+        panes.lines().collect::<Vec<_>>(),
+        vec!["0:0:0:1", "1:1:1:1"]
+    );
+
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session]));
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.index}:#{pane.active}:#{pane.zoomed}:#{window.zoomed_flag}",
+        ],
+    );
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(
+        panes.lines().collect::<Vec<_>>(),
+        vec!["0:0:0:0", "1:1:0:0"]
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn zoom_pane_by_index_selects_requested_pane() {
+    let socket = unique_socket("zoom-pane-index");
+    let session = format!("zoom-pane-index-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session, "-p", "0"]));
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.index}:#{pane.active}:#{pane.zoomed}:#{window.zoomed_flag}",
+        ],
+    );
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(
+        panes.lines().collect::<Vec<_>>(),
+        vec!["0:1:1:1", "1:0:0:1"]
+    );
+
+    let active = poll_capture(&socket, &session, "base-ready");
+    assert!(active.contains("base-ready"), "{active:?}");
+    assert!(!active.contains("split-ready"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn zoom_pane_follows_selection_and_clears_when_zoomed_pane_is_killed() {
+    let socket = unique_socket("zoom-pane-select-kill");
+    let session = format!("zoom-pane-select-kill-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session]));
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.index}:#{pane.active}:#{pane.zoomed}:#{window.zoomed_flag}",
+        ],
+    );
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(
+        panes.lines().collect::<Vec<_>>(),
+        vec!["0:1:1:1", "1:0:0:1"]
+    );
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "0"]));
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.index}:#{pane.active}:#{pane.zoomed}:#{window.zoomed_flag}",
+        ],
+    );
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0:1:0:0"]);
+
+    let active = poll_capture(&socket, &session, "split-ready");
+    assert!(active.contains("split-ready"), "{active:?}");
+    assert!(!active.contains("base-ready"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn zoom_pane_follows_new_split_when_already_zoomed() {
+    let socket = unique_socket("zoom-pane-split");
+    let session = format!("zoom-pane-split-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session]));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.index}:#{pane.active}:#{pane.zoomed}:#{window.zoomed_flag}",
+        ],
+    );
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(
+        panes.lines().collect::<Vec<_>>(),
+        vec!["0:0:0:1", "1:1:1:1"]
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
