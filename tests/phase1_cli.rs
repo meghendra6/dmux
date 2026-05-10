@@ -14,7 +14,7 @@ fn unique_socket(name: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!(
+    std::path::PathBuf::from("/tmp").join(format!(
         "dmux-{name}-{}-{nanos}.sock",
         std::process::id()
     ))
@@ -50,16 +50,29 @@ fn detached_session_keeps_process_output_available_for_capture() {
     );
     assert_success(&output);
 
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-
-    let output = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
-    assert_success(&output);
-    let captured = String::from_utf8_lossy(&output.stdout);
+    let captured = poll_capture(&socket, &session, "done");
     assert!(captured.contains("ready"), "{captured:?}");
     assert!(captured.contains("done"), "{captured:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+fn poll_capture(socket: &std::path::Path, session: &str, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(socket, &["capture-pane", "-t", session, "-p"]);
+        assert_success(&output);
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if last.contains(needle) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
 }
 
 #[test]
