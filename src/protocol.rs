@@ -40,6 +40,10 @@ pub enum Request {
         session: String,
         pane: usize,
     },
+    KillPane {
+        session: String,
+        pane: Option<usize>,
+    },
     Kill {
         session: String,
     },
@@ -86,6 +90,13 @@ pub fn encode_list_panes(session: &str) -> String {
 
 pub fn encode_select_pane(session: &str, pane: usize) -> String {
     format!("SELECT_PANE\t{session}\t{pane}\n")
+}
+
+pub fn encode_kill_pane(session: &str, pane: Option<usize>) -> String {
+    match pane {
+        Some(pane) => format!("KILL_PANE\t{session}\t{pane}\n"),
+        None => format!("KILL_PANE\t{session}\tactive\n"),
+    }
 }
 
 pub fn encode_kill(session: &str) -> String {
@@ -165,6 +176,10 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 .parse::<usize>()
                 .map_err(|_| "SELECT_PANE has invalid pane index".to_string())?,
         }),
+        ["KILL_PANE", session, pane] => Ok(Request::KillPane {
+            session: (*session).to_string(),
+            pane: decode_optional_pane(pane)?,
+        }),
         ["KILL", session] => Ok(Request::Kill {
             session: (*session).to_string(),
         }),
@@ -185,6 +200,17 @@ fn decode_split_direction(value: &str) -> Result<SplitDirection, String> {
         "h" => Ok(SplitDirection::Horizontal),
         "v" => Ok(SplitDirection::Vertical),
         _ => Err("SPLIT has invalid direction".to_string()),
+    }
+}
+
+fn decode_optional_pane(value: &str) -> Result<Option<usize>, String> {
+    if value == "active" {
+        Ok(None)
+    } else {
+        value
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| "KILL_PANE has invalid pane index".to_string())
     }
 }
 
@@ -288,6 +314,30 @@ mod tests {
             Request::SelectPane {
                 session: "dev".to_string(),
                 pane: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_kill_pane_request_with_index() {
+        let line = encode_kill_pane("dev", Some(1));
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::KillPane {
+                session: "dev".to_string(),
+                pane: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_kill_pane_request_for_active_pane() {
+        let line = encode_kill_pane("dev", None);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::KillPane {
+                session: "dev".to_string(),
+                pane: None,
             }
         );
     }

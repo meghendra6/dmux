@@ -4,6 +4,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
@@ -82,10 +83,86 @@ pub fn spawn(spec: &SpawnSpec) -> io::Result<PtyProcess> {
     })
 }
 
-pub fn terminate(pid: c_int) {
-    const SIGTERM: c_int = 15;
-    unsafe {
-        kill(pid, SIGTERM);
+pub fn terminate(pid: c_int) -> io::Result<()> {
+    signal_process_group(pid, SIGTERM)?;
+    let _ = wait_for_exit(pid, Duration::from_millis(1_000))?;
+
+    if !process_group_exists(pid)? {
+        return Ok(());
+    }
+
+    signal_process_group(pid, SIGKILL)?;
+    let _ = wait_for_exit(pid, Duration::from_millis(1_000))?;
+    if wait_for_group_exit(pid, Duration::from_millis(1_000))? {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("process group {pid} did not exit after SIGKILL"),
+    ))
+}
+
+fn signal_process_group(pgid: c_int, signal: c_int) -> io::Result<()> {
+    let result = unsafe { kill(-pgid, signal) };
+    if result == -1 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ESRCH) {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn process_group_exists(pgid: c_int) -> io::Result<bool> {
+    let result = unsafe { kill(-pgid, 0) };
+    if result == -1 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ESRCH) {
+            Ok(false)
+        } else {
+            Err(err)
+        }
+    } else {
+        Ok(true)
+    }
+}
+
+fn wait_for_group_exit(pgid: c_int, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_group_exists(pgid)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_exit(pid: c_int, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut status = 0;
+        let result = unsafe { waitpid(pid, &mut status, WNOHANG) };
+        if result == pid {
+            return Ok(true);
+        }
+        if result == -1 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(ECHILD) {
+                return Ok(true);
+            }
+            return Err(err);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -153,6 +230,12 @@ const TIOCSWINSZ: CULong = 0x5414;
 
 type CULong = std::os::raw::c_ulong;
 
+const SIGKILL: c_int = 9;
+const SIGTERM: c_int = 15;
+const WNOHANG: c_int = 1;
+const ECHILD: i32 = 10;
+const ESRCH: i32 = 3;
+
 #[cfg_attr(target_os = "linux", link(name = "util"))]
 unsafe extern "C" {
     fn forkpty(
@@ -164,6 +247,7 @@ unsafe extern "C" {
     fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
     fn _exit(status: c_int) -> !;
     fn kill(pid: c_int, sig: c_int) -> c_int;
+    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn ioctl(fd: c_int, request: CULong, ...) -> c_int;
 }
 

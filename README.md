@@ -15,6 +15,7 @@ Implemented Phase 0/1 commands:
 - `dmux split -t <name> -h|-v [-- command...]`
 - `dmux list-panes -t <name>`
 - `dmux select-pane -t <name> -p <index>`
+- `dmux kill-pane -t <name> [-p <index>]`
 - `dmux kill-session -t <name>`
 - `dmux kill-server`
 
@@ -30,6 +31,7 @@ Implemented Phase 2 groundwork:
 - attached clients request PTY resize on terminal `SIGWINCH`
 - split-pane sessions with a server-side active pane
 - active pane selection by pane index
+- pane removal while keeping the session alive
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
