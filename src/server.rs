@@ -73,6 +73,10 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::New { session, command } => handle_new(&state, &mut stream, session, command),
         Request::List => handle_list(&state, &mut stream),
         Request::Capture { session } => handle_capture(&state, &mut stream, &session),
+        Request::Resize { .. } => {
+            write_err(&mut stream, "resize is not implemented")?;
+            Ok(())
+        }
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
         Request::Attach { session } => handle_attach(&state, stream, &session),

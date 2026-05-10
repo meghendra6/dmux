@@ -13,6 +13,11 @@ pub enum Request {
     Capture {
         session: String,
     },
+    Resize {
+        session: String,
+        cols: u16,
+        rows: u16,
+    },
     Kill {
         session: String,
     },
@@ -34,6 +39,10 @@ pub fn encode_list() -> &'static str {
 
 pub fn encode_capture(session: &str) -> String {
     format!("CAPTURE\t{session}\n")
+}
+
+pub fn encode_resize(session: &str, cols: u16, rows: u16) -> String {
+    format!("RESIZE\t{session}\t{cols}\t{rows}\n")
 }
 
 pub fn encode_kill(session: &str) -> String {
@@ -73,6 +82,15 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["CAPTURE", session] => Ok(Request::Capture {
             session: (*session).to_string(),
         }),
+        ["RESIZE", session, cols, rows] => Ok(Request::Resize {
+            session: (*session).to_string(),
+            cols: cols
+                .parse::<u16>()
+                .map_err(|_| "RESIZE has invalid cols".to_string())?,
+            rows: rows
+                .parse::<u16>()
+                .map_err(|_| "RESIZE has invalid rows".to_string())?,
+        }),
         ["KILL", session] => Ok(Request::Kill {
             session: (*session).to_string(),
         }),
@@ -95,6 +113,19 @@ mod tests {
             Request::New {
                 session: "dev".to_string(),
                 command
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_resize_request() {
+        let line = encode_resize("dev", 100, 40);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::Resize {
+                session: "dev".to_string(),
+                cols: 100,
+                rows: 40,
             }
         );
     }
