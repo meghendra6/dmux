@@ -9,7 +9,7 @@ Implemented Phase 0/1 commands:
 - `dmux attach -t <name>`
 - `dmux ls`
 - `dmux capture-pane -t <name> -p [--screen|--history|--all]`
-- `dmux save-buffer -t <name> [-b <buffer>] [--screen|--history|--all]`
+- `dmux save-buffer -t <name> [-b <buffer>] [--screen|--history|--all] [--start-line <n> --end-line <n>|--search <text>]`
 - `dmux list-buffers`
 - `dmux paste-buffer -t <name> [-b <buffer>]`
 - `dmux delete-buffer -b <buffer>`
@@ -37,7 +37,9 @@ scrollback, or `--all` for the combined output explicitly.
 `save-buffer` currently stores captured active-pane text in an in-memory buffer
 with a 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name
 the buffer, omit `-b` to create an automatic name, and omit `-b` on
-`paste-buffer` to paste the latest saved buffer.
+`paste-buffer` to paste the latest saved buffer. Selection is command-driven
+for now: `--start-line`/`--end-line` saves a 1-based inclusive line range, and
+`--search` saves the first matching line.
 
 Implemented Phase 2 groundwork:
 
@@ -58,6 +60,7 @@ Implemented Phase 2 groundwork:
 - pane zoom state while keeping all panes alive
 - server-side statusline format expansion
 - in-memory buffers backed by pane capture and paste into active panes
+- command-driven line range and search selection for buffer saves
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
@@ -66,7 +69,8 @@ Current limits:
 - zoomed panes are tracked server-side, but layout rendering is not implemented yet
 - statusline format expansion is implemented, but attach-time statusline rendering is not implemented yet
 - in-memory screen and scrollback only
-- buffer contents are in-memory only and are not yet fed by interactive selection
+- interactive vi/emacs and mouse selection are not implemented yet
+- buffer contents are in-memory only
 - full terminal protocol support is incomplete
 - no layout or named-window support yet
 - Unix/macOS POSIX PTY support only
