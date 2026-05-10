@@ -158,3 +158,37 @@ fn capture_pane_applies_carriage_return_overwrite() {
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
+
+#[test]
+fn resize_pane_updates_child_pty_size() {
+    let socket = unique_socket("resize");
+    let session = format!("resize-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "stty size; while true; do sleep 0.2; stty size; done",
+        ],
+    ));
+
+    let initial = poll_capture(&socket, &session, "24 80");
+    assert!(initial.contains("24 80"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "100", "-y", "40"],
+    ));
+
+    let resized = poll_capture(&socket, &session, "40 100");
+    assert!(resized.contains("40 100"), "{resized:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}

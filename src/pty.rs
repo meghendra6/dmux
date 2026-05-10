@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
 
@@ -29,6 +29,7 @@ pub struct SpawnSpec {
     pub session: String,
     pub command: Vec<String>,
     pub cwd: PathBuf,
+    pub size: PtySize,
 }
 
 impl SpawnSpec {
@@ -43,6 +44,7 @@ impl SpawnSpec {
             session,
             command,
             cwd,
+            size: PtySize { cols: 80, rows: 24 },
         }
     }
 }
@@ -54,7 +56,7 @@ pub struct PtyProcess {
 
 pub fn spawn(spec: &SpawnSpec) -> io::Result<PtyProcess> {
     let mut master: c_int = -1;
-    let winsize = WinSize::from(PtySize { cols: 80, rows: 24 });
+    let winsize = WinSize::from(spec.size);
 
     let pid = unsafe {
         forkpty(
@@ -84,6 +86,16 @@ pub fn terminate(pid: c_int) {
     const SIGTERM: c_int = 15;
     unsafe {
         kill(pid, SIGTERM);
+    }
+}
+
+pub fn resize(master: &File, size: PtySize) -> io::Result<()> {
+    let winsize = WinSize::from(size);
+    let result = unsafe { ioctl(master.as_raw_fd(), TIOCSWINSZ, &winsize) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -133,6 +145,14 @@ impl From<PtySize> for WinSize {
     }
 }
 
+#[cfg(target_os = "macos")]
+const TIOCSWINSZ: CULong = 0x8008_7467;
+
+#[cfg(target_os = "linux")]
+const TIOCSWINSZ: CULong = 0x5414;
+
+type CULong = std::os::raw::c_ulong;
+
 #[cfg_attr(target_os = "linux", link(name = "util"))]
 unsafe extern "C" {
     fn forkpty(
@@ -144,6 +164,7 @@ unsafe extern "C" {
     fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
     fn _exit(status: c_int) -> !;
     fn kill(pid: c_int, sig: c_int) -> c_int;
+    fn ioctl(fd: c_int, request: CULong, ...) -> c_int;
 }
 
 #[cfg(test)]

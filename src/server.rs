@@ -1,5 +1,5 @@
 use crate::protocol::{self, Request};
-use crate::pty::{self, SpawnSpec};
+use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::TerminalState;
 use std::collections::HashMap;
 use std::fs::File;
@@ -47,6 +47,7 @@ struct ServerState {
 struct Session {
     child_pid: i32,
     writer: Arc<Mutex<File>>,
+    size: Mutex<PtySize>,
     raw_history: Arc<Mutex<Vec<u8>>>,
     terminal: Arc<Mutex<TerminalState>>,
     clients: Arc<Mutex<Vec<UnixStream>>>,
@@ -73,10 +74,11 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::New { session, command } => handle_new(&state, &mut stream, session, command),
         Request::List => handle_list(&state, &mut stream),
         Request::Capture { session } => handle_capture(&state, &mut stream, &session),
-        Request::Resize { .. } => {
-            write_err(&mut stream, "resize is not implemented")?;
-            Ok(())
-        }
+        Request::Resize {
+            session,
+            cols,
+            rows,
+        } => handle_resize(&state, &mut stream, &session, cols, rows),
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
         Request::Attach { session } => handle_attach(&state, stream, &session),
@@ -102,6 +104,7 @@ fn handle_new(
     let session = Arc::new(Session {
         child_pid: process.child_pid,
         writer: Arc::new(Mutex::new(process.master)),
+        size: Mutex::new(spec.size),
         raw_history: Arc::new(Mutex::new(Vec::new())),
         terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 10_000))),
         clients: Arc::new(Mutex::new(Vec::new())),
@@ -143,6 +146,44 @@ fn handle_capture(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str)
     write_ok(stream)?;
     let captured = session.terminal.lock().unwrap().capture_text();
     stream.write_all(captured.as_bytes())
+}
+
+fn handle_resize(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    cols: u16,
+    rows: u16,
+) -> io::Result<()> {
+    let size = match PtySize::new(cols, rows) {
+        Ok(size) => size,
+        Err(err) => {
+            write_err(stream, &err.to_string())?;
+            return Ok(());
+        }
+    };
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    {
+        let writer = session.writer.lock().unwrap();
+        pty::resize(&writer, size)?;
+    }
+    *session.size.lock().unwrap() = size;
+    session
+        .terminal
+        .lock()
+        .unwrap()
+        .resize(size.cols as usize, size.rows as usize);
+
+    write_ok(stream)
 }
 
 fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {
