@@ -29,6 +29,9 @@ pub enum Request {
     Attach {
         session: String,
     },
+    AttachSnapshot {
+        session: String,
+    },
     List,
     Capture {
         session: String,
@@ -119,6 +122,10 @@ pub fn encode_new(session: &str, command: &[String]) -> String {
 
 pub fn encode_attach(session: &str) -> String {
     format!("ATTACH\t{session}\n")
+}
+
+pub fn encode_attach_snapshot(session: &str) -> String {
+    format!("ATTACH_SNAPSHOT\t{session}\n")
 }
 
 pub fn encode_list() -> &'static str {
@@ -290,6 +297,9 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
         }),
         ["LIST"] => Ok(Request::List),
+        ["ATTACH_SNAPSHOT", session] => Ok(Request::AttachSnapshot {
+            session: (*session).to_string(),
+        }),
         ["CAPTURE", session] => Ok(Request::Capture {
             session: (*session).to_string(),
             mode: CaptureMode::All,
@@ -876,6 +886,17 @@ mod tests {
             Request::StatusLine {
                 session: "dev".to_string(),
                 format: None,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_attach_snapshot_request() {
+        let line = encode_attach_snapshot("dev");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::AttachSnapshot {
+                session: "dev".to_string(),
             }
         );
     }
