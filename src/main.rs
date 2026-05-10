@@ -65,6 +65,27 @@ fn run() -> Result<(), String> {
             send_request(&socket, &protocol::encode_send(&session, &bytes), true)?;
             Ok(())
         }
+        cli::Command::SplitWindow {
+            session,
+            direction,
+            command,
+        } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_split(&session, direction, &command),
+                true,
+            )?;
+            Ok(())
+        }
+        cli::Command::ListPanes { session } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let body = send_request(&socket, &protocol::encode_list_panes(&session), true)?;
+            print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
         cli::Command::KillSession { session } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;

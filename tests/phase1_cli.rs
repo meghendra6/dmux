@@ -261,3 +261,52 @@ fn send_keys_writes_input_to_detached_session() {
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
+
+#[test]
+fn split_window_creates_second_active_pane() {
+    let socket = unique_socket("split-window");
+    let session = format!("split-window-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+
+    let panes = dmux(&socket, &["list-panes", "-t", &session]);
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+
+    let active = poll_capture(&socket, &session, "split-ready");
+    assert!(active.contains("split-ready"), "{active:?}");
+    assert!(!active.contains("base-ready"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}

@@ -1,5 +1,11 @@
 pub const ARG_SEPARATOR: char = '\u{1f}';
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     New {
@@ -21,6 +27,14 @@ pub enum Request {
     Send {
         session: String,
         bytes: Vec<u8>,
+    },
+    Split {
+        session: String,
+        direction: SplitDirection,
+        command: Vec<String>,
+    },
+    ListPanes {
+        session: String,
     },
     Kill {
         session: String,
@@ -51,6 +65,19 @@ pub fn encode_resize(session: &str, cols: u16, rows: u16) -> String {
 
 pub fn encode_send(session: &str, bytes: &[u8]) -> String {
     format!("SEND\t{session}\t{}\n", encode_hex(bytes))
+}
+
+pub fn encode_split(session: &str, direction: SplitDirection, command: &[String]) -> String {
+    let joined = command.join(&ARG_SEPARATOR.to_string());
+    format!(
+        "SPLIT\t{session}\t{}\t{}\t{joined}\n",
+        encode_split_direction(direction),
+        command.len()
+    )
+}
+
+pub fn encode_list_panes(session: &str) -> String {
+    format!("LIST_PANES\t{session}\n")
 }
 
 pub fn encode_kill(session: &str) -> String {
@@ -103,11 +130,47 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
             bytes: decode_hex(hex)?,
         }),
+        ["SPLIT", session, direction, argc, joined] => {
+            let argc = argc
+                .parse::<usize>()
+                .map_err(|_| "SPLIT has invalid argc".to_string())?;
+            let command = if *joined == "" {
+                Vec::new()
+            } else {
+                joined.split(ARG_SEPARATOR).map(str::to_string).collect()
+            };
+            if command.len() != argc {
+                return Err("SPLIT argc does not match command".to_string());
+            }
+            Ok(Request::Split {
+                session: (*session).to_string(),
+                direction: decode_split_direction(direction)?,
+                command,
+            })
+        }
+        ["LIST_PANES", session] => Ok(Request::ListPanes {
+            session: (*session).to_string(),
+        }),
         ["KILL", session] => Ok(Request::Kill {
             session: (*session).to_string(),
         }),
         ["KILL_SERVER"] => Ok(Request::KillServer),
         _ => Err(format!("unknown request line: {line:?}")),
+    }
+}
+
+fn encode_split_direction(direction: SplitDirection) -> &'static str {
+    match direction {
+        SplitDirection::Horizontal => "h",
+        SplitDirection::Vertical => "v",
+    }
+}
+
+fn decode_split_direction(value: &str) -> Result<SplitDirection, String> {
+    match value {
+        "h" => Ok(SplitDirection::Horizontal),
+        "v" => Ok(SplitDirection::Vertical),
+        _ => Err("SPLIT has invalid direction".to_string()),
     }
 }
 
@@ -184,6 +247,21 @@ mod tests {
             Request::Send {
                 session: "dev".to_string(),
                 bytes: b"hello\r".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_split_request() {
+        let command = vec!["sh".to_string(), "-c".to_string(), "echo split".to_string()];
+        let line = encode_split("dev", SplitDirection::Horizontal, &command);
+
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::Split {
+                session: "dev".to_string(),
+                direction: SplitDirection::Horizontal,
+                command,
             }
         );
     }

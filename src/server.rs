@@ -45,6 +45,40 @@ struct ServerState {
 }
 
 struct Session {
+    panes: Mutex<Vec<Arc<Pane>>>,
+    active_pane: Mutex<usize>,
+}
+
+impl Session {
+    fn new(pane: Arc<Pane>) -> Self {
+        Self {
+            panes: Mutex::new(vec![pane]),
+            active_pane: Mutex::new(0),
+        }
+    }
+
+    fn active_pane(&self) -> Option<Arc<Pane>> {
+        let active = *self.active_pane.lock().unwrap();
+        self.panes.lock().unwrap().get(active).cloned()
+    }
+
+    fn add_pane(&self, pane: Arc<Pane>) {
+        let mut active = self.active_pane.lock().unwrap();
+        let mut panes = self.panes.lock().unwrap();
+        panes.push(pane);
+        *active = panes.len() - 1;
+    }
+
+    fn pane_count(&self) -> usize {
+        self.panes.lock().unwrap().len()
+    }
+
+    fn panes(&self) -> Vec<Arc<Pane>> {
+        self.panes.lock().unwrap().clone()
+    }
+}
+
+struct Pane {
     child_pid: i32,
     writer: Arc<Mutex<File>>,
     size: Mutex<PtySize>,
@@ -80,6 +114,12 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             rows,
         } => handle_resize(&state, &mut stream, &session, cols, rows),
         Request::Send { session, bytes } => handle_send(&state, &mut stream, &session, &bytes),
+        Request::Split {
+            session,
+            direction: _,
+            command,
+        } => handle_split(&state, &mut stream, &session, command),
+        Request::ListPanes { session } => handle_list_panes(&state, &mut stream, &session),
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
         Request::Attach { session } => handle_attach(&state, stream, &session),
@@ -99,21 +139,37 @@ fn handle_new(
     }
 
     let cwd = std::env::current_dir()?;
-    let spec = SpawnSpec::new(name.clone(), command, cwd);
+    let pane = spawn_pane(name.clone(), command, cwd, PtySize { cols: 80, rows: 24 })?;
+    let session = Arc::new(Session::new(pane));
+    sessions.insert(name, session);
+    write_ok(stream)
+}
+
+fn spawn_pane(
+    session_name: String,
+    command: Vec<String>,
+    cwd: PathBuf,
+    size: PtySize,
+) -> io::Result<Arc<Pane>> {
+    let mut spec = SpawnSpec::new(session_name, command, cwd);
+    spec.size = size;
     let process = pty::spawn(&spec)?;
     let reader = process.master.try_clone()?;
-    let session = Arc::new(Session {
+    let pane = Arc::new(Pane {
         child_pid: process.child_pid,
         writer: Arc::new(Mutex::new(process.master)),
         size: Mutex::new(spec.size),
         raw_history: Arc::new(Mutex::new(Vec::new())),
-        terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 10_000))),
+        terminal: Arc::new(Mutex::new(TerminalState::new(
+            spec.size.cols as usize,
+            spec.size.rows as usize,
+            10_000,
+        ))),
         clients: Arc::new(Mutex::new(Vec::new())),
     });
 
-    start_output_pump(reader, Arc::clone(&session));
-    sessions.insert(name, session);
-    write_ok(stream)
+    start_output_pump(reader, Arc::clone(&pane));
+    Ok(pane)
 }
 
 fn handle_list(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::Result<()> {
@@ -143,9 +199,13 @@ fn handle_capture(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str)
         write_err(stream, "missing session")?;
         return Ok(());
     };
+    let Some(pane) = session.active_pane() else {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    };
 
     write_ok(stream)?;
-    let captured = session.terminal.lock().unwrap().capture_text();
+    let captured = pane.terminal.lock().unwrap().capture_text();
     stream.write_all(captured.as_bytes())
 }
 
@@ -172,14 +232,17 @@ fn handle_resize(
         write_err(stream, "missing session")?;
         return Ok(());
     };
+    let Some(pane) = session.active_pane() else {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    };
 
     {
-        let writer = session.writer.lock().unwrap();
+        let writer = pane.writer.lock().unwrap();
         pty::resize(&writer, size)?;
     }
-    *session.size.lock().unwrap() = size;
-    session
-        .terminal
+    *pane.size.lock().unwrap() = size;
+    pane.terminal
         .lock()
         .unwrap()
         .resize(size.cols as usize, size.rows as usize);
@@ -202,9 +265,62 @@ fn handle_send(
         write_err(stream, "missing session")?;
         return Ok(());
     };
+    let Some(pane) = session.active_pane() else {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    };
 
-    session.writer.lock().unwrap().write_all(bytes)?;
+    pane.writer.lock().unwrap().write_all(bytes)?;
     write_ok(stream)
+}
+
+fn handle_split(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    command: Vec<String>,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+    let Some(active) = session.active_pane() else {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    };
+
+    let size = *active.size.lock().unwrap();
+    let cwd = std::env::current_dir()?;
+    let pane = spawn_pane(name.to_string(), command, cwd, size)?;
+    session.add_pane(pane);
+    write_ok(stream)
+}
+
+fn handle_list_panes(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    for index in 0..session.pane_count() {
+        writeln!(stream, "{index}")?;
+    }
+    Ok(())
 }
 
 fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {
@@ -214,7 +330,9 @@ fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) ->
         return Ok(());
     };
 
-    pty::terminate(session.child_pid);
+    for pane in session.panes() {
+        pty::terminate(pane.child_pid);
+    }
     write_ok(stream)
 }
 
@@ -227,7 +345,9 @@ fn handle_kill_server(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::
         .map(|(_, session)| session)
         .collect::<Vec<_>>();
     for session in sessions {
-        pty::terminate(session.child_pid);
+        for pane in session.panes() {
+            pty::terminate(pane.child_pid);
+        }
     }
 
     write_ok(stream)?;
@@ -246,13 +366,17 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
         write_err(&mut stream, "missing session")?;
         return Ok(());
     };
+    let Some(pane) = session.active_pane() else {
+        write_err(&mut stream, "missing pane")?;
+        return Ok(());
+    };
 
     write_ok(&mut stream)?;
     {
-        let history = session.raw_history.lock().unwrap();
+        let history = pane.raw_history.lock().unwrap();
         stream.write_all(&history)?;
     }
-    session.clients.lock().unwrap().push(stream.try_clone()?);
+    pane.clients.lock().unwrap().push(stream.try_clone()?);
 
     let mut buf = [0_u8; 8192];
     loop {
@@ -260,13 +384,13 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
         if n == 0 {
             break;
         }
-        session.writer.lock().unwrap().write_all(&buf[..n])?;
+        pane.writer.lock().unwrap().write_all(&buf[..n])?;
     }
 
     Ok(())
 }
 
-fn start_output_pump(mut reader: File, session: Arc<Session>) {
+fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
     std::thread::spawn(move || {
         let mut buf = [0_u8; 8192];
         loop {
@@ -276,9 +400,9 @@ fn start_output_pump(mut reader: File, session: Arc<Session>) {
                 Err(_) => break,
             };
             let bytes = &buf[..n];
-            append_history(&session.raw_history, bytes);
-            session.terminal.lock().unwrap().apply_bytes(bytes);
-            broadcast(&session.clients, bytes);
+            append_history(&pane.raw_history, bytes);
+            pane.terminal.lock().unwrap().apply_bytes(bytes);
+            broadcast(&pane.clients, bytes);
         }
     });
 }
