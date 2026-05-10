@@ -667,7 +667,7 @@ cargo test --test phase1_cli attach_renders_split_pane_snapshot attach_renders_v
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit split snapshot wiring**
+- [x] **Step 7: Commit split snapshot wiring**
 
 Run:
 
@@ -682,7 +682,7 @@ git commit -m "feat: render split layout snapshots"
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-05-11-devmux-live-layout-foundation.md`
 
-- [ ] **Step 1: Update README**
+- [x] **Step 1: Update README**
 
 Update implemented groundwork from:
 
@@ -708,7 +708,7 @@ to:
 - multi-pane attach rendering is split-layout snapshot-only when multiple panes are visible and exits after rendering; live multi-pane attach and live layout redraw are not implemented yet
 ```
 
-- [ ] **Step 2: Run full verification**
+- [x] **Step 2: Run full verification**
 
 Run:
 
