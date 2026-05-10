@@ -11,6 +11,9 @@ Implemented Phase 0/1 commands:
 - `dmux capture-pane -t <name> -p`
 - `dmux resize-pane -t <name> -x <cols> -y <rows>`
 - `dmux send-keys -t <name> <keys...>`
+- `dmux split-window -t <name> -h|-v [-- command...]`
+- `dmux split -t <name> -h|-v [-- command...]`
+- `dmux list-panes -t <name>`
 - `dmux kill-session -t <name>`
 - `dmux kill-server`
 
@@ -24,11 +27,12 @@ Implemented Phase 2 groundwork:
 - detached session input through `send-keys`
 - attach-time PTY resize to the current terminal size when available
 - attached clients request PTY resize on terminal `SIGWINCH`
+- split-pane sessions with a server-side active pane
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
 
-- single pane per session
+- split panes are tracked server-side, but layout rendering is not implemented yet
 - in-memory screen and scrollback only
 - full terminal protocol support is incomplete
 - no layout/window support yet

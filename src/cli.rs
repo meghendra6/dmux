@@ -1,3 +1,5 @@
+use crate::protocol::SplitDirection;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     New {
@@ -20,6 +22,14 @@ pub enum Command {
     SendKeys {
         session: String,
         keys: Vec<String>,
+    },
+    SplitWindow {
+        session: String,
+        direction: SplitDirection,
+        command: Vec<String>,
+    },
+    ListPanes {
+        session: String,
     },
     KillSession {
         session: String,
@@ -56,6 +66,8 @@ where
         "capture-pane" => parse_capture(args),
         "resize-pane" => parse_resize_pane(args),
         "send-keys" => parse_send_keys(args),
+        "split-window" | "split" => parse_split_window(args),
+        "list-panes" => parse_list_panes(args),
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
@@ -202,6 +214,67 @@ fn parse_send_keys(args: Vec<String>) -> Result<Command, String> {
     })
 }
 
+fn parse_split_window(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut direction = None;
+    let mut command = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "split-window requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-h" => {
+                set_split_direction(&mut direction, SplitDirection::Horizontal)?;
+                i += 1;
+            }
+            "-v" => {
+                set_split_direction(&mut direction, SplitDirection::Vertical)?;
+                i += 1;
+            }
+            "--" => {
+                command.extend(args[i + 1..].iter().cloned());
+                break;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("split-window does not support option {value:?}"));
+            }
+            _ => {
+                command.extend(args[i..].iter().cloned());
+                break;
+            }
+        }
+    }
+
+    Ok(Command::SplitWindow {
+        session: session.ok_or_else(|| "split-window requires -t <session>".to_string())?,
+        direction: direction.ok_or_else(|| "split-window requires one of -h or -v".to_string())?,
+        command,
+    })
+}
+
+fn parse_list_panes(args: Vec<String>) -> Result<Command, String> {
+    let session = parse_target(args, "list-panes")?
+        .ok_or_else(|| "list-panes requires -t <session>".to_string())?;
+    Ok(Command::ListPanes { session })
+}
+
+fn set_split_direction(
+    direction: &mut Option<SplitDirection>,
+    value: SplitDirection,
+) -> Result<(), String> {
+    if direction.replace(value).is_some() {
+        Err("split-window accepts only one direction".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn parse_target(args: Vec<String>, command: &str) -> Result<Option<String>, String> {
     let mut target = None;
     let mut i = 0;
@@ -285,6 +358,42 @@ mod tests {
             Command::SendKeys {
                 session: "dev".to_string(),
                 keys: vec!["echo hi".to_string(), "Enter".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_split_window_target_direction_and_command() {
+        let command = parse_args([
+            "dmux",
+            "split-window",
+            "-t",
+            "dev",
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "echo split",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            command,
+            Command::SplitWindow {
+                session: "dev".to_string(),
+                direction: crate::protocol::SplitDirection::Horizontal,
+                command: vec!["sh".to_string(), "-c".to_string(), "echo split".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_list_panes_target() {
+        let command = parse_args(["dmux", "list-panes", "-t", "dev"]).unwrap();
+        assert_eq!(
+            command,
+            Command::ListPanes {
+                session: "dev".to_string()
             }
         );
     }
