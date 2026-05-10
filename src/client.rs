@@ -32,6 +32,8 @@ where
         )));
     }
 
+    write_attach_status_line(socket, session)?;
+
     let _guard = RawModeGuard::enable();
     install_winch_handler();
     let mut output_stream = stream.try_clone()?;
@@ -70,6 +72,19 @@ fn copy_attach_output(output_stream: &mut UnixStream) {
         }
         let _ = stdout.flush();
     }
+}
+
+fn write_attach_status_line(socket: &Path, session: &str) -> io::Result<()> {
+    let body = send_control_request(socket, &protocol::encode_status_line(session, None))?;
+    let status = String::from_utf8_lossy(&body);
+    let status = status.trim_end();
+    if status.is_empty() {
+        return Ok(());
+    }
+
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(format!("{status}\r\n").as_bytes())?;
+    stdout.flush()
 }
 
 pub fn detect_attach_size() -> Option<PtySize> {

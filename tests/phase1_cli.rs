@@ -560,6 +560,52 @@ fn attach_resizes_session_before_passthrough() {
 }
 
 #[test]
+fn attach_renders_status_line_snapshot() {
+    let socket = unique_socket("attach-status-line");
+    let session = format!("attach-status-line-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run attach");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("{session} [0] pane 0")),
+        "{stdout:?}"
+    );
+
+    let captured = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
+    assert_success(&captured);
+    let captured = String::from_utf8_lossy(&captured.stdout);
+    assert!(
+        !captured.contains(&format!("{session} [0] pane 0")),
+        "{captured:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn send_keys_writes_input_to_detached_session() {
     let socket = unique_socket("send-keys");
     let session = format!("send-keys-{}", std::process::id());
