@@ -37,6 +37,43 @@ fn assert_success(output: &Output) {
     );
 }
 
+fn assert_contains_ordered_line(text: &str, first: &str, middle: &str, last: &str) {
+    for line in text.lines() {
+        let Some(first_index) = line.find(first) else {
+            continue;
+        };
+        let Some(middle_offset) = line[first_index + first.len()..].find(middle) else {
+            continue;
+        };
+        let middle_index = first_index + first.len() + middle_offset;
+        if line[middle_index + middle.len()..].contains(last) {
+            return;
+        }
+    }
+
+    panic!("missing ordered line containing {first:?}, {middle:?}, {last:?} in {text:?}");
+}
+
+fn assert_vertical_layout(text: &str, top: &str, bottom: &str) {
+    let lines = text.lines().collect::<Vec<_>>();
+    let top_index = lines
+        .iter()
+        .position(|line| line.contains(top))
+        .unwrap_or_else(|| panic!("missing top {top:?} in {text:?}"));
+    let bottom_index = lines
+        .iter()
+        .position(|line| line.contains(bottom))
+        .unwrap_or_else(|| panic!("missing bottom {bottom:?} in {text:?}"));
+
+    assert!(top_index < bottom_index, "{text:?}");
+    assert!(
+        lines[top_index + 1..bottom_index]
+            .iter()
+            .any(|line| !line.is_empty() && line.chars().all(|ch| ch == '-')),
+        "{text:?}"
+    );
+}
+
 #[test]
 fn detached_session_keeps_process_output_available_for_capture() {
     let socket = unique_socket("capture");
@@ -651,16 +688,67 @@ fn attach_renders_split_pane_snapshot() {
         .expect("run attach");
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("-- pane 0 --"), "{stdout:?}");
-    assert!(stdout.contains("base-ready"), "{stdout:?}");
-    assert!(stdout.contains("-- pane 1 --"), "{stdout:?}");
-    assert!(stdout.contains("split-ready"), "{stdout:?}");
+    assert_contains_ordered_line(&stdout, "base-ready", " | ", "split-ready");
+    assert!(!stdout.contains("-- pane 0 --"), "{stdout:?}");
+    assert!(!stdout.contains("-- pane 1 --"), "{stdout:?}");
 
     let captured = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
     assert_success(&captured);
     let captured = String::from_utf8_lossy(&captured.stdout);
-    assert!(!captured.contains("-- pane 0 --"), "{captured:?}");
-    assert!(!captured.contains("-- pane 1 --"), "{captured:?}");
+    assert!(!captured.contains(" | "), "{captured:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_renders_vertical_split_layout_snapshot() {
+    let socket = unique_socket("attach-vertical-layout");
+    let session = format!("attach-vertical-layout-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run attach");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_vertical_layout(&stdout, "base-ready", "split-ready");
+    assert!(!stdout.contains("-- pane 0 --"), "{stdout:?}");
+    assert!(!stdout.contains("-- pane 1 --"), "{stdout:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

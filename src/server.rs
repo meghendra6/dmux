@@ -215,8 +215,8 @@ impl Session {
         self.windows.lock().unwrap().active_pane()
     }
 
-    fn add_pane(&self, pane: Arc<Pane>) {
-        self.windows.lock().unwrap().add_pane(pane);
+    fn add_pane(&self, direction: SplitDirection, pane: Arc<Pane>) {
+        self.windows.lock().unwrap().add_pane(direction, pane);
     }
 
     fn select_pane(&self, index: usize) -> bool {
@@ -262,10 +262,15 @@ impl Session {
     fn attach_panes(&self) -> Vec<IndexedPane> {
         self.windows.lock().unwrap().attach_panes()
     }
+
+    fn attach_layout_snapshot(&self) -> AttachLayoutSnapshot {
+        self.windows.lock().unwrap().attach_layout_snapshot()
+    }
 }
 
 struct Window {
     panes: PaneSet<Arc<Pane>>,
+    layout: LayoutNode,
     zoomed: Option<usize>,
 }
 
@@ -280,12 +285,7 @@ enum LayoutNode {
 }
 
 impl LayoutNode {
-    fn split_pane(
-        &mut self,
-        target: usize,
-        direction: SplitDirection,
-        new_index: usize,
-    ) -> bool {
+    fn split_pane(&mut self, target: usize, direction: SplitDirection, new_index: usize) -> bool {
         match self {
             LayoutNode::Pane(index) if *index == target => {
                 *self = LayoutNode::Split {
@@ -336,6 +336,7 @@ impl Window {
     fn new(pane: Arc<Pane>) -> Self {
         Self {
             panes: PaneSet::new(pane),
+            layout: LayoutNode::Pane(0),
             zoomed: None,
         }
     }
@@ -344,8 +345,11 @@ impl Window {
         self.panes.active()
     }
 
-    fn add_pane(&mut self, pane: Arc<Pane>) {
+    fn add_pane(&mut self, direction: SplitDirection, pane: Arc<Pane>) {
+        let split_index = self.panes.active_index();
+        let new_index = self.panes.len();
         self.panes.add(pane);
+        let _ = self.layout.split_pane(split_index, direction, new_index);
         if self.zoomed.is_some() {
             self.zoomed = Some(self.panes.active_index());
         }
@@ -367,6 +371,7 @@ impl Window {
             .expect("validated pane index must exist while session lock is held");
         pty::terminate(pane.child_pid).map_err(|err| err.to_string())?;
         self.panes.kill_at(index);
+        self.layout.remove_pane(index);
         self.adjust_zoom_after_pane_removal(index);
         Ok(())
     }
@@ -405,6 +410,33 @@ impl Window {
                     .map(|pane| IndexedPane { index, pane })
             })
             .collect()
+    }
+
+    fn attach_layout_snapshot(&self) -> AttachLayoutSnapshot {
+        if let Some(index) = self.zoomed {
+            let panes = self
+                .panes
+                .get(index)
+                .cloned()
+                .map(|pane| vec![IndexedPane { index, pane }])
+                .unwrap_or_default();
+            return AttachLayoutSnapshot {
+                layout: LayoutNode::Pane(index),
+                panes,
+            };
+        }
+
+        AttachLayoutSnapshot {
+            layout: self.layout.clone(),
+            panes: (0..self.panes.len())
+                .filter_map(|index| {
+                    self.panes
+                        .get(index)
+                        .cloned()
+                        .map(|pane| IndexedPane { index, pane })
+                })
+                .collect(),
+        }
     }
 
     fn active_pane_index(&self) -> usize {
@@ -489,9 +521,9 @@ impl WindowSet {
         self.active_window()?.active_pane()
     }
 
-    fn add_pane(&mut self, pane: Arc<Pane>) {
+    fn add_pane(&mut self, direction: SplitDirection, pane: Arc<Pane>) {
         if let Some(window) = self.active_window_mut() {
-            window.add_pane(pane);
+            window.add_pane(direction, pane);
         }
     }
 
@@ -521,6 +553,11 @@ impl WindowSet {
     fn attach_panes(&self) -> Vec<IndexedPane> {
         self.active_window()
             .map_or_else(Vec::new, Window::attach_panes)
+    }
+
+    fn attach_layout_snapshot(&self) -> AttachLayoutSnapshot {
+        self.active_window()
+            .map_or_else(AttachLayoutSnapshot::empty, Window::attach_layout_snapshot)
     }
 
     fn status_context(&self, session_name: &str) -> Option<StatusContext> {
@@ -576,6 +613,20 @@ struct PaneDescription {
 struct IndexedPane {
     index: usize,
     pane: Arc<Pane>,
+}
+
+struct AttachLayoutSnapshot {
+    layout: LayoutNode,
+    panes: Vec<IndexedPane>,
+}
+
+impl AttachLayoutSnapshot {
+    fn empty() -> Self {
+        Self {
+            layout: LayoutNode::Pane(0),
+            panes: Vec::new(),
+        }
+    }
 }
 
 struct PaneSnapshot {
@@ -731,9 +782,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::Send { session, bytes } => handle_send(&state, &mut stream, &session, &bytes),
         Request::Split {
             session,
-            direction: _,
+            direction,
             command,
-        } => handle_split(&state, &mut stream, &session, command),
+        } => handle_split(&state, &mut stream, &session, direction, command),
         Request::ListPanes { session, format } => {
             handle_list_panes(&state, &mut stream, &session, format.as_deref())
         }
@@ -1067,6 +1118,7 @@ fn handle_split(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     name: &str,
+    direction: SplitDirection,
     command: Vec<String>,
 ) -> io::Result<()> {
     let session = {
@@ -1086,7 +1138,7 @@ fn handle_split(
     let size = *active.size.lock().unwrap();
     let cwd = std::env::current_dir()?;
     let pane = spawn_pane(name.to_string(), command, cwd, size)?;
-    session.add_pane(pane);
+    session.add_pane(direction, pane);
     write_ok(stream)
 }
 
@@ -1494,12 +1546,13 @@ fn handle_attach_snapshot(
 }
 
 fn attach_pane_snapshot(session: &Session) -> Option<String> {
-    let panes = session.attach_panes();
-    if panes.len() <= 1 {
+    let snapshot = session.attach_layout_snapshot();
+    if snapshot.panes.len() <= 1 {
         return None;
     }
 
-    let snapshots = panes
+    let panes = snapshot
+        .panes
         .into_iter()
         .map(|pane| PaneSnapshot {
             index: pane.index,
@@ -1507,7 +1560,7 @@ fn attach_pane_snapshot(session: &Session) -> Option<String> {
         })
         .collect::<Vec<_>>();
 
-    Some(render_ordered_pane_sections(&snapshots))
+    Some(render_attach_pane_snapshot(&snapshot.layout, &panes))
 }
 
 fn render_attach_pane_snapshot(layout: &LayoutNode, panes: &[PaneSnapshot]) -> String {
@@ -1522,10 +1575,7 @@ fn render_attach_pane_snapshot(layout: &LayoutNode, panes: &[PaneSnapshot]) -> S
     }
 }
 
-fn render_layout_lines(
-    layout: &LayoutNode,
-    screens: &HashMap<usize, &str>,
-) -> Option<Vec<String>> {
+fn render_layout_lines(layout: &LayoutNode, screens: &HashMap<usize, &str>) -> Option<Vec<String>> {
     match layout {
         LayoutNode::Pane(index) => screens.get(index).map(|screen| screen_lines(screen)),
         LayoutNode::Split {

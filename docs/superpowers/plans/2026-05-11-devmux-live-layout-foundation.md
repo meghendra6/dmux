@@ -350,7 +350,7 @@ cargo test server::tests::render_attach_layout_joins_horizontal_panes server::te
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit renderer**
+- [x] **Step 5: Commit renderer**
 
 Run:
 
@@ -365,7 +365,7 @@ git commit -m "feat: render pane layout text"
 - Modify: `src/server.rs`
 - Modify: `tests/phase1_cli.rs`
 
-- [ ] **Step 1: Write failing integration tests**
+- [x] **Step 1: Write failing integration tests**
 
 Modify `attach_renders_split_pane_snapshot` in `tests/phase1_cli.rs` to assert horizontal layout output:
 
@@ -477,7 +477,7 @@ fn assert_vertical_layout(text: &str, top: &str, bottom: &str) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify RED**
+- [x] **Step 2: Run test to verify RED**
 
 Run:
 
@@ -487,7 +487,7 @@ cargo test --test phase1_cli attach_renders_split_pane_snapshot attach_renders_v
 
 Expected: FAIL because attach snapshots still use labeled sections and split direction is not stored in `Window`.
 
-- [ ] **Step 3: Add attach layout snapshot data**
+- [x] **Step 3: Add attach layout snapshot data**
 
 Add:
 
@@ -524,7 +524,7 @@ fn attach_layout_snapshot(&self) -> AttachLayoutSnapshot {
 }
 ```
 
-- [ ] **Step 4: Add layout to `Window` and pass split direction**
+- [x] **Step 4: Add layout to `Window` and pass split direction**
 
 Change `Window`:
 
@@ -633,7 +633,7 @@ Update `handle_split` to accept `direction: SplitDirection` and call:
 session.add_pane(direction, pane);
 ```
 
-- [ ] **Step 5: Use layout in `attach_pane_snapshot`**
+- [x] **Step 5: Use layout in `attach_pane_snapshot`**
 
 Update:
 
@@ -657,7 +657,7 @@ fn attach_pane_snapshot(session: &Session) -> Option<String> {
 }
 ```
 
-- [ ] **Step 6: Run integration tests to verify GREEN**
+- [x] **Step 6: Run integration tests to verify GREEN**
 
 Run:
 
