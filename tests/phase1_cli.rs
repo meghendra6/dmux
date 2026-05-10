@@ -104,3 +104,57 @@ fn attach_reports_missing_session() {
 
     let _ = dmux(&socket, &["kill-server"]);
 }
+
+#[test]
+fn capture_pane_strips_sgr_sequences() {
+    let socket = unique_socket("sgr-capture");
+    let session = format!("sgr-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf '\\033[31mred\\033[0m\\n'; sleep 30",
+        ],
+    ));
+
+    let captured = poll_capture(&socket, &session, "red");
+    assert!(captured.contains("red"), "{captured:?}");
+    assert!(!captured.contains('\x1b'), "{captured:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn capture_pane_applies_carriage_return_overwrite() {
+    let socket = unique_socket("cr-capture");
+    let session = format!("cr-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf 'hello\\rworld'; sleep 30",
+        ],
+    ));
+
+    let captured = poll_capture(&socket, &session, "world");
+    assert!(captured.contains("world"), "{captured:?}");
+    assert!(!captured.contains("hello"), "{captured:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}

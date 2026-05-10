@@ -1,5 +1,6 @@
 use crate::protocol::{self, Request};
 use crate::pty::{self, SpawnSpec};
+use crate::term::TerminalState;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
@@ -46,7 +47,8 @@ struct ServerState {
 struct Session {
     child_pid: i32,
     writer: Arc<Mutex<File>>,
-    history: Arc<Mutex<Vec<u8>>>,
+    raw_history: Arc<Mutex<Vec<u8>>>,
+    terminal: Arc<Mutex<TerminalState>>,
     clients: Arc<Mutex<Vec<UnixStream>>>,
 }
 
@@ -96,7 +98,8 @@ fn handle_new(
     let session = Arc::new(Session {
         child_pid: process.child_pid,
         writer: Arc::new(Mutex::new(process.master)),
-        history: Arc::new(Mutex::new(Vec::new())),
+        raw_history: Arc::new(Mutex::new(Vec::new())),
+        terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 10_000))),
         clients: Arc::new(Mutex::new(Vec::new())),
     });
 
@@ -134,8 +137,8 @@ fn handle_capture(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str)
     };
 
     write_ok(stream)?;
-    let history = session.history.lock().unwrap();
-    stream.write_all(&history)
+    let captured = session.terminal.lock().unwrap().capture_text();
+    stream.write_all(captured.as_bytes())
 }
 
 fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {
@@ -180,7 +183,7 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
 
     write_ok(&mut stream)?;
     {
-        let history = session.history.lock().unwrap();
+        let history = session.raw_history.lock().unwrap();
         stream.write_all(&history)?;
     }
     session.clients.lock().unwrap().push(stream.try_clone()?);
@@ -207,7 +210,8 @@ fn start_output_pump(mut reader: File, session: Arc<Session>) {
                 Err(_) => break,
             };
             let bytes = &buf[..n];
-            append_history(&session.history, bytes);
+            append_history(&session.raw_history, bytes);
+            session.terminal.lock().unwrap().apply_bytes(bytes);
             broadcast(&session.clients, bytes);
         }
     });
