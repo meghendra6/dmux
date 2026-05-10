@@ -21,6 +21,8 @@ Implemented Phase 0/1 commands:
 - `dmux select-pane -t <name> -p <index>`
 - `dmux kill-pane -t <name> [-p <index>]`
 - `dmux zoom-pane -t <name> [-p <index>]`
+- `dmux status-line -t <name> [-F <format>]`
+- `dmux display-message -t <name> -p <format>`
 - `dmux kill-session -t <name>`
 - `dmux kill-server`
 
@@ -40,12 +42,14 @@ Implemented Phase 2 groundwork:
 - active pane selection by pane index
 - pane removal while keeping the session alive
 - pane zoom state while keeping all panes alive
+- server-side statusline format expansion
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
 
 - split panes are tracked server-side, but layout rendering is not implemented yet
 - zoomed panes are tracked server-side, but layout rendering is not implemented yet
+- statusline format expansion is implemented, but attach-time statusline rendering is not implemented yet
 - in-memory screen and scrollback only
 - full terminal protocol support is incomplete
 - no layout or named-window support yet

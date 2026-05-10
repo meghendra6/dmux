@@ -64,6 +64,14 @@ pub enum Request {
         session: String,
         pane: Option<usize>,
     },
+    StatusLine {
+        session: String,
+        format: Option<String>,
+    },
+    DisplayMessage {
+        session: String,
+        format: String,
+    },
     Kill {
         session: String,
     },
@@ -150,6 +158,23 @@ pub fn encode_zoom_pane(session: &str, pane: Option<usize>) -> String {
         Some(pane) => format!("ZOOM_PANE\t{session}\t{pane}\n"),
         None => format!("ZOOM_PANE\t{session}\tactive\n"),
     }
+}
+
+pub fn encode_status_line(session: &str, format: Option<&str>) -> String {
+    match format {
+        Some(format) => format!(
+            "STATUS_LINE_FORMAT\t{session}\t{}\n",
+            encode_hex(format.as_bytes())
+        ),
+        None => format!("STATUS_LINE\t{session}\n"),
+    }
+}
+
+pub fn encode_display_message(session: &str, format: &str) -> String {
+    format!(
+        "DISPLAY_MESSAGE\t{session}\t{}\n",
+        encode_hex(format.as_bytes())
+    )
 }
 
 pub fn encode_kill(session: &str) -> String {
@@ -271,6 +296,18 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["ZOOM_PANE", session, pane] => Ok(Request::ZoomPane {
             session: (*session).to_string(),
             pane: decode_optional_zoom_pane(pane)?,
+        }),
+        ["STATUS_LINE", session] => Ok(Request::StatusLine {
+            session: (*session).to_string(),
+            format: None,
+        }),
+        ["STATUS_LINE_FORMAT", session, format] => Ok(Request::StatusLine {
+            session: (*session).to_string(),
+            format: Some(decode_utf8_hex(format, "STATUS_LINE_FORMAT")?),
+        }),
+        ["DISPLAY_MESSAGE", session, format] => Ok(Request::DisplayMessage {
+            session: (*session).to_string(),
+            format: decode_utf8_hex(format, "DISPLAY_MESSAGE")?,
         }),
         ["KILL", session] => Ok(Request::Kill {
             session: (*session).to_string(),
@@ -555,5 +592,41 @@ mod tests {
     fn rejects_invalid_zoom_pane_index() {
         let err = decode_request("ZOOM_PANE\tdev\tbad\n").unwrap_err();
         assert_eq!(err, "ZOOM_PANE has invalid pane index");
+    }
+
+    #[test]
+    fn round_trips_status_line_request() {
+        let line = encode_status_line("dev", None);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::StatusLine {
+                session: "dev".to_string(),
+                format: None,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_status_line_format_request() {
+        let line = encode_status_line("dev", Some("#{session.name}:#{pane.index}"));
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::StatusLine {
+                session: "dev".to_string(),
+                format: Some("#{session.name}:#{pane.index}".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_display_message_request() {
+        let line = encode_display_message("dev", "#{window.list}");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::DisplayMessage {
+                session: "dev".to_string(),
+                format: "#{window.list}".to_string(),
+            }
+        );
     }
 }

@@ -98,6 +98,10 @@ impl Session {
     fn zoom_pane(&self, target: Option<usize>) -> Result<(), String> {
         self.windows.lock().unwrap().zoom_pane(target)
     }
+
+    fn status_context(&self, name: &str) -> Option<StatusContext> {
+        self.windows.lock().unwrap().status_context(name)
+    }
 }
 
 struct Window {
@@ -158,6 +162,18 @@ impl Window {
                 window_zoomed,
             })
             .collect()
+    }
+
+    fn active_pane_index(&self) -> usize {
+        self.panes.active_index()
+    }
+
+    fn active_pane_zoomed(&self) -> bool {
+        self.zoomed == Some(self.panes.active_index())
+    }
+
+    fn is_zoomed(&self) -> bool {
+        self.zoomed.is_some()
     }
 
     fn zoom_pane(&mut self, target: Option<usize>) -> Result<(), String> {
@@ -259,6 +275,18 @@ impl WindowSet {
             .map_or_else(Vec::new, Window::pane_descriptions)
     }
 
+    fn status_context(&self, session_name: &str) -> Option<StatusContext> {
+        let window = self.active_window()?;
+        Some(StatusContext {
+            session_name: session_name.to_string(),
+            window_index: self.active,
+            window_count: self.windows.len(),
+            pane_index: window.active_pane_index(),
+            pane_zoomed: window.active_pane_zoomed(),
+            window_zoomed: window.is_zoomed(),
+        })
+    }
+
     fn len(&self) -> usize {
         self.windows.len()
     }
@@ -294,6 +322,15 @@ struct PaneDescription {
     index: usize,
     active: bool,
     zoomed: bool,
+    window_zoomed: bool,
+}
+
+struct StatusContext {
+    session_name: String,
+    window_index: usize,
+    window_count: usize,
+    pane_index: usize,
+    pane_zoomed: bool,
     window_zoomed: bool,
 }
 
@@ -437,6 +474,12 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         }
         Request::ZoomPane { session, pane } => {
             handle_zoom_pane(&state, &mut stream, &session, pane)
+        }
+        Request::StatusLine { session, format } => {
+            handle_status_line(&state, &mut stream, &session, format.as_deref())
+        }
+        Request::DisplayMessage { session, format } => {
+            handle_display_message(&state, &mut stream, &session, &format)
         }
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
@@ -678,6 +721,98 @@ fn handle_zoom_pane(
     }
 
     write_ok(stream)
+}
+
+fn handle_status_line(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    format: Option<&str>,
+) -> io::Result<()> {
+    let context = status_context(state, name);
+    let Some(context) = context else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    let format = format.unwrap_or("#{session.name} #{window.list} pane #{pane.index}");
+    writeln!(stream, "{}", format_status_line(format, &context))
+}
+
+fn handle_display_message(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    format: &str,
+) -> io::Result<()> {
+    let context = status_context(state, name);
+    let Some(context) = context else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    writeln!(stream, "{}", format_status_line(format, &context))
+}
+
+fn status_context(state: &Arc<ServerState>, name: &str) -> Option<StatusContext> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    }?;
+
+    session.status_context(name)
+}
+
+fn format_status_line(format: &str, context: &StatusContext) -> String {
+    let window_index = context.window_index.to_string();
+    let window_list = format_window_list(context);
+    let pane_index = context.pane_index.to_string();
+    let pane_zoomed = if context.pane_zoomed { "1" } else { "0" };
+    let window_zoomed = if context.window_zoomed { "1" } else { "0" };
+    let replacements = [
+        ("#{session.name}", context.session_name.as_str()),
+        ("#{window.index}", window_index.as_str()),
+        ("#{window.list}", window_list.as_str()),
+        ("#{pane.index}", pane_index.as_str()),
+        ("#{pane.zoomed}", pane_zoomed),
+        ("#{window.zoomed_flag}", window_zoomed),
+    ];
+    let mut output = String::with_capacity(format.len());
+    let mut remaining = format;
+
+    while !remaining.is_empty() {
+        if let Some((token, value)) = replacements
+            .iter()
+            .find(|(token, _)| remaining.starts_with(*token))
+        {
+            output.push_str(value);
+            remaining = &remaining[token.len()..];
+        } else {
+            let ch = remaining
+                .chars()
+                .next()
+                .expect("non-empty string must contain a character");
+            output.push(ch);
+            remaining = &remaining[ch.len_utf8()..];
+        }
+    }
+
+    output
+}
+
+fn format_window_list(context: &StatusContext) -> String {
+    (0..context.window_count)
+        .map(|index| {
+            if index == context.window_index {
+                format!("[{index}]")
+            } else {
+                index.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn handle_select_pane(

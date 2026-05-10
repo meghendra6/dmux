@@ -1200,3 +1200,196 @@ fn zoom_pane_follows_new_split_when_already_zoomed() {
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
+
+#[test]
+fn status_line_reports_active_window_pane_and_zoom_state() {
+    let socket = unique_socket("status-line");
+    let session = format!("status-line-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new-window",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf window-ready; sleep 30",
+        ],
+    ));
+    let window = poll_capture(&socket, &session, "window-ready");
+    assert!(window.contains("window-ready"), "{window:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session]));
+
+    let output = dmux(
+        &socket,
+        &[
+            "status-line",
+            "-t",
+            &session,
+            "-F",
+            "#{session.name}|#{window.index}|#{window.list}|#{pane.index}|#{pane.zoomed}|#{window.zoomed_flag}",
+        ],
+    );
+    assert_success(&output);
+    let line = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(line.trim_end(), format!("{session}|1|0 [1]|1|1|1"));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn display_message_prints_status_format() {
+    let socket = unique_socket("display-message");
+    let session = format!("display-message-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let output = dmux(
+        &socket,
+        &[
+            "display-message",
+            "-t",
+            &session,
+            "-p",
+            "#{session.name}:#{window.index}:#{pane.index}",
+        ],
+    );
+    assert_success(&output);
+    let line = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(line.trim_end(), format!("{session}:0:0"));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn display_message_preserves_token_like_session_names() {
+    let socket = unique_socket("display-message-token-name");
+    let session = format!("#{{pane.index}}-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let output = dmux(
+        &socket,
+        &["display-message", "-t", &session, "-p", "#{session.name}"],
+    );
+    assert_success(&output);
+    let line = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(line.trim_end(), session);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn status_line_uses_default_format() {
+    let socket = unique_socket("status-line-default");
+    let session = format!("status-line-default-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let output = dmux(&socket, &["status-line", "-t", &session]);
+    assert_success(&output);
+    let line = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(line.trim_end(), format!("{session} [0] pane 0"));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn status_line_and_display_message_report_missing_session() {
+    let socket = unique_socket("status-line-missing");
+
+    let output = dmux(&socket, &["status-line", "-t", "missing"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing session"), "{stderr:?}");
+
+    let output = dmux(
+        &socket,
+        &["display-message", "-t", "missing", "-p", "#{session.name}"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing session"), "{stderr:?}");
+
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
