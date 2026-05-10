@@ -90,6 +90,10 @@ impl Session {
     fn window_count(&self) -> usize {
         self.windows.lock().unwrap().len()
     }
+
+    fn kill_window(&self, target: Option<usize>) -> Result<(), String> {
+        self.windows.lock().unwrap().kill_window(target)
+    }
 }
 
 struct Window {
@@ -132,6 +136,13 @@ impl Window {
 
     fn panes(&self) -> Vec<Arc<Pane>> {
         self.panes.all()
+    }
+
+    fn terminate_panes(&self) -> Result<(), String> {
+        for pane in self.panes() {
+            pty::terminate(pane.child_pid).map_err(|err| err.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -203,6 +214,26 @@ impl WindowSet {
 
     fn len(&self) -> usize {
         self.windows.len()
+    }
+
+    fn kill_window(&mut self, target: Option<usize>) -> Result<(), String> {
+        if self.windows.len() <= 1 {
+            return Err("cannot kill last window; use kill-session".to_string());
+        }
+
+        let index = target.unwrap_or(self.active);
+        if index >= self.windows.len() {
+            return Err("missing window".to_string());
+        }
+
+        self.windows[index].terminate_panes()?;
+        self.windows.remove(index);
+        if self.active == index {
+            self.active = index.saturating_sub(1).min(self.windows.len() - 1);
+        } else if self.active > index {
+            self.active -= 1;
+        }
+        Ok(())
     }
 }
 
@@ -334,6 +365,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::ListWindows { session } => handle_list_windows(&state, &mut stream, &session),
         Request::SelectWindow { session, window } => {
             handle_select_window(&state, &mut stream, &session, window)
+        }
+        Request::KillWindow { session, window } => {
+            handle_kill_window(&state, &mut stream, &session, window)
         }
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
@@ -656,6 +690,30 @@ fn handle_select_window(
 
     if !session.select_window(index) {
         write_err(stream, "missing window")?;
+        return Ok(());
+    }
+
+    write_ok(stream)
+}
+
+fn handle_kill_window(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    window: Option<usize>,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    if let Err(message) = session.kill_window(window) {
+        write_err(stream, &message)?;
         return Ok(());
     }
 

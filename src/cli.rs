@@ -50,6 +50,10 @@ pub enum Command {
         session: String,
         window: usize,
     },
+    KillWindow {
+        session: String,
+        window: Option<usize>,
+    },
     KillSession {
         session: String,
     },
@@ -92,6 +96,7 @@ where
         "new-window" => parse_new_window(args),
         "list-windows" => parse_list_windows(args),
         "select-window" => parse_select_window(args),
+        "kill-window" => parse_kill_window(args),
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
@@ -431,6 +436,40 @@ fn parse_select_window(args: Vec<String>) -> Result<Command, String> {
     })
 }
 
+fn parse_kill_window(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut window = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "kill-window requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-w" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "kill-window requires a window index after -w".to_string())?;
+                window =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        "kill-window -w must be a non-negative integer".to_string()
+                    })?);
+                i += 2;
+            }
+            value => return Err(format!("kill-window does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::KillWindow {
+        session: session.ok_or_else(|| "kill-window requires -t <session>".to_string())?,
+        window,
+    })
+}
+
 fn set_split_direction(
     direction: &mut Option<SplitDirection>,
     value: SplitDirection,
@@ -646,6 +685,30 @@ mod tests {
             Command::SelectWindow {
                 session: "dev".to_string(),
                 window: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_kill_window_target_and_index() {
+        let command = parse_args(["dmux", "kill-window", "-t", "dev", "-w", "1"]).unwrap();
+        assert_eq!(
+            command,
+            Command::KillWindow {
+                session: "dev".to_string(),
+                window: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_kill_window_target_without_index() {
+        let command = parse_args(["dmux", "kill-window", "-t", "dev"]).unwrap();
+        assert_eq!(
+            command,
+            Command::KillWindow {
+                session: "dev".to_string(),
+                window: None,
             }
         );
     }

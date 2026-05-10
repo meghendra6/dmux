@@ -670,3 +670,255 @@ fn new_window_creates_second_active_window() {
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
+
+#[test]
+fn kill_window_removes_active_window_and_keeps_session() {
+    let socket = unique_socket("kill-window");
+    let session = format!("kill-window-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-window; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-window");
+    assert!(base.contains("base-window"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new-window",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf second-window; sleep 30",
+        ],
+    ));
+    let second = poll_capture(&socket, &session, "second-window");
+    assert!(second.contains("second-window"), "{second:?}");
+
+    assert_success(&dmux(&socket, &["kill-window", "-t", &session]));
+
+    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    assert_success(&windows);
+    let windows = String::from_utf8_lossy(&windows.stdout);
+    assert_eq!(windows.lines().collect::<Vec<_>>(), vec!["0"]);
+
+    let active = poll_capture(&socket, &session, "base-window");
+    assert!(active.contains("base-window"), "{active:?}");
+    assert!(!active.contains("second-window"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn kill_window_by_index_keeps_reindexed_active_window() {
+    let socket = unique_socket("kill-window-index");
+    let session = format!("kill-window-index-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-window; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-window");
+    assert!(base.contains("base-window"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new-window",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf second-window; sleep 30",
+        ],
+    ));
+    let second = poll_capture(&socket, &session, "second-window");
+    assert!(second.contains("second-window"), "{second:?}");
+
+    assert_success(&dmux(&socket, &["kill-window", "-t", &session, "-w", "0"]));
+
+    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    assert_success(&windows);
+    let windows = String::from_utf8_lossy(&windows.stdout);
+    assert_eq!(windows.lines().collect::<Vec<_>>(), vec!["0"]);
+
+    let active = poll_capture(&socket, &session, "second-window");
+    assert!(active.contains("second-window"), "{active:?}");
+    assert!(!active.contains("base-window"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn kill_window_terminates_all_removed_window_panes() {
+    let socket = unique_socket("kill-window-terminates");
+    let session = format!("kill-window-terminates-{}", std::process::id());
+    let window_pid_file = unique_temp_file("kill-window-pid");
+    let split_pid_file = unique_temp_file("kill-window-split-pid");
+    let _ = std::fs::remove_file(&window_pid_file);
+    let _ = std::fs::remove_file(&split_pid_file);
+    let window_command = format!(
+        "printf $$ > {}; printf second-window; while :; do sleep 0.1; done",
+        window_pid_file.display()
+    );
+    let split_command = format!(
+        "printf $$ > {}; printf split-window; while :; do sleep 0.1; done",
+        split_pid_file.display()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-window; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-window");
+    assert!(base.contains("base-window"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new-window",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &window_command,
+        ],
+    ));
+    let second = poll_capture(&socket, &session, "second-window");
+    assert!(second.contains("second-window"), "{second:?}");
+    assert!(
+        poll_file_exists(&window_pid_file),
+        "missing {}",
+        window_pid_file.display()
+    );
+    let window_pid = std::fs::read_to_string(&window_pid_file).expect("read window pid file");
+    let window_pid = window_pid.trim();
+    assert!(
+        process_exists(window_pid),
+        "window process {window_pid} should be alive"
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            &split_command,
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-window");
+    assert!(split.contains("split-window"), "{split:?}");
+    assert!(
+        poll_file_exists(&split_pid_file),
+        "missing {}",
+        split_pid_file.display()
+    );
+    let split_pid = std::fs::read_to_string(&split_pid_file).expect("read split pid file");
+    let split_pid = split_pid.trim();
+    assert!(
+        process_exists(split_pid),
+        "split process {split_pid} should be alive"
+    );
+
+    assert_success(&dmux(&socket, &["kill-window", "-t", &session, "-w", "1"]));
+    assert!(
+        poll_process_gone(window_pid),
+        "window process {window_pid} should be gone"
+    );
+    assert!(
+        poll_process_gone(split_pid),
+        "split process {split_pid} should be gone"
+    );
+
+    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    assert_success(&windows);
+    let windows = String::from_utf8_lossy(&windows.stdout);
+    assert_eq!(windows.lines().collect::<Vec<_>>(), vec!["0"]);
+
+    let active = poll_capture(&socket, &session, "base-window");
+    assert!(active.contains("base-window"), "{active:?}");
+    assert!(!active.contains("second-window"), "{active:?}");
+    assert!(!active.contains("split-window"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(&window_pid_file);
+    let _ = std::fs::remove_file(&split_pid_file);
+}
+
+#[test]
+fn kill_window_rejects_last_window_and_keeps_session_usable() {
+    let socket = unique_socket("kill-window-last");
+    let session = format!("kill-window-last-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-window; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-window");
+    assert!(base.contains("base-window"), "{base:?}");
+
+    let output = dmux(&socket, &["kill-window", "-t", &session]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot kill last window"), "{stderr:?}");
+
+    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    assert_success(&windows);
+    let windows = String::from_utf8_lossy(&windows.stdout);
+    assert_eq!(windows.lines().collect::<Vec<_>>(), vec!["0"]);
+
+    let active = poll_capture(&socket, &session, "base-window");
+    assert!(active.contains("base-window"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
