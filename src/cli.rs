@@ -1,4 +1,4 @@
-use crate::protocol::SplitDirection;
+use crate::protocol::{CaptureMode, SplitDirection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -13,6 +13,7 @@ pub enum Command {
     ListSessions,
     CapturePane {
         session: String,
+        mode: CaptureMode,
     },
     ResizePane {
         session: String,
@@ -166,9 +167,50 @@ fn parse_attach(args: Vec<String>) -> Result<Command, String> {
 }
 
 fn parse_capture(args: Vec<String>) -> Result<Command, String> {
-    let session = parse_target(args, "capture-pane")?
-        .ok_or_else(|| "capture-pane requires -t <session>".to_string())?;
-    Ok(Command::CapturePane { session })
+    let mut session = None;
+    let mut mode = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "capture-pane requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-p" => {
+                i += 1;
+            }
+            "--screen" => {
+                set_capture_mode(&mut mode, CaptureMode::Screen)?;
+                i += 1;
+            }
+            "--history" => {
+                set_capture_mode(&mut mode, CaptureMode::History)?;
+                i += 1;
+            }
+            "--all" => {
+                set_capture_mode(&mut mode, CaptureMode::All)?;
+                i += 1;
+            }
+            value => return Err(format!("capture-pane does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::CapturePane {
+        session: session.ok_or_else(|| "capture-pane requires -t <session>".to_string())?,
+        mode: mode.unwrap_or(CaptureMode::All),
+    })
+}
+
+fn set_capture_mode(mode: &mut Option<CaptureMode>, value: CaptureMode) -> Result<(), String> {
+    if mode.replace(value).is_some() {
+        Err("capture-pane accepts only one capture mode".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_kill_session(args: Vec<String>) -> Result<Command, String> {
@@ -673,9 +715,61 @@ mod tests {
         assert_eq!(
             command,
             Command::CapturePane {
-                session: "dev".to_string()
+                session: "dev".to_string(),
+                mode: CaptureMode::All,
             }
         );
+    }
+
+    #[test]
+    fn parses_capture_pane_screen_mode() {
+        let command = parse_args(["dmux", "capture-pane", "-t", "dev", "-p", "--screen"]).unwrap();
+        assert_eq!(
+            command,
+            Command::CapturePane {
+                session: "dev".to_string(),
+                mode: CaptureMode::Screen,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_capture_pane_history_mode() {
+        let command = parse_args(["dmux", "capture-pane", "-t", "dev", "-p", "--history"]).unwrap();
+        assert_eq!(
+            command,
+            Command::CapturePane {
+                session: "dev".to_string(),
+                mode: CaptureMode::History,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_capture_pane_all_mode() {
+        let command = parse_args(["dmux", "capture-pane", "-t", "dev", "-p", "--all"]).unwrap();
+        assert_eq!(
+            command,
+            Command::CapturePane {
+                session: "dev".to_string(),
+                mode: CaptureMode::All,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_capture_pane_modes() {
+        let err = parse_args([
+            "dmux",
+            "capture-pane",
+            "-t",
+            "dev",
+            "-p",
+            "--screen",
+            "--history",
+        ])
+        .unwrap_err();
+        assert!(err.contains("only one capture mode"), "{err}");
     }
 
     #[test]

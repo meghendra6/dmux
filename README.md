@@ -8,7 +8,7 @@ Implemented Phase 0/1 commands:
 - `dmux new -s <name> [-- command...]`
 - `dmux attach -t <name>`
 - `dmux ls`
-- `dmux capture-pane -t <name> -p`
+- `dmux capture-pane -t <name> -p [--screen|--history|--all]`
 - `dmux resize-pane -t <name> -x <cols> -y <rows>`
 - `dmux send-keys -t <name> <keys...>`
 - `dmux new-window -t <name> [-- command...]`
@@ -26,10 +26,15 @@ Implemented Phase 0/1 commands:
 - `dmux kill-session -t <name>`
 - `dmux kill-server`
 
+`capture-pane -p` defaults to combined scrollback history plus the current
+screen. Use `--screen` for only the current screen, `--history` for only
+scrollback, or `--all` for the combined output explicitly.
+
 Implemented Phase 2 groundwork:
 
 - basic terminal screen state for printable shell output
 - scrollback-backed `capture-pane -p`
+- explicit screen/history/all capture modes for `capture-pane`
 - SGR escape stripping in captures
 - carriage-return overwrite handling in captures
 - explicit PTY resize requests with screen-state resize

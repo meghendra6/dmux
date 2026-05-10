@@ -64,6 +64,57 @@ fn detached_session_keeps_process_output_available_for_capture() {
     assert_success(&dmux(&socket, &["kill-server"]));
 }
 
+#[test]
+fn capture_pane_modes_separate_history_from_screen() {
+    let socket = unique_socket("capture-modes");
+    let session = format!("capture-modes-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "for i in $(seq 1 30); do echo line-$i; done; sleep 30",
+        ],
+    ));
+    let all = poll_capture(&socket, &session, "line-30");
+    assert!(has_line(&all, "line-1"), "{all:?}");
+    assert!(has_line(&all, "line-30"), "{all:?}");
+
+    let screen = dmux(&socket, &["capture-pane", "-t", &session, "-p", "--screen"]);
+    assert_success(&screen);
+    let screen = String::from_utf8_lossy(&screen.stdout);
+    assert!(!has_line(&screen, "line-1"), "{screen:?}");
+    assert!(has_line(&screen, "line-30"), "{screen:?}");
+
+    let history = dmux(
+        &socket,
+        &["capture-pane", "-t", &session, "-p", "--history"],
+    );
+    assert_success(&history);
+    let history = String::from_utf8_lossy(&history.stdout);
+    assert!(has_line(&history, "line-1"), "{history:?}");
+    assert!(!has_line(&history, "line-30"), "{history:?}");
+
+    let all = dmux(&socket, &["capture-pane", "-t", &session, "-p", "--all"]);
+    assert_success(&all);
+    let all = String::from_utf8_lossy(&all.stdout);
+    assert!(has_line(&all, "line-1"), "{all:?}");
+    assert!(has_line(&all, "line-30"), "{all:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+fn has_line(text: &str, needle: &str) -> bool {
+    text.lines().any(|line| line == needle)
+}
+
 fn poll_capture(socket: &std::path::Path, session: &str, needle: &str) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut last = String::new();

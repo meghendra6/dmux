@@ -22,16 +22,22 @@ impl TerminalState {
     }
 
     pub fn capture_text(&self) -> String {
-        let mut lines = self.scrollback.lines.iter().cloned().collect::<Vec<_>>();
-        lines.extend(self.screen.non_empty_lines());
+        join_capture_lines(
+            self.scrollback
+                .lines
+                .iter()
+                .cloned()
+                .chain(self.screen.non_empty_lines())
+                .collect(),
+        )
+    }
 
-        if lines.is_empty() {
-            String::new()
-        } else {
-            let mut text = lines.join("\n");
-            text.push('\n');
-            text
-        }
+    pub fn capture_history_text(&self) -> String {
+        join_capture_lines(self.scrollback.lines.iter().cloned().collect())
+    }
+
+    pub fn capture_screen_text(&self) -> String {
+        join_capture_lines(self.screen.non_empty_lines())
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -105,6 +111,16 @@ impl TerminalState {
             b'D' => self.screen.move_left(parse_count(params)),
             _ => {}
         }
+    }
+}
+
+fn join_capture_lines(lines: Vec<String>) -> String {
+    if lines.is_empty() {
+        String::new()
+    } else {
+        let mut text = lines.join("\n");
+        text.push('\n');
+        text
     }
 }
 
@@ -323,6 +339,26 @@ mod tests {
         let captured = state.capture_text();
         assert!(captured.contains("1"), "{captured:?}");
         assert!(captured.contains("4"), "{captured:?}");
+    }
+
+    #[test]
+    fn capture_screen_excludes_scrollback() {
+        let mut state = TerminalState::new(20, 3, 100);
+        state.apply_bytes(b"one\r\ntwo\r\nthree\r\nfour");
+        let screen = state.capture_screen_text();
+        assert_eq!(screen, "two\nthree\nfour\n");
+        assert!(!screen.contains("one"), "{screen:?}");
+        assert!(screen.contains("four"), "{screen:?}");
+    }
+
+    #[test]
+    fn capture_history_excludes_current_screen() {
+        let mut state = TerminalState::new(20, 3, 100);
+        state.apply_bytes(b"one\r\ntwo\r\nthree\r\nfour");
+        let history = state.capture_history_text();
+        assert_eq!(history, "one\n");
+        assert!(history.contains("one"), "{history:?}");
+        assert!(!history.contains("four"), "{history:?}");
     }
 
     #[test]

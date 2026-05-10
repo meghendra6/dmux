@@ -37,10 +37,10 @@ fn run() -> Result<(), String> {
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
-        cli::Command::CapturePane { session } => {
+        cli::Command::CapturePane { session, mode } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            let body = send_request(&socket, &protocol::encode_capture(&session), true)?;
+            let body = send_request(&socket, &protocol::encode_capture(&session, mode), true)?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
