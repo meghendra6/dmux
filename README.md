@@ -10,6 +10,7 @@ Implemented Phase 0/1 commands:
 - `dmux ls`
 - `dmux capture-pane -t <name> -p`
 - `dmux resize-pane -t <name> -x <cols> -y <rows>`
+- `dmux send-keys -t <name> <keys...>`
 - `dmux kill-session -t <name>`
 - `dmux kill-server`
 
@@ -20,6 +21,7 @@ Implemented Phase 2 groundwork:
 - SGR escape stripping in captures
 - carriage-return overwrite handling in captures
 - explicit PTY resize requests with screen-state resize
+- detached session input through `send-keys`
 - attach-time PTY resize to the current terminal size when available
 - attached clients request PTY resize on terminal `SIGWINCH`
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
@@ -31,3 +33,6 @@ Current limits:
 - full terminal protocol support is incomplete
 - no layout/window support yet
 - Unix/macOS POSIX PTY support only
+
+Supported `send-keys` tokens are literal text plus `Enter`, `Space`, `Tab`,
+`Escape`, and `C-c`.

@@ -18,6 +18,10 @@ pub enum Request {
         cols: u16,
         rows: u16,
     },
+    Send {
+        session: String,
+        bytes: Vec<u8>,
+    },
     Kill {
         session: String,
     },
@@ -43,6 +47,10 @@ pub fn encode_capture(session: &str) -> String {
 
 pub fn encode_resize(session: &str, cols: u16, rows: u16) -> String {
     format!("RESIZE\t{session}\t{cols}\t{rows}\n")
+}
+
+pub fn encode_send(session: &str, bytes: &[u8]) -> String {
+    format!("SEND\t{session}\t{}\n", encode_hex(bytes))
 }
 
 pub fn encode_kill(session: &str) -> String {
@@ -91,11 +99,49 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 .parse::<u16>()
                 .map_err(|_| "RESIZE has invalid rows".to_string())?,
         }),
+        ["SEND", session, hex] => Ok(Request::Send {
+            session: (*session).to_string(),
+            bytes: decode_hex(hex)?,
+        }),
         ["KILL", session] => Ok(Request::Kill {
             session: (*session).to_string(),
         }),
         ["KILL_SERVER"] => Ok(Request::KillServer),
         _ => Err(format!("unknown request line: {line:?}")),
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("hex payload has odd length".to_string());
+    }
+
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = hex_value(pair[0])?;
+            let lo = hex_value(pair[1])?;
+            Ok((hi << 4) | lo)
+        })
+        .collect()
+}
+
+fn hex_value(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("hex payload contains non-hex byte".to_string()),
     }
 }
 
@@ -126,6 +172,18 @@ mod tests {
                 session: "dev".to_string(),
                 cols: 100,
                 rows: 40,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_send_request() {
+        let line = encode_send("dev", b"hello\r");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::Send {
+                session: "dev".to_string(),
+                bytes: b"hello\r".to_vec(),
             }
         );
     }

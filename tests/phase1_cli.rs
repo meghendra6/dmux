@@ -230,3 +230,34 @@ fn attach_resizes_session_before_passthrough() {
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
+
+#[test]
+fn send_keys_writes_input_to_detached_session() {
+    let socket = unique_socket("send-keys");
+    let session = format!("send-keys-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "read line; echo got:$line; sleep 30",
+        ],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "hello", "Enter"],
+    ));
+
+    let captured = poll_capture(&socket, &session, "got:hello");
+    assert!(captured.contains("got:hello"), "{captured:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
