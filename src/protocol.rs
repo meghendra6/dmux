@@ -27,6 +27,19 @@ pub enum Request {
         session: String,
         mode: CaptureMode,
     },
+    SaveBuffer {
+        session: String,
+        buffer: Option<String>,
+        mode: CaptureMode,
+    },
+    ListBuffers,
+    PasteBuffer {
+        session: String,
+        buffer: Option<String>,
+    },
+    DeleteBuffer {
+        buffer: String,
+    },
     Resize {
         session: String,
         cols: u16,
@@ -101,6 +114,29 @@ pub fn encode_list() -> &'static str {
 
 pub fn encode_capture(session: &str, mode: CaptureMode) -> String {
     format!("CAPTURE\t{session}\t{}\n", encode_capture_mode(mode))
+}
+
+pub fn encode_save_buffer(session: &str, buffer: Option<&str>, mode: CaptureMode) -> String {
+    format!(
+        "SAVE_BUFFER\t{session}\t{}\t{}\n",
+        encode_capture_mode(mode),
+        encode_optional_text(buffer)
+    )
+}
+
+pub fn encode_list_buffers() -> &'static str {
+    "LIST_BUFFERS\n"
+}
+
+pub fn encode_paste_buffer(session: &str, buffer: Option<&str>) -> String {
+    format!(
+        "PASTE_BUFFER\t{session}\t{}\n",
+        encode_optional_text(buffer)
+    )
+}
+
+pub fn encode_delete_buffer(buffer: &str) -> String {
+    format!("DELETE_BUFFER\t{}\n", encode_hex(buffer.as_bytes()))
 }
 
 pub fn encode_resize(session: &str, cols: u16, rows: u16) -> String {
@@ -226,6 +262,19 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["CAPTURE", session, mode] => Ok(Request::Capture {
             session: (*session).to_string(),
             mode: decode_capture_mode(mode)?,
+        }),
+        ["SAVE_BUFFER", session, mode, buffer] => Ok(Request::SaveBuffer {
+            session: (*session).to_string(),
+            buffer: decode_optional_text(buffer, "SAVE_BUFFER")?,
+            mode: decode_capture_mode(mode)?,
+        }),
+        ["LIST_BUFFERS"] => Ok(Request::ListBuffers),
+        ["PASTE_BUFFER", session, buffer] => Ok(Request::PasteBuffer {
+            session: (*session).to_string(),
+            buffer: decode_optional_text(buffer, "PASTE_BUFFER")?,
+        }),
+        ["DELETE_BUFFER", buffer] => Ok(Request::DeleteBuffer {
+            buffer: decode_utf8_hex(buffer, "DELETE_BUFFER")?,
         }),
         ["RESIZE", session, cols, rows] => Ok(Request::Resize {
             session: (*session).to_string(),
@@ -389,6 +438,20 @@ fn decode_utf8_hex(hex: &str, command: &str) -> Result<String, String> {
     String::from_utf8(decode_hex(hex)?).map_err(|_| format!("{command} has non-utf8 format"))
 }
 
+fn encode_optional_text(value: Option<&str>) -> String {
+    value
+        .map(|value| encode_hex(value.as_bytes()))
+        .unwrap_or_default()
+}
+
+fn decode_optional_text(value: &str, command: &str) -> Result<Option<String>, String> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        decode_utf8_hex(value, command).map(Some)
+    }
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -485,6 +548,31 @@ mod tests {
             Request::Capture {
                 session: "dev".to_string(),
                 mode: CaptureMode::All,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_save_buffer_request() {
+        let line = encode_save_buffer("dev", Some("saved"), CaptureMode::Screen);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::SaveBuffer {
+                session: "dev".to_string(),
+                buffer: Some("saved".to_string()),
+                mode: CaptureMode::Screen,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_paste_buffer_request() {
+        let line = encode_paste_buffer("dev", Some("saved"));
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::PasteBuffer {
+                session: "dev".to_string(),
+                buffer: Some("saved".to_string()),
             }
         );
     }

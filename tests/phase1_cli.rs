@@ -111,6 +111,78 @@ fn capture_pane_modes_separate_history_from_screen() {
     assert_success(&dmux(&socket, &["kill-server"]));
 }
 
+#[test]
+fn buffers_save_capture_list_paste_and_delete() {
+    let socket = unique_socket("buffers");
+    let source = format!("buffer-source-{}", std::process::id());
+    let sink = format!("buffer-sink-{}", std::process::id());
+    let file = unique_temp_file("buffer-paste");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &source,
+            "--",
+            "sh",
+            "-c",
+            "printf buffer-alpha; printf '\\n'; sleep 30",
+        ],
+    ));
+    let captured = poll_capture(&socket, &source, "buffer-alpha");
+    assert!(captured.contains("buffer-alpha"), "{captured:?}");
+
+    let saved = dmux(
+        &socket,
+        &["save-buffer", "-t", &source, "-b", "saved", "--screen"],
+    );
+    assert_success(&saved);
+    assert_eq!(String::from_utf8_lossy(&saved.stdout), "saved\n");
+
+    let listed = dmux(&socket, &["list-buffers"]);
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.lines().any(|line| line == "saved\t13\tbuffer-alpha"),
+        "{listed:?}"
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &sink,
+            "--",
+            "sh",
+            "-c",
+            &format!("cat > {}; sleep 30", file.display()),
+        ],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &["paste-buffer", "-t", &sink, "-b", "saved"],
+    ));
+    assert!(poll_file_contains(&file, "buffer-alpha"));
+
+    assert_success(&dmux(&socket, &["delete-buffer", "-b", "saved"]));
+    let listed = dmux(&socket, &["list-buffers"]);
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        !listed.lines().any(|line| line.starts_with("saved\t")),
+        "{listed:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &source]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &sink]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
 fn has_line(text: &str, needle: &str) -> bool {
     text.lines().any(|line| line == needle)
 }
@@ -130,6 +202,17 @@ fn poll_capture(socket: &std::path::Path, session: &str, needle: &str) -> String
     }
 
     last
+}
+
+fn poll_file_contains(path: &std::path::Path, needle: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(path).is_ok_and(|text| text.contains(needle)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
 }
 
 fn poll_file_exists(path: &std::path::Path) -> bool {

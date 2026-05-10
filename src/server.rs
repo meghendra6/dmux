@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 const MAX_HISTORY_BYTES: usize = 1024 * 1024;
+const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_BUFFERS: usize = 50;
 
 pub fn run(socket_path: PathBuf) -> io::Result<()> {
     if let Some(parent) = socket_path.parent() {
@@ -21,6 +23,7 @@ pub fn run(socket_path: PathBuf) -> io::Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     let state = Arc::new(ServerState {
         sessions: Mutex::new(HashMap::new()),
+        buffers: Mutex::new(BufferStore::new()),
         socket_path,
     });
 
@@ -41,7 +44,104 @@ pub fn run(socket_path: PathBuf) -> io::Result<()> {
 
 struct ServerState {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    buffers: Mutex<BufferStore>,
     socket_path: PathBuf,
+}
+
+struct Buffer {
+    name: String,
+    text: String,
+}
+
+struct BufferDescription {
+    name: String,
+    bytes: usize,
+    preview: String,
+}
+
+struct BufferStore {
+    buffers: Vec<Buffer>,
+    next_auto: usize,
+}
+
+impl BufferStore {
+    fn new() -> Self {
+        Self {
+            buffers: Vec::new(),
+            next_auto: 0,
+        }
+    }
+
+    fn save(&mut self, name: Option<&str>, text: String) -> Result<String, String> {
+        if text.len() > MAX_BUFFER_BYTES {
+            return Err("buffer exceeds maximum size".to_string());
+        }
+
+        let name = match name {
+            Some(name) if name.is_empty() => return Err("buffer name cannot be empty".to_string()),
+            Some(name) => name.to_string(),
+            None => self.next_name(),
+        };
+
+        if let Some(index) = self.buffers.iter().position(|buffer| buffer.name == name) {
+            self.buffers.remove(index);
+        }
+
+        self.buffers.push(Buffer {
+            name: name.clone(),
+            text,
+        });
+        while self.buffers.len() > MAX_BUFFERS {
+            self.buffers.remove(0);
+        }
+        Ok(name)
+    }
+
+    fn list(&self) -> Vec<BufferDescription> {
+        self.buffers
+            .iter()
+            .map(|buffer| BufferDescription {
+                name: buffer.name.clone(),
+                bytes: buffer.text.len(),
+                preview: buffer_preview(&buffer.text),
+            })
+            .collect()
+    }
+
+    fn resolve(&self, name: Option<&str>) -> Option<&Buffer> {
+        match name {
+            Some(name) => self.buffers.iter().find(|buffer| buffer.name == name),
+            None => self.buffers.last(),
+        }
+    }
+
+    fn delete(&mut self, name: &str) -> bool {
+        let Some(index) = self.buffers.iter().position(|buffer| buffer.name == name) else {
+            return false;
+        };
+        self.buffers.remove(index);
+        true
+    }
+
+    fn next_name(&mut self) -> String {
+        loop {
+            let name = format!("buffer-{}", self.next_auto);
+            self.next_auto += 1;
+            if !self.buffers.iter().any(|buffer| buffer.name == name) {
+                return name;
+            }
+        }
+    }
+}
+
+fn buffer_preview(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or("")
+        .replace('\t', " ")
+        .chars()
+        .take(40)
+        .collect()
 }
 
 struct Session {
@@ -442,6 +542,16 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::New { session, command } => handle_new(&state, &mut stream, session, command),
         Request::List => handle_list(&state, &mut stream),
         Request::Capture { session, mode } => handle_capture(&state, &mut stream, &session, mode),
+        Request::SaveBuffer {
+            session,
+            buffer,
+            mode,
+        } => handle_save_buffer(&state, &mut stream, &session, buffer.as_deref(), mode),
+        Request::ListBuffers => handle_list_buffers(&state, &mut stream),
+        Request::PasteBuffer { session, buffer } => {
+            handle_paste_buffer(&state, &mut stream, &session, buffer.as_deref())
+        }
+        Request::DeleteBuffer { buffer } => handle_delete_buffer(&state, &mut stream, &buffer),
         Request::Resize {
             session,
             cols,
@@ -571,15 +681,112 @@ fn handle_capture(
     };
 
     write_ok(stream)?;
-    let captured = {
-        let terminal = pane.terminal.lock().unwrap();
-        match mode {
-            CaptureMode::Screen => terminal.capture_screen_text(),
-            CaptureMode::History => terminal.capture_history_text(),
-            CaptureMode::All => terminal.capture_text(),
+    let captured = capture_pane_text(&pane, mode);
+    stream.write_all(captured.as_bytes())
+}
+
+fn capture_pane_text(pane: &Pane, mode: CaptureMode) -> String {
+    let terminal = pane.terminal.lock().unwrap();
+    match mode {
+        CaptureMode::Screen => terminal.capture_screen_text(),
+        CaptureMode::History => terminal.capture_history_text(),
+        CaptureMode::All => terminal.capture_text(),
+    }
+}
+
+fn handle_save_buffer(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    buffer: Option<&str>,
+    mode: CaptureMode,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+    let Some(pane) = session.active_pane() else {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    };
+
+    let captured = capture_pane_text(&pane, mode);
+    let saved_name = match state.buffers.lock().unwrap().save(buffer, captured) {
+        Ok(name) => name,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
         }
     };
-    stream.write_all(captured.as_bytes())
+
+    write_ok(stream)?;
+    writeln!(stream, "{saved_name}")
+}
+
+fn handle_list_buffers(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::Result<()> {
+    let buffers = state.buffers.lock().unwrap().list();
+
+    write_ok(stream)?;
+    for buffer in buffers {
+        writeln!(
+            stream,
+            "{}\t{}\t{}",
+            buffer.name, buffer.bytes, buffer.preview
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_paste_buffer(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    buffer: Option<&str>,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+    let Some(pane) = session.active_pane() else {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    };
+    let Some(text) = state
+        .buffers
+        .lock()
+        .unwrap()
+        .resolve(buffer)
+        .map(|buffer| buffer.text.clone())
+    else {
+        write_err(stream, "missing buffer")?;
+        return Ok(());
+    };
+
+    pane.writer.lock().unwrap().write_all(text.as_bytes())?;
+    write_ok(stream)
+}
+
+fn handle_delete_buffer(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    buffer: &str,
+) -> io::Result<()> {
+    if !state.buffers.lock().unwrap().delete(buffer) {
+        write_err(stream, "missing buffer")?;
+        return Ok(());
+    }
+
+    write_ok(stream)
 }
 
 fn handle_resize(
@@ -1114,5 +1321,24 @@ mod tests {
             Err("cannot kill last pane; use kill-session")
         );
         assert_eq!(panes.active(), Some("base"));
+    }
+
+    #[test]
+    fn buffer_store_evicts_oldest_buffer_at_capacity() {
+        let mut store = BufferStore::new();
+
+        for index in 0..=MAX_BUFFERS {
+            store
+                .save(Some(&format!("buffer-{index}")), format!("text-{index}"))
+                .unwrap();
+        }
+
+        assert!(store.resolve(Some("buffer-0")).is_none());
+        assert!(
+            store
+                .resolve(Some(&format!("buffer-{MAX_BUFFERS}")))
+                .is_some()
+        );
+        assert_eq!(store.list().len(), MAX_BUFFERS);
     }
 }
