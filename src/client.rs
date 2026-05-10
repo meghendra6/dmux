@@ -91,6 +91,27 @@ fn parse_stty_size(value: &str) -> io::Result<PtySize> {
     PtySize::new(cols, rows)
 }
 
+fn maybe_emit_resize<F>(
+    current: Option<PtySize>,
+    last: &mut Option<PtySize>,
+    emit: F,
+) -> io::Result<()>
+where
+    F: FnOnce(PtySize) -> io::Result<()>,
+{
+    let Some(size) = current else {
+        return Ok(());
+    };
+
+    if *last == Some(size) {
+        return Ok(());
+    }
+
+    emit(size)?;
+    *last = Some(size);
+    Ok(())
+}
+
 fn forward_stdin_until_detach(stream: &mut UnixStream) -> io::Result<()> {
     let mut stdin = io::stdin().lock();
     let mut buf = [0_u8; 1024];
@@ -223,6 +244,54 @@ mod tests {
                 cols: 120,
                 rows: 40
             }
+        );
+    }
+
+    #[test]
+    fn maybe_emit_resize_only_emits_changed_sizes() {
+        let mut last = Some(crate::pty::PtySize { cols: 80, rows: 24 });
+        let mut emitted = Vec::new();
+
+        maybe_emit_resize(
+            Some(crate::pty::PtySize { cols: 80, rows: 24 }),
+            &mut last,
+            |size| {
+                emitted.push(size);
+                Ok(())
+            },
+        )
+        .unwrap();
+        maybe_emit_resize(
+            Some(crate::pty::PtySize {
+                cols: 100,
+                rows: 40,
+            }),
+            &mut last,
+            |size| {
+                emitted.push(size);
+                Ok(())
+            },
+        )
+        .unwrap();
+        maybe_emit_resize(None, &mut last, |size| {
+            emitted.push(size);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            emitted,
+            vec![crate::pty::PtySize {
+                cols: 100,
+                rows: 40
+            }]
+        );
+        assert_eq!(
+            last,
+            Some(crate::pty::PtySize {
+                cols: 100,
+                rows: 40
+            })
         );
     }
 }
