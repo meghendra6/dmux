@@ -75,16 +75,30 @@ fn run() -> Result<(), String> {
         cli::Command::Attach { session } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            if let Some(size) = client::detect_attach_size() {
+            let initial_size = client::detect_attach_size();
+            if let Some(size) = initial_size {
                 send_request(
                     &socket,
                     &protocol::encode_resize(&session, size.cols, size.rows),
                     true,
                 )?;
             }
-            client::attach(&socket, &session).map_err(|err| err.to_string())
+            client::attach(&socket, &session, initial_size, |size| {
+                send_request(
+                    &socket,
+                    &protocol::encode_resize(&session, size.cols, size.rows),
+                    true,
+                )
+                .map(|_| ())
+                .map_err(io_error)
+            })
+            .map_err(|err| err.to_string())
         }
     }
+}
+
+fn io_error(message: String) -> std::io::Error {
+    std::io::Error::other(message)
 }
 
 fn ensure_server(socket: &std::path::Path) -> Result<(), String> {

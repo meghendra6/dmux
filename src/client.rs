@@ -4,8 +4,19 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-pub fn attach(socket: &Path, session: &str) -> io::Result<()> {
+static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
+
+pub fn attach<F>(
+    socket: &Path,
+    session: &str,
+    initial_size: Option<PtySize>,
+    mut on_resize: F,
+) -> io::Result<()>
+where
+    F: FnMut(PtySize) -> io::Result<()>,
+{
     let mut stream = UnixStream::connect(socket)?;
     stream.write_all(protocol::encode_attach(session).as_bytes())?;
 
@@ -20,6 +31,7 @@ pub fn attach(socket: &Path, session: &str) -> io::Result<()> {
     }
 
     let _guard = RawModeGuard::enable();
+    install_winch_handler();
     let mut output_stream = stream.try_clone()?;
     let output = std::thread::spawn(move || {
         let mut stdout = io::stdout().lock();
@@ -27,7 +39,13 @@ pub fn attach(socket: &Path, session: &str) -> io::Result<()> {
         let _ = stdout.flush();
     });
 
-    forward_stdin_until_detach(&mut stream)?;
+    let mut last_size = initial_size;
+    forward_stdin_until_detach(&mut stream, || {
+        if take_winch_pending() {
+            maybe_emit_resize(detect_attach_size(), &mut last_size, &mut on_resize)?;
+        }
+        Ok(())
+    })?;
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = output.join();
     Ok(())
@@ -112,12 +130,16 @@ where
     Ok(())
 }
 
-fn forward_stdin_until_detach(stream: &mut UnixStream) -> io::Result<()> {
+fn forward_stdin_until_detach<F>(stream: &mut UnixStream, mut tick: F) -> io::Result<()>
+where
+    F: FnMut() -> io::Result<()>,
+{
     let mut stdin = io::stdin().lock();
     let mut buf = [0_u8; 1024];
     let mut saw_prefix = false;
 
     loop {
+        tick()?;
         let n = stdin.read(&mut buf)?;
         if n == 0 {
             break;
@@ -150,6 +172,21 @@ fn forward_stdin_until_detach(stream: &mut UnixStream) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn install_winch_handler() {
+    const SIGWINCH: i32 = 28;
+    unsafe {
+        signal(SIGWINCH, handle_winch);
+    }
+}
+
+fn take_winch_pending() -> bool {
+    WINCH_PENDING.swap(false, Ordering::SeqCst)
+}
+
+extern "C" fn handle_winch(_: i32) {
+    WINCH_PENDING.store(true, Ordering::SeqCst);
 }
 
 struct RawModeGuard {
@@ -199,6 +236,10 @@ fn stdin_is_tty() -> bool {
     }
 
     unsafe { isatty(0) == 1 }
+}
+
+unsafe extern "C" {
+    fn signal(signum: i32, handler: extern "C" fn(i32)) -> extern "C" fn(i32);
 }
 
 fn read_line(stream: &mut UnixStream) -> io::Result<String> {
@@ -293,5 +334,12 @@ mod tests {
                 rows: 40
             })
         );
+    }
+
+    #[test]
+    fn winch_flag_can_be_taken_once() {
+        WINCH_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(take_winch_pending());
+        assert!(!take_winch_pending());
     }
 }
