@@ -36,6 +36,10 @@ pub enum Request {
     ListPanes {
         session: String,
     },
+    SelectPane {
+        session: String,
+        pane: usize,
+    },
     Kill {
         session: String,
     },
@@ -78,6 +82,10 @@ pub fn encode_split(session: &str, direction: SplitDirection, command: &[String]
 
 pub fn encode_list_panes(session: &str) -> String {
     format!("LIST_PANES\t{session}\n")
+}
+
+pub fn encode_select_pane(session: &str, pane: usize) -> String {
+    format!("SELECT_PANE\t{session}\t{pane}\n")
 }
 
 pub fn encode_kill(session: &str) -> String {
@@ -150,6 +158,12 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         }
         ["LIST_PANES", session] => Ok(Request::ListPanes {
             session: (*session).to_string(),
+        }),
+        ["SELECT_PANE", session, pane] => Ok(Request::SelectPane {
+            session: (*session).to_string(),
+            pane: pane
+                .parse::<usize>()
+                .map_err(|_| "SELECT_PANE has invalid pane index".to_string())?,
         }),
         ["KILL", session] => Ok(Request::Kill {
             session: (*session).to_string(),
@@ -262,6 +276,18 @@ mod tests {
                 session: "dev".to_string(),
                 direction: SplitDirection::Horizontal,
                 command,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_select_pane_request() {
+        let line = encode_select_pane("dev", 1);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::SelectPane {
+                session: "dev".to_string(),
+                pane: 1,
             }
         );
     }
