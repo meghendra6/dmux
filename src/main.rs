@@ -4,6 +4,7 @@ mod paths;
 mod protocol;
 mod pty;
 mod server;
+mod term;
 
 fn main() {
     if let Err(err) = run() {
