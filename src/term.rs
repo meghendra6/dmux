@@ -34,6 +34,10 @@ impl TerminalState {
         }
     }
 
+    pub fn resize(&mut self, width: usize, height: usize) {
+        self.screen.resize(width, height);
+    }
+
     fn apply_byte(&mut self, byte: u8) {
         match &mut self.parser {
             ParserState::Ground => match byte {
@@ -158,6 +162,30 @@ impl TerminalScreen {
         self.rows = vec![vec![' '; self.width]; self.height];
         self.cursor_row = 0;
         self.cursor_col = 0;
+    }
+
+    fn resize(&mut self, width: usize, height: usize) {
+        let width = width.max(1);
+        let height = height.max(1);
+        let old_cursor_col = self.cursor_col;
+        let mut rows = vec![vec![' '; width]; height];
+        let copy_rows = self.height.min(height);
+        let copy_cols = self.width.min(width);
+
+        for (row_index, row) in rows.iter_mut().enumerate().take(copy_rows) {
+            row[..copy_cols].copy_from_slice(&self.rows[row_index][..copy_cols]);
+        }
+
+        self.width = width;
+        self.height = height;
+        self.rows = rows;
+        self.cursor_row = self.cursor_row.min(self.height - 1);
+        if old_cursor_col >= self.width {
+            self.cursor_col = 0;
+            self.cursor_row = (self.cursor_row + 1).min(self.height - 1);
+        } else {
+            self.cursor_col = self.cursor_col.min(self.width - 1);
+        }
     }
 
     fn clear_line_from_cursor(&mut self) {
@@ -295,5 +323,17 @@ mod tests {
         let captured = state.capture_text();
         assert!(captured.contains("1"), "{captured:?}");
         assert!(captured.contains("4"), "{captured:?}");
+    }
+
+    #[test]
+    fn resize_changes_wrap_width_for_future_output() {
+        let mut state = TerminalState::new(5, 3, 100);
+        state.apply_bytes(b"abcde");
+        state.resize(3, 3);
+        state.apply_bytes(b"XYZ");
+
+        let captured = state.capture_text();
+        assert!(captured.contains("abc"), "{captured:?}");
+        assert!(captured.contains("XYZ"), "{captured:?}");
     }
 }

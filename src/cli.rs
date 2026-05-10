@@ -12,6 +12,11 @@ pub enum Command {
     CapturePane {
         session: String,
     },
+    ResizePane {
+        session: String,
+        cols: u16,
+        rows: u16,
+    },
     KillSession {
         session: String,
     },
@@ -45,6 +50,7 @@ where
         "attach" | "attach-session" => parse_attach(args),
         "ls" | "list-sessions" => Ok(Command::ListSessions),
         "capture-pane" => parse_capture(args),
+        "resize-pane" => parse_resize_pane(args),
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
@@ -109,6 +115,54 @@ fn parse_kill_session(args: Vec<String>) -> Result<Command, String> {
     Ok(Command::KillSession { session })
 }
 
+fn parse_resize_pane(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut cols = None;
+    let mut rows = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "resize-pane requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-x" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "resize-pane requires columns after -x".to_string())?;
+                cols = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| "resize-pane -x must be a positive integer".to_string())?,
+                );
+                i += 2;
+            }
+            "-y" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "resize-pane requires rows after -y".to_string())?;
+                rows = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| "resize-pane -y must be a positive integer".to_string())?,
+                );
+                i += 2;
+            }
+            value => return Err(format!("resize-pane does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::ResizePane {
+        session: session.ok_or_else(|| "resize-pane requires -t <session>".to_string())?,
+        cols: cols.ok_or_else(|| "resize-pane requires -x <cols>".to_string())?,
+        rows: rows.ok_or_else(|| "resize-pane requires -y <rows>".to_string())?,
+    })
+}
+
 fn parse_target(args: Vec<String>, command: &str) -> Result<Option<String>, String> {
     let mut target = None;
     let mut i = 0;
@@ -168,5 +222,19 @@ mod tests {
     fn rejects_missing_session_target() {
         let err = parse_args(["dmux", "kill-session"]).unwrap_err();
         assert!(err.contains("-t"));
+    }
+
+    #[test]
+    fn parses_resize_pane_target_and_size() {
+        let command =
+            parse_args(["dmux", "resize-pane", "-t", "dev", "-x", "100", "-y", "40"]).unwrap();
+        assert_eq!(
+            command,
+            Command::ResizePane {
+                session: "dev".to_string(),
+                cols: 100,
+                rows: 40,
+            }
+        );
     }
 }
