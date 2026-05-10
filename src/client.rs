@@ -28,7 +28,7 @@ pub fn attach(socket: &Path, session: &str) -> io::Result<()> {
     });
 
     forward_stdin_until_detach(&mut stream)?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = output.join();
     Ok(())
 }

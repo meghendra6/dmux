@@ -1,4 +1,4 @@
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn dmux(socket: &std::path::Path, args: &[&str]) -> Output {
@@ -188,6 +188,44 @@ fn resize_pane_updates_child_pty_size() {
 
     let resized = poll_capture(&socket, &session, "40 100");
     assert!(resized.contains("40 100"), "{resized:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_resizes_session_before_passthrough() {
+    let socket = unique_socket("attach-size");
+    let session = format!("attach-size-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "stty size; while true; do sleep 0.2; stty size; done",
+        ],
+    ));
+
+    let initial = poll_capture(&socket, &session, "24 80");
+    assert!(initial.contains("24 80"), "{initial:?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .env("DEVMUX_ATTACH_SIZE", "132x43")
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run attach");
+    assert_success(&output);
+
+    let resized = poll_capture(&socket, &session, "43 132");
+    assert!(resized.contains("43 132"), "{resized:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
