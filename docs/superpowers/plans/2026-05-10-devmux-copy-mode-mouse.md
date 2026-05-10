@@ -231,7 +231,7 @@ Expected: formatting and tests pass; keyword scan prints no matches; whitespace 
 
 Dispatch a read-only review subagent over `git diff origin/main`. Apply technically valid blocking or important findings and rerun full verification.
 
-- [ ] **Step 6: Commit and open draft PR**
+- [x] **Step 6: Commit and open draft PR**
 
 Run:
 
