@@ -75,6 +75,13 @@ fn run() -> Result<(), String> {
         cli::Command::Attach { session } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
+            if let Some(size) = client::detect_attach_size() {
+                send_request(
+                    &socket,
+                    &protocol::encode_resize(&session, size.cols, size.rows),
+                    true,
+                )?;
+            }
             client::attach(&socket, &session).map_err(|err| err.to_string())
         }
     }

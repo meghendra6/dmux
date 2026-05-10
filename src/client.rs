@@ -1,4 +1,5 @@
 use crate::protocol;
+use crate::pty::PtySize;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -27,9 +28,67 @@ pub fn attach(socket: &Path, session: &str) -> io::Result<()> {
     });
 
     forward_stdin_until_detach(&mut stream)?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = output.join();
     Ok(())
+}
+
+pub fn detect_attach_size() -> Option<PtySize> {
+    if let Ok(value) = std::env::var("DEVMUX_ATTACH_SIZE") {
+        return parse_attach_size(&value).ok();
+    }
+
+    if !stdin_is_tty() {
+        return None;
+    }
+
+    let output = ProcessCommand::new("stty")
+        .arg("size")
+        .stdin(Stdio::inherit())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_stty_size(&String::from_utf8_lossy(&output.stdout)).ok()
+}
+
+fn parse_attach_size(value: &str) -> io::Result<PtySize> {
+    let (cols, rows) = value
+        .split_once('x')
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected <cols>x<rows>"))?;
+    let cols = cols
+        .parse::<u16>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid columns"))?;
+    let rows = rows
+        .parse::<u16>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid rows"))?;
+    PtySize::new(cols, rows)
+}
+
+fn parse_stty_size(value: &str) -> io::Result<PtySize> {
+    let mut parts = value.split_whitespace();
+    let rows = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing rows"))?
+        .parse::<u16>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid rows"))?;
+    let cols = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing columns"))?
+        .parse::<u16>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid columns"))?;
+
+    if parts.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unexpected extra size fields",
+        ));
+    }
+
+    PtySize::new(cols, rows)
 }
 
 fn forward_stdin_until_detach(stream: &mut UnixStream) -> io::Result<()> {
@@ -137,4 +196,33 @@ fn read_line(stream: &mut UnixStream) -> io::Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_attach_size_override() {
+        assert_eq!(
+            parse_attach_size("120x40").unwrap(),
+            crate::pty::PtySize {
+                cols: 120,
+                rows: 40
+            }
+        );
+        assert!(parse_attach_size("0x40").is_err());
+        assert!(parse_attach_size("120").is_err());
+    }
+
+    #[test]
+    fn parses_stty_size_output_as_rows_then_cols() {
+        assert_eq!(
+            parse_stty_size("40 120\n").unwrap(),
+            crate::pty::PtySize {
+                cols: 120,
+                rows: 40
+            }
+        );
+    }
 }

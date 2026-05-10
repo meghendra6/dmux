@@ -20,6 +20,8 @@ Implemented Phase 2 groundwork:
 - SGR escape stripping in captures
 - carriage-return overwrite handling in captures
 - explicit PTY resize requests with screen-state resize
+- attach-time PTY resize to the current terminal size when available
+- `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
 
