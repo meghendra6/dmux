@@ -51,7 +51,11 @@ fn run() -> Result<(), String> {
         } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            send_request(&socket, &protocol::encode_resize(&session, cols, rows), true)?;
+            send_request(
+                &socket,
+                &protocol::encode_resize(&session, cols, rows),
+                true,
+            )?;
             Ok(())
         }
         cli::Command::KillSession { session } => {

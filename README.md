@@ -9,6 +9,7 @@ Implemented Phase 0/1 commands:
 - `dmux attach -t <name>`
 - `dmux ls`
 - `dmux capture-pane -t <name> -p`
+- `dmux resize-pane -t <name> -x <cols> -y <rows>`
 - `dmux kill-session -t <name>`
 - `dmux kill-server`
 
@@ -18,6 +19,7 @@ Implemented Phase 2 groundwork:
 - scrollback-backed `capture-pane -p`
 - SGR escape stripping in captures
 - carriage-return overwrite handling in captures
+- explicit PTY resize requests with screen-state resize
 
 Current limits:
 
