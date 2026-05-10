@@ -156,7 +156,7 @@ cargo test server::tests::layout_node_splits_active_leaf_horizontally server::te
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit layout model**
+- [x] **Step 5: Commit layout model**
 
 Run:
 
@@ -170,7 +170,7 @@ git commit -m "feat: add pane layout tree"
 **Files:**
 - Modify: `src/server.rs`
 
-- [ ] **Step 1: Write failing renderer unit tests**
+- [x] **Step 1: Write failing renderer unit tests**
 
 Add these tests to `src/server.rs`:
 
@@ -222,7 +222,7 @@ fn render_attach_layout_stacks_vertical_panes() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify RED**
+- [x] **Step 2: Run test to verify RED**
 
 Run:
 
@@ -232,7 +232,7 @@ cargo test server::tests::render_attach_layout_joins_horizontal_panes server::te
 
 Expected: FAIL because `render_attach_pane_snapshot` still accepts only a pane list and prints labeled sections.
 
-- [ ] **Step 3: Implement renderer helpers**
+- [x] **Step 3: Implement renderer helpers**
 
 Change `render_attach_pane_snapshot` to accept a layout:
 
@@ -340,7 +340,7 @@ fn render_ordered_pane_sections(panes: &[PaneSnapshot]) -> String {
 }
 ```
 
-- [ ] **Step 4: Run test to verify GREEN**
+- [x] **Step 4: Run test to verify GREEN**
 
 Run:
 

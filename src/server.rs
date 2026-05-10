@@ -1507,10 +1507,98 @@ fn attach_pane_snapshot(session: &Session) -> Option<String> {
         })
         .collect::<Vec<_>>();
 
-    Some(render_attach_pane_snapshot(&snapshots))
+    Some(render_ordered_pane_sections(&snapshots))
 }
 
-fn render_attach_pane_snapshot(panes: &[PaneSnapshot]) -> String {
+fn render_attach_pane_snapshot(layout: &LayoutNode, panes: &[PaneSnapshot]) -> String {
+    let screens = panes
+        .iter()
+        .map(|pane| (pane.index, pane.screen.as_str()))
+        .collect::<HashMap<_, _>>();
+
+    match render_layout_lines(layout, &screens) {
+        Some(lines) => render_client_lines(&lines),
+        None => render_ordered_pane_sections(panes),
+    }
+}
+
+fn render_layout_lines(
+    layout: &LayoutNode,
+    screens: &HashMap<usize, &str>,
+) -> Option<Vec<String>> {
+    match layout {
+        LayoutNode::Pane(index) => screens.get(index).map(|screen| screen_lines(screen)),
+        LayoutNode::Split {
+            direction,
+            first,
+            second,
+        } => {
+            let first = render_layout_lines(first, screens)?;
+            let second = render_layout_lines(second, screens)?;
+            Some(match direction {
+                SplitDirection::Horizontal => join_horizontal(first, second),
+                SplitDirection::Vertical => join_vertical(first, second),
+            })
+        }
+    }
+}
+
+fn screen_lines(screen: &str) -> Vec<String> {
+    let lines = screen.lines().map(str::to_string).collect::<Vec<_>>();
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+fn join_horizontal(left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    let width = max_line_width(&left);
+    let rows = left.len().max(right.len());
+    (0..rows)
+        .map(|index| {
+            let mut line = pad_to_width(left.get(index).map_or("", String::as_str), width);
+            line.push_str(" | ");
+            line.push_str(right.get(index).map_or("", String::as_str));
+            line
+        })
+        .collect()
+}
+
+fn join_vertical(mut top: Vec<String>, bottom: Vec<String>) -> Vec<String> {
+    let width = max_line_width(&top).max(max_line_width(&bottom)).max(1);
+    top.push("-".repeat(width));
+    top.extend(bottom);
+    top
+}
+
+fn max_line_width(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+fn pad_to_width(line: &str, width: usize) -> String {
+    let mut padded = line.to_string();
+    let len = line.chars().count();
+    if len < width {
+        padded.push_str(&" ".repeat(width - len));
+    }
+    padded
+}
+
+fn render_client_lines(lines: &[String]) -> String {
+    let mut output = String::new();
+    for line in lines {
+        output.push_str(line);
+        output.push_str("\r\n");
+    }
+    output
+}
+
+fn render_ordered_pane_sections(panes: &[PaneSnapshot]) -> String {
     let mut output = String::new();
     for pane in panes {
         output.push_str("\r\n-- pane ");
@@ -1635,6 +1723,58 @@ mod tests {
                 first: Box::new(LayoutNode::Pane(0)),
                 second: Box::new(LayoutNode::Pane(1)),
             }
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_joins_horizontal_panes() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "base-ready\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "split-ready\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_pane_snapshot(&layout, &panes);
+
+        assert!(
+            rendered.contains("base-ready | split-ready\r\n"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_stacks_vertical_panes() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "base-ready\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "split-ready\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_pane_snapshot(&layout, &panes);
+
+        assert!(
+            rendered.contains("base-ready\r\n-----------\r\nsplit-ready\r\n"),
+            "{rendered:?}"
         );
     }
 
