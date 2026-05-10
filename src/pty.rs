@@ -5,6 +5,25 @@ use std::os::fd::FromRawFd;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtySize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl PtySize {
+    pub fn new(cols: u16, rows: u16) -> io::Result<Self> {
+        if cols == 0 || rows == 0 {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pty size dimensions must be non-zero",
+            ))
+        } else {
+            Ok(Self { cols, rows })
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnSpec {
     pub session: String,
@@ -35,12 +54,7 @@ pub struct PtyProcess {
 
 pub fn spawn(spec: &SpawnSpec) -> io::Result<PtyProcess> {
     let mut master: c_int = -1;
-    let winsize = WinSize {
-        ws_row: 24,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
+    let winsize = WinSize::from(PtySize { cols: 80, rows: 24 });
 
     let pid = unsafe {
         forkpty(
@@ -108,6 +122,17 @@ struct WinSize {
     ws_ypixel: u16,
 }
 
+impl From<PtySize> for WinSize {
+    fn from(size: PtySize) -> Self {
+        Self {
+            ws_row: size.rows,
+            ws_col: size.cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }
+    }
+}
+
 #[cfg_attr(target_os = "linux", link(name = "util"))]
 unsafe extern "C" {
     fn forkpty(
@@ -133,5 +158,15 @@ mod tests {
             std::path::PathBuf::from("/tmp"),
         );
         assert!(!spec.command.is_empty());
+    }
+
+    #[test]
+    fn pty_size_rejects_zero_dimensions() {
+        assert!(PtySize::new(0, 24).is_err());
+        assert!(PtySize::new(80, 0).is_err());
+        assert_eq!(
+            PtySize::new(80, 24).unwrap(),
+            PtySize { cols: 80, rows: 24 }
+        );
     }
 }
