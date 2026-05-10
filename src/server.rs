@@ -45,36 +45,37 @@ struct ServerState {
 }
 
 struct Session {
-    panes: Mutex<Vec<Arc<Pane>>>,
-    active_pane: Mutex<usize>,
+    panes: Mutex<PaneSet<Arc<Pane>>>,
 }
 
 impl Session {
     fn new(pane: Arc<Pane>) -> Self {
         Self {
-            panes: Mutex::new(vec![pane]),
-            active_pane: Mutex::new(0),
+            panes: Mutex::new(PaneSet::new(pane)),
         }
     }
 
     fn active_pane(&self) -> Option<Arc<Pane>> {
-        let active = *self.active_pane.lock().unwrap();
-        self.panes.lock().unwrap().get(active).cloned()
+        self.panes.lock().unwrap().active()
     }
 
     fn add_pane(&self, pane: Arc<Pane>) {
-        let mut active = self.active_pane.lock().unwrap();
-        let mut panes = self.panes.lock().unwrap();
-        panes.push(pane);
-        *active = panes.len() - 1;
+        self.panes.lock().unwrap().add(pane);
     }
 
     fn select_pane(&self, index: usize) -> bool {
-        if index >= self.panes.lock().unwrap().len() {
-            return false;
-        }
-        *self.active_pane.lock().unwrap() = index;
-        true
+        self.panes.lock().unwrap().select(index)
+    }
+
+    fn kill_pane(&self, target: Option<usize>) -> Result<(), String> {
+        let mut panes = self.panes.lock().unwrap();
+        let index = panes.kill_index(target).map_err(str::to_string)?;
+        let pane = panes
+            .get(index)
+            .expect("validated pane index must exist while session lock is held");
+        pty::terminate(pane.child_pid).map_err(|err| err.to_string())?;
+        panes.kill_at(index);
+        Ok(())
     }
 
     fn pane_count(&self) -> usize {
@@ -82,7 +83,81 @@ impl Session {
     }
 
     fn panes(&self) -> Vec<Arc<Pane>> {
-        self.panes.lock().unwrap().clone()
+        self.panes.lock().unwrap().all()
+    }
+}
+
+struct PaneSet<T> {
+    panes: Vec<T>,
+    active: usize,
+}
+
+impl<T> PaneSet<T> {
+    fn new(pane: T) -> Self {
+        Self {
+            panes: vec![pane],
+            active: 0,
+        }
+    }
+
+    fn add(&mut self, pane: T) {
+        self.panes.push(pane);
+        self.active = self.panes.len() - 1;
+    }
+
+    fn select(&mut self, index: usize) -> bool {
+        if index >= self.panes.len() {
+            return false;
+        }
+        self.active = index;
+        true
+    }
+
+    #[cfg(test)]
+    fn kill(&mut self, target: Option<usize>) -> Result<T, &'static str> {
+        let index = self.kill_index(target)?;
+        Ok(self.kill_at(index))
+    }
+
+    fn kill_index(&self, target: Option<usize>) -> Result<usize, &'static str> {
+        if self.panes.len() <= 1 {
+            return Err("cannot kill last pane; use kill-session");
+        }
+
+        let index = target.unwrap_or(self.active);
+        if index >= self.panes.len() {
+            return Err("missing pane");
+        }
+
+        Ok(index)
+    }
+
+    fn kill_at(&mut self, index: usize) -> T {
+        let pane = self.panes.remove(index);
+        if self.active == index {
+            self.active = index.saturating_sub(1).min(self.panes.len() - 1);
+        } else if self.active > index {
+            self.active -= 1;
+        }
+        pane
+    }
+
+    fn get(&self, index: usize) -> Option<&T> {
+        self.panes.get(index)
+    }
+
+    fn len(&self) -> usize {
+        self.panes.len()
+    }
+}
+
+impl<T: Clone> PaneSet<T> {
+    fn active(&self) -> Option<T> {
+        self.panes.get(self.active).cloned()
+    }
+
+    fn all(&self) -> Vec<T> {
+        self.panes.clone()
     }
 }
 
@@ -130,6 +205,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::ListPanes { session } => handle_list_panes(&state, &mut stream, &session),
         Request::SelectPane { session, pane } => {
             handle_select_pane(&state, &mut stream, &session, pane)
+        }
+        Request::KillPane { session, pane } => {
+            handle_kill_pane(&state, &mut stream, &session, pane)
         }
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
@@ -358,6 +436,33 @@ fn handle_select_pane(
     write_ok(stream)
 }
 
+fn handle_kill_pane(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    pane: Option<usize>,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    match session.kill_pane(pane) {
+        Ok(()) => {}
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+
+    write_ok(stream)
+}
+
 fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {
     let session = state.sessions.lock().unwrap().remove(name);
     let Some(session) = session else {
@@ -366,7 +471,7 @@ fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) ->
     };
 
     for pane in session.panes() {
-        pty::terminate(pane.child_pid);
+        let _ = pty::terminate(pane.child_pid);
     }
     write_ok(stream)
 }
@@ -381,7 +486,7 @@ fn handle_kill_server(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::
         .collect::<Vec<_>>();
     for session in sessions {
         for pane in session.panes() {
-            pty::terminate(pane.child_pid);
+            let _ = pty::terminate(pane.child_pid);
         }
     }
 
@@ -470,4 +575,32 @@ fn write_ok(stream: &mut UnixStream) -> io::Result<()> {
 
 fn write_err(stream: &mut UnixStream, message: &str) -> io::Result<()> {
     writeln!(stream, "ERR {message}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_set_removes_active_and_selects_previous_pane() {
+        let mut panes = PaneSet::new("base");
+        panes.add("split");
+
+        let removed = panes.kill(None).unwrap();
+
+        assert_eq!(removed, "split");
+        assert_eq!(panes.active(), Some("base"));
+        assert_eq!(panes.len(), 1);
+    }
+
+    #[test]
+    fn pane_set_rejects_last_pane_removal() {
+        let mut panes = PaneSet::new("base");
+
+        assert_eq!(
+            panes.kill(None),
+            Err("cannot kill last pane; use kill-session")
+        );
+        assert_eq!(panes.active(), Some("base"));
+    }
 }

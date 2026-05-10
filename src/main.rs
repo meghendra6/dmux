@@ -92,6 +92,12 @@ fn run() -> Result<(), String> {
             send_request(&socket, &protocol::encode_select_pane(&session, pane), true)?;
             Ok(())
         }
+        cli::Command::KillPane { session, pane } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(&socket, &protocol::encode_kill_pane(&session, pane), true)?;
+            Ok(())
+        }
         cli::Command::KillSession { session } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;

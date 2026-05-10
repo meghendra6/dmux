@@ -18,6 +18,14 @@ fn unique_socket(name: &str) -> std::path::PathBuf {
         .join(format!("dmux-{name}-{}-{nanos}.sock", std::process::id()))
 }
 
+fn unique_temp_file(name: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::path::PathBuf::from("/tmp").join(format!("dmux-{name}-{}-{nanos}.tmp", std::process::id()))
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -71,6 +79,38 @@ fn poll_capture(socket: &std::path::Path, session: &str, needle: &str) -> String
     }
 
     last
+}
+
+fn poll_file_exists(path: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+fn process_exists(pid: &str) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn poll_process_gone(pid: &str) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if !process_exists(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
 }
 
 #[test]
@@ -355,4 +395,223 @@ fn select_pane_switches_active_capture_target() {
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn kill_pane_removes_active_pane_and_keeps_session() {
+    let socket = unique_socket("kill-pane");
+    let session = format!("kill-pane-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session]));
+
+    let panes = dmux(&socket, &["list-panes", "-t", &session]);
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
+
+    let active = poll_capture(&socket, &session, "base-ready");
+    assert!(active.contains("base-ready"), "{active:?}");
+    assert!(!active.contains("split-ready"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn kill_pane_by_index_keeps_reindexed_active_pane() {
+    let socket = unique_socket("kill-pane-index");
+    let session = format!("kill-pane-index-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "0"]));
+
+    let panes = dmux(&socket, &["list-panes", "-t", &session]);
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
+
+    let active = poll_capture(&socket, &session, "split-ready");
+    assert!(active.contains("split-ready"), "{active:?}");
+    assert!(!active.contains("base-ready"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn kill_pane_terminates_removed_pane_process() {
+    let socket = unique_socket("kill-pane-terminates");
+    let session = format!("kill-pane-terminates-{}", std::process::id());
+    let sentinel = unique_temp_file("kill-pane-terminates");
+    let pid_file = unique_temp_file("kill-pane-pid");
+    let _ = std::fs::remove_file(&sentinel);
+    let _ = std::fs::remove_file(&pid_file);
+    let command = format!(
+        "printf $$ > {}; trap 'printf terminated > {}; sleep 0.2; exit 0' TERM; printf base-ready; while :; do sleep 0.1; done",
+        pid_file.display(),
+        sentinel.display()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", &command],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+    assert!(
+        poll_file_exists(&pid_file),
+        "missing {}",
+        pid_file.display()
+    );
+    let pid = std::fs::read_to_string(&pid_file).expect("read pid file");
+    let pid = pid.trim();
+    assert!(process_exists(pid), "process {pid} should be alive");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "0"]));
+    assert!(
+        poll_file_exists(&sentinel),
+        "missing {}",
+        sentinel.display()
+    );
+    assert!(!process_exists(pid), "process {pid} should be gone");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(&sentinel);
+    let _ = std::fs::remove_file(&pid_file);
+}
+
+#[test]
+fn kill_pane_terminates_removed_pane_process_group() {
+    let socket = unique_socket("kill-pane-process-group");
+    let session = format!("kill-pane-process-group-{}", std::process::id());
+    let child_pid_file = unique_temp_file("kill-pane-child-pid");
+    let _ = std::fs::remove_file(&child_pid_file);
+    let command = format!(
+        "sh -c 'trap \"\" TERM HUP; printf $$ > {}; while :; do sleep 0.1; done' & printf base-ready; wait",
+        child_pid_file.display()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", &command],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+    assert!(
+        poll_file_exists(&child_pid_file),
+        "missing {}",
+        child_pid_file.display()
+    );
+    let child_pid = std::fs::read_to_string(&child_pid_file).expect("read child pid file");
+    let child_pid = child_pid.trim();
+    assert!(
+        process_exists(child_pid),
+        "child process {child_pid} should be alive"
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "0"]));
+    assert!(
+        poll_process_gone(child_pid),
+        "child process {child_pid} should be gone"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(&child_pid_file);
 }

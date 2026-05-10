@@ -35,6 +35,10 @@ pub enum Command {
         session: String,
         pane: usize,
     },
+    KillPane {
+        session: String,
+        pane: Option<usize>,
+    },
     KillSession {
         session: String,
     },
@@ -73,6 +77,7 @@ where
         "split-window" | "split" => parse_split_window(args),
         "list-panes" => parse_list_panes(args),
         "select-pane" => parse_select_pane(args),
+        "kill-pane" => parse_kill_pane(args),
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
@@ -303,6 +308,41 @@ fn parse_select_pane(args: Vec<String>) -> Result<Command, String> {
     })
 }
 
+fn parse_kill_pane(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut pane = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "kill-pane requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-p" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "kill-pane requires a pane index after -p".to_string())?;
+                pane = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "kill-pane -p must be a non-negative integer".to_string())?,
+                );
+                i += 2;
+            }
+            value => return Err(format!("kill-pane does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::KillPane {
+        session: session.ok_or_else(|| "kill-pane requires -t <session>".to_string())?,
+        pane,
+    })
+}
+
 fn set_split_direction(
     direction: &mut Option<SplitDirection>,
     value: SplitDirection,
@@ -445,6 +485,30 @@ mod tests {
             Command::SelectPane {
                 session: "dev".to_string(),
                 pane: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_kill_pane_target_and_index() {
+        let command = parse_args(["dmux", "kill-pane", "-t", "dev", "-p", "1"]).unwrap();
+        assert_eq!(
+            command,
+            Command::KillPane {
+                session: "dev".to_string(),
+                pane: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_kill_pane_target_without_index() {
+        let command = parse_args(["dmux", "kill-pane", "-t", "dev"]).unwrap();
+        assert_eq!(
+            command,
+            Command::KillPane {
+                session: "dev".to_string(),
+                pane: None,
             }
         );
     }
