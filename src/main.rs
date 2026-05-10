@@ -44,6 +44,44 @@ fn run() -> Result<(), String> {
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
+        cli::Command::SaveBuffer {
+            session,
+            buffer,
+            mode,
+        } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let body = send_request(
+                &socket,
+                &protocol::encode_save_buffer(&session, buffer.as_deref(), mode),
+                true,
+            )?;
+            print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
+        cli::Command::ListBuffers => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let body = send_request(&socket, protocol::encode_list_buffers(), true)?;
+            print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
+        cli::Command::PasteBuffer { session, buffer } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_paste_buffer(&session, buffer.as_deref()),
+                true,
+            )?;
+            Ok(())
+        }
+        cli::Command::DeleteBuffer { buffer } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(&socket, &protocol::encode_delete_buffer(&buffer), true)?;
+            Ok(())
+        }
         cli::Command::ResizePane {
             session,
             cols,

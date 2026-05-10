@@ -15,6 +15,19 @@ pub enum Command {
         session: String,
         mode: CaptureMode,
     },
+    SaveBuffer {
+        session: String,
+        buffer: Option<String>,
+        mode: CaptureMode,
+    },
+    ListBuffers,
+    PasteBuffer {
+        session: String,
+        buffer: Option<String>,
+    },
+    DeleteBuffer {
+        buffer: String,
+    },
     ResizePane {
         session: String,
         cols: u16,
@@ -101,6 +114,10 @@ where
         "attach" | "attach-session" => parse_attach(args),
         "ls" | "list-sessions" => Ok(Command::ListSessions),
         "capture-pane" => parse_capture(args),
+        "save-buffer" => parse_save_buffer(args),
+        "list-buffers" => parse_list_buffers(args),
+        "paste-buffer" => parse_paste_buffer(args),
+        "delete-buffer" => parse_delete_buffer(args),
         "resize-pane" => parse_resize_pane(args),
         "send-keys" => parse_send_keys(args),
         "split-window" | "split" => parse_split_window(args),
@@ -207,9 +224,123 @@ fn parse_capture(args: Vec<String>) -> Result<Command, String> {
 
 fn set_capture_mode(mode: &mut Option<CaptureMode>, value: CaptureMode) -> Result<(), String> {
     if mode.replace(value).is_some() {
-        Err("capture-pane accepts only one capture mode".to_string())
+        Err("only one capture mode may be supplied".to_string())
     } else {
         Ok(())
+    }
+}
+
+fn parse_save_buffer(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut buffer = None;
+    let mut mode = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "save-buffer requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-b" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "save-buffer requires a buffer name after -b".to_string())?;
+                buffer = Some(parse_buffer_name(value, "save-buffer")?);
+                i += 2;
+            }
+            "--screen" => {
+                set_capture_mode(&mut mode, CaptureMode::Screen)?;
+                i += 1;
+            }
+            "--history" => {
+                set_capture_mode(&mut mode, CaptureMode::History)?;
+                i += 1;
+            }
+            "--all" => {
+                set_capture_mode(&mut mode, CaptureMode::All)?;
+                i += 1;
+            }
+            value => return Err(format!("save-buffer does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::SaveBuffer {
+        session: session.ok_or_else(|| "save-buffer requires -t <session>".to_string())?,
+        buffer,
+        mode: mode.unwrap_or(CaptureMode::All),
+    })
+}
+
+fn parse_list_buffers(args: Vec<String>) -> Result<Command, String> {
+    if let Some(value) = args.first() {
+        return Err(format!("list-buffers does not support argument {value:?}"));
+    }
+
+    Ok(Command::ListBuffers)
+}
+
+fn parse_paste_buffer(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut buffer = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "paste-buffer requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-b" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "paste-buffer requires a buffer name after -b".to_string())?;
+                buffer = Some(parse_buffer_name(value, "paste-buffer")?);
+                i += 2;
+            }
+            value => return Err(format!("paste-buffer does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::PasteBuffer {
+        session: session.ok_or_else(|| "paste-buffer requires -t <session>".to_string())?,
+        buffer,
+    })
+}
+
+fn parse_delete_buffer(args: Vec<String>) -> Result<Command, String> {
+    let mut buffer = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-b" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "delete-buffer requires a buffer name after -b".to_string())?;
+                buffer = Some(parse_buffer_name(value, "delete-buffer")?);
+                i += 2;
+            }
+            value => return Err(format!("delete-buffer does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::DeleteBuffer {
+        buffer: buffer.ok_or_else(|| "delete-buffer requires -b <buffer>".to_string())?,
+    })
+}
+
+fn parse_buffer_name(value: &str, command: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err(format!("{command} -b requires a non-empty buffer name"))
+    } else {
+        Ok(value.to_string())
     }
 }
 
@@ -770,6 +901,64 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.contains("only one capture mode"), "{err}");
+    }
+
+    #[test]
+    fn parses_save_buffer_named_screen_capture() {
+        let command = parse_args([
+            "dmux",
+            "save-buffer",
+            "-t",
+            "dev",
+            "-b",
+            "saved",
+            "--screen",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::SaveBuffer {
+                session: "dev".to_string(),
+                buffer: Some("saved".to_string()),
+                mode: CaptureMode::Screen,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_list_buffers() {
+        assert_eq!(
+            parse_args(["dmux", "list-buffers"]).unwrap(),
+            Command::ListBuffers
+        );
+    }
+
+    #[test]
+    fn parses_paste_buffer_named_target() {
+        let command = parse_args(["dmux", "paste-buffer", "-t", "dev", "-b", "saved"]).unwrap();
+        assert_eq!(
+            command,
+            Command::PasteBuffer {
+                session: "dev".to_string(),
+                buffer: Some("saved".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_delete_buffer_named() {
+        assert_eq!(
+            parse_args(["dmux", "delete-buffer", "-b", "saved"]).unwrap(),
+            Command::DeleteBuffer {
+                buffer: "saved".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_empty_buffer_name() {
+        let err = parse_args(["dmux", "save-buffer", "-t", "dev", "-b", ""]).unwrap_err();
+        assert!(err.contains("non-empty buffer name"), "{err}");
     }
 
     #[test]
