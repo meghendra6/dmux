@@ -40,6 +40,11 @@ pub enum Request {
         mode: CaptureMode,
         selection: BufferSelection,
     },
+    CopyMode {
+        session: String,
+        mode: CaptureMode,
+        search: Option<String>,
+    },
     ListBuffers,
     PasteBuffer {
         session: String,
@@ -148,6 +153,14 @@ pub fn encode_save_buffer(
 
 pub fn encode_list_buffers() -> &'static str {
     "LIST_BUFFERS\n"
+}
+
+pub fn encode_copy_mode(session: &str, mode: CaptureMode, search: Option<&str>) -> String {
+    format!(
+        "COPY_MODE\t{session}\t{}\t{}\n",
+        encode_capture_mode(mode),
+        encode_optional_text(search)
+    )
 }
 
 pub fn encode_paste_buffer(session: &str, buffer: Option<&str>) -> String {
@@ -305,6 +318,11 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             buffer: decode_optional_text(buffer, "SAVE_BUFFER_SEARCH")?,
             mode: decode_capture_mode(mode)?,
             selection: BufferSelection::Search(decode_utf8_hex(needle, "SAVE_BUFFER_SEARCH")?),
+        }),
+        ["COPY_MODE", session, mode, search] => Ok(Request::CopyMode {
+            session: (*session).to_string(),
+            mode: decode_capture_mode(mode)?,
+            search: decode_optional_text(search, "COPY_MODE")?,
         }),
         ["LIST_BUFFERS"] => Ok(Request::ListBuffers),
         ["PASTE_BUFFER", session, buffer] => Ok(Request::PasteBuffer {
@@ -651,6 +669,19 @@ mod tests {
                 buffer: Some("match".to_string()),
                 mode: CaptureMode::All,
                 selection: BufferSelection::Search("needle".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_copy_mode_request() {
+        let line = encode_copy_mode("dev", CaptureMode::History, Some("needle"));
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::CopyMode {
+                session: "dev".to_string(),
+                mode: CaptureMode::History,
+                search: Some("needle".to_string()),
             }
         );
     }

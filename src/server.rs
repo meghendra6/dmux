@@ -144,6 +144,19 @@ fn buffer_preview(text: &str) -> String {
         .collect()
 }
 
+fn format_copy_mode_lines(text: &str, search: Option<&str>) -> String {
+    let mut output = String::new();
+    for (index, line) in text.lines().enumerate() {
+        if search.is_none_or(|needle| line.contains(needle)) {
+            output.push_str(&(index + 1).to_string());
+            output.push('\t');
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output
+}
+
 fn select_buffer_text(text: &str, selection: &BufferSelection) -> Result<String, String> {
     match selection {
         BufferSelection::All => Ok(text.to_string()),
@@ -598,6 +611,11 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             mode,
             &selection,
         ),
+        Request::CopyMode {
+            session,
+            mode,
+            search,
+        } => handle_copy_mode(&state, &mut stream, &session, mode, search.as_deref()),
         Request::ListBuffers => handle_list_buffers(&state, &mut stream),
         Request::PasteBuffer { session, buffer } => {
             handle_paste_buffer(&state, &mut stream, &session, buffer.as_deref())
@@ -799,6 +817,33 @@ fn handle_list_buffers(state: &Arc<ServerState>, stream: &mut UnixStream) -> io:
         )?;
     }
     Ok(())
+}
+
+fn handle_copy_mode(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    mode: CaptureMode,
+    search: Option<&str>,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+    let Some(pane) = session.active_pane() else {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    };
+
+    let captured = capture_pane_text(&pane, mode);
+    let output = format_copy_mode_lines(&captured, search);
+    write_ok(stream)?;
+    stream.write_all(output.as_bytes())
 }
 
 fn handle_paste_buffer(
@@ -1439,5 +1484,17 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "missing match");
+    }
+
+    #[test]
+    fn format_copy_mode_lines_numbers_all_lines() {
+        let text = format_copy_mode_lines("first\nsecond\n", None);
+        assert_eq!(text, "1\tfirst\n2\tsecond\n");
+    }
+
+    #[test]
+    fn format_copy_mode_lines_filters_search_matches() {
+        let text = format_copy_mode_lines("first\nneedle-one\nlast\nneedle-two\n", Some("needle"));
+        assert_eq!(text, "2\tneedle-one\n4\tneedle-two\n");
     }
 }

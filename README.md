@@ -9,6 +9,7 @@ Implemented Phase 0/1 commands:
 - `dmux attach -t <name>`
 - `dmux ls`
 - `dmux capture-pane -t <name> -p [--screen|--history|--all]`
+- `dmux copy-mode -t <name> [--screen|--history|--all] [--search <text>]`
 - `dmux save-buffer -t <name> [-b <buffer>] [--screen|--history|--all] [--start-line <n> --end-line <n>|--search <text>]`
 - `dmux list-buffers`
 - `dmux paste-buffer -t <name> [-b <buffer>]`
@@ -33,6 +34,12 @@ Implemented Phase 0/1 commands:
 `capture-pane -p` defaults to combined scrollback history plus the current
 screen. Use `--screen` for only the current screen, `--history` for only
 scrollback, or `--all` for the combined output explicitly.
+
+`copy-mode` currently prints command-driven line inspection output as
+`<line-number><tab><text>` from the same `--screen`, `--history`, and `--all`
+capture sources as `capture-pane`; default and `--all` are combined history plus
+screen. Use `--search` to show only matching lines while preserving their
+original line numbers.
 
 `save-buffer` currently stores captured active-pane text in an in-memory buffer
 with a 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name
@@ -61,6 +68,7 @@ Implemented Phase 2 groundwork:
 - server-side statusline format expansion
 - in-memory buffers backed by pane capture and paste into active panes
 - command-driven line range and search selection for buffer saves
+- command-driven line-numbered copy-mode inspection with search filtering
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:

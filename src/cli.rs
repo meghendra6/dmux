@@ -21,6 +21,11 @@ pub enum Command {
         mode: CaptureMode,
         selection: BufferSelection,
     },
+    CopyMode {
+        session: String,
+        mode: CaptureMode,
+        search: Option<String>,
+    },
     ListBuffers,
     PasteBuffer {
         session: String,
@@ -116,6 +121,7 @@ where
         "ls" | "list-sessions" => Ok(Command::ListSessions),
         "capture-pane" => parse_capture(args),
         "save-buffer" => parse_save_buffer(args),
+        "copy-mode" => parse_copy_mode(args),
         "list-buffers" => parse_list_buffers(args),
         "paste-buffer" => parse_paste_buffer(args),
         "delete-buffer" => parse_delete_buffer(args),
@@ -303,6 +309,54 @@ fn parse_save_buffer(args: Vec<String>) -> Result<Command, String> {
         buffer,
         mode: mode.unwrap_or(CaptureMode::All),
         selection,
+    })
+}
+
+fn parse_copy_mode(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut mode = None;
+    let mut search = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "copy-mode requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "--screen" => {
+                set_capture_mode(&mut mode, CaptureMode::Screen)?;
+                i += 1;
+            }
+            "--history" => {
+                set_capture_mode(&mut mode, CaptureMode::History)?;
+                i += 1;
+            }
+            "--all" => {
+                set_capture_mode(&mut mode, CaptureMode::All)?;
+                i += 1;
+            }
+            "--search" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "copy-mode requires text after --search".to_string())?;
+                if value.is_empty() {
+                    return Err("copy-mode --search requires non-empty text".to_string());
+                }
+                search = Some(value.clone());
+                i += 2;
+            }
+            value => return Err(format!("copy-mode does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::CopyMode {
+        session: session.ok_or_else(|| "copy-mode requires -t <session>".to_string())?,
+        mode: mode.unwrap_or(CaptureMode::All),
+        search,
     })
 }
 
@@ -1060,6 +1114,53 @@ mod tests {
         let err =
             parse_args(["dmux", "save-buffer", "-t", "dev", "--start-line", "1"]).unwrap_err();
         assert!(err.contains("--start-line and --end-line"), "{err}");
+    }
+
+    #[test]
+    fn parses_copy_mode_history_search() {
+        let command = parse_args([
+            "dmux",
+            "copy-mode",
+            "-t",
+            "dev",
+            "--history",
+            "--search",
+            "needle",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::CopyMode {
+                session: "dev".to_string(),
+                mode: CaptureMode::History,
+                search: Some("needle".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_copy_mode_default_all() {
+        assert_eq!(
+            parse_args(["dmux", "copy-mode", "-t", "dev"]).unwrap(),
+            Command::CopyMode {
+                session: "dev".to_string(),
+                mode: CaptureMode::All,
+                search: None,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_copy_mode_multiple_capture_modes() {
+        let err =
+            parse_args(["dmux", "copy-mode", "-t", "dev", "--screen", "--history"]).unwrap_err();
+        assert!(err.contains("only one capture mode"), "{err}");
+    }
+
+    #[test]
+    fn rejects_copy_mode_empty_search() {
+        let err = parse_args(["dmux", "copy-mode", "-t", "dev", "--search", ""]).unwrap_err();
+        assert!(err.contains("non-empty text"), "{err}");
     }
 
     #[test]
