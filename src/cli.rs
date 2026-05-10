@@ -59,6 +59,14 @@ pub enum Command {
         session: String,
         pane: Option<usize>,
     },
+    StatusLine {
+        session: String,
+        format: Option<String>,
+    },
+    DisplayMessage {
+        session: String,
+        format: String,
+    },
     KillSession {
         session: String,
     },
@@ -103,6 +111,8 @@ where
         "select-window" => parse_select_window(args),
         "kill-window" => parse_kill_window(args),
         "zoom-pane" => parse_zoom_pane(args),
+        "status-line" => parse_status_line(args),
+        "display-message" => parse_display_message(args),
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
@@ -536,6 +546,72 @@ fn parse_zoom_pane(args: Vec<String>) -> Result<Command, String> {
     })
 }
 
+fn parse_status_line(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut format = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "status-line requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-F" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "status-line requires a format after -F".to_string())?;
+                format = Some(value.clone());
+                i += 2;
+            }
+            value => return Err(format!("status-line does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::StatusLine {
+        session: session.ok_or_else(|| "status-line requires -t <session>".to_string())?,
+        format,
+    })
+}
+
+fn parse_display_message(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut format = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "display-message requires a session name after -t".to_string()
+                })?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-p" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "display-message requires a format after -p".to_string())?;
+                format = Some(value.clone());
+                i += 2;
+            }
+            value => {
+                return Err(format!(
+                    "display-message does not support argument {value:?}"
+                ));
+            }
+        }
+    }
+
+    Ok(Command::DisplayMessage {
+        session: session.ok_or_else(|| "display-message requires -t <session>".to_string())?,
+        format: format.ok_or_else(|| "display-message requires -p <format>".to_string())?,
+    })
+}
+
 fn set_split_direction(
     direction: &mut Option<SplitDirection>,
     value: SplitDirection,
@@ -820,6 +896,58 @@ mod tests {
             Command::ZoomPane {
                 session: "dev".to_string(),
                 pane: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_status_line_target() {
+        let command = parse_args(["dmux", "status-line", "-t", "dev"]).unwrap();
+        assert_eq!(
+            command,
+            Command::StatusLine {
+                session: "dev".to_string(),
+                format: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_status_line_format() {
+        let command = parse_args([
+            "dmux",
+            "status-line",
+            "-t",
+            "dev",
+            "-F",
+            "#{session.name}:#{window.index}:#{pane.index}",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::StatusLine {
+                session: "dev".to_string(),
+                format: Some("#{session.name}:#{window.index}:#{pane.index}".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_display_message_print_format() {
+        let command = parse_args([
+            "dmux",
+            "display-message",
+            "-t",
+            "dev",
+            "-p",
+            "#{session.name}:#{pane.index}",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::DisplayMessage {
+                session: "dev".to_string(),
+                format: "#{session.name}:#{pane.index}".to_string(),
             }
         );
     }

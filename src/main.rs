@@ -145,6 +145,28 @@ fn run() -> Result<(), String> {
             send_request(&socket, &protocol::encode_zoom_pane(&session, pane), true)?;
             Ok(())
         }
+        cli::Command::StatusLine { session, format } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let body = send_request(
+                &socket,
+                &protocol::encode_status_line(&session, format.as_deref()),
+                true,
+            )?;
+            print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
+        cli::Command::DisplayMessage { session, format } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let body = send_request(
+                &socket,
+                &protocol::encode_display_message(&session, &format),
+                true,
+            )?;
+            print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
         cli::Command::KillSession { session } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
