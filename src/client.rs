@@ -7,6 +7,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
+const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 pub fn attach<F>(
     socket: &Path,
@@ -245,27 +247,27 @@ fn run_copy_mode(socket: &Path, session: &str, initial_input: &[u8]) -> io::Resu
     let output = String::from_utf8_lossy(&body);
     let mut view = CopyModeView::from_numbered_output(&output)?;
 
+    let _mouse = MouseModeGuard::enable()?;
     write_copy_mode_view(&view)?;
     if view.is_empty() {
         write_copy_mode_message("empty")?;
         return Ok(());
     }
 
-    for byte in initial_input {
-        if handle_copy_mode_byte(socket, session, &mut view, *byte)? {
-            return Ok(());
-        }
+    let mut input_state = CopyModeInputState::default();
+    if handle_copy_mode_input(socket, session, &mut view, &mut input_state, initial_input)? {
+        return Ok(());
     }
 
     let mut stdin = io::stdin().lock();
-    let mut byte = [0_u8; 1];
+    let mut buf = [0_u8; 1024];
     loop {
-        let n = stdin.read(&mut byte)?;
+        let n = stdin.read(&mut buf)?;
         if n == 0 {
             break;
         }
 
-        if handle_copy_mode_byte(socket, session, &mut view, byte[0])? {
+        if handle_copy_mode_input(socket, session, &mut view, &mut input_state, &buf[..n])? {
             break;
         }
     }
@@ -273,37 +275,39 @@ fn run_copy_mode(socket: &Path, session: &str, initial_input: &[u8]) -> io::Resu
     Ok(())
 }
 
-fn handle_copy_mode_byte(
+fn handle_copy_mode_input(
     socket: &Path,
     session: &str,
     view: &mut CopyModeView,
-    byte: u8,
+    input_state: &mut CopyModeInputState,
+    input: &[u8],
 ) -> io::Result<bool> {
-    match view.apply_key(byte) {
+    for action in input_state.apply(view, input) {
+        if apply_copy_mode_action(socket, session, view, action)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn apply_copy_mode_action(
+    socket: &Path,
+    session: &str,
+    view: &mut CopyModeView,
+    action: CopyModeAction,
+) -> io::Result<bool> {
+    match action {
         CopyModeAction::Redraw => {
             write_copy_mode_view(view)?;
             Ok(false)
         }
         CopyModeAction::CopyLine(line) => {
-            let body = send_control_request(
-                socket,
-                &protocol::encode_save_buffer(
-                    session,
-                    None,
-                    protocol::CaptureMode::All,
-                    protocol::BufferSelection::LineRange {
-                        start: line,
-                        end: line,
-                    },
-                ),
-            )?;
-            let saved = String::from_utf8_lossy(&body);
-            let saved = saved.trim_end();
-            if saved.is_empty() {
-                write_copy_mode_message("copied")?;
-            } else {
-                write_copy_mode_message(&format!("copied to {saved}"))?;
-            }
+            save_copy_mode_range(socket, session, line, line)?;
+            Ok(true)
+        }
+        CopyModeAction::CopyLineRange { start, end } => {
+            save_copy_mode_range(socket, session, start, end)?;
             Ok(true)
         }
         CopyModeAction::Exit => {
@@ -312,6 +316,26 @@ fn handle_copy_mode_byte(
         }
         CopyModeAction::Ignore => Ok(false),
     }
+}
+
+fn save_copy_mode_range(socket: &Path, session: &str, start: usize, end: usize) -> io::Result<()> {
+    let body = send_control_request(
+        socket,
+        &protocol::encode_save_buffer(
+            session,
+            None,
+            protocol::CaptureMode::All,
+            protocol::BufferSelection::LineRange { start, end },
+        ),
+    )?;
+    let saved = String::from_utf8_lossy(&body);
+    let saved = saved.trim_end();
+    if saved.is_empty() {
+        write_copy_mode_message("copied")?;
+    } else {
+        write_copy_mode_message(&format!("copied to {saved}"))?;
+    }
+    Ok(())
 }
 
 fn write_copy_mode_view(view: &CopyModeView) -> io::Result<()> {
@@ -345,6 +369,85 @@ fn send_control_request(socket: &Path, line: &str) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
+fn parse_sgr_mouse_event(input: &[u8]) -> Option<(SgrMouseEvent, usize)> {
+    if !input.starts_with(b"\x1b[<") {
+        return None;
+    }
+
+    let tail = &input[3..];
+    let end = tail
+        .iter()
+        .position(|byte| *byte == b'M' || *byte == b'm')?;
+    let terminator = tail[end];
+    let fields = std::str::from_utf8(&tail[..end]).ok()?;
+    let mut parts = fields.split(';');
+    let code = parts.next()?.parse::<u16>().ok()?;
+    let col = parts.next()?.parse::<u16>().ok()?;
+    let row = parts.next()?.parse::<u16>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Some((
+        SgrMouseEvent {
+            code,
+            col,
+            row,
+            release: terminator == b'm',
+        },
+        3 + end + 1,
+    ))
+}
+
+#[derive(Default)]
+struct CopyModeInputState {
+    pending: Vec<u8>,
+}
+
+impl CopyModeInputState {
+    fn apply(&mut self, view: &mut CopyModeView, input: &[u8]) -> Vec<CopyModeAction> {
+        let mut bytes = Vec::new();
+        if !self.pending.is_empty() {
+            bytes.extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        bytes.extend_from_slice(input);
+
+        let mut actions = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if bytes[offset] == 0x1b {
+                let remaining = &bytes[offset..];
+                if let Some((event, consumed)) = parse_sgr_mouse_event(remaining) {
+                    offset += consumed;
+                    actions.push(view.apply_mouse_event(event));
+                } else if is_incomplete_sgr_mouse_event(remaining) {
+                    self.pending.extend_from_slice(remaining);
+                    break;
+                } else {
+                    offset += 1;
+                    actions.push(CopyModeAction::Exit);
+                }
+            } else {
+                let byte = bytes[offset];
+                offset += 1;
+                actions.push(view.apply_key(byte));
+            }
+        }
+
+        actions
+    }
+}
+
+fn is_incomplete_sgr_mouse_event(input: &[u8]) -> bool {
+    input.starts_with(b"\x1b[<")
+        && input.len() < 64
+        && !input.iter().any(|byte| *byte == b'M' || *byte == b'm')
+        && input[3..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';')
+}
+
 fn install_winch_handler() {
     const SIGWINCH: i32 = 28;
     unsafe {
@@ -360,8 +463,17 @@ fn take_winch_pending() -> bool {
 enum CopyModeAction {
     Redraw,
     CopyLine(usize),
+    CopyLineRange { start: usize, end: usize },
     Exit,
     Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SgrMouseEvent {
+    code: u16,
+    col: u16,
+    row: u16,
+    release: bool,
 }
 
 struct CopyModeLine {
@@ -372,6 +484,7 @@ struct CopyModeLine {
 struct CopyModeView {
     lines: Vec<CopyModeLine>,
     cursor: usize,
+    selection_anchor: Option<usize>,
 }
 
 impl CopyModeView {
@@ -390,7 +503,11 @@ impl CopyModeView {
             });
         }
 
-        Ok(Self { lines, cursor: 0 })
+        Ok(Self {
+            lines,
+            cursor: 0,
+            selection_anchor: None,
+        })
     }
 
     fn cursor_line_number(&self) -> Option<usize> {
@@ -428,11 +545,74 @@ impl CopyModeView {
         }
     }
 
+    fn apply_mouse_event(&mut self, event: SgrMouseEvent) -> CopyModeAction {
+        if event.release {
+            let Some(anchor) = self.selection_anchor.take() else {
+                return CopyModeAction::Ignore;
+            };
+            if event.col == 0 {
+                return CopyModeAction::Ignore;
+            }
+            let Some(index) = self.line_index_for_mouse_row(event.row) else {
+                return CopyModeAction::Ignore;
+            };
+
+            self.cursor = index;
+            let (start_index, end_index) = normalized_indexes(anchor, index);
+            return CopyModeAction::CopyLineRange {
+                start: self.lines[start_index].number,
+                end: self.lines[end_index].number,
+            };
+        }
+
+        if event.col == 0 {
+            return CopyModeAction::Ignore;
+        }
+        let Some(index) = self.line_index_for_mouse_row(event.row) else {
+            return CopyModeAction::Ignore;
+        };
+
+        if event.code & 32 != 0 {
+            if self.selection_anchor.is_some() {
+                self.cursor = index;
+                return CopyModeAction::Redraw;
+            }
+            return CopyModeAction::Ignore;
+        }
+
+        if event.code & 3 == 0 {
+            self.selection_anchor = Some(index);
+            self.cursor = index;
+            return CopyModeAction::Redraw;
+        }
+
+        CopyModeAction::Ignore
+    }
+
+    fn line_index_for_mouse_row(&self, row: u16) -> Option<usize> {
+        if row < 2 {
+            return None;
+        }
+        let index = usize::from(row) - 2;
+        self.lines.get(index).map(|_| index)
+    }
+
+    fn selected_bounds(&self) -> Option<(usize, usize)> {
+        self.selection_anchor
+            .map(|anchor| normalized_indexes(anchor, self.cursor))
+    }
+
     fn render(&self) -> String {
-        let mut output = String::from("\r\n-- copy mode --\r\n");
+        let mut output = String::from("\x1b[2J\x1b[H-- copy mode --\r\n");
+        let selected = self.selected_bounds();
         for (index, line) in self.lines.iter().enumerate() {
             if index == self.cursor {
                 output.push('>');
+            } else if selected
+                .map(|(start, end)| index >= start && index <= end)
+                .unwrap_or(false)
+            {
+                output.push('*');
             } else {
                 output.push(' ');
             }
@@ -446,12 +626,39 @@ impl CopyModeView {
     }
 }
 
+fn normalized_indexes(left: usize, right: usize) -> (usize, usize) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
 extern "C" fn handle_winch(_: i32) {
     WINCH_PENDING.store(true, Ordering::SeqCst);
 }
 
 struct RawModeGuard {
     saved: Option<String>,
+}
+
+struct MouseModeGuard;
+
+impl MouseModeGuard {
+    fn enable() -> io::Result<Self> {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(ENABLE_MOUSE_MODE)?;
+        stdout.flush()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MouseModeGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(DISABLE_MOUSE_MODE);
+        let _ = stdout.flush();
+    }
 }
 
 impl RawModeGuard {
@@ -628,6 +835,149 @@ mod tests {
 
         assert_eq!(view.apply_key(b'q'), CopyModeAction::Exit);
         assert_eq!(view.apply_key(0x1b), CopyModeAction::Exit);
+    }
+
+    #[test]
+    fn copy_mode_mouse_click_copies_clicked_line() {
+        let mut view = CopyModeView::from_numbered_output("3\talpha\n4\tbeta\n").unwrap();
+
+        assert_eq!(
+            view.apply_mouse_event(SgrMouseEvent {
+                code: 0,
+                col: 1,
+                row: 3,
+                release: false,
+            }),
+            CopyModeAction::Redraw
+        );
+        assert_eq!(
+            view.apply_mouse_event(SgrMouseEvent {
+                code: 0,
+                col: 1,
+                row: 3,
+                release: true,
+            }),
+            CopyModeAction::CopyLineRange { start: 4, end: 4 }
+        );
+    }
+
+    #[test]
+    fn copy_mode_mouse_drag_copies_inclusive_line_range() {
+        let mut view = CopyModeView::from_numbered_output("10\tone\n11\ttwo\n12\tthree\n").unwrap();
+
+        assert_eq!(
+            view.apply_mouse_event(SgrMouseEvent {
+                code: 0,
+                col: 1,
+                row: 2,
+                release: false,
+            }),
+            CopyModeAction::Redraw
+        );
+        assert_eq!(
+            view.apply_mouse_event(SgrMouseEvent {
+                code: 32,
+                col: 1,
+                row: 4,
+                release: false,
+            }),
+            CopyModeAction::Redraw
+        );
+        assert_eq!(
+            view.apply_mouse_event(SgrMouseEvent {
+                code: 0,
+                col: 1,
+                row: 4,
+                release: true,
+            }),
+            CopyModeAction::CopyLineRange { start: 10, end: 12 }
+        );
+    }
+
+    #[test]
+    fn parses_sgr_mouse_press_and_release() {
+        assert_eq!(
+            parse_sgr_mouse_event(b"\x1b[<0;12;3M"),
+            Some((
+                SgrMouseEvent {
+                    code: 0,
+                    col: 12,
+                    row: 3,
+                    release: false,
+                },
+                10,
+            ))
+        );
+        assert_eq!(
+            parse_sgr_mouse_event(b"\x1b[<0;12;3m"),
+            Some((
+                SgrMouseEvent {
+                    code: 0,
+                    col: 12,
+                    row: 3,
+                    release: true,
+                },
+                10,
+            ))
+        );
+    }
+
+    #[test]
+    fn copy_mode_input_buffers_split_sgr_mouse_event() {
+        let mut view = CopyModeView::from_numbered_output("3\talpha\n4\tbeta\n").unwrap();
+        let mut input = CopyModeInputState::default();
+
+        assert_eq!(input.apply(&mut view, b"\x1b[<0;1"), Vec::new());
+        assert_eq!(input.apply(&mut view, b";3M"), vec![CopyModeAction::Redraw]);
+        assert_eq!(view.cursor_line_number(), Some(4));
+    }
+
+    #[test]
+    fn copy_mode_mouse_release_without_anchor_does_not_copy() {
+        let mut view = CopyModeView::from_numbered_output("3\talpha\n4\tbeta\n").unwrap();
+
+        assert_eq!(
+            view.apply_mouse_event(SgrMouseEvent {
+                code: 0,
+                col: 1,
+                row: 2,
+                release: true,
+            }),
+            CopyModeAction::Ignore
+        );
+    }
+
+    #[test]
+    fn copy_mode_mouse_release_outside_lines_clears_anchor() {
+        let mut view = CopyModeView::from_numbered_output("3\talpha\n4\tbeta\n").unwrap();
+
+        assert_eq!(
+            view.apply_mouse_event(SgrMouseEvent {
+                code: 0,
+                col: 1,
+                row: 2,
+                release: false,
+            }),
+            CopyModeAction::Redraw
+        );
+        assert_eq!(
+            view.apply_mouse_event(SgrMouseEvent {
+                code: 0,
+                col: 1,
+                row: 99,
+                release: true,
+            }),
+            CopyModeAction::Ignore
+        );
+        assert_eq!(
+            view.apply_mouse_event(SgrMouseEvent {
+                code: 0,
+                col: 1,
+                row: 3,
+                release: true,
+            }),
+            CopyModeAction::Ignore
+        );
     }
 
     #[test]

@@ -43,8 +43,9 @@ original line numbers.
 
 Attached clients can enter the current basic copy-mode view with `C-b [`.
 Inside copy-mode, `j`/`k` and `Ctrl-n`/`Ctrl-p` move the cursor, `y` or Enter
-saves the current line to a buffer, and `q` or Escape exits. Mouse selection is
-not implemented yet.
+saves the current line to a buffer, and `q` or Escape exits. Mouse click saves
+one rendered line; mouse drag saves an inclusive line range. Mouse selection is
+currently basic line-level selection.
 
 `save-buffer` currently stores captured active-pane text in an in-memory buffer
 with a 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name
@@ -75,6 +76,7 @@ Implemented Phase 2 groundwork:
 - command-driven line range and search selection for buffer saves
 - command-driven line-numbered copy-mode inspection with search filtering
 - attach-time basic copy-mode key handling for line copy
+- attach-time basic copy-mode mouse selection for line ranges
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
@@ -83,7 +85,7 @@ Current limits:
 - zoomed panes are tracked server-side, but layout rendering is not implemented yet
 - statusline format expansion is implemented, but attach-time statusline rendering is not implemented yet
 - in-memory screen and scrollback only
-- copy-mode mouse selection is not implemented yet
+- copy-mode selection is line-based only
 - buffer contents are in-memory only
 - full terminal protocol support is incomplete
 - no layout or named-window support yet
