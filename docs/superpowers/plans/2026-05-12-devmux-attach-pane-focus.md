@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `src/client.rs`
 
-- [ ] **Step 1: Write failing unit tests**
+- [x] **Step 1: Write failing unit tests**
 
 Add these tests near the existing live snapshot input tests in `src/client.rs`:
 
@@ -48,7 +48,7 @@ fn next_pane_index_rejects_missing_active_pane() {
 }
 ```
 
-- [ ] **Step 2: Run unit tests to verify RED**
+- [x] **Step 2: Run unit tests to verify RED**
 
 Run:
 
@@ -58,7 +58,7 @@ cargo test live_snapshot_input_selects_next_pane_on_prefix_o next_pane_index_
 
 Expected: FAIL because `SelectNextPane` and `next_pane_index_from_listing` do not exist.
 
-- [ ] **Step 3: Implement input action and pane list parser**
+- [x] **Step 3: Implement input action and pane list parser**
 
 In `src/client.rs`, add a new action variant:
 
@@ -137,7 +137,7 @@ fn parse_pane_listing(listing: &str) -> io::Result<Vec<PaneListEntry>> {
 }
 ```
 
-- [ ] **Step 4: Run unit tests to verify GREEN**
+- [x] **Step 4: Run unit tests to verify GREEN**
 
 Run:
 
@@ -148,13 +148,15 @@ cargo test next_pane_index_
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit parser and translator**
+- [x] **Step 5: Keep parser and translator with attach pane cycling commit**
 
-Run:
+The parser and translator were folded into the attach pane cycling commit to avoid an intermediate commit with temporary dead-code warnings.
+
+Final commit command:
 
 ```bash
-git add src/client.rs
-git commit -m "feat: parse attach pane focus input"
+git add src/client.rs tests/phase1_cli.rs docs/superpowers/plans/2026-05-12-devmux-attach-pane-focus.md
+git commit -m "feat: cycle pane focus in attach"
 ```
 
 ### Task 2: Cycle Active Pane From Live Attach
@@ -163,7 +165,7 @@ git commit -m "feat: parse attach pane focus input"
 - Modify: `src/client.rs`
 - Modify: `tests/phase1_cli.rs`
 
-- [ ] **Step 1: Write failing integration test**
+- [x] **Step 1: Write failing integration test**
 
 Add this test after `attach_live_input_routes_stdin_to_active_split_pane` in `tests/phase1_cli.rs`:
 
@@ -259,7 +261,7 @@ fn attach_prefix_o_cycles_active_pane_for_live_input() {
 }
 ```
 
-- [ ] **Step 2: Run integration test to verify RED**
+- [x] **Step 2: Run integration test to verify RED**
 
 Run:
 
@@ -269,7 +271,7 @@ cargo test --test phase1_cli attach_prefix_o_cycles_active_pane_for_live_input
 
 Expected: FAIL because `C-b o` is currently forwarded literally and does not change active pane.
 
-- [ ] **Step 3: Add focus event and control helper**
+- [x] **Step 3: Add focus event and control helper**
 
 In `src/client.rs`, add the event variant:
 
@@ -305,7 +307,7 @@ fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
 }
 ```
 
-- [ ] **Step 4: Handle focus event in redraw loop**
+- [x] **Step 4: Handle focus event in redraw loop**
 
 Update `run_live_snapshot_attach`:
 
@@ -317,7 +319,7 @@ Ok(LiveSnapshotInputEvent::SelectNextPane) => {
 }
 ```
 
-- [ ] **Step 5: Run focused tests to verify GREEN**
+- [x] **Step 5: Run focused tests to verify GREEN**
 
 Run:
 
@@ -330,7 +332,7 @@ cargo test live_snapshot_input_
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit attach pane cycling**
+- [x] **Step 6: Commit attach pane cycling**
 
 Run:
 

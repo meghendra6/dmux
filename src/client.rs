@@ -224,6 +224,7 @@ enum AttachInputAction {
 enum LiveSnapshotInputAction {
     Forward { bytes: Vec<u8> },
     Detach { forward: Vec<u8> },
+    SelectNextPane,
 }
 
 fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAction {
@@ -267,6 +268,14 @@ fn translate_live_snapshot_input(input: &[u8], saw_prefix: &mut bool) -> LiveSna
             *saw_prefix = false;
             match *byte {
                 b'd' => return LiveSnapshotInputAction::Detach { forward: output },
+                b'o' => {
+                    if output.is_empty() {
+                        return LiveSnapshotInputAction::SelectNextPane;
+                    }
+                    output.push(0x02);
+                    output.push(*byte);
+                    continue;
+                }
                 0x02 => {
                     output.push(0x02);
                     continue;
@@ -298,9 +307,48 @@ fn finish_live_snapshot_input(saw_prefix: &mut bool) -> Option<Vec<u8>> {
     Some(vec![0x02])
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneListEntry {
+    index: usize,
+    active: bool,
+}
+
+fn next_pane_index_from_listing(listing: &str) -> io::Result<usize> {
+    let entries = parse_pane_listing(listing)?;
+    if entries.is_empty() {
+        return Err(io::Error::other("missing pane"));
+    }
+
+    let active = entries
+        .iter()
+        .position(|entry| entry.active)
+        .ok_or_else(|| io::Error::other("missing active pane"))?;
+    Ok(entries[(active + 1) % entries.len()].index)
+}
+
+fn parse_pane_listing(listing: &str) -> io::Result<Vec<PaneListEntry>> {
+    let mut entries = Vec::new();
+    for line in listing.lines() {
+        let Some((index, active)) = line.split_once('\t') else {
+            return Err(io::Error::other("invalid pane listing"));
+        };
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| io::Error::other("invalid pane index"))?;
+        let active = match active {
+            "0" => false,
+            "1" => true,
+            _ => return Err(io::Error::other("invalid active pane flag")),
+        };
+        entries.push(PaneListEntry { index, active });
+    }
+    Ok(entries)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveSnapshotInputEvent {
     Forward(Vec<u8>),
+    SelectNextPane,
     Detach,
     Eof,
 }
@@ -341,6 +389,9 @@ fn spawn_live_snapshot_input_thread() -> mpsc::Receiver<LiveSnapshotInputEvent> 
                     let _ = sender.send(LiveSnapshotInputEvent::Detach);
                     break;
                 }
+                LiveSnapshotInputAction::SelectNextPane => {
+                    let _ = sender.send(LiveSnapshotInputEvent::SelectNextPane);
+                }
             }
         }
     });
@@ -365,6 +416,11 @@ fn run_live_snapshot_attach(
                     last_redraw = Instant::now();
                 }
             }
+            Ok(LiveSnapshotInputEvent::SelectNextPane) => {
+                select_next_pane(socket, session)?;
+                write_live_snapshot_frame(socket, session)?;
+                last_redraw = Instant::now();
+            }
             Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 write_live_snapshot_frame(socket, session)?;
@@ -375,6 +431,17 @@ fn run_live_snapshot_attach(
     }
 
     let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
+    let body = send_control_request(
+        socket,
+        &protocol::encode_list_panes(session, Some("#{pane.index}\t#{pane.active}")),
+    )?;
+    let listing = String::from_utf8_lossy(&body);
+    let next = next_pane_index_from_listing(&listing)?;
+    let _ = send_control_request(socket, &protocol::encode_select_pane(session, next))?;
     Ok(())
 }
 
@@ -1059,6 +1126,33 @@ mod tests {
             LiveSnapshotInputAction::Forward { bytes: vec![0x02] }
         );
         assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_selects_next_pane_on_prefix_o() {
+        let mut saw_prefix = false;
+
+        let action = translate_live_snapshot_input(b"\x02o", &mut saw_prefix);
+
+        assert_eq!(action, LiveSnapshotInputAction::SelectNextPane);
+        assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn next_pane_index_wraps_after_active_pane() {
+        assert_eq!(
+            next_pane_index_from_listing("0\t0\n1\t1\n2\t0\n").unwrap(),
+            2
+        );
+        assert_eq!(
+            next_pane_index_from_listing("0\t0\n1\t0\n2\t1\n").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn next_pane_index_rejects_missing_active_pane() {
+        assert!(next_pane_index_from_listing("0\t0\n1\t0\n").is_err());
     }
 
     #[test]
