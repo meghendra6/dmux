@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `src/client.rs`
 
-- [ ] **Step 1: Write failing unit tests**
+- [x] **Step 1: Write failing unit tests**
 
 Add tests near the existing live snapshot input tests:
 
@@ -69,7 +69,7 @@ fn live_snapshot_input_forwards_bytes_before_copy_mode_prefix() {
 }
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -81,7 +81,7 @@ cargo test live_snapshot_input_forwards_bytes_before_copy_mode_prefix
 
 Expected: FAIL because `LiveSnapshotInputAction::EnterCopyMode` does not exist.
 
-- [ ] **Step 3: Add the action variant and translator branch**
+- [x] **Step 3: Add the action variant and translator branch**
 
 In `src/client.rs`, update `LiveSnapshotInputAction`:
 
@@ -139,7 +139,7 @@ for (index, byte) in input.iter().enumerate() {
 }
 ```
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run:
 
@@ -155,7 +155,7 @@ Expected: PASS.
 - Modify: `src/client.rs`
 - Modify: `tests/phase1_cli.rs`
 
-- [ ] **Step 1: Write failing integration test**
+- [x] **Step 1: Write failing integration test**
 
 Add this test after `attach_prefix_o_cycles_active_pane_for_live_input`:
 
@@ -224,14 +224,14 @@ fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
         listed = String::from_utf8_lossy(&output.stdout).to_string();
         if listed
             .lines()
-            .any(|line| line.ends_with("\t10\tsplit-copy"))
+            .any(|line| line.ends_with("\t11\tsplit-copy"))
         {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(
-        listed.lines().any(|line| line.ends_with("\t10\tsplit-copy")),
+        listed.lines().any(|line| line.ends_with("\t11\tsplit-copy")),
         "{listed:?}"
     );
 
@@ -251,7 +251,7 @@ fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
 }
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run:
 
@@ -261,7 +261,7 @@ cargo test --test phase1_cli attach_prefix_bracket_copies_active_pane_line_in_mu
 
 Expected: FAIL because `C-b [` is currently forwarded literally in live snapshot attach.
 
-- [ ] **Step 3: Add live snapshot events**
+- [x] **Step 3: Add live snapshot events**
 
 In `src/client.rs`, update `LiveSnapshotInputEvent`:
 
@@ -277,7 +277,7 @@ enum LiveSnapshotInputEvent {
 }
 ```
 
-- [ ] **Step 4: Split copy-mode reader handling**
+- [x] **Step 4: Split copy-mode reader handling**
 
 Replace `run_copy_mode` with a wrapper plus helper:
 
@@ -328,7 +328,7 @@ fn run_copy_mode_with_reader<R: Read>(
 }
 ```
 
-- [ ] **Step 5: Run copy-mode on the input thread**
+- [x] **Step 5: Run copy-mode on the input thread**
 
 Change `spawn_live_snapshot_input_thread` to accept `socket: PathBuf` and
 `session: String`. Keep the stdin lock in that thread and handle the new action:
@@ -355,7 +355,7 @@ fn spawn_live_snapshot_input_thread(
     }
 ```
 
-- [ ] **Step 6: Pause and resume redraw in the attach loop**
+- [x] **Step 6: Pause and resume redraw in the attach loop**
 
 Update `run_live_snapshot_attach`:
 
@@ -404,7 +404,7 @@ loop {
 }
 ```
 
-- [ ] **Step 7: Verify GREEN**
+- [x] **Step 7: Verify GREEN**
 
 Run:
 
@@ -417,7 +417,7 @@ cargo test --test phase1_cli attach_prefix_o_cycles_active_pane_for_live_input
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit implementation**
+- [x] **Step 8: Commit implementation**
 
 Run:
 

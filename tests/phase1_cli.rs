@@ -1062,6 +1062,98 @@ fn attach_prefix_o_cycles_active_pane_for_live_input() {
 }
 
 #[test]
+fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
+    let socket = unique_socket("attach-copy-mode");
+    let session = format!("attach-copy-mode-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-copy; printf '\\n'; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-copy");
+    assert!(base.contains("base-copy"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-copy; printf '\\n'; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-copy");
+    assert!(split.contains("split-copy"), "{split:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin
+            .write_all(b"\x02[y")
+            .expect("write copy-mode entry and copy key");
+        stdin.flush().expect("flush copy-mode input");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut listed = String::new();
+    while std::time::Instant::now() < deadline {
+        let output = dmux(&socket, &["list-buffers"]);
+        assert_success(&output);
+        listed = String::from_utf8_lossy(&output.stdout).to_string();
+        if listed
+            .lines()
+            .any(|line| line.ends_with("\t11\tsplit-copy"))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.ends_with("\t11\tsplit-copy")),
+        "{listed:?}"
+    );
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("-- copy mode --"), "{stdout:?}");
+    assert!(stdout.contains("-- copy mode: copied to "), "{stdout:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_multi_pane_keeps_snapshot_handshake_for_client_compatibility() {
     let socket = unique_socket("attach-snapshot-handshake");
     let session = format!("attach-snapshot-handshake-{}", std::process::id());
