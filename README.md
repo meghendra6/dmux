@@ -46,7 +46,8 @@ view with `C-b [`. Inside copy-mode, `j`/`k` and `Ctrl-n`/`Ctrl-p` move the
 cursor, `y` or Enter saves the current line to a buffer, and `q` or Escape
 exits. Mouse click saves one rendered line; mouse drag saves an inclusive line
 range. Mouse selection is currently basic line-level selection. Unzoomed
-multi-pane attach is read-only and handles `C-b d` to detach.
+multi-pane attach routes input to the server active pane and handles `C-b d` to
+detach.
 
 `save-buffer` currently stores captured active-pane text in an in-memory buffer
 with a 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name
@@ -80,7 +81,7 @@ Implemented Phase 2 groundwork:
 - attach-time basic copy-mode mouse selection for line ranges
 - attach-time statusline snapshot rendering
 - attach-time split-pane layout snapshot rendering
-- polling-based read-only live redraw for multi-pane attach
+- polling-based live redraw for multi-pane attach
 - active-pane input routing for polling multi-pane attach
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 

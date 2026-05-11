@@ -66,6 +66,19 @@ fn live_snapshot_input_forwards_literal_prefix_with_regular_key() {
 }
 
 #[test]
+fn live_snapshot_input_forwards_single_literal_prefix_on_double_prefix() {
+    let mut saw_prefix = false;
+
+    let action = translate_live_snapshot_input(b"\x02\x02", &mut saw_prefix);
+
+    assert_eq!(
+        action,
+        LiveSnapshotInputAction::Forward { bytes: vec![0x02] }
+    );
+    assert!(!saw_prefix);
+}
+
+#[test]
 fn live_snapshot_input_flushes_pending_prefix_on_eof() {
     let mut saw_prefix = true;
 
@@ -169,6 +182,7 @@ Add this test in `tests/phase1_cli.rs` after `attach_live_redraws_split_pane_out
 fn attach_live_input_routes_stdin_to_active_split_pane() {
     let socket = unique_socket("attach-live-input");
     let session = format!("attach-live-input-{}", std::process::id());
+    let file = unique_temp_file("attach-live-input-base");
 
     assert_success(&dmux(
         &socket,
@@ -180,7 +194,7 @@ fn attach_live_input_routes_stdin_to_active_split_pane() {
             "--",
             "sh",
             "-c",
-            "printf base-ready; sleep 30",
+            &format!("printf base-ready; cat > {}; sleep 30", file.display()),
         ],
     ));
     let base = poll_capture(&socket, &session, "base-ready");
@@ -215,12 +229,23 @@ fn attach_live_input_routes_stdin_to_active_split_pane() {
 
     {
         let stdin = child.stdin.as_mut().expect("attach stdin");
-        stdin.write_all(b"hello\n").expect("write attach input");
+        stdin.write_all(b"hello\r").expect("write attach input");
         stdin.flush().expect("flush attach input");
     }
 
     let typed = poll_capture(&socket, &session, "typed:hello");
     assert!(typed.contains("typed:hello"), "{typed:?}");
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin
+            .write_all(b"base-file\n")
+            .expect("write selected pane attach input");
+        stdin.flush().expect("flush selected pane attach input");
+    }
+    assert!(poll_file_contains(&file, "base-file"));
+
     std::thread::sleep(std::time::Duration::from_millis(250));
 
     {
@@ -313,11 +338,22 @@ fn spawn_live_snapshot_input_thread() -> mpsc::Receiver<LiveSnapshotInputEvent> 
 Update `run_live_snapshot_attach`:
 
 ```rust
+let mut last_redraw = Instant::now();
+
 loop {
     match input.recv_timeout(LIVE_SNAPSHOT_REDRAW_INTERVAL) {
-        Ok(LiveSnapshotInputEvent::Forward(bytes)) => stream.write_all(&bytes)?,
+        Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
+            stream.write_all(&bytes)?;
+            if last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL {
+                write_live_snapshot_frame(socket, session)?;
+                last_redraw = Instant::now();
+            }
+        }
         Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
-        Err(mpsc::RecvTimeoutError::Timeout) => write_live_snapshot_frame(socket, session)?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            write_live_snapshot_frame(socket, session)?;
+            last_redraw = Instant::now();
+        }
         Err(mpsc::RecvTimeoutError::Disconnected) => break,
     }
 }
@@ -410,7 +446,7 @@ cargo test
 
 Expected: formatting and whitespace checks pass; keyword scan prints no matches; all unit and integration tests pass.
 
-- [ ] **Step 3: Request critical review**
+- [x] **Step 3: Request critical review**
 
 Dispatch a read-only review subagent against `git diff origin/main` with this brief:
 
@@ -419,6 +455,13 @@ Review the live attach input diff for correctness. Focus on multi-pane attach st
 ```
 
 Apply technically valid Critical or Important findings, rerun full verification, and update this plan's checkboxes.
+
+Applied review findings:
+
+- `C-b C-b` now forwards one literal prefix byte.
+- The live redraw loop redraws after forwarded input when the polling interval has elapsed, so continuous input cannot indefinitely postpone redraws.
+- The integration test now selects a different active pane after attach starts and verifies input follows that selection.
+- README no longer describes unzoomed multi-pane attach as read-only.
 
 - [ ] **Step 4: Open PR and merge after validation**
 

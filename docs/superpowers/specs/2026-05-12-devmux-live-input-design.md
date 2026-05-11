@@ -89,6 +89,7 @@ Add tests before implementation:
 - live snapshot input translation preserves literal prefix bytes
 - unzoomed multi-pane attach forwards typed stdin to the active split pane
 - forwarded input becomes visible through the live redraw output
+- attach input follows active pane changes made after attach starts
 - existing compatibility remains: `OK\tSNAPSHOT\n` handshake, zoomed raw attach,
   and detach behavior still pass
 

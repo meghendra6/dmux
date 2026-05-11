@@ -864,6 +864,7 @@ fn attach_live_redraws_split_pane_output_after_attach_starts() {
 fn attach_live_input_routes_stdin_to_active_split_pane() {
     let socket = unique_socket("attach-live-input");
     let session = format!("attach-live-input-{}", std::process::id());
+    let file = unique_temp_file("attach-live-input-base");
 
     assert_success(&dmux(
         &socket,
@@ -875,7 +876,7 @@ fn attach_live_input_routes_stdin_to_active_split_pane() {
             "--",
             "sh",
             "-c",
-            "printf base-ready; sleep 30",
+            &format!("printf base-ready; cat > {}; sleep 30", file.display()),
         ],
     ));
     let base = poll_capture(&socket, &session, "base-ready");
@@ -910,12 +911,24 @@ fn attach_live_input_routes_stdin_to_active_split_pane() {
 
     {
         let stdin = child.stdin.as_mut().expect("attach stdin");
-        stdin.write_all(b"hello\n").expect("write attach input");
+        stdin.write_all(b"hello\r").expect("write attach input");
         stdin.flush().expect("flush attach input");
     }
 
     let typed = poll_capture(&socket, &session, "typed:hello");
     assert!(typed.contains("typed:hello"), "{typed:?}");
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin
+            .write_all(b"base-file\n")
+            .expect("write selected pane attach input");
+        stdin.flush().expect("flush selected pane attach input");
+    }
+
+    assert!(poll_file_contains(&file, "base-file"));
+
     std::thread::sleep(std::time::Duration::from_millis(250));
 
     {
