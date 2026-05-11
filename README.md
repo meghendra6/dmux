@@ -81,11 +81,12 @@ Implemented Phase 2 groundwork:
 - attach-time statusline snapshot rendering
 - attach-time split-pane layout snapshot rendering
 - polling-based read-only live redraw for multi-pane attach
+- active-pane input routing for polling multi-pane attach
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
 
-- multi-pane attach live redraw is polling-based and read-only; unzoomed multi-pane input routing is not implemented yet
+- multi-pane attach live redraw is polling-based and routes input to the server active pane; in-attach pane focus switching and multi-pane copy-mode are not implemented yet
 - zoomed panes are tracked server-side and keep single-pane live attach behavior
 - attach-time statusline rendering is snapshot-only for raw single-pane attach and polled during multi-pane live redraw; event-driven live status redraw is not implemented yet
 - in-memory screen and scrollback only
