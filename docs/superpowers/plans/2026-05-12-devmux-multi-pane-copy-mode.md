@@ -432,7 +432,7 @@ git commit -m "feat: add multi-pane attach copy mode"
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-05-12-devmux-multi-pane-copy-mode.md`
 
-- [ ] **Step 1: Update README**
+- [x] **Step 1: Update README**
 
 Update the copy-mode attach paragraph to say:
 
@@ -452,7 +452,7 @@ Update current limits:
 - multi-pane attach live redraw is polling-based and routes input to the server active pane; numbered pane selection, mouse focus, and composed-layout copy-mode are not implemented yet
 ```
 
-- [ ] **Step 2: Run full verification**
+- [x] **Step 2: Run full verification**
 
 Run:
 
