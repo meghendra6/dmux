@@ -2,7 +2,7 @@ use crate::protocol;
 use crate::pty::PtySize;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -225,6 +225,7 @@ enum LiveSnapshotInputAction {
     Forward(Vec<u8>),
     Detach,
     SelectNextPane,
+    EnterCopyMode { initial_input: Vec<u8> },
 }
 
 fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAction {
@@ -267,7 +268,7 @@ fn translate_live_snapshot_input(
     let mut output = Vec::with_capacity(input.len());
     let mut actions = Vec::new();
 
-    for byte in input {
+    for (index, byte) in input.iter().enumerate() {
         if *saw_prefix {
             *saw_prefix = false;
             match *byte {
@@ -288,6 +289,17 @@ fn translate_live_snapshot_input(
                     }
                     actions.push(LiveSnapshotInputAction::SelectNextPane);
                     continue;
+                }
+                b'[' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::EnterCopyMode {
+                        initial_input: input[index + 1..].to_vec(),
+                    });
+                    return actions;
                 }
                 0x02 => {
                     output.push(0x02);
@@ -361,15 +373,21 @@ fn parse_pane_listing(listing: &str) -> io::Result<Vec<PaneListEntry>> {
     Ok(entries)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 enum LiveSnapshotInputEvent {
     Forward(Vec<u8>),
     SelectNextPane,
+    PauseRedraw(mpsc::Sender<()>),
+    RedrawNow,
+    Error(String),
     Detach,
     Eof,
 }
 
-fn spawn_live_snapshot_input_thread() -> mpsc::Receiver<LiveSnapshotInputEvent> {
+fn spawn_live_snapshot_input_thread(
+    socket: PathBuf,
+    session: String,
+) -> mpsc::Receiver<LiveSnapshotInputEvent> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
@@ -404,6 +422,26 @@ fn spawn_live_snapshot_input_thread() -> mpsc::Receiver<LiveSnapshotInputEvent> 
                     LiveSnapshotInputAction::SelectNextPane => {
                         let _ = sender.send(LiveSnapshotInputEvent::SelectNextPane);
                     }
+                    LiveSnapshotInputAction::EnterCopyMode { initial_input } => {
+                        let (pause_ack, pause_ready) = mpsc::channel();
+                        let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw(pause_ack));
+                        let _ = pause_ready.recv();
+                        match run_copy_mode_with_reader(
+                            &socket,
+                            &session,
+                            &initial_input,
+                            &mut stdin,
+                        ) {
+                            Ok(()) => {
+                                let _ = sender.send(LiveSnapshotInputEvent::RedrawNow);
+                            }
+                            Err(error) => {
+                                let _ =
+                                    sender.send(LiveSnapshotInputEvent::Error(error.to_string()));
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -416,28 +454,43 @@ fn run_live_snapshot_attach(
     session: &str,
     stream: &mut UnixStream,
 ) -> io::Result<()> {
-    let input = spawn_live_snapshot_input_thread();
+    let input = spawn_live_snapshot_input_thread(socket.to_path_buf(), session.to_string());
     write_live_snapshot_frame(socket, session)?;
     let mut last_redraw = Instant::now();
+    let mut redraw_paused = false;
 
     loop {
         match input.recv_timeout(LIVE_SNAPSHOT_REDRAW_INTERVAL) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
                 stream.write_all(&bytes)?;
-                if last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL {
+                if !redraw_paused && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL {
                     write_live_snapshot_frame(socket, session)?;
                     last_redraw = Instant::now();
                 }
             }
             Ok(LiveSnapshotInputEvent::SelectNextPane) => {
                 select_next_pane(socket, session)?;
+                if !redraw_paused {
+                    write_live_snapshot_frame(socket, session)?;
+                }
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::PauseRedraw(pause_ack)) => {
+                redraw_paused = true;
+                let _ = pause_ack.send(());
+            }
+            Ok(LiveSnapshotInputEvent::RedrawNow) => {
+                redraw_paused = false;
                 write_live_snapshot_frame(socket, session)?;
                 last_redraw = Instant::now();
             }
+            Ok(LiveSnapshotInputEvent::Error(message)) => return Err(io::Error::other(message)),
             Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                write_live_snapshot_frame(socket, session)?;
-                last_redraw = Instant::now();
+                if !redraw_paused {
+                    write_live_snapshot_frame(socket, session)?;
+                    last_redraw = Instant::now();
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -504,6 +557,16 @@ where
 }
 
 fn run_copy_mode(socket: &Path, session: &str, initial_input: &[u8]) -> io::Result<()> {
+    let mut stdin = io::stdin().lock();
+    run_copy_mode_with_reader(socket, session, initial_input, &mut stdin)
+}
+
+fn run_copy_mode_with_reader<R: Read>(
+    socket: &Path,
+    session: &str,
+    initial_input: &[u8],
+    stdin: &mut R,
+) -> io::Result<()> {
     let body = send_control_request(
         socket,
         &protocol::encode_copy_mode(session, protocol::CaptureMode::All, None),
@@ -523,7 +586,6 @@ fn run_copy_mode(socket: &Path, session: &str, initial_input: &[u8]) -> io::Resu
         return Ok(());
     }
 
-    let mut stdin = io::stdin().lock();
     let mut buf = [0_u8; 1024];
     loop {
         let n = stdin.read(&mut buf)?;
@@ -1136,6 +1198,54 @@ mod tests {
         let actions = translate_live_snapshot_input(b"\x02o", &mut saw_prefix);
 
         assert_eq!(actions, vec![LiveSnapshotInputAction::SelectNextPane]);
+        assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_enters_copy_mode_on_prefix_bracket() {
+        let mut saw_prefix = false;
+
+        let actions = translate_live_snapshot_input(b"\x02[", &mut saw_prefix);
+
+        assert_eq!(
+            actions,
+            vec![LiveSnapshotInputAction::EnterCopyMode {
+                initial_input: Vec::new(),
+            }]
+        );
+        assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_passes_coalesced_copy_mode_keys_as_initial_input() {
+        let mut saw_prefix = false;
+
+        let actions = translate_live_snapshot_input(b"\x02[y", &mut saw_prefix);
+
+        assert_eq!(
+            actions,
+            vec![LiveSnapshotInputAction::EnterCopyMode {
+                initial_input: vec![b'y'],
+            }]
+        );
+        assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_forwards_bytes_before_copy_mode_prefix() {
+        let mut saw_prefix = false;
+
+        let actions = translate_live_snapshot_input(b"abc\x02[y", &mut saw_prefix);
+
+        assert_eq!(
+            actions,
+            vec![
+                LiveSnapshotInputAction::Forward(b"abc".to_vec()),
+                LiveSnapshotInputAction::EnterCopyMode {
+                    initial_input: vec![b'y'],
+                },
+            ]
+        );
         assert!(!saw_prefix);
     }
 

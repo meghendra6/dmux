@@ -41,13 +41,13 @@ capture sources as `capture-pane`; default and `--all` are combined history plus
 screen. Use `--search` to show only matching lines while preserving their
 original line numbers.
 
-Single-pane and zoomed attached clients can enter the current basic copy-mode
-view with `C-b [`. Inside copy-mode, `j`/`k` and `Ctrl-n`/`Ctrl-p` move the
-cursor, `y` or Enter saves the current line to a buffer, and `q` or Escape
-exits. Mouse click saves one rendered line; mouse drag saves an inclusive line
-range. Mouse selection is currently basic line-level selection. Unzoomed
-multi-pane attach routes input to the server active pane and handles `C-b d` to
-detach and `C-b o` to cycle the server active pane.
+Attached clients can enter the current basic copy-mode view with `C-b [`.
+Inside copy-mode, `j`/`k` and `Ctrl-n`/`Ctrl-p` move the cursor, `y` or Enter
+saves the current line to a buffer, and `q` or Escape exits. Mouse click saves
+one rendered line; mouse drag saves an inclusive line range. Mouse selection is
+currently basic line-level selection. Unzoomed multi-pane attach routes input
+and copy-mode to the server active pane and handles `C-b d` to detach and
+`C-b o` to cycle the server active pane.
 
 `save-buffer` currently stores captured active-pane text in an in-memory buffer
 with a 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name
@@ -84,11 +84,12 @@ Implemented Phase 2 groundwork:
 - polling-based live redraw for multi-pane attach
 - active-pane input routing for polling multi-pane attach
 - attach-time pane cycling for polling multi-pane attach
+- multi-pane attach copy-mode entry for the active pane
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
 
-- multi-pane attach live redraw is polling-based and routes input to the server active pane; numbered pane selection, mouse focus, and multi-pane copy-mode are not implemented yet
+- multi-pane attach live redraw is polling-based and routes input to the server active pane; numbered pane selection, mouse focus, and composed-layout copy-mode are not implemented yet
 - zoomed panes are tracked server-side and keep single-pane live attach behavior
 - attach-time statusline rendering is snapshot-only for raw single-pane attach and polled during multi-pane live redraw; event-driven live status redraw is not implemented yet
 - in-memory screen and scrollback only
