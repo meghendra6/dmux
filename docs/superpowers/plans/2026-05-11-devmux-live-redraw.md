@@ -475,7 +475,7 @@ cargo test --test phase1_cli attach_keeps_zoomed_split_pane_live
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit live redraw implementation**
+- [x] **Step 7: Commit live redraw implementation**
 
 Run:
 
@@ -490,7 +490,7 @@ git commit -m "feat: add live split redraw attach"
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-05-11-devmux-live-redraw.md`
 
-- [ ] **Step 1: Update README**
+- [x] **Step 1: Update README**
 
 Add implemented groundwork:
 
@@ -504,7 +504,7 @@ Update the current multi-pane attach limit:
 - multi-pane attach live redraw is polling-based and read-only; unzoomed multi-pane input routing is not implemented yet
 ```
 
-- [ ] **Step 2: Run full verification**
+- [x] **Step 2: Run full verification**
 
 Run:
 
