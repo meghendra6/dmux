@@ -102,7 +102,7 @@ cargo test client::tests::parses_live_snapshot_attach_ok
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit handshake**
+- [x] **Step 5: Commit handshake**
 
 Run:
 
@@ -117,7 +117,7 @@ git commit -m "feat: add live snapshot attach mode"
 - Modify: `src/client.rs`
 - Modify: `tests/phase1_cli.rs`
 
-- [ ] **Step 1: Write failing read-only input unit tests**
+- [x] **Step 1: Write failing read-only input unit tests**
 
 Add these tests to `src/client.rs`:
 
@@ -143,7 +143,7 @@ fn live_snapshot_input_ignores_arbitrary_bytes_without_forwarding() {
 }
 ```
 
-- [ ] **Step 2: Write failing integration test**
+- [x] **Step 2: Write failing integration test**
 
 Add this helper near the existing poll helpers in `tests/phase1_cli.rs`:
 
@@ -235,7 +235,7 @@ fn attach_live_redraws_split_pane_output_after_attach_starts() {
 }
 ```
 
-- [ ] **Step 3: Run unit tests to verify RED**
+- [x] **Step 3: Run unit tests to verify RED**
 
 Run:
 
@@ -245,7 +245,7 @@ cargo test live_snapshot_input_
 
 Expected: FAIL because `LiveSnapshotInputAction` and `translate_live_snapshot_input` do not exist.
 
-- [ ] **Step 4: Run integration test to verify RED**
+- [x] **Step 4: Run integration test to verify RED**
 
 Run:
 
@@ -255,13 +255,15 @@ cargo test --test phase1_cli attach_live_redraws_split_pane_output_after_attach_
 
 Expected: FAIL because `LiveSnapshot` mode is parsed but not handled by a redraw loop, or because multi-pane attach exits before `late:hello` can appear.
 
-- [ ] **Step 5: Commit failing tests**
+- [x] **Step 5: Keep tests with the implementation commit**
 
-Run:
+The failing tests were kept in the working tree and folded into the implementation commit so the branch does not contain an intentionally uncompilable intermediate commit.
+
+Final commit command:
 
 ```bash
 git add src/client.rs tests/phase1_cli.rs
-git commit -m "test: cover live split redraw attach"
+git commit -m "feat: add live split redraw attach"
 ```
 
 ### Task 3: Implement Read-Only Live Redraw
@@ -269,7 +271,7 @@ git commit -m "test: cover live split redraw attach"
 **Files:**
 - Modify: `src/client.rs`
 
-- [ ] **Step 1: Add input action and translation**
+- [x] **Step 1: Add input action and translation**
 
 Add near `AttachInputAction`:
 
@@ -306,7 +308,7 @@ fn translate_live_snapshot_input(
 }
 ```
 
-- [ ] **Step 2: Add redraw helpers**
+- [x] **Step 2: Add redraw helpers**
 
 Add imports:
 
@@ -370,7 +372,7 @@ fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<()> {
 }
 ```
 
-- [ ] **Step 3: Add input thread and redraw loop**
+- [x] **Step 3: Add input thread and redraw loop**
 
 Add:
 
@@ -429,7 +431,7 @@ fn run_live_snapshot_attach(socket: &Path, session: &str, stream: &mut UnixStrea
 }
 ```
 
-- [ ] **Step 4: Route `LiveSnapshot` mode in `attach`**
+- [x] **Step 4: Route `LiveSnapshot` mode in `attach`**
 
 Update the attach mode branch:
 
@@ -451,7 +453,7 @@ write_attach_status_line(socket, session)?;
 
 Leave the existing raw live attach code after this block.
 
-- [ ] **Step 5: Run unit tests to verify GREEN**
+- [x] **Step 5: Run unit tests to verify GREEN**
 
 Run:
 
@@ -461,7 +463,7 @@ cargo test live_snapshot_input_
 
 Expected: PASS.
 
-- [ ] **Step 6: Run integration tests to verify GREEN**
+- [x] **Step 6: Run integration tests to verify GREEN**
 
 Run:
 

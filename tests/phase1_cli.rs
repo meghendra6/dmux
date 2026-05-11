@@ -439,6 +439,20 @@ fn poll_process_gone(pid: &str) -> bool {
     false
 }
 
+fn wait_for_child_exit(mut child: std::process::Child) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if child.try_wait().expect("poll child").is_some() {
+            return child.wait_with_output().expect("wait child output");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            return child.wait_with_output().expect("wait killed child output");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn list_sessions_reports_created_session() {
     let socket = unique_socket("list");
@@ -749,6 +763,79 @@ fn attach_renders_vertical_split_layout_snapshot() {
     assert_vertical_layout(&stdout, "base-ready", "split-ready");
     assert!(!stdout.contains("-- pane 0 --"), "{stdout:?}");
     assert!(!stdout.contains("-- pane 1 --"), "{stdout:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_live_redraws_split_pane_output_after_attach_starts() {
+    let socket = unique_socket("attach-live-redraw");
+    let session = format!("attach-live-redraw-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; echo late:$line; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "hello", "Enter"],
+    ));
+    let late = poll_capture(&socket, &session, "late:hello");
+    assert!(late.contains("late:hello"), "{late:?}");
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("base-ready"), "{stdout:?}");
+    assert!(stdout.contains(" | "), "{stdout:?}");
+    assert!(stdout.contains("late:hello"), "{stdout:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
