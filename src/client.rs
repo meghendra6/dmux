@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
 const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
@@ -222,8 +222,8 @@ enum AttachInputAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveSnapshotInputAction {
-    Continue,
-    Detach,
+    Forward { bytes: Vec<u8> },
+    Detach { forward: Vec<u8> },
 }
 
 fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAction {
@@ -260,29 +260,47 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAct
 }
 
 fn translate_live_snapshot_input(input: &[u8], saw_prefix: &mut bool) -> LiveSnapshotInputAction {
+    let mut output = Vec::with_capacity(input.len());
+
     for byte in input {
         if *saw_prefix {
             *saw_prefix = false;
             match *byte {
-                b'd' => return LiveSnapshotInputAction::Detach,
+                b'd' => return LiveSnapshotInputAction::Detach { forward: output },
                 0x02 => {
-                    *saw_prefix = true;
+                    output.push(0x02);
                     continue;
                 }
-                _ => continue,
+                _ => {
+                    output.push(0x02);
+                    output.push(*byte);
+                    continue;
+                }
             }
         }
 
         if *byte == 0x02 {
             *saw_prefix = true;
+        } else {
+            output.push(*byte);
         }
     }
 
-    LiveSnapshotInputAction::Continue
+    LiveSnapshotInputAction::Forward { bytes: output }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+fn finish_live_snapshot_input(saw_prefix: &mut bool) -> Option<Vec<u8>> {
+    if !*saw_prefix {
+        return None;
+    }
+
+    *saw_prefix = false;
+    Some(vec![0x02])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveSnapshotInputEvent {
+    Forward(Vec<u8>),
     Detach,
     Eof,
 }
@@ -297,6 +315,9 @@ fn spawn_live_snapshot_input_thread() -> mpsc::Receiver<LiveSnapshotInputEvent> 
         loop {
             let n = match stdin.read(&mut buf) {
                 Ok(0) => {
+                    if let Some(bytes) = finish_live_snapshot_input(&mut saw_prefix) {
+                        let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
+                    }
                     let _ = sender.send(LiveSnapshotInputEvent::Eof);
                     break;
                 }
@@ -307,11 +328,19 @@ fn spawn_live_snapshot_input_thread() -> mpsc::Receiver<LiveSnapshotInputEvent> 
                 }
             };
 
-            if translate_live_snapshot_input(&buf[..n], &mut saw_prefix)
-                == LiveSnapshotInputAction::Detach
-            {
-                let _ = sender.send(LiveSnapshotInputEvent::Detach);
-                break;
+            match translate_live_snapshot_input(&buf[..n], &mut saw_prefix) {
+                LiveSnapshotInputAction::Forward { bytes } => {
+                    if !bytes.is_empty() {
+                        let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
+                    }
+                }
+                LiveSnapshotInputAction::Detach { forward } => {
+                    if !forward.is_empty() {
+                        let _ = sender.send(LiveSnapshotInputEvent::Forward(forward));
+                    }
+                    let _ = sender.send(LiveSnapshotInputEvent::Detach);
+                    break;
+                }
             }
         }
     });
@@ -325,11 +354,22 @@ fn run_live_snapshot_attach(
 ) -> io::Result<()> {
     let input = spawn_live_snapshot_input_thread();
     write_live_snapshot_frame(socket, session)?;
+    let mut last_redraw = Instant::now();
 
     loop {
         match input.recv_timeout(LIVE_SNAPSHOT_REDRAW_INTERVAL) {
+            Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
+                stream.write_all(&bytes)?;
+                if last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL {
+                    write_live_snapshot_frame(socket, session)?;
+                    last_redraw = Instant::now();
+                }
+            }
             Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => write_live_snapshot_frame(socket, session)?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                write_live_snapshot_frame(socket, session)?;
+                last_redraw = Instant::now();
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -964,22 +1004,70 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_input_detaches_on_prefix_d() {
+    fn live_snapshot_input_forwards_arbitrary_bytes() {
         let mut saw_prefix = false;
 
-        let action = translate_live_snapshot_input(b"\x02d", &mut saw_prefix);
+        let action = translate_live_snapshot_input(b"hello\n", &mut saw_prefix);
 
-        assert_eq!(action, LiveSnapshotInputAction::Detach);
+        assert_eq!(
+            action,
+            LiveSnapshotInputAction::Forward {
+                bytes: b"hello\n".to_vec()
+            }
+        );
         assert!(!saw_prefix);
     }
 
     #[test]
-    fn live_snapshot_input_ignores_arbitrary_bytes_without_forwarding() {
+    fn live_snapshot_input_detaches_on_prefix_d_without_forwarding_bytes() {
         let mut saw_prefix = false;
 
-        let action = translate_live_snapshot_input(b"ignored\n", &mut saw_prefix);
+        let action = translate_live_snapshot_input(b"\x02d", &mut saw_prefix);
 
-        assert_eq!(action, LiveSnapshotInputAction::Continue);
+        assert_eq!(
+            action,
+            LiveSnapshotInputAction::Detach {
+                forward: Vec::new()
+            }
+        );
+        assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_forwards_literal_prefix_with_regular_key() {
+        let mut saw_prefix = false;
+
+        let action = translate_live_snapshot_input(b"\x02x", &mut saw_prefix);
+
+        assert_eq!(
+            action,
+            LiveSnapshotInputAction::Forward {
+                bytes: b"\x02x".to_vec()
+            }
+        );
+        assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_forwards_single_literal_prefix_on_double_prefix() {
+        let mut saw_prefix = false;
+
+        let action = translate_live_snapshot_input(b"\x02\x02", &mut saw_prefix);
+
+        assert_eq!(
+            action,
+            LiveSnapshotInputAction::Forward { bytes: vec![0x02] }
+        );
+        assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_flushes_pending_prefix_on_eof() {
+        let mut saw_prefix = true;
+
+        let pending = finish_live_snapshot_input(&mut saw_prefix);
+
+        assert_eq!(pending, Some(vec![0x02]));
         assert!(!saw_prefix);
     }
 
