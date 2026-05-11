@@ -18,7 +18,6 @@ const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 enum AttachMode {
     Live,
     Snapshot,
-    LiveSnapshot,
 }
 
 pub fn attach<F>(
@@ -40,13 +39,6 @@ where
     let attach_mode = parse_attach_ok(&response)?;
 
     if attach_mode == AttachMode::Snapshot {
-        write_attach_status_line(socket, session)?;
-        write_attach_pane_snapshot(socket, session)?;
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-        return Ok(());
-    }
-
-    if attach_mode == AttachMode::LiveSnapshot {
         let _guard = RawModeGuard::enable();
         return run_live_snapshot_attach(socket, session, &mut stream);
     }
@@ -121,24 +113,9 @@ fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
         return Ok(AttachMode::Snapshot);
     }
 
-    if response == "OK\tLIVE_SNAPSHOT\n" {
-        return Ok(AttachMode::LiveSnapshot);
-    }
-
     Err(io::Error::other(format!(
         "unexpected server response: {response:?}"
     )))
-}
-
-fn write_attach_pane_snapshot(socket: &Path, session: &str) -> io::Result<()> {
-    let body = read_attach_pane_snapshot(socket, session)?;
-    if body.is_empty() {
-        return Ok(());
-    }
-
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(&body)?;
-    stdout.flush()
 }
 
 fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<()> {
@@ -979,10 +956,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_live_snapshot_attach_ok() {
+    fn parses_snapshot_attach_ok() {
         assert_eq!(
-            parse_attach_ok("OK\tLIVE_SNAPSHOT\n").unwrap(),
-            AttachMode::LiveSnapshot
+            parse_attach_ok("OK\tSNAPSHOT\n").unwrap(),
+            AttachMode::Snapshot
         );
     }
 

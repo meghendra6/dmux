@@ -4,56 +4,55 @@
 
 **Goal:** Make unzoomed multi-pane `attach` stay open and redraw split-layout snapshots repeatedly in read-only mode.
 
-**Architecture:** Add a `LIVE_SNAPSHOT` attach handshake for multiple visible panes. Write failing integration tests before the redraw implementation, then implement a client-side polling redraw loop that repeatedly requests `status-line` and `ATTACH_SNAPSHOT`. Keep existing raw live attach unchanged for single visible panes and zoomed split windows.
+**Architecture:** Reuse the existing `SNAPSHOT` attach handshake for multiple visible panes. Write failing integration tests before the redraw implementation, then implement a client-side polling redraw loop that repeatedly requests `status-line` and `ATTACH_SNAPSHOT`. Keep existing raw live attach unchanged for single visible panes and zoomed split windows.
 
 **Tech Stack:** Rust standard library, existing Unix socket protocol, existing attach client in `src/client.rs`, existing attach snapshot renderer in `src/server.rs`, integration tests in `tests/phase1_cli.rs`.
 
 ---
 
-### Task 1: Add Live Snapshot Handshake
+### Task 1: Preserve Snapshot Handshake
 
 **Files:**
 - Modify: `src/client.rs`
 - Modify: `src/server.rs`
 
-- [x] **Step 1: Write failing parser test**
+- [x] **Step 1: Keep snapshot parser coverage**
 
 Add this test to `src/client.rs` in `#[cfg(test)] mod tests`:
 
 ```rust
 #[test]
-fn parses_live_snapshot_attach_ok() {
+fn parses_snapshot_attach_ok() {
     assert_eq!(
-        parse_attach_ok("OK\tLIVE_SNAPSHOT\n").unwrap(),
-        AttachMode::LiveSnapshot
+        parse_attach_ok("OK\tSNAPSHOT\n").unwrap(),
+        AttachMode::Snapshot
     );
 }
 ```
 
-- [x] **Step 2: Run parser test to verify RED**
+- [x] **Step 2: Run parser test**
 
 Run:
 
 ```bash
-cargo test client::tests::parses_live_snapshot_attach_ok
+cargo test client::tests::parses_snapshot_attach_ok
 ```
 
-Expected: FAIL because `AttachMode::LiveSnapshot` does not exist and `parse_attach_ok` rejects `OK\tLIVE_SNAPSHOT\n`.
+Expected: PASS, proving the existing snapshot handshake remains understood.
 
-- [x] **Step 3: Implement handshake mode**
+- [x] **Step 3: Keep server on the existing snapshot response**
 
-Update `AttachMode` in `src/client.rs`:
+Keep `AttachMode` in `src/client.rs` to the existing modes:
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachMode {
     Live,
     Snapshot,
-    LiveSnapshot,
 }
 ```
 
-Update `parse_attach_ok`:
+Keep `parse_attach_ok` on the existing attach responses:
 
 ```rust
 fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
@@ -65,21 +64,17 @@ fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
         return Ok(AttachMode::Snapshot);
     }
 
-    if response == "OK\tLIVE_SNAPSHOT\n" {
-        return Ok(AttachMode::LiveSnapshot);
-    }
-
     Err(io::Error::other(format!(
         "unexpected server response: {response:?}"
     )))
 }
 ```
 
-Rename the server helper in `src/server.rs`:
+Keep the server helper in `src/server.rs` on the existing wire response:
 
 ```rust
-fn write_attach_live_snapshot_ok(stream: &mut UnixStream) -> io::Result<()> {
-    stream.write_all(b"OK\tLIVE_SNAPSHOT\n")
+fn write_attach_snapshot_ok(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_all(b"OK\tSNAPSHOT\n")
 }
 ```
 
@@ -87,28 +82,28 @@ Update the multi-pane branch in `handle_attach`:
 
 ```rust
 if has_attach_pane_snapshot(&session) {
-    write_attach_live_snapshot_ok(&mut stream)?;
+    write_attach_snapshot_ok(&mut stream)?;
     return Ok(());
 }
 ```
 
-- [x] **Step 4: Run parser test to verify GREEN**
+- [x] **Step 4: Add and run handshake compatibility regression**
 
 Run:
 
 ```bash
-cargo test client::tests::parses_live_snapshot_attach_ok
+cargo test --test phase1_cli attach_multi_pane_keeps_snapshot_handshake_for_client_compatibility
 ```
 
-Expected: PASS.
+Expected: FAIL before the review fix if the server emits a new attach response; PASS after the server keeps `OK\tSNAPSHOT\n`.
 
-- [x] **Step 5: Commit handshake**
+- [x] **Step 5: Commit handshake compatibility fix**
 
 Run:
 
 ```bash
 git add src/client.rs src/server.rs
-git commit -m "feat: add live snapshot attach mode"
+git commit -m "fix: preserve split attach snapshot handshake"
 ```
 
 ### Task 2: Write Live Redraw Failing Tests
@@ -253,7 +248,7 @@ Run:
 cargo test --test phase1_cli attach_live_redraws_split_pane_output_after_attach_starts
 ```
 
-Expected: FAIL because `LiveSnapshot` mode is parsed but not handled by a redraw loop, or because multi-pane attach exits before `late:hello` can appear.
+Expected: FAIL because snapshot mode exits before `late:hello` can appear.
 
 - [x] **Step 5: Keep tests with the implementation commit**
 
@@ -431,19 +426,12 @@ fn run_live_snapshot_attach(socket: &Path, session: &str, stream: &mut UnixStrea
 }
 ```
 
-- [x] **Step 4: Route `LiveSnapshot` mode in `attach`**
+- [x] **Step 4: Route `Snapshot` mode into the live redraw loop**
 
 Update the attach mode branch:
 
 ```rust
 if attach_mode == AttachMode::Snapshot {
-    write_attach_status_line(socket, session)?;
-    write_attach_pane_snapshot(socket, session)?;
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-    return Ok(());
-}
-
-if attach_mode == AttachMode::LiveSnapshot {
     let _guard = RawModeGuard::enable();
     return run_live_snapshot_attach(socket, session, &mut stream);
 }
@@ -517,7 +505,7 @@ cargo test
 
 Expected: formatting and whitespace checks pass; keyword scan prints no matches; all unit and integration tests pass.
 
-- [ ] **Step 3: Request critical review**
+- [x] **Step 3: Request critical review**
 
 Dispatch a read-only review subagent against `git diff origin/main` with this brief:
 

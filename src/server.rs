@@ -1492,7 +1492,7 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
     };
 
     if has_attach_pane_snapshot(&session) {
-        write_attach_live_snapshot_ok(&mut stream)?;
+        write_attach_snapshot_ok(&mut stream)?;
         return Ok(());
     }
 
@@ -1519,8 +1519,8 @@ fn has_attach_pane_snapshot(session: &Session) -> bool {
     session.attach_panes().len() > 1
 }
 
-fn write_attach_live_snapshot_ok(stream: &mut UnixStream) -> io::Result<()> {
-    stream.write_all(b"OK\tLIVE_SNAPSHOT\n")
+fn write_attach_snapshot_ok(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_all(b"OK\tSNAPSHOT\n")
 }
 
 fn handle_attach_snapshot(
@@ -1547,7 +1547,7 @@ fn handle_attach_snapshot(
 
 fn attach_pane_snapshot(session: &Session) -> Option<String> {
     let snapshot = session.attach_layout_snapshot();
-    if snapshot.panes.len() <= 1 {
+    if snapshot.panes.is_empty() {
         return None;
     }
 

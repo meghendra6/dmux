@@ -41,11 +41,12 @@ capture sources as `capture-pane`; default and `--all` are combined history plus
 screen. Use `--search` to show only matching lines while preserving their
 original line numbers.
 
-Attached clients can enter the current basic copy-mode view with `C-b [`.
-Inside copy-mode, `j`/`k` and `Ctrl-n`/`Ctrl-p` move the cursor, `y` or Enter
-saves the current line to a buffer, and `q` or Escape exits. Mouse click saves
-one rendered line; mouse drag saves an inclusive line range. Mouse selection is
-currently basic line-level selection.
+Single-pane and zoomed attached clients can enter the current basic copy-mode
+view with `C-b [`. Inside copy-mode, `j`/`k` and `Ctrl-n`/`Ctrl-p` move the
+cursor, `y` or Enter saves the current line to a buffer, and `q` or Escape
+exits. Mouse click saves one rendered line; mouse drag saves an inclusive line
+range. Mouse selection is currently basic line-level selection. Unzoomed
+multi-pane attach is read-only and handles `C-b d` to detach.
 
 `save-buffer` currently stores captured active-pane text in an in-memory buffer
 with a 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name

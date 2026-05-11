@@ -37,13 +37,17 @@ stream behavior.
 
 ## Chosen Design
 
-When multiple panes are visible, `ATTACH` returns a new attach mode:
+When multiple panes are visible, `ATTACH` keeps returning the existing snapshot
+mode:
 
 ```text
-OK\tLIVE_SNAPSHOT
+OK\tSNAPSHOT
 ```
 
-The client handles this mode by entering a read-only redraw loop:
+The client handles this mode by entering a read-only redraw loop. This keeps
+older clients compatible with newer servers: an older client still renders the
+snapshot once and exits, while the newer client polls the existing snapshot
+endpoint.
 
 - render the statusline and current split-layout snapshot immediately
 - clear the terminal viewport before each redraw using ANSI home + clear-screen
@@ -52,9 +56,8 @@ The client handles this mode by entering a read-only redraw loop:
 - exit on stdin EOF, which keeps non-interactive tests from hanging
 - do not forward arbitrary stdin bytes to pane PTYs in this mode
 
-The existing `OK\tSNAPSHOT` parser branch remains for compatibility, but the
-server stops emitting it for normal multi-pane attach. Zoomed panes still expose
-one visible pane, so `ATTACH` returns `OK` and uses the existing live raw path.
+Zoomed panes still expose one visible pane, so `ATTACH` returns `OK` and uses
+the existing live raw path.
 
 ## Timing
 
@@ -65,7 +68,7 @@ poll captured stdout until newly emitted pane content appears.
 ## Data Flow
 
 1. Client sends `ATTACH`.
-2. Server detects multiple visible panes and writes `OK\tLIVE_SNAPSHOT\n`.
+2. Server detects multiple visible panes and writes `OK\tSNAPSHOT\n`.
 3. Client enters raw mode and starts a read-only input thread that watches for
    `C-b d` or EOF.
 4. Client redraw loop requests `status-line` and `ATTACH_SNAPSHOT`.
@@ -79,13 +82,14 @@ poll captured stdout until newly emitted pane content appears.
 - If stdin EOF happens before the first tick, the client renders one frame first
   and then exits.
 - If a pane disappears between redraw requests, the next `ATTACH_SNAPSHOT`
-  reflects the server's current active window state.
+  reflects the server's current active window state, including a single
+  remaining visible pane.
 
 ## Tests
 
 Add tests before implementation:
 
-- parser accepts `OK\tLIVE_SNAPSHOT\n`
+- multi-pane attach keeps the existing `OK\tSNAPSHOT\n` handshake
 - live snapshot input exits on `C-b d` without forwarding bytes
 - unzoomed split-pane attach stays open long enough to render output emitted
   after attach starts
