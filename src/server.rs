@@ -1493,7 +1493,7 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
 
     if has_attach_pane_snapshot(&session) {
         write_attach_snapshot_ok(&mut stream)?;
-        return Ok(());
+        return forward_multi_pane_attach_input(&session, &mut stream);
     }
 
     write_ok(&mut stream)?;
@@ -1521,6 +1521,26 @@ fn has_attach_pane_snapshot(session: &Session) -> bool {
 
 fn write_attach_snapshot_ok(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_all(b"OK\tSNAPSHOT\n")
+}
+
+fn forward_multi_pane_attach_input(
+    session: &Arc<Session>,
+    stream: &mut UnixStream,
+) -> io::Result<()> {
+    let mut buf = [0_u8; 8192];
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+
+        let Some(pane) = session.active_pane() else {
+            break;
+        };
+        pane.writer.lock().unwrap().write_all(&buf[..n])?;
+    }
+
+    Ok(())
 }
 
 fn handle_attach_snapshot(

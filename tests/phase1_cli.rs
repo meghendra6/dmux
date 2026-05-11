@@ -861,6 +861,79 @@ fn attach_live_redraws_split_pane_output_after_attach_starts() {
 }
 
 #[test]
+fn attach_live_input_routes_stdin_to_active_split_pane() {
+    let socket = unique_socket("attach-live-input");
+    let session = format!("attach-live-input-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; echo typed:$line; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"hello\n").expect("write attach input");
+        stdin.flush().expect("flush attach input");
+    }
+
+    let typed = poll_capture(&socket, &session, "typed:hello");
+    assert!(typed.contains("typed:hello"), "{typed:?}");
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("typed:hello"), "{stdout:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_multi_pane_keeps_snapshot_handshake_for_client_compatibility() {
     let socket = unique_socket("attach-snapshot-handshake");
     let session = format!("attach-snapshot-handshake-{}", std::process::id());

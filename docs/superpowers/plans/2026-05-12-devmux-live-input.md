@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `src/client.rs`
 
-- [ ] **Step 1: Replace the read-only translation unit tests**
+- [x] **Step 1: Replace the read-only translation unit tests**
 
 In `src/client.rs`, replace the existing `live_snapshot_input_...` tests with:
 
@@ -76,7 +76,7 @@ fn live_snapshot_input_flushes_pending_prefix_on_eof() {
 }
 ```
 
-- [ ] **Step 2: Run unit tests to verify RED**
+- [x] **Step 2: Run unit tests to verify RED**
 
 Run:
 
@@ -86,7 +86,7 @@ cargo test live_snapshot_input_
 
 Expected: FAIL because `LiveSnapshotInputAction` still has `Continue`, has no forwarding payload, and `finish_live_snapshot_input` does not exist.
 
-- [ ] **Step 3: Implement forwardable input translation**
+- [x] **Step 3: Implement forwardable input translation**
 
 In `src/client.rs`, replace `LiveSnapshotInputAction` and `translate_live_snapshot_input` with:
 
@@ -133,7 +133,7 @@ fn finish_live_snapshot_input(saw_prefix: &mut bool) -> Option<Vec<u8>> {
 }
 ```
 
-- [ ] **Step 4: Run unit tests to verify GREEN**
+- [x] **Step 4: Run unit tests to verify GREEN**
 
 Run:
 
@@ -143,13 +143,15 @@ cargo test live_snapshot_input_
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit client translator**
+- [x] **Step 5: Keep translator with live input forwarding commit**
 
-Run:
+The translator was folded into the live input forwarding commit to avoid an intermediate commit with a temporary dead-code warning.
+
+Final commit command:
 
 ```bash
-git add src/client.rs
-git commit -m "feat: translate live attach input"
+git add src/client.rs src/server.rs tests/phase1_cli.rs docs/superpowers/plans/2026-05-12-devmux-live-input.md
+git commit -m "feat: route live attach input"
 ```
 
 ### Task 2: Forward Live Snapshot Input Over The Attach Stream
@@ -158,7 +160,7 @@ git commit -m "feat: translate live attach input"
 - Modify: `src/client.rs`
 - Modify: `src/server.rs`
 
-- [ ] **Step 1: Write failing integration test**
+- [x] **Step 1: Write failing integration test**
 
 Add this test in `tests/phase1_cli.rs` after `attach_live_redraws_split_pane_output_after_attach_starts`:
 
@@ -237,7 +239,7 @@ fn attach_live_input_routes_stdin_to_active_split_pane() {
 }
 ```
 
-- [ ] **Step 2: Run integration test to verify RED**
+- [x] **Step 2: Run integration test to verify RED**
 
 Run:
 
@@ -247,7 +249,7 @@ cargo test --test phase1_cli attach_live_input_routes_stdin_to_active_split_pane
 
 Expected: FAIL because the client does not forward live snapshot input and the server returns from multi-pane `ATTACH` after the handshake.
 
-- [ ] **Step 3: Update live snapshot input events**
+- [x] **Step 3: Update live snapshot input events**
 
 In `src/client.rs`, replace `LiveSnapshotInputEvent` with:
 
@@ -306,7 +308,7 @@ fn spawn_live_snapshot_input_thread() -> mpsc::Receiver<LiveSnapshotInputEvent> 
 }
 ```
 
-- [ ] **Step 4: Forward events in the redraw loop**
+- [x] **Step 4: Forward events in the redraw loop**
 
 Update `run_live_snapshot_attach`:
 
@@ -321,7 +323,7 @@ loop {
 }
 ```
 
-- [ ] **Step 5: Keep the server multi-pane attach stream open for input**
+- [x] **Step 5: Keep the server multi-pane attach stream open for input**
 
 In `src/server.rs`, update the multi-pane branch in `handle_attach`:
 
@@ -353,7 +355,7 @@ fn forward_multi_pane_attach_input(session: &Arc<Session>, stream: &mut UnixStre
 }
 ```
 
-- [ ] **Step 6: Run focused integration tests to verify GREEN**
+- [x] **Step 6: Run focused integration tests to verify GREEN**
 
 Run:
 
@@ -366,7 +368,7 @@ cargo test --test phase1_cli attach_keeps_zoomed_split_pane_live
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit live input forwarding**
+- [x] **Step 7: Commit live input forwarding**
 
 Run:
 
