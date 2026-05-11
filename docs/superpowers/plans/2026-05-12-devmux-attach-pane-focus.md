@@ -347,7 +347,7 @@ git commit -m "feat: cycle pane focus in attach"
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-05-12-devmux-attach-pane-focus.md`
 
-- [ ] **Step 1: Update README**
+- [x] **Step 1: Update README**
 
 Add implemented groundwork:
 
@@ -361,7 +361,7 @@ Update current limits:
 - multi-pane attach live redraw is polling-based and routes input to the server active pane; numbered pane selection, mouse focus, and multi-pane copy-mode are not implemented yet
 ```
 
-- [ ] **Step 2: Run full verification**
+- [x] **Step 2: Run full verification**
 
 Run:
 
