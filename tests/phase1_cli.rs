@@ -404,6 +404,33 @@ fn poll_capture(socket: &std::path::Path, session: &str, needle: &str) -> String
     last
 }
 
+fn poll_active_pane(socket: &std::path::Path, session: &str, expected: usize) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+    let expected = format!("{expected}\t1");
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(
+            socket,
+            &[
+                "list-panes",
+                "-t",
+                session,
+                "-F",
+                "#{pane.index}\t#{pane.active}",
+            ],
+        );
+        assert_success(&output);
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if last.lines().any(|line| line == expected) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
+}
+
 fn poll_file_contains(path: &std::path::Path, needle: &str) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
@@ -941,6 +968,94 @@ fn attach_live_input_routes_stdin_to_active_split_pane() {
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("typed:hello"), "{stdout:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_prefix_o_cycles_active_pane_for_live_input() {
+    let socket = unique_socket("attach-pane-cycle");
+    let session = format!("attach-pane-cycle-{}", std::process::id());
+    let base_file = unique_temp_file("attach-pane-cycle-base");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; echo split-typed:$line; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin
+            .write_all(b"\x02obase-cycle\n")
+            .expect("write coalesced cycle and base input");
+        stdin.flush().expect("flush coalesced base input");
+    }
+    assert!(poll_file_contains(&base_file, "base-cycle"));
+    let panes = poll_active_pane(&socket, &session, 0);
+    assert!(panes.lines().any(|line| line == "0\t1"), "{panes:?}");
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02o").expect("write second cycle input");
+        stdin.flush().expect("flush second cycle input");
+    }
+    let panes = poll_active_pane(&socket, &session, 1);
+    assert!(panes.lines().any(|line| line == "1\t1"), "{panes:?}");
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"split\r").expect("write split input");
+        stdin.flush().expect("flush split input");
+    }
+    let split = poll_capture(&socket, &session, "split-typed:split");
+    assert!(split.contains("split-typed:split"), "{split:?}");
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

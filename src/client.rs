@@ -222,8 +222,9 @@ enum AttachInputAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveSnapshotInputAction {
-    Forward { bytes: Vec<u8> },
-    Detach { forward: Vec<u8> },
+    Forward(Vec<u8>),
+    Detach,
+    SelectNextPane,
 }
 
 fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAction {
@@ -259,14 +260,35 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAct
     AttachInputAction::Forward(output)
 }
 
-fn translate_live_snapshot_input(input: &[u8], saw_prefix: &mut bool) -> LiveSnapshotInputAction {
+fn translate_live_snapshot_input(
+    input: &[u8],
+    saw_prefix: &mut bool,
+) -> Vec<LiveSnapshotInputAction> {
     let mut output = Vec::with_capacity(input.len());
+    let mut actions = Vec::new();
 
     for byte in input {
         if *saw_prefix {
             *saw_prefix = false;
             match *byte {
-                b'd' => return LiveSnapshotInputAction::Detach { forward: output },
+                b'd' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::Detach);
+                    return actions;
+                }
+                b'o' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::SelectNextPane);
+                    continue;
+                }
                 0x02 => {
                     output.push(0x02);
                     continue;
@@ -286,7 +308,10 @@ fn translate_live_snapshot_input(input: &[u8], saw_prefix: &mut bool) -> LiveSna
         }
     }
 
-    LiveSnapshotInputAction::Forward { bytes: output }
+    if !output.is_empty() {
+        actions.push(LiveSnapshotInputAction::Forward(output));
+    }
+    actions
 }
 
 fn finish_live_snapshot_input(saw_prefix: &mut bool) -> Option<Vec<u8>> {
@@ -298,9 +323,48 @@ fn finish_live_snapshot_input(saw_prefix: &mut bool) -> Option<Vec<u8>> {
     Some(vec![0x02])
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneListEntry {
+    index: usize,
+    active: bool,
+}
+
+fn next_pane_index_from_listing(listing: &str) -> io::Result<usize> {
+    let entries = parse_pane_listing(listing)?;
+    if entries.is_empty() {
+        return Err(io::Error::other("missing pane"));
+    }
+
+    let active = entries
+        .iter()
+        .position(|entry| entry.active)
+        .ok_or_else(|| io::Error::other("missing active pane"))?;
+    Ok(entries[(active + 1) % entries.len()].index)
+}
+
+fn parse_pane_listing(listing: &str) -> io::Result<Vec<PaneListEntry>> {
+    let mut entries = Vec::new();
+    for line in listing.lines() {
+        let Some((index, active)) = line.split_once('\t') else {
+            return Err(io::Error::other("invalid pane listing"));
+        };
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| io::Error::other("invalid pane index"))?;
+        let active = match active {
+            "0" => false,
+            "1" => true,
+            _ => return Err(io::Error::other("invalid active pane flag")),
+        };
+        entries.push(PaneListEntry { index, active });
+    }
+    Ok(entries)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveSnapshotInputEvent {
     Forward(Vec<u8>),
+    SelectNextPane,
     Detach,
     Eof,
 }
@@ -328,18 +392,18 @@ fn spawn_live_snapshot_input_thread() -> mpsc::Receiver<LiveSnapshotInputEvent> 
                 }
             };
 
-            match translate_live_snapshot_input(&buf[..n], &mut saw_prefix) {
-                LiveSnapshotInputAction::Forward { bytes } => {
-                    if !bytes.is_empty() {
+            for action in translate_live_snapshot_input(&buf[..n], &mut saw_prefix) {
+                match action {
+                    LiveSnapshotInputAction::Forward(bytes) => {
                         let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
                     }
-                }
-                LiveSnapshotInputAction::Detach { forward } => {
-                    if !forward.is_empty() {
-                        let _ = sender.send(LiveSnapshotInputEvent::Forward(forward));
+                    LiveSnapshotInputAction::Detach => {
+                        let _ = sender.send(LiveSnapshotInputEvent::Detach);
+                        return;
                     }
-                    let _ = sender.send(LiveSnapshotInputEvent::Detach);
-                    break;
+                    LiveSnapshotInputAction::SelectNextPane => {
+                        let _ = sender.send(LiveSnapshotInputEvent::SelectNextPane);
+                    }
                 }
             }
         }
@@ -365,6 +429,11 @@ fn run_live_snapshot_attach(
                     last_redraw = Instant::now();
                 }
             }
+            Ok(LiveSnapshotInputEvent::SelectNextPane) => {
+                select_next_pane(socket, session)?;
+                write_live_snapshot_frame(socket, session)?;
+                last_redraw = Instant::now();
+            }
             Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 write_live_snapshot_frame(socket, session)?;
@@ -375,6 +444,17 @@ fn run_live_snapshot_attach(
     }
 
     let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
+    let body = send_control_request(
+        socket,
+        &protocol::encode_list_panes(session, Some("#{pane.index}\t#{pane.active}")),
+    )?;
+    let listing = String::from_utf8_lossy(&body);
+    let next = next_pane_index_from_listing(&listing)?;
+    let _ = send_control_request(socket, &protocol::encode_select_pane(session, next))?;
     Ok(())
 }
 
@@ -1007,13 +1087,11 @@ mod tests {
     fn live_snapshot_input_forwards_arbitrary_bytes() {
         let mut saw_prefix = false;
 
-        let action = translate_live_snapshot_input(b"hello\n", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"hello\n", &mut saw_prefix);
 
         assert_eq!(
-            action,
-            LiveSnapshotInputAction::Forward {
-                bytes: b"hello\n".to_vec()
-            }
+            actions,
+            vec![LiveSnapshotInputAction::Forward(b"hello\n".to_vec())]
         );
         assert!(!saw_prefix);
     }
@@ -1022,14 +1100,9 @@ mod tests {
     fn live_snapshot_input_detaches_on_prefix_d_without_forwarding_bytes() {
         let mut saw_prefix = false;
 
-        let action = translate_live_snapshot_input(b"\x02d", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02d", &mut saw_prefix);
 
-        assert_eq!(
-            action,
-            LiveSnapshotInputAction::Detach {
-                forward: Vec::new()
-            }
-        );
+        assert_eq!(actions, vec![LiveSnapshotInputAction::Detach]);
         assert!(!saw_prefix);
     }
 
@@ -1037,13 +1110,11 @@ mod tests {
     fn live_snapshot_input_forwards_literal_prefix_with_regular_key() {
         let mut saw_prefix = false;
 
-        let action = translate_live_snapshot_input(b"\x02x", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02x", &mut saw_prefix);
 
         assert_eq!(
-            action,
-            LiveSnapshotInputAction::Forward {
-                bytes: b"\x02x".to_vec()
-            }
+            actions,
+            vec![LiveSnapshotInputAction::Forward(b"\x02x".to_vec())]
         );
         assert!(!saw_prefix);
     }
@@ -1052,13 +1123,54 @@ mod tests {
     fn live_snapshot_input_forwards_single_literal_prefix_on_double_prefix() {
         let mut saw_prefix = false;
 
-        let action = translate_live_snapshot_input(b"\x02\x02", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02\x02", &mut saw_prefix);
+
+        assert_eq!(actions, vec![LiveSnapshotInputAction::Forward(vec![0x02])]);
+        assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_selects_next_pane_on_prefix_o() {
+        let mut saw_prefix = false;
+
+        let actions = translate_live_snapshot_input(b"\x02o", &mut saw_prefix);
+
+        assert_eq!(actions, vec![LiveSnapshotInputAction::SelectNextPane]);
+        assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_preserves_order_when_prefix_o_shares_a_read() {
+        let mut saw_prefix = false;
+
+        let actions = translate_live_snapshot_input(b"abc\x02odef", &mut saw_prefix);
 
         assert_eq!(
-            action,
-            LiveSnapshotInputAction::Forward { bytes: vec![0x02] }
+            actions,
+            vec![
+                LiveSnapshotInputAction::Forward(b"abc".to_vec()),
+                LiveSnapshotInputAction::SelectNextPane,
+                LiveSnapshotInputAction::Forward(b"def".to_vec()),
+            ]
         );
         assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn next_pane_index_wraps_after_active_pane() {
+        assert_eq!(
+            next_pane_index_from_listing("0\t0\n1\t1\n2\t0\n").unwrap(),
+            2
+        );
+        assert_eq!(
+            next_pane_index_from_listing("0\t0\n1\t0\n2\t1\n").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn next_pane_index_rejects_missing_active_pane() {
+        assert!(next_pane_index_from_listing("0\t0\n1\t0\n").is_err());
     }
 
     #[test]
