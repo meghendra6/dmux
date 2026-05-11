@@ -5,10 +5,14 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
 const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+const LIVE_SNAPSHOT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachMode {
@@ -34,13 +38,12 @@ where
     }
     let attach_mode = parse_attach_ok(&response)?;
 
-    write_attach_status_line(socket, session)?;
     if attach_mode == AttachMode::Snapshot {
-        write_attach_pane_snapshot(socket, session)?;
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-        return Ok(());
+        let _guard = RawModeGuard::enable();
+        return run_live_snapshot_attach(socket, session, &mut stream);
     }
 
+    write_attach_status_line(socket, session)?;
     let _guard = RawModeGuard::enable();
     install_winch_handler();
     let mut output_stream = stream.try_clone()?;
@@ -81,16 +84,23 @@ fn copy_attach_output(output_stream: &mut UnixStream) {
     }
 }
 
-fn write_attach_status_line(socket: &Path, session: &str) -> io::Result<()> {
+fn read_attach_status_line(socket: &Path, session: &str) -> io::Result<String> {
     let body = send_control_request(socket, &protocol::encode_status_line(session, None))?;
-    let status = String::from_utf8_lossy(&body);
-    let status = status.trim_end();
+    Ok(String::from_utf8_lossy(&body).trim_end().to_string())
+}
+
+fn read_attach_pane_snapshot(socket: &Path, session: &str) -> io::Result<Vec<u8>> {
+    send_control_request(socket, &protocol::encode_attach_snapshot(session))
+}
+
+fn write_attach_status_line(socket: &Path, session: &str) -> io::Result<()> {
+    let status = read_attach_status_line(socket, session)?;
     if status.is_empty() {
         return Ok(());
     }
 
     let mut stdout = io::stdout().lock();
-    stdout.write_all(format!("{status}\r\n").as_bytes())?;
+    stdout.write_all(format!("{}\r\n", status).as_bytes())?;
     stdout.flush()
 }
 
@@ -108,14 +118,16 @@ fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
     )))
 }
 
-fn write_attach_pane_snapshot(socket: &Path, session: &str) -> io::Result<()> {
-    let body = send_control_request(socket, &protocol::encode_attach_snapshot(session))?;
-    if body.is_empty() {
-        return Ok(());
-    }
+fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<()> {
+    let status = read_attach_status_line(socket, session)?;
+    let snapshot = read_attach_pane_snapshot(socket, session)?;
 
     let mut stdout = io::stdout().lock();
-    stdout.write_all(&body)?;
+    stdout.write_all(CLEAR_SCREEN)?;
+    if !status.is_empty() {
+        stdout.write_all(format!("{status}\r\n").as_bytes())?;
+    }
+    stdout.write_all(&snapshot)?;
     stdout.flush()
 }
 
@@ -208,6 +220,12 @@ enum AttachInputAction {
     Detach,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveSnapshotInputAction {
+    Continue,
+    Detach,
+}
+
 fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAction {
     let mut output = Vec::with_capacity(input.len());
 
@@ -239,6 +257,85 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAct
     }
 
     AttachInputAction::Forward(output)
+}
+
+fn translate_live_snapshot_input(input: &[u8], saw_prefix: &mut bool) -> LiveSnapshotInputAction {
+    for byte in input {
+        if *saw_prefix {
+            *saw_prefix = false;
+            match *byte {
+                b'd' => return LiveSnapshotInputAction::Detach,
+                0x02 => {
+                    *saw_prefix = true;
+                    continue;
+                }
+                _ => continue,
+            }
+        }
+
+        if *byte == 0x02 {
+            *saw_prefix = true;
+        }
+    }
+
+    LiveSnapshotInputAction::Continue
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveSnapshotInputEvent {
+    Detach,
+    Eof,
+}
+
+fn spawn_live_snapshot_input_thread() -> mpsc::Receiver<LiveSnapshotInputEvent> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut buf = [0_u8; 1024];
+        let mut saw_prefix = false;
+
+        loop {
+            let n = match stdin.read(&mut buf) {
+                Ok(0) => {
+                    let _ = sender.send(LiveSnapshotInputEvent::Eof);
+                    break;
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    let _ = sender.send(LiveSnapshotInputEvent::Eof);
+                    break;
+                }
+            };
+
+            if translate_live_snapshot_input(&buf[..n], &mut saw_prefix)
+                == LiveSnapshotInputAction::Detach
+            {
+                let _ = sender.send(LiveSnapshotInputEvent::Detach);
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+fn run_live_snapshot_attach(
+    socket: &Path,
+    session: &str,
+    stream: &mut UnixStream,
+) -> io::Result<()> {
+    let input = spawn_live_snapshot_input_thread();
+    write_live_snapshot_frame(socket, session)?;
+
+    loop {
+        match input.recv_timeout(LIVE_SNAPSHOT_REDRAW_INTERVAL) {
+            Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => write_live_snapshot_frame(socket, session)?,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
 }
 
 fn forward_stdin_until_detach<F, C>(
@@ -856,6 +953,34 @@ mod tests {
         WINCH_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(take_winch_pending());
         assert!(!take_winch_pending());
+    }
+
+    #[test]
+    fn parses_snapshot_attach_ok() {
+        assert_eq!(
+            parse_attach_ok("OK\tSNAPSHOT\n").unwrap(),
+            AttachMode::Snapshot
+        );
+    }
+
+    #[test]
+    fn live_snapshot_input_detaches_on_prefix_d() {
+        let mut saw_prefix = false;
+
+        let action = translate_live_snapshot_input(b"\x02d", &mut saw_prefix);
+
+        assert_eq!(action, LiveSnapshotInputAction::Detach);
+        assert!(!saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_ignores_arbitrary_bytes_without_forwarding() {
+        let mut saw_prefix = false;
+
+        let action = translate_live_snapshot_input(b"ignored\n", &mut saw_prefix);
+
+        assert_eq!(action, LiveSnapshotInputAction::Continue);
+        assert!(!saw_prefix);
     }
 
     #[test]

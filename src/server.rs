@@ -1547,7 +1547,7 @@ fn handle_attach_snapshot(
 
 fn attach_pane_snapshot(session: &Session) -> Option<String> {
     let snapshot = session.attach_layout_snapshot();
-    if snapshot.panes.len() <= 1 {
+    if snapshot.panes.is_empty() {
         return None;
     }
 
