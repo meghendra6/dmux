@@ -16,7 +16,7 @@
 - Modify: `src/client.rs`
 - Modify: `src/server.rs`
 
-- [ ] **Step 1: Write failing parser test**
+- [x] **Step 1: Write failing parser test**
 
 Add this test to `src/client.rs` in `#[cfg(test)] mod tests`:
 
@@ -30,7 +30,7 @@ fn parses_live_snapshot_attach_ok() {
 }
 ```
 
-- [ ] **Step 2: Run parser test to verify RED**
+- [x] **Step 2: Run parser test to verify RED**
 
 Run:
 
@@ -40,7 +40,7 @@ cargo test client::tests::parses_live_snapshot_attach_ok
 
 Expected: FAIL because `AttachMode::LiveSnapshot` does not exist and `parse_attach_ok` rejects `OK\tLIVE_SNAPSHOT\n`.
 
-- [ ] **Step 3: Implement handshake mode**
+- [x] **Step 3: Implement handshake mode**
 
 Update `AttachMode` in `src/client.rs`:
 
@@ -92,7 +92,7 @@ if has_attach_pane_snapshot(&session) {
 }
 ```
 
-- [ ] **Step 4: Run parser test to verify GREEN**
+- [x] **Step 4: Run parser test to verify GREEN**
 
 Run:
 

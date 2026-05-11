@@ -14,6 +14,7 @@ const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 enum AttachMode {
     Live,
     Snapshot,
+    LiveSnapshot,
 }
 
 pub fn attach<F>(
@@ -101,6 +102,10 @@ fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
 
     if response == "OK\tSNAPSHOT\n" {
         return Ok(AttachMode::Snapshot);
+    }
+
+    if response == "OK\tLIVE_SNAPSHOT\n" {
+        return Ok(AttachMode::LiveSnapshot);
     }
 
     Err(io::Error::other(format!(
@@ -856,6 +861,14 @@ mod tests {
         WINCH_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(take_winch_pending());
         assert!(!take_winch_pending());
+    }
+
+    #[test]
+    fn parses_live_snapshot_attach_ok() {
+        assert_eq!(
+            parse_attach_ok("OK\tLIVE_SNAPSHOT\n").unwrap(),
+            AttachMode::LiveSnapshot
+        );
     }
 
     #[test]
