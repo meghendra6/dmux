@@ -4,7 +4,7 @@
 
 **Goal:** Add `C-b [` copy-mode entry to unzoomed multi-pane attach, using the current server active pane.
 
-**Architecture:** Keep the server unchanged because copy-mode and save-buffer already target the active pane. Extend the live snapshot client input events so `C-b [` pauses polling redraw, runs the existing copy-mode UI on the input thread, then requests an immediate redraw before normal attach input resumes.
+**Architecture:** Keep the server unchanged because copy-mode and save-buffer already target the active pane. Extend the live snapshot client input events so `C-b [` asks the redraw loop to pause, waits for acknowledgement, runs the existing copy-mode UI on the input thread, then requests an immediate redraw before normal attach input resumes.
 
 **Tech Stack:** Rust standard library, existing Unix socket control requests, existing client copy-mode UI, integration tests in `tests/phase1_cli.rs`.
 
@@ -269,7 +269,7 @@ In `src/client.rs`, update `LiveSnapshotInputEvent`:
 enum LiveSnapshotInputEvent {
     Forward(Vec<u8>),
     SelectNextPane,
-    PauseRedraw,
+    PauseRedraw(mpsc::Sender<()>),
     RedrawNow,
     Error(String),
     Detach,
@@ -342,7 +342,9 @@ fn spawn_live_snapshot_input_thread(
     let mut stdin = io::stdin().lock();
     ...
     LiveSnapshotInputAction::EnterCopyMode { initial_input } => {
-        let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw);
+        let (pause_ack, pause_ready) = mpsc::channel();
+        let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw(pause_ack));
+        let _ = pause_ready.recv();
         match run_copy_mode_with_reader(&socket, &session, &initial_input, &mut stdin) {
             Ok(()) => {
                 let _ = sender.send(LiveSnapshotInputEvent::RedrawNow);
@@ -367,8 +369,9 @@ let mut redraw_paused = false;
 
 loop {
     match input.recv_timeout(LIVE_SNAPSHOT_REDRAW_INTERVAL) {
-        Ok(LiveSnapshotInputEvent::PauseRedraw) => {
+        Ok(LiveSnapshotInputEvent::PauseRedraw(pause_ack)) => {
             redraw_paused = true;
+            let _ = pause_ack.send(());
         }
         Ok(LiveSnapshotInputEvent::RedrawNow) => {
             redraw_paused = false;

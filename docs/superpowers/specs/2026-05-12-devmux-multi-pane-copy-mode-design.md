@@ -30,9 +30,10 @@ initial input.
 
 The live snapshot input thread will run copy-mode itself because it is the
 component that owns stdin. Before it enters copy-mode, it sends a pause event to
-the redraw loop so polling frames do not overwrite the copy-mode UI. After
-copy-mode exits, it sends a redraw event and resumes normal live snapshot input
-processing.
+the redraw loop and waits for an acknowledgement, so any forwarded bytes before
+the prefix are processed and polling frames do not overwrite the copy-mode UI.
+After copy-mode exits, it sends a redraw event and resumes normal live snapshot
+input processing.
 
 `run_copy_mode` will be split into a small wrapper plus a reader-based helper.
 Single-pane attach keeps calling the wrapper, while live snapshot attach reuses
@@ -43,13 +44,14 @@ stdin readers.
 
 1. User presses `C-b [` during unzoomed multi-pane attach.
 2. The input thread translates it to `EnterCopyMode`.
-3. The input thread sends `PauseRedraw` to the redraw loop.
-4. The input thread calls the existing copy-mode workflow against the current
+3. The input thread sends `PauseRedraw` to the redraw loop and waits for ack.
+4. The redraw loop pauses polling redraw and acknowledges the pause.
+5. The input thread calls the existing copy-mode workflow against the current
    active pane.
-5. Copy-mode reads further keys from the same stdin reader until copy or exit.
-6. `SAVE_BUFFER` stores copied text from the active pane.
-7. The input thread sends `RedrawNow` and resumes normal attach input handling.
-8. The redraw loop renders the current statusline and split layout again.
+6. Copy-mode reads further keys from the same stdin reader until copy or exit.
+7. `SAVE_BUFFER` stores copied text from the active pane.
+8. The input thread sends `RedrawNow` and resumes normal attach input handling.
+9. The redraw loop renders the current statusline and split layout again.
 
 ## Error Handling
 

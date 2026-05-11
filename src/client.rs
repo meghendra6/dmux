@@ -373,11 +373,11 @@ fn parse_pane_listing(listing: &str) -> io::Result<Vec<PaneListEntry>> {
     Ok(entries)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 enum LiveSnapshotInputEvent {
     Forward(Vec<u8>),
     SelectNextPane,
-    PauseRedraw,
+    PauseRedraw(mpsc::Sender<()>),
     RedrawNow,
     Error(String),
     Detach,
@@ -423,7 +423,9 @@ fn spawn_live_snapshot_input_thread(
                         let _ = sender.send(LiveSnapshotInputEvent::SelectNextPane);
                     }
                     LiveSnapshotInputAction::EnterCopyMode { initial_input } => {
-                        let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw);
+                        let (pause_ack, pause_ready) = mpsc::channel();
+                        let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw(pause_ack));
+                        let _ = pause_ready.recv();
                         match run_copy_mode_with_reader(
                             &socket,
                             &session,
@@ -473,8 +475,9 @@ fn run_live_snapshot_attach(
                 }
                 last_redraw = Instant::now();
             }
-            Ok(LiveSnapshotInputEvent::PauseRedraw) => {
+            Ok(LiveSnapshotInputEvent::PauseRedraw(pause_ack)) => {
                 redraw_paused = true;
+                let _ = pause_ack.send(());
             }
             Ok(LiveSnapshotInputEvent::RedrawNow) => {
                 redraw_paused = false;
