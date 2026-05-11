@@ -374,7 +374,7 @@ cargo test
 
 Expected: formatting and whitespace checks pass; keyword scan prints no matches; all unit and integration tests pass.
 
-- [ ] **Step 3: Request critical review**
+- [x] **Step 3: Request critical review**
 
 Dispatch a read-only review subagent against `git diff origin/main` with this brief:
 

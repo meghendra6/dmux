@@ -404,6 +404,33 @@ fn poll_capture(socket: &std::path::Path, session: &str, needle: &str) -> String
     last
 }
 
+fn poll_active_pane(socket: &std::path::Path, session: &str, expected: usize) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+    let expected = format!("{expected}\t1");
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(
+            socket,
+            &[
+                "list-panes",
+                "-t",
+                session,
+                "-F",
+                "#{pane.index}\t#{pane.active}",
+            ],
+        );
+        assert_success(&output);
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if last.lines().any(|line| line == expected) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
+}
+
 fn poll_file_contains(path: &std::path::Path, needle: &str) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
@@ -997,24 +1024,22 @@ fn attach_prefix_o_cycles_active_pane_for_live_input() {
 
     {
         let stdin = child.stdin.as_mut().expect("attach stdin");
-        stdin.write_all(b"\x02o").expect("write cycle input");
-        stdin.flush().expect("flush cycle input");
-    }
-    std::thread::sleep(std::time::Duration::from_millis(150));
-
-    {
-        let stdin = child.stdin.as_mut().expect("attach stdin");
-        stdin.write_all(b"base-cycle\n").expect("write base input");
-        stdin.flush().expect("flush base input");
+        stdin
+            .write_all(b"\x02obase-cycle\n")
+            .expect("write coalesced cycle and base input");
+        stdin.flush().expect("flush coalesced base input");
     }
     assert!(poll_file_contains(&base_file, "base-cycle"));
+    let panes = poll_active_pane(&socket, &session, 0);
+    assert!(panes.lines().any(|line| line == "0\t1"), "{panes:?}");
 
     {
         let stdin = child.stdin.as_mut().expect("attach stdin");
         stdin.write_all(b"\x02o").expect("write second cycle input");
         stdin.flush().expect("flush second cycle input");
     }
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    let panes = poll_active_pane(&socket, &session, 1);
+    assert!(panes.lines().any(|line| line == "1\t1"), "{panes:?}");
 
     {
         let stdin = child.stdin.as_mut().expect("attach stdin");
