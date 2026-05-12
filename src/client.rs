@@ -21,6 +21,27 @@ enum AttachMode {
     Snapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MousePosition {
+    col: u16,
+    row: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachPaneRegion {
+    pane: usize,
+    row_start: usize,
+    row_end: usize,
+    col_start: usize,
+    col_end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachLayoutSnapshotResponse {
+    snapshot: Vec<u8>,
+    regions: Vec<AttachPaneRegion>,
+}
+
 pub fn attach<F>(
     socket: &Path,
     session: &str,
@@ -92,6 +113,77 @@ fn read_attach_status_line(socket: &Path, session: &str) -> io::Result<String> {
 
 fn read_attach_pane_snapshot(socket: &Path, session: &str) -> io::Result<Vec<u8>> {
     send_control_request(socket, &protocol::encode_attach_snapshot(session))
+}
+
+fn read_attach_layout_snapshot(
+    socket: &Path,
+    session: &str,
+) -> io::Result<AttachLayoutSnapshotResponse> {
+    let body = send_control_request(socket, &protocol::encode_attach_layout_snapshot(session))?;
+    parse_attach_layout_snapshot_response(&body)
+}
+
+fn parse_attach_layout_snapshot_response(body: &[u8]) -> io::Result<AttachLayoutSnapshotResponse> {
+    let mut cursor = 0;
+    let header = read_body_line(body, &mut cursor)?;
+    let Some(count) = header.strip_prefix("REGIONS\t") else {
+        return Err(io::Error::other("missing regions header"));
+    };
+    let count = count
+        .parse::<usize>()
+        .map_err(|_| io::Error::other("invalid region count"))?;
+
+    let mut regions = Vec::with_capacity(count);
+    for _ in 0..count {
+        let line = read_body_line(body, &mut cursor)?;
+        regions.push(parse_attach_pane_region(line)?);
+    }
+
+    let snapshot = read_body_line(body, &mut cursor)?;
+    let Some(len) = snapshot.strip_prefix("SNAPSHOT\t") else {
+        return Err(io::Error::other("missing snapshot header"));
+    };
+    let len = len
+        .parse::<usize>()
+        .map_err(|_| io::Error::other("invalid snapshot length"))?;
+    if body.len().saturating_sub(cursor) < len {
+        return Err(io::Error::other("truncated snapshot body"));
+    }
+
+    Ok(AttachLayoutSnapshotResponse {
+        snapshot: body[cursor..cursor + len].to_vec(),
+        regions,
+    })
+}
+
+fn read_body_line<'a>(body: &'a [u8], cursor: &mut usize) -> io::Result<&'a str> {
+    let Some(relative_end) = body[*cursor..].iter().position(|byte| *byte == b'\n') else {
+        return Err(io::Error::other("missing response line"));
+    };
+    let start = *cursor;
+    let end = start + relative_end;
+    *cursor = end + 1;
+    std::str::from_utf8(&body[start..end]).map_err(|_| io::Error::other("non-utf8 response line"))
+}
+
+fn parse_attach_pane_region(line: &str) -> io::Result<AttachPaneRegion> {
+    let parts = line.split('\t').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["REGION", pane, row_start, row_end, col_start, col_end] => Ok(AttachPaneRegion {
+            pane: parse_region_field(pane, "invalid region pane")?,
+            row_start: parse_region_field(row_start, "invalid region row start")?,
+            row_end: parse_region_field(row_end, "invalid region row end")?,
+            col_start: parse_region_field(col_start, "invalid region col start")?,
+            col_end: parse_region_field(col_end, "invalid region col end")?,
+        }),
+        _ => Err(io::Error::other("invalid region line")),
+    }
+}
+
+fn parse_region_field(value: &str, message: &str) -> io::Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|_| io::Error::other(message))
 }
 
 fn write_attach_status_line(socket: &Path, session: &str) -> io::Result<()> {
@@ -235,6 +327,7 @@ enum AttachInputAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveSnapshotInputAction {
     Forward(Vec<u8>),
+    MousePress(MousePosition),
     Detach,
     SelectNextPane,
     ShowPaneNumbers,
@@ -246,6 +339,7 @@ enum LiveSnapshotInputAction {
 struct LiveSnapshotInputState {
     saw_prefix: bool,
     selecting_pane: bool,
+    mouse_pending: Vec<u8>,
 }
 
 fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAction {
@@ -285,29 +379,75 @@ fn translate_live_snapshot_input(
     input: &[u8],
     state: &mut LiveSnapshotInputState,
 ) -> Vec<LiveSnapshotInputAction> {
-    let mut output = Vec::with_capacity(input.len());
-    let mut actions = Vec::new();
+    let mut bytes = Vec::new();
+    if !state.mouse_pending.is_empty() {
+        bytes.extend_from_slice(&state.mouse_pending);
+        state.mouse_pending.clear();
+    }
+    bytes.extend_from_slice(input);
 
-    for (index, byte) in input.iter().enumerate() {
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut actions = Vec::new();
+    let mut offset = 0;
+
+    while offset < bytes.len() {
+        if bytes[offset] == 0x1b {
+            let remaining = &bytes[offset..];
+            if let Some((event, consumed)) = parse_sgr_mouse_event(remaining) {
+                if !output.is_empty() {
+                    actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                        &mut output,
+                    )));
+                }
+                if let Some(position) = live_mouse_press_position(event) {
+                    actions.push(LiveSnapshotInputAction::MousePress(position));
+                }
+                offset += consumed;
+                continue;
+            }
+            if is_incomplete_sgr_mouse_event(remaining) {
+                if !output.is_empty() {
+                    actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                        &mut output,
+                    )));
+                }
+                state.mouse_pending.extend_from_slice(remaining);
+                break;
+            }
+            if let Some(consumed) = complete_sgr_mouse_event_len(remaining) {
+                if !output.is_empty() {
+                    actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                        &mut output,
+                    )));
+                }
+                offset += consumed;
+                continue;
+            }
+        }
+
+        let byte = bytes[offset];
         if state.selecting_pane {
             state.selecting_pane = false;
             if byte.is_ascii_digit() {
                 actions.push(LiveSnapshotInputAction::SelectPane(usize::from(
-                    *byte - b'0',
+                    byte - b'0',
                 )));
+                offset += 1;
                 continue;
             }
-            if *byte == 0x02 {
+            if byte == 0x02 {
                 state.saw_prefix = true;
+                offset += 1;
                 continue;
             }
-            output.push(*byte);
+            output.push(byte);
+            offset += 1;
             continue;
         }
 
         if state.saw_prefix {
             state.saw_prefix = false;
-            match *byte {
+            match byte {
                 b'd' => {
                     if !output.is_empty() {
                         actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
@@ -324,6 +464,7 @@ fn translate_live_snapshot_input(
                         )));
                     }
                     actions.push(LiveSnapshotInputAction::SelectNextPane);
+                    offset += 1;
                     continue;
                 }
                 b'q' => {
@@ -334,6 +475,7 @@ fn translate_live_snapshot_input(
                     }
                     state.selecting_pane = true;
                     actions.push(LiveSnapshotInputAction::ShowPaneNumbers);
+                    offset += 1;
                     continue;
                 }
                 b'[' => {
@@ -343,27 +485,30 @@ fn translate_live_snapshot_input(
                         )));
                     }
                     actions.push(LiveSnapshotInputAction::EnterCopyMode {
-                        initial_input: input[index + 1..].to_vec(),
+                        initial_input: bytes[offset + 1..].to_vec(),
                     });
                     return actions;
                 }
                 0x02 => {
                     output.push(0x02);
+                    offset += 1;
                     continue;
                 }
                 _ => {
                     output.push(0x02);
-                    output.push(*byte);
+                    output.push(byte);
+                    offset += 1;
                     continue;
                 }
             }
         }
 
-        if *byte == 0x02 {
+        if byte == 0x02 {
             state.saw_prefix = true;
         } else {
-            output.push(*byte);
+            output.push(byte);
         }
+        offset += 1;
     }
 
     if !output.is_empty() {
@@ -374,12 +519,26 @@ fn translate_live_snapshot_input(
 
 fn finish_live_snapshot_input(state: &mut LiveSnapshotInputState) -> Option<Vec<u8>> {
     state.selecting_pane = false;
+    state.mouse_pending.clear();
     if !state.saw_prefix {
         return None;
     }
 
     state.saw_prefix = false;
     Some(vec![0x02])
+}
+
+fn live_mouse_press_position(event: SgrMouseEvent) -> Option<MousePosition> {
+    if event.release || event.col == 0 || event.row == 0 {
+        return None;
+    }
+    if event.code & 64 != 0 || event.code & 32 != 0 || event.code & 3 != 0 {
+        return None;
+    }
+    Some(MousePosition {
+        col: event.col,
+        row: event.row,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,6 +641,7 @@ fn spawn_live_snapshot_input_thread(
                     LiveSnapshotInputAction::SelectPane(index) => {
                         let _ = sender.send(LiveSnapshotInputEvent::SelectPane(index));
                     }
+                    LiveSnapshotInputAction::MousePress(_) => {}
                     LiveSnapshotInputAction::EnterCopyMode { initial_input } => {
                         let (pause_ack, pause_ready) = mpsc::channel();
                         let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw(pause_ack));
@@ -650,6 +810,24 @@ fn pane_number_message_text(socket: &Path, session: &str) -> io::Result<String> 
 
 fn pane_index_exists(entries: &[PaneListEntry], index: usize) -> bool {
     entries.iter().any(|entry| entry.index == index)
+}
+
+fn pane_at_mouse_position(
+    regions: &[AttachPaneRegion],
+    header_rows: usize,
+    position: MousePosition,
+) -> Option<usize> {
+    let row = usize::from(position.row).checked_sub(1 + header_rows)?;
+    let col = usize::from(position.col).checked_sub(1)?;
+    regions
+        .iter()
+        .find(|region| {
+            row >= region.row_start
+                && row < region.row_end
+                && col >= region.col_start
+                && col < region.col_end
+        })
+        .map(|region| region.pane)
 }
 
 fn select_numbered_pane(socket: &Path, session: &str, index: usize) -> io::Result<bool> {
@@ -933,6 +1111,17 @@ fn is_incomplete_sgr_mouse_event(input: &[u8]) -> bool {
         && input[3..]
             .iter()
             .all(|byte| byte.is_ascii_digit() || *byte == b';')
+}
+
+fn complete_sgr_mouse_event_len(input: &[u8]) -> Option<usize> {
+    if !input.starts_with(b"\x1b[<") {
+        return None;
+    }
+
+    input[3..]
+        .iter()
+        .position(|byte| *byte == b'M' || *byte == b'm')
+        .map(|end| 3 + end + 1)
 }
 
 fn install_winch_handler() {
@@ -1307,6 +1496,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_attach_layout_snapshot_response() {
+        let parsed = parse_attach_layout_snapshot_response(
+            b"REGIONS\t1\nREGION\t2\t3\t4\t5\t6\nSNAPSHOT\t7\nabc\r\nxy",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.snapshot, b"abc\r\nxy");
+        assert_eq!(
+            parsed.regions,
+            vec![AttachPaneRegion {
+                pane: 2,
+                row_start: 3,
+                row_end: 4,
+                col_start: 5,
+                col_end: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn pane_at_mouse_position_subtracts_header_rows() {
+        let regions = vec![AttachPaneRegion {
+            pane: 1,
+            row_start: 0,
+            row_end: 1,
+            col_start: 13,
+            col_end: 24,
+        }];
+
+        assert_eq!(
+            pane_at_mouse_position(&regions, 1, MousePosition { col: 14, row: 2 }),
+            Some(1)
+        );
+        assert_eq!(
+            pane_at_mouse_position(&regions, 2, MousePosition { col: 14, row: 2 }),
+            None
+        );
+    }
+
+    #[test]
     fn live_snapshot_input_forwards_arbitrary_bytes() {
         let mut state = LiveSnapshotInputState::default();
 
@@ -1317,6 +1546,60 @@ mod tests {
             vec![LiveSnapshotInputAction::Forward(b"hello\n".to_vec())]
         );
         assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_emits_mouse_press_and_trailing_bytes() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"\x1b[<0;14;2Mtyped", &mut state);
+
+        assert_eq!(
+            actions,
+            vec![
+                LiveSnapshotInputAction::MousePress(MousePosition { col: 14, row: 2 }),
+                LiveSnapshotInputAction::Forward(b"typed".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_snapshot_input_preserves_order_around_mouse_press() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"abc\x1b[<0;1;2Mdef", &mut state);
+
+        assert_eq!(
+            actions,
+            vec![
+                LiveSnapshotInputAction::Forward(b"abc".to_vec()),
+                LiveSnapshotInputAction::MousePress(MousePosition { col: 1, row: 2 }),
+                LiveSnapshotInputAction::Forward(b"def".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_snapshot_input_buffers_split_sgr_mouse_event() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert!(translate_live_snapshot_input(b"\x1b[<0;1", &mut state).is_empty());
+        assert_eq!(
+            translate_live_snapshot_input(b";2M", &mut state),
+            vec![LiveSnapshotInputAction::MousePress(MousePosition {
+                col: 1,
+                row: 2
+            })]
+        );
+    }
+
+    #[test]
+    fn live_snapshot_input_consumes_non_press_mouse_events() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert!(translate_live_snapshot_input(b"\x1b[<0;1;2m", &mut state).is_empty());
+        assert!(translate_live_snapshot_input(b"\x1b[<32;1;2M", &mut state).is_empty());
+        assert!(translate_live_snapshot_input(b"\x1b[<64;1;2M", &mut state).is_empty());
     }
 
     #[test]
@@ -1523,6 +1806,7 @@ mod tests {
         let mut state = LiveSnapshotInputState {
             saw_prefix: true,
             selecting_pane: false,
+            mouse_pending: Vec::new(),
         };
 
         let pending = finish_live_snapshot_input(&mut state);
