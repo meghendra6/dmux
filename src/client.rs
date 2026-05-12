@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
@@ -402,9 +402,18 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAct
     AttachInputAction::Forward(output)
 }
 
+#[cfg(test)]
 fn translate_live_snapshot_input(
     input: &[u8],
     state: &mut LiveSnapshotInputState,
+) -> Vec<LiveSnapshotInputAction> {
+    translate_live_snapshot_input_with_mouse(input, state, true)
+}
+
+fn translate_live_snapshot_input_with_mouse(
+    input: &[u8],
+    state: &mut LiveSnapshotInputState,
+    mouse_focus_enabled: bool,
 ) -> Vec<LiveSnapshotInputAction> {
     let mut bytes = Vec::new();
     if !state.mouse_pending.is_empty() {
@@ -418,7 +427,7 @@ fn translate_live_snapshot_input(
     let mut offset = 0;
 
     while offset < bytes.len() {
-        if bytes[offset] == 0x1b {
+        if mouse_focus_enabled && bytes[offset] == 0x1b {
             let remaining = &bytes[offset..];
             if let Some((event, consumed)) = parse_sgr_mouse_event(remaining) {
                 if !output.is_empty() {
@@ -432,15 +441,6 @@ fn translate_live_snapshot_input(
                 }
                 offset += consumed;
                 continue;
-            }
-            if is_partial_sgr_mouse_prefix(remaining) {
-                if !output.is_empty() {
-                    actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                        &mut output,
-                    )));
-                }
-                state.mouse_pending.extend_from_slice(remaining);
-                break;
             }
             if is_incomplete_sgr_mouse_event(remaining) {
                 if !output.is_empty() {
@@ -650,6 +650,7 @@ enum LiveSnapshotInputEvent {
 fn spawn_live_snapshot_input_thread(
     socket: PathBuf,
     session: String,
+    mouse_focus_enabled: Arc<AtomicBool>,
 ) -> mpsc::Receiver<LiveSnapshotInputEvent> {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
@@ -673,7 +674,12 @@ fn spawn_live_snapshot_input_thread(
                 }
             };
 
-            for action in translate_live_snapshot_input(&buf[..n], &mut input_state) {
+            let mouse_focus_enabled = mouse_focus_enabled.load(Ordering::SeqCst);
+            for action in translate_live_snapshot_input_with_mouse(
+                &buf[..n],
+                &mut input_state,
+                mouse_focus_enabled,
+            ) {
                 match action {
                     LiveSnapshotInputAction::Forward(bytes) => {
                         let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
@@ -726,9 +732,15 @@ fn run_live_snapshot_attach(
     session: &str,
     stream: &mut UnixStream,
 ) -> io::Result<()> {
-    let input = spawn_live_snapshot_input_thread(socket.to_path_buf(), session.to_string());
-    let _mouse = MouseModeGuard::enable()?;
+    let mouse_focus_enabled = Arc::new(AtomicBool::new(false));
+    let input = spawn_live_snapshot_input_thread(
+        socket.to_path_buf(),
+        session.to_string(),
+        Arc::clone(&mouse_focus_enabled),
+    );
     let mut frame = write_live_snapshot_frame(socket, session)?;
+    let mut mouse_mode = None;
+    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
     let mut last_redraw = Instant::now();
     let mut redraw_paused = false;
     let mut pane_number_message = None;
@@ -743,6 +755,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                     )?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     last_redraw = Instant::now();
                 }
             }
@@ -751,6 +764,7 @@ fn run_live_snapshot_attach(
                 pane_number_message = None;
                 if !redraw_paused {
                     frame = write_live_snapshot_frame(socket, session)?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 }
                 last_redraw = Instant::now();
             }
@@ -763,6 +777,7 @@ fn run_live_snapshot_attach(
                     session,
                     &mut pane_number_message,
                 )?;
+                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::SelectPane(index)) => {
@@ -770,6 +785,7 @@ fn run_live_snapshot_attach(
                 pane_number_message = None;
                 if !redraw_paused {
                     frame = write_live_snapshot_frame(socket, session)?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 }
                 last_redraw = Instant::now();
             }
@@ -781,6 +797,7 @@ fn run_live_snapshot_attach(
                     pane_number_message = None;
                     if !redraw_paused {
                         frame = write_live_snapshot_frame(socket, session)?;
+                        sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     }
                     last_redraw = Instant::now();
                 }
@@ -792,6 +809,7 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::RedrawNow) => {
                 redraw_paused = false;
                 frame = write_live_snapshot_frame(socket, session)?;
+                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::Error(message)) => return Err(io::Error::other(message)),
@@ -803,6 +821,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                     )?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     last_redraw = Instant::now();
                 }
             }
@@ -811,6 +830,24 @@ fn run_live_snapshot_attach(
     }
 
     let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+fn sync_live_mouse_mode(
+    mouse_focus_enabled: &AtomicBool,
+    mouse_mode: &mut Option<MouseModeGuard>,
+    frame: &LiveSnapshotFrame,
+) -> io::Result<()> {
+    let enabled = !frame.regions.is_empty();
+    if enabled {
+        if mouse_mode.is_none() {
+            *mouse_mode = Some(MouseModeGuard::enable()?);
+        }
+        mouse_focus_enabled.store(true, Ordering::SeqCst);
+    } else {
+        mouse_focus_enabled.store(false, Ordering::SeqCst);
+        *mouse_mode = None;
+    }
     Ok(())
 }
 
@@ -1176,11 +1213,6 @@ fn is_incomplete_sgr_mouse_event(input: &[u8]) -> bool {
         && input[3..]
             .iter()
             .all(|byte| byte.is_ascii_digit() || *byte == b';')
-}
-
-fn is_partial_sgr_mouse_prefix(input: &[u8]) -> bool {
-    const PREFIX: &[u8] = b"\x1b[<";
-    input.len() < PREFIX.len() && PREFIX.starts_with(input)
 }
 
 fn complete_sgr_mouse_event_len(input: &[u8]) -> Option<usize> {
@@ -1728,37 +1760,24 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_input_buffers_sgr_mouse_event_split_inside_prefix() {
+    fn live_snapshot_input_forwards_standalone_escape_without_waiting() {
         let mut state = LiveSnapshotInputState::default();
 
-        assert!(translate_live_snapshot_input(b"\x1b", &mut state).is_empty());
         assert_eq!(
-            translate_live_snapshot_input(b"[<0;1;2M", &mut state),
-            vec![LiveSnapshotInputAction::MousePress(MousePosition {
-                col: 1,
-                row: 2
-            })]
-        );
-
-        let mut state = LiveSnapshotInputState::default();
-        assert!(translate_live_snapshot_input(b"\x1b[", &mut state).is_empty());
-        assert_eq!(
-            translate_live_snapshot_input(b"<0;1;2M", &mut state),
-            vec![LiveSnapshotInputAction::MousePress(MousePosition {
-                col: 1,
-                row: 2
-            })]
+            translate_live_snapshot_input(b"\x1b", &mut state),
+            vec![LiveSnapshotInputAction::Forward(b"\x1b".to_vec())]
         );
     }
 
     #[test]
-    fn live_snapshot_input_forwards_non_mouse_escape_after_prefix_split() {
+    fn live_snapshot_input_forwards_mouse_sequence_when_mouse_focus_disabled() {
         let mut state = LiveSnapshotInputState::default();
 
-        assert!(translate_live_snapshot_input(b"\x1b", &mut state).is_empty());
         assert_eq!(
-            translate_live_snapshot_input(b"x", &mut state),
-            vec![LiveSnapshotInputAction::Forward(b"\x1bx".to_vec())]
+            translate_live_snapshot_input_with_mouse(b"\x1b[<0;1;2Mtyped", &mut state, false,),
+            vec![LiveSnapshotInputAction::Forward(
+                b"\x1b[<0;1;2Mtyped".to_vec()
+            )]
         );
     }
 
@@ -1767,10 +1786,13 @@ mod tests {
         let mut state = LiveSnapshotInputState::default();
 
         assert!(translate_live_snapshot_input(b"\x02", &mut state).is_empty());
-        assert!(translate_live_snapshot_input(b"\x1b", &mut state).is_empty());
+        assert_eq!(
+            translate_live_snapshot_input(b"\x1b", &mut state),
+            vec![LiveSnapshotInputAction::Forward(b"\x02\x1b".to_vec())]
+        );
         assert_eq!(
             translate_live_snapshot_input(b"x", &mut state),
-            vec![LiveSnapshotInputAction::Forward(b"\x02\x1bx".to_vec())]
+            vec![LiveSnapshotInputAction::Forward(b"x".to_vec())]
         );
         assert!(!state.saw_prefix);
     }
