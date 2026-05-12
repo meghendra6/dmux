@@ -133,7 +133,7 @@ fn parse_attach_layout_snapshot_response(body: &[u8]) -> io::Result<AttachLayout
         .parse::<usize>()
         .map_err(|_| io::Error::other("invalid region count"))?;
 
-    let mut regions = Vec::with_capacity(count);
+    let mut regions = Vec::new();
     for _ in 0..count {
         let line = read_body_line(body, &mut cursor)?;
         regions.push(parse_attach_pane_region(line)?);
@@ -146,8 +146,12 @@ fn parse_attach_layout_snapshot_response(body: &[u8]) -> io::Result<AttachLayout
     let len = len
         .parse::<usize>()
         .map_err(|_| io::Error::other("invalid snapshot length"))?;
-    if body.len().saturating_sub(cursor) < len {
+    let remaining = body.len().saturating_sub(cursor);
+    if remaining < len {
         return Err(io::Error::other("truncated snapshot body"));
+    }
+    if remaining > len {
+        return Err(io::Error::other("extra snapshot body bytes"));
     }
 
     Ok(AttachLayoutSnapshotResponse {
@@ -399,6 +403,7 @@ fn translate_live_snapshot_input(
                         &mut output,
                     )));
                 }
+                clear_live_snapshot_command_state(state);
                 if let Some(position) = live_mouse_press_position(event) {
                     actions.push(LiveSnapshotInputAction::MousePress(position));
                 }
@@ -411,6 +416,7 @@ fn translate_live_snapshot_input(
                         &mut output,
                     )));
                 }
+                clear_live_snapshot_command_state(state);
                 state.mouse_pending.extend_from_slice(remaining);
                 break;
             }
@@ -420,6 +426,7 @@ fn translate_live_snapshot_input(
                         &mut output,
                     )));
                 }
+                clear_live_snapshot_command_state(state);
                 offset += consumed;
                 continue;
             }
@@ -515,6 +522,11 @@ fn translate_live_snapshot_input(
         actions.push(LiveSnapshotInputAction::Forward(output));
     }
     actions
+}
+
+fn clear_live_snapshot_command_state(state: &mut LiveSnapshotInputState) {
+    state.saw_prefix = false;
+    state.selecting_pane = false;
 }
 
 fn finish_live_snapshot_input(state: &mut LiveSnapshotInputState) -> Option<Vec<u8>> {
@@ -1516,6 +1528,25 @@ mod tests {
     }
 
     #[test]
+    fn rejects_extra_bytes_after_attach_layout_snapshot_body() {
+        let error =
+            parse_attach_layout_snapshot_response(b"REGIONS\t0\nSNAPSHOT\t3\nabcd").unwrap_err();
+
+        assert_eq!(error.to_string(), "extra snapshot body bytes");
+    }
+
+    #[test]
+    fn rejects_huge_region_count_without_allocating() {
+        let body = format!("REGIONS\t{}\n", usize::MAX);
+
+        let result =
+            std::panic::catch_unwind(|| parse_attach_layout_snapshot_response(body.as_bytes()));
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
     fn pane_at_mouse_position_subtracts_header_rows() {
         let regions = vec![AttachPaneRegion {
             pane: 1,
@@ -1600,6 +1631,43 @@ mod tests {
         assert!(translate_live_snapshot_input(b"\x1b[<0;1;2m", &mut state).is_empty());
         assert!(translate_live_snapshot_input(b"\x1b[<32;1;2M", &mut state).is_empty());
         assert!(translate_live_snapshot_input(b"\x1b[<64;1;2M", &mut state).is_empty());
+    }
+
+    #[test]
+    fn live_snapshot_input_mouse_press_clears_pending_prefix() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert!(translate_live_snapshot_input(b"\x02", &mut state).is_empty());
+        let actions = translate_live_snapshot_input(b"\x1b[<0;1;2Md", &mut state);
+
+        assert_eq!(
+            actions,
+            vec![
+                LiveSnapshotInputAction::MousePress(MousePosition { col: 1, row: 2 }),
+                LiveSnapshotInputAction::Forward(b"d".to_vec()),
+            ]
+        );
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_mouse_press_clears_number_selection() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02q", &mut state),
+            vec![LiveSnapshotInputAction::ShowPaneNumbers]
+        );
+        let actions = translate_live_snapshot_input(b"\x1b[<0;1;2M1", &mut state);
+
+        assert_eq!(
+            actions,
+            vec![
+                LiveSnapshotInputAction::MousePress(MousePosition { col: 1, row: 2 }),
+                LiveSnapshotInputAction::Forward(b"1".to_vec()),
+            ]
+        );
+        assert!(!state.selecting_pane);
     }
 
     #[test]
