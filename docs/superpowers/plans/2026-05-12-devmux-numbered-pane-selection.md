@@ -494,7 +494,7 @@ Update current limits:
 Record branch, scope, tests run, PR number after creation, review findings, merge
 status, and retrospective notes. Do not stage or commit `HANDOFF.md`.
 
-- [ ] **Step 3: Run full verification before commit/PR**
+- [x] **Step 3: Run full verification before commit/PR**
 
 Run:
 
@@ -507,7 +507,7 @@ cargo test
 
 Expected: formatting and whitespace checks pass; reserved keyword scan prints no matches; all unit and integration tests pass.
 
-- [ ] **Step 4: Commit documentation and plan state**
+- [x] **Step 4: Commit documentation and plan state**
 
 Run:
 
