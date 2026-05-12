@@ -1457,6 +1457,76 @@ fn attach_multi_pane_keeps_snapshot_handshake_for_client_compatibility() {
 }
 
 #[test]
+fn attach_layout_snapshot_response_includes_regions_without_changing_plain_snapshot() {
+    let socket = unique_socket("attach-layout-regions");
+    let session = format!("attach-layout-regions-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(format!("ATTACH_LAYOUT_SNAPSHOT\t{session}\n").as_bytes())
+        .expect("write layout snapshot request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    let mut body = String::new();
+    stream.read_to_string(&mut body).expect("read layout body");
+
+    assert!(body.starts_with("REGIONS\t2\n"), "{body:?}");
+    assert!(body.contains("REGION\t0\t0\t1\t0\t10\n"), "{body:?}");
+    assert!(body.contains("REGION\t1\t0\t1\t13\t24\n"), "{body:?}");
+    assert!(body.contains("SNAPSHOT\t"), "{body:?}");
+    assert!(body.contains("base-ready | split-ready\r\n"), "{body:?}");
+
+    let mut plain = UnixStream::connect(&socket).expect("connect socket");
+    plain
+        .write_all(format!("ATTACH_SNAPSHOT\t{session}\n").as_bytes())
+        .expect("write plain snapshot request");
+    assert_eq!(read_socket_line(&mut plain), "OK\n");
+    let mut plain_body = String::new();
+    plain
+        .read_to_string(&mut plain_body)
+        .expect("read plain snapshot body");
+    assert!(!plain_body.contains("REGIONS\t"), "{plain_body:?}");
+    assert!(
+        plain_body.contains("base-ready | split-ready\r\n"),
+        "{plain_body:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_live_redraws_remaining_pane_after_split_collapses() {
     let socket = unique_socket("attach-live-collapse");
     let session = format!("attach-live-collapse-{}", std::process::id());

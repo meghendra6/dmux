@@ -32,6 +32,9 @@ pub enum Request {
     AttachSnapshot {
         session: String,
     },
+    AttachLayoutSnapshot {
+        session: String,
+    },
     List,
     Capture {
         session: String,
@@ -126,6 +129,11 @@ pub fn encode_attach(session: &str) -> String {
 
 pub fn encode_attach_snapshot(session: &str) -> String {
     format!("ATTACH_SNAPSHOT\t{session}\n")
+}
+
+#[allow(dead_code)]
+pub fn encode_attach_layout_snapshot(session: &str) -> String {
+    format!("ATTACH_LAYOUT_SNAPSHOT\t{session}\n")
 }
 
 pub fn encode_list() -> &'static str {
@@ -298,6 +306,9 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         }),
         ["LIST"] => Ok(Request::List),
         ["ATTACH_SNAPSHOT", session] => Ok(Request::AttachSnapshot {
+            session: (*session).to_string(),
+        }),
+        ["ATTACH_LAYOUT_SNAPSHOT", session] => Ok(Request::AttachLayoutSnapshot {
             session: (*session).to_string(),
         }),
         ["CAPTURE", session] => Ok(Request::Capture {
@@ -896,6 +907,17 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::AttachSnapshot {
+                session: "dev".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_attach_layout_snapshot_request() {
+        let line = encode_attach_layout_snapshot("dev");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::AttachLayoutSnapshot {
                 session: "dev".to_string(),
             }
         );
