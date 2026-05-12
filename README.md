@@ -87,6 +87,7 @@ Implemented Phase 2 groundwork:
 - attach-time pane cycling for polling multi-pane attach
 - attach-time numbered pane selection for polling multi-pane attach
 - multi-pane attach copy-mode entry for the active pane
+- attach layout pane-region mapping foundation
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:

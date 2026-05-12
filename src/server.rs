@@ -634,6 +634,21 @@ struct PaneSnapshot {
     screen: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedAttachLayout {
+    lines: Vec<String>,
+    regions: Vec<PaneRegion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneRegion {
+    pane: usize,
+    row_start: usize,
+    row_end: usize,
+    col_start: usize,
+    col_end: usize,
+}
+
 struct StatusContext {
     session_name: String,
     window_index: usize,
@@ -1584,8 +1599,18 @@ fn attach_pane_snapshot(session: &Session) -> Option<String> {
 }
 
 fn render_attach_pane_snapshot(layout: &LayoutNode, panes: &[PaneSnapshot]) -> String {
+    match render_attach_layout(layout, panes) {
+        Some(rendered) => render_client_lines(&rendered.lines),
+        None => render_ordered_pane_sections(panes),
+    }
+}
+
+fn render_attach_layout(
+    layout: &LayoutNode,
+    panes: &[PaneSnapshot],
+) -> Option<RenderedAttachLayout> {
     if !layout_matches_panes(layout, panes) {
-        return render_ordered_pane_sections(panes);
+        return None;
     }
 
     let screens = panes
@@ -1593,10 +1618,7 @@ fn render_attach_pane_snapshot(layout: &LayoutNode, panes: &[PaneSnapshot]) -> S
         .map(|pane| (pane.index, pane.screen.as_str()))
         .collect::<HashMap<_, _>>();
 
-    match render_layout_lines(layout, &screens) {
-        Some(lines) => render_client_lines(&lines),
-        None => render_ordered_pane_sections(panes),
-    }
+    render_layout(layout, &screens)
 }
 
 fn layout_matches_panes(layout: &LayoutNode, panes: &[PaneSnapshot]) -> bool {
@@ -1620,22 +1642,120 @@ fn collect_layout_pane_indexes(layout: &LayoutNode, indexes: &mut Vec<usize>) {
     }
 }
 
-fn render_layout_lines(layout: &LayoutNode, screens: &HashMap<usize, &str>) -> Option<Vec<String>> {
+fn render_layout(
+    layout: &LayoutNode,
+    screens: &HashMap<usize, &str>,
+) -> Option<RenderedAttachLayout> {
     match layout {
-        LayoutNode::Pane(index) => screens.get(index).map(|screen| screen_lines(screen)),
+        LayoutNode::Pane(index) => {
+            let lines = screen_lines(screens.get(index)?);
+            let width = max_line_width(&lines);
+            let height = lines.len().max(1);
+            Some(RenderedAttachLayout {
+                lines,
+                regions: vec![PaneRegion {
+                    pane: *index,
+                    row_start: 0,
+                    row_end: height,
+                    col_start: 0,
+                    col_end: width,
+                }],
+            })
+        }
         LayoutNode::Split {
             direction,
             first,
             second,
         } => {
-            let first = render_layout_lines(first, screens)?;
-            let second = render_layout_lines(second, screens)?;
+            let first = render_layout(first, screens)?;
+            let second = render_layout(second, screens)?;
             Some(match direction {
-                SplitDirection::Horizontal => join_horizontal(first, second),
-                SplitDirection::Vertical => join_vertical(first, second),
+                SplitDirection::Horizontal => join_horizontal_layout(first, second),
+                SplitDirection::Vertical => join_vertical_layout(first, second),
             })
         }
     }
+}
+
+fn join_horizontal_layout(
+    left: RenderedAttachLayout,
+    right: RenderedAttachLayout,
+) -> RenderedAttachLayout {
+    let left_width = max_line_width(&left.lines);
+    let rows = left.lines.len().max(right.lines.len()).max(1);
+    let left_height = left.lines.len().max(1);
+    let right_height = right.lines.len().max(1);
+    let lines = join_horizontal(left.lines, right.lines);
+
+    let mut regions = expand_boundary_region_rows(left.regions, left_height, rows);
+    regions.extend(offset_regions(
+        expand_boundary_region_rows(right.regions, right_height, rows),
+        0,
+        left_width + 3,
+    ));
+    RenderedAttachLayout { lines, regions }
+}
+
+fn join_vertical_layout(
+    top: RenderedAttachLayout,
+    bottom: RenderedAttachLayout,
+) -> RenderedAttachLayout {
+    let width = max_line_width(&top.lines)
+        .max(max_line_width(&bottom.lines))
+        .max(1);
+    let top_height = top.lines.len().max(1);
+    let top_width = max_line_width(&top.lines);
+    let bottom_width = max_line_width(&bottom.lines);
+    let lines = join_vertical(top.lines, bottom.lines);
+
+    let mut regions = expand_boundary_region_cols(top.regions, top_width, width);
+    regions.extend(offset_regions(
+        expand_boundary_region_cols(bottom.regions, bottom_width, width),
+        top_height + 1,
+        0,
+    ));
+
+    RenderedAttachLayout { lines, regions }
+}
+
+fn expand_boundary_region_rows(
+    mut regions: Vec<PaneRegion>,
+    current_row_end: usize,
+    target_row_end: usize,
+) -> Vec<PaneRegion> {
+    for region in &mut regions {
+        if region.row_end == current_row_end {
+            region.row_end = target_row_end;
+        }
+    }
+    regions
+}
+
+fn expand_boundary_region_cols(
+    mut regions: Vec<PaneRegion>,
+    current_col_end: usize,
+    target_col_end: usize,
+) -> Vec<PaneRegion> {
+    for region in &mut regions {
+        if region.col_end == current_col_end {
+            region.col_end = target_col_end;
+        }
+    }
+    regions
+}
+
+fn offset_regions(
+    mut regions: Vec<PaneRegion>,
+    row_offset: usize,
+    col_offset: usize,
+) -> Vec<PaneRegion> {
+    for region in &mut regions {
+        region.row_start += row_offset;
+        region.row_end += row_offset;
+        region.col_start += col_offset;
+        region.col_end += col_offset;
+    }
+    regions
 }
 
 fn screen_lines(screen: &str) -> Vec<String> {
@@ -1841,9 +1961,47 @@ mod tests {
 
         let rendered = render_attach_pane_snapshot(&layout, &panes);
 
-        assert!(
-            rendered.contains("base-ready | split-ready\r\n"),
-            "{rendered:?}"
+        assert_eq!(rendered, "base-ready | split-ready\r\n");
+    }
+
+    #[test]
+    fn render_attach_layout_maps_horizontal_pane_regions() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "left\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "right\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_layout(&layout, &panes).unwrap();
+
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 4,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 7,
+                    col_end: 12,
+                },
+            ]
         );
     }
 
@@ -1867,14 +2025,217 @@ mod tests {
 
         let rendered = render_attach_pane_snapshot(&layout, &panes);
 
-        assert!(
-            rendered.contains("base-ready\r\n-----------\r\nsplit-ready\r\n"),
-            "{rendered:?}"
+        assert_eq!(rendered, "base-ready\r\n-----------\r\nsplit-ready\r\n");
+    }
+
+    #[test]
+    fn render_attach_layout_maps_vertical_pane_regions() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "top\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "bottom\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_layout(&layout, &panes).unwrap();
+        let top = rendered
+            .regions
+            .iter()
+            .find(|region| region.pane == 0)
+            .unwrap();
+        let bottom = rendered
+            .regions
+            .iter()
+            .find(|region| region.pane == 1)
+            .unwrap();
+
+        assert!(top.row_end <= bottom.row_start, "{rendered:?}");
+
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 6,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 2,
+                    row_end: 3,
+                    col_start: 0,
+                    col_end: 6,
+                },
+            ]
         );
     }
 
     #[test]
-    fn render_attach_layout_falls_back_when_layout_omits_visible_pane() {
+    fn render_attach_layout_offsets_nested_pane_regions() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Split {
+                direction: SplitDirection::Vertical,
+                first: Box::new(LayoutNode::Pane(1)),
+                second: Box::new(LayoutNode::Pane(2)),
+            }),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "left\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "top\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 2,
+                screen: "bottom\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_layout(&layout, &panes).unwrap();
+
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 3,
+                    col_start: 0,
+                    col_end: 4,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 7,
+                    col_end: 13,
+                },
+                PaneRegion {
+                    pane: 2,
+                    row_start: 2,
+                    row_end: 3,
+                    col_start: 7,
+                    col_end: 13,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_expands_only_bottom_nested_region_rows() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Split {
+                direction: SplitDirection::Vertical,
+                first: Box::new(LayoutNode::Pane(0)),
+                second: Box::new(LayoutNode::Pane(1)),
+            }),
+            second: Box::new(LayoutNode::Pane(2)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "top\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "bottom\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 2,
+                screen: "right0\nright1\nright2\nright3\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_layout(&layout, &panes).unwrap();
+
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 6,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 2,
+                    row_end: 4,
+                    col_start: 0,
+                    col_end: 6,
+                },
+                PaneRegion {
+                    pane: 2,
+                    row_start: 0,
+                    row_end: 4,
+                    col_start: 9,
+                    col_end: 15,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_expands_right_region_rows_for_left_padding() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "left0\nleft1\nleft2\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "right\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_layout(&layout, &panes).unwrap();
+
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 3,
+                    col_start: 0,
+                    col_end: 5,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 3,
+                    col_start: 8,
+                    col_end: 13,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_returns_none_when_layout_omits_visible_pane() {
         let layout = LayoutNode::Pane(0);
         let panes = vec![
             PaneSnapshot {
@@ -1886,6 +2247,8 @@ mod tests {
                 screen: "split-ready\n".to_string(),
             },
         ];
+
+        assert!(render_attach_layout(&layout, &panes).is_none());
 
         let rendered = render_attach_pane_snapshot(&layout, &panes);
 
