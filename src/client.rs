@@ -12,6 +12,7 @@ static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
 const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 const LIVE_SNAPSHOT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +120,14 @@ fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
 }
 
 fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<()> {
+    write_live_snapshot_frame_with_message(socket, session, None)
+}
+
+fn write_live_snapshot_frame_with_message(
+    socket: &Path,
+    session: &str,
+    message: Option<&str>,
+) -> io::Result<()> {
     let status = read_attach_status_line(socket, session)?;
     let snapshot = read_attach_pane_snapshot(socket, session)?;
 
@@ -126,6 +135,9 @@ fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<()> {
     stdout.write_all(CLEAR_SCREEN)?;
     if !status.is_empty() {
         stdout.write_all(format!("{status}\r\n").as_bytes())?;
+    }
+    if let Some(message) = message {
+        stdout.write_all(format!("{message}\r\n").as_bytes())?;
     }
     stdout.write_all(&snapshot)?;
     stdout.flush()
@@ -225,7 +237,15 @@ enum LiveSnapshotInputAction {
     Forward(Vec<u8>),
     Detach,
     SelectNextPane,
+    ShowPaneNumbers,
+    SelectPane(usize),
     EnterCopyMode { initial_input: Vec<u8> },
+}
+
+#[derive(Default)]
+struct LiveSnapshotInputState {
+    saw_prefix: bool,
+    selecting_pane: bool,
 }
 
 fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAction {
@@ -263,14 +283,30 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAct
 
 fn translate_live_snapshot_input(
     input: &[u8],
-    saw_prefix: &mut bool,
+    state: &mut LiveSnapshotInputState,
 ) -> Vec<LiveSnapshotInputAction> {
     let mut output = Vec::with_capacity(input.len());
     let mut actions = Vec::new();
 
     for (index, byte) in input.iter().enumerate() {
-        if *saw_prefix {
-            *saw_prefix = false;
+        if state.selecting_pane {
+            state.selecting_pane = false;
+            if byte.is_ascii_digit() {
+                actions.push(LiveSnapshotInputAction::SelectPane(usize::from(
+                    *byte - b'0',
+                )));
+                continue;
+            }
+            if *byte == 0x02 {
+                state.saw_prefix = true;
+                continue;
+            }
+            output.push(*byte);
+            continue;
+        }
+
+        if state.saw_prefix {
+            state.saw_prefix = false;
             match *byte {
                 b'd' => {
                     if !output.is_empty() {
@@ -288,6 +324,16 @@ fn translate_live_snapshot_input(
                         )));
                     }
                     actions.push(LiveSnapshotInputAction::SelectNextPane);
+                    continue;
+                }
+                b'q' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    state.selecting_pane = true;
+                    actions.push(LiveSnapshotInputAction::ShowPaneNumbers);
                     continue;
                 }
                 b'[' => {
@@ -314,7 +360,7 @@ fn translate_live_snapshot_input(
         }
 
         if *byte == 0x02 {
-            *saw_prefix = true;
+            state.saw_prefix = true;
         } else {
             output.push(*byte);
         }
@@ -326,12 +372,13 @@ fn translate_live_snapshot_input(
     actions
 }
 
-fn finish_live_snapshot_input(saw_prefix: &mut bool) -> Option<Vec<u8>> {
-    if !*saw_prefix {
+fn finish_live_snapshot_input(state: &mut LiveSnapshotInputState) -> Option<Vec<u8>> {
+    state.selecting_pane = false;
+    if !state.saw_prefix {
         return None;
     }
 
-    *saw_prefix = false;
+    state.saw_prefix = false;
     Some(vec![0x02])
 }
 
@@ -341,8 +388,13 @@ struct PaneListEntry {
     active: bool,
 }
 
+#[cfg(test)]
 fn next_pane_index_from_listing(listing: &str) -> io::Result<usize> {
     let entries = parse_pane_listing(listing)?;
+    next_pane_index_from_entries(&entries)
+}
+
+fn next_pane_index_from_entries(entries: &[PaneListEntry]) -> io::Result<usize> {
     if entries.is_empty() {
         return Err(io::Error::other("missing pane"));
     }
@@ -377,6 +429,8 @@ fn parse_pane_listing(listing: &str) -> io::Result<Vec<PaneListEntry>> {
 enum LiveSnapshotInputEvent {
     Forward(Vec<u8>),
     SelectNextPane,
+    ShowPaneNumbers,
+    SelectPane(usize),
     PauseRedraw(mpsc::Sender<()>),
     RedrawNow,
     Error(String),
@@ -392,12 +446,12 @@ fn spawn_live_snapshot_input_thread(
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut buf = [0_u8; 1024];
-        let mut saw_prefix = false;
+        let mut input_state = LiveSnapshotInputState::default();
 
         loop {
             let n = match stdin.read(&mut buf) {
                 Ok(0) => {
-                    if let Some(bytes) = finish_live_snapshot_input(&mut saw_prefix) {
+                    if let Some(bytes) = finish_live_snapshot_input(&mut input_state) {
                         let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
                     }
                     let _ = sender.send(LiveSnapshotInputEvent::Eof);
@@ -410,7 +464,7 @@ fn spawn_live_snapshot_input_thread(
                 }
             };
 
-            for action in translate_live_snapshot_input(&buf[..n], &mut saw_prefix) {
+            for action in translate_live_snapshot_input(&buf[..n], &mut input_state) {
                 match action {
                     LiveSnapshotInputAction::Forward(bytes) => {
                         let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
@@ -421,6 +475,12 @@ fn spawn_live_snapshot_input_thread(
                     }
                     LiveSnapshotInputAction::SelectNextPane => {
                         let _ = sender.send(LiveSnapshotInputEvent::SelectNextPane);
+                    }
+                    LiveSnapshotInputAction::ShowPaneNumbers => {
+                        let _ = sender.send(LiveSnapshotInputEvent::ShowPaneNumbers);
+                    }
+                    LiveSnapshotInputAction::SelectPane(index) => {
+                        let _ = sender.send(LiveSnapshotInputEvent::SelectPane(index));
                     }
                     LiveSnapshotInputAction::EnterCopyMode { initial_input } => {
                         let (pause_ack, pause_ready) = mpsc::channel();
@@ -458,18 +518,43 @@ fn run_live_snapshot_attach(
     write_live_snapshot_frame(socket, session)?;
     let mut last_redraw = Instant::now();
     let mut redraw_paused = false;
+    let mut pane_number_message = None;
 
     loop {
         match input.recv_timeout(LIVE_SNAPSHOT_REDRAW_INTERVAL) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
-                stream.write_all(&bytes)?;
+                forward_live_snapshot_input(socket, session, &bytes)?;
                 if !redraw_paused && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL {
-                    write_live_snapshot_frame(socket, session)?;
+                    write_live_snapshot_frame_with_pane_number_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                    )?;
                     last_redraw = Instant::now();
                 }
             }
             Ok(LiveSnapshotInputEvent::SelectNextPane) => {
                 select_next_pane(socket, session)?;
+                pane_number_message = None;
+                if !redraw_paused {
+                    write_live_snapshot_frame(socket, session)?;
+                }
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::ShowPaneNumbers) => {
+                let message = pane_number_message_text(socket, session)?;
+                pane_number_message =
+                    Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
+                write_live_snapshot_frame_with_pane_number_message(
+                    socket,
+                    session,
+                    &mut pane_number_message,
+                )?;
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::SelectPane(index)) => {
+                let _ = select_numbered_pane(socket, session, index)?;
+                pane_number_message = None;
                 if !redraw_paused {
                     write_live_snapshot_frame(socket, session)?;
                 }
@@ -488,7 +573,11 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !redraw_paused {
-                    write_live_snapshot_frame(socket, session)?;
+                    write_live_snapshot_frame_with_pane_number_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                    )?;
                     last_redraw = Instant::now();
                 }
             }
@@ -500,13 +589,85 @@ fn run_live_snapshot_attach(
     Ok(())
 }
 
-fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
+fn forward_live_snapshot_input(socket: &Path, session: &str, bytes: &[u8]) -> io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let _ = send_control_request(socket, &protocol::encode_send(session, bytes))?;
+    Ok(())
+}
+
+fn write_live_snapshot_frame_with_pane_number_message(
+    socket: &Path,
+    session: &str,
+    pane_number_message: &mut Option<(String, Instant)>,
+) -> io::Result<()> {
+    if pane_number_message
+        .as_ref()
+        .is_some_and(|(_, until)| Instant::now() >= *until)
+    {
+        *pane_number_message = None;
+    }
+
+    let message = pane_number_message
+        .as_ref()
+        .map(|(message, _)| message.as_str());
+    write_live_snapshot_frame_with_message(socket, session, message)
+}
+
+fn pane_entries(socket: &Path, session: &str) -> io::Result<Vec<PaneListEntry>> {
     let body = send_control_request(
         socket,
         &protocol::encode_list_panes(session, Some("#{pane.index}\t#{pane.active}")),
     )?;
     let listing = String::from_utf8_lossy(&body);
-    let next = next_pane_index_from_listing(&listing)?;
+    parse_pane_listing(&listing)
+}
+
+fn format_pane_number_message(entries: &[PaneListEntry]) -> String {
+    let indexes = entries
+        .iter()
+        .map(|entry| {
+            if entry.active {
+                format!("[{}]", entry.index)
+            } else {
+                entry.index.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("panes: {indexes}")
+}
+
+fn pane_number_message_text(socket: &Path, session: &str) -> io::Result<String> {
+    let entries = pane_entries(socket, session)?;
+    if entries.is_empty() {
+        return Err(io::Error::other("missing pane"));
+    }
+    Ok(format_pane_number_message(&entries))
+}
+
+fn pane_index_exists(entries: &[PaneListEntry], index: usize) -> bool {
+    entries.iter().any(|entry| entry.index == index)
+}
+
+fn select_numbered_pane(socket: &Path, session: &str, index: usize) -> io::Result<bool> {
+    let entries = pane_entries(socket, session)?;
+    if entries.is_empty() {
+        return Err(io::Error::other("missing pane"));
+    }
+    if !pane_index_exists(&entries, index) {
+        return Ok(false);
+    }
+
+    let _ = send_control_request(socket, &protocol::encode_select_pane(session, index))?;
+    Ok(true)
+}
+
+fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
+    let entries = pane_entries(socket, session)?;
+    let next = next_pane_index_from_entries(&entries)?;
     let _ = send_control_request(socket, &protocol::encode_select_pane(session, next))?;
     Ok(())
 }
@@ -1147,65 +1308,124 @@ mod tests {
 
     #[test]
     fn live_snapshot_input_forwards_arbitrary_bytes() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"hello\n", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"hello\n", &mut state);
 
         assert_eq!(
             actions,
             vec![LiveSnapshotInputAction::Forward(b"hello\n".to_vec())]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_detaches_on_prefix_d_without_forwarding_bytes() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02d", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02d", &mut state);
 
         assert_eq!(actions, vec![LiveSnapshotInputAction::Detach]);
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_forwards_literal_prefix_with_regular_key() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02x", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02x", &mut state);
 
         assert_eq!(
             actions,
             vec![LiveSnapshotInputAction::Forward(b"\x02x".to_vec())]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_forwards_single_literal_prefix_on_double_prefix() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02\x02", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02\x02", &mut state);
 
         assert_eq!(actions, vec![LiveSnapshotInputAction::Forward(vec![0x02])]);
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_selects_next_pane_on_prefix_o() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02o", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02o", &mut state);
 
         assert_eq!(actions, vec![LiveSnapshotInputAction::SelectNextPane]);
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_shows_pane_numbers_on_prefix_q() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"\x02q", &mut state);
+
+        assert_eq!(actions, vec![LiveSnapshotInputAction::ShowPaneNumbers]);
+        assert!(state.selecting_pane);
+    }
+
+    #[test]
+    fn live_snapshot_input_selects_numbered_pane_after_prefix_q_across_reads() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02q", &mut state),
+            vec![LiveSnapshotInputAction::ShowPaneNumbers]
+        );
+        let actions = translate_live_snapshot_input(b"0", &mut state);
+
+        assert_eq!(actions, vec![LiveSnapshotInputAction::SelectPane(0)]);
+        assert!(!state.selecting_pane);
+    }
+
+    #[test]
+    fn live_snapshot_input_preserves_order_for_coalesced_number_selection() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"abc\x02q0def", &mut state);
+
+        assert_eq!(
+            actions,
+            vec![
+                LiveSnapshotInputAction::Forward(b"abc".to_vec()),
+                LiveSnapshotInputAction::ShowPaneNumbers,
+                LiveSnapshotInputAction::SelectPane(0),
+                LiveSnapshotInputAction::Forward(b"def".to_vec()),
+            ]
+        );
+        assert!(!state.selecting_pane);
+    }
+
+    #[test]
+    fn live_snapshot_input_cancels_number_selection_on_non_digit() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02q", &mut state),
+            vec![LiveSnapshotInputAction::ShowPaneNumbers]
+        );
+        let actions = translate_live_snapshot_input(b"x", &mut state);
+
+        assert_eq!(
+            actions,
+            vec![LiveSnapshotInputAction::Forward(b"x".to_vec())]
+        );
+        assert!(!state.selecting_pane);
     }
 
     #[test]
     fn live_snapshot_input_enters_copy_mode_on_prefix_bracket() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02[", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02[", &mut state);
 
         assert_eq!(
             actions,
@@ -1213,14 +1433,14 @@ mod tests {
                 initial_input: Vec::new(),
             }]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_passes_coalesced_copy_mode_keys_as_initial_input() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02[y", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02[y", &mut state);
 
         assert_eq!(
             actions,
@@ -1228,14 +1448,14 @@ mod tests {
                 initial_input: vec![b'y'],
             }]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_forwards_bytes_before_copy_mode_prefix() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"abc\x02[y", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"abc\x02[y", &mut state);
 
         assert_eq!(
             actions,
@@ -1246,14 +1466,14 @@ mod tests {
                 },
             ]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_preserves_order_when_prefix_o_shares_a_read() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"abc\x02odef", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"abc\x02odef", &mut state);
 
         assert_eq!(
             actions,
@@ -1263,7 +1483,7 @@ mod tests {
                 LiveSnapshotInputAction::Forward(b"def".to_vec()),
             ]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
@@ -1284,13 +1504,31 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_input_flushes_pending_prefix_on_eof() {
-        let mut saw_prefix = true;
+    fn pane_number_message_brackets_active_pane() {
+        let entries = parse_pane_listing("0\t0\n1\t1\n2\t0\n").unwrap();
 
-        let pending = finish_live_snapshot_input(&mut saw_prefix);
+        assert_eq!(format_pane_number_message(&entries), "panes: 0 [1] 2");
+    }
+
+    #[test]
+    fn pane_index_exists_checks_listing() {
+        let entries = parse_pane_listing("0\t0\n1\t1\n").unwrap();
+
+        assert!(pane_index_exists(&entries, 1));
+        assert!(!pane_index_exists(&entries, 9));
+    }
+
+    #[test]
+    fn live_snapshot_input_flushes_pending_prefix_on_eof() {
+        let mut state = LiveSnapshotInputState {
+            saw_prefix: true,
+            selecting_pane: false,
+        };
+
+        let pending = finish_live_snapshot_input(&mut state);
 
         assert_eq!(pending, Some(vec![0x02]));
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
