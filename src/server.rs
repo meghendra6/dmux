@@ -2194,6 +2194,47 @@ mod tests {
     }
 
     #[test]
+    fn render_attach_layout_expands_right_region_rows_for_left_padding() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "left0\nleft1\nleft2\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "right\n".to_string(),
+            },
+        ];
+
+        let rendered = render_attach_layout(&layout, &panes).unwrap();
+
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 3,
+                    col_start: 0,
+                    col_end: 5,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 3,
+                    col_start: 8,
+                    col_end: 13,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn render_attach_layout_returns_none_when_layout_omits_visible_pane() {
         let layout = LayoutNode::Pane(0);
         let panes = vec![
