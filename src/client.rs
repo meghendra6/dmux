@@ -12,6 +12,7 @@ static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
 const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 const LIVE_SNAPSHOT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +120,14 @@ fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
 }
 
 fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<()> {
+    write_live_snapshot_frame_with_message(socket, session, None)
+}
+
+fn write_live_snapshot_frame_with_message(
+    socket: &Path,
+    session: &str,
+    message: Option<&str>,
+) -> io::Result<()> {
     let status = read_attach_status_line(socket, session)?;
     let snapshot = read_attach_pane_snapshot(socket, session)?;
 
@@ -126,6 +135,9 @@ fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<()> {
     stdout.write_all(CLEAR_SCREEN)?;
     if !status.is_empty() {
         stdout.write_all(format!("{status}\r\n").as_bytes())?;
+    }
+    if let Some(message) = message {
+        stdout.write_all(format!("{message}\r\n").as_bytes())?;
     }
     stdout.write_all(&snapshot)?;
     stdout.flush()
@@ -376,8 +388,13 @@ struct PaneListEntry {
     active: bool,
 }
 
+#[cfg(test)]
 fn next_pane_index_from_listing(listing: &str) -> io::Result<usize> {
     let entries = parse_pane_listing(listing)?;
+    next_pane_index_from_entries(&entries)
+}
+
+fn next_pane_index_from_entries(entries: &[PaneListEntry]) -> io::Result<usize> {
     if entries.is_empty() {
         return Err(io::Error::other("missing pane"));
     }
@@ -412,6 +429,8 @@ fn parse_pane_listing(listing: &str) -> io::Result<Vec<PaneListEntry>> {
 enum LiveSnapshotInputEvent {
     Forward(Vec<u8>),
     SelectNextPane,
+    ShowPaneNumbers,
+    SelectPane(usize),
     PauseRedraw(mpsc::Sender<()>),
     RedrawNow,
     Error(String),
@@ -457,8 +476,12 @@ fn spawn_live_snapshot_input_thread(
                     LiveSnapshotInputAction::SelectNextPane => {
                         let _ = sender.send(LiveSnapshotInputEvent::SelectNextPane);
                     }
-                    LiveSnapshotInputAction::ShowPaneNumbers
-                    | LiveSnapshotInputAction::SelectPane(_) => {}
+                    LiveSnapshotInputAction::ShowPaneNumbers => {
+                        let _ = sender.send(LiveSnapshotInputEvent::ShowPaneNumbers);
+                    }
+                    LiveSnapshotInputAction::SelectPane(index) => {
+                        let _ = sender.send(LiveSnapshotInputEvent::SelectPane(index));
+                    }
                     LiveSnapshotInputAction::EnterCopyMode { initial_input } => {
                         let (pause_ack, pause_ready) = mpsc::channel();
                         let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw(pause_ack));
@@ -495,18 +518,43 @@ fn run_live_snapshot_attach(
     write_live_snapshot_frame(socket, session)?;
     let mut last_redraw = Instant::now();
     let mut redraw_paused = false;
+    let mut pane_number_message = None;
 
     loop {
         match input.recv_timeout(LIVE_SNAPSHOT_REDRAW_INTERVAL) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
                 stream.write_all(&bytes)?;
                 if !redraw_paused && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL {
-                    write_live_snapshot_frame(socket, session)?;
+                    write_live_snapshot_frame_with_pane_number_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                    )?;
                     last_redraw = Instant::now();
                 }
             }
             Ok(LiveSnapshotInputEvent::SelectNextPane) => {
                 select_next_pane(socket, session)?;
+                pane_number_message = None;
+                if !redraw_paused {
+                    write_live_snapshot_frame(socket, session)?;
+                }
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::ShowPaneNumbers) => {
+                let message = pane_number_message_text(socket, session)?;
+                pane_number_message =
+                    Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
+                write_live_snapshot_frame_with_pane_number_message(
+                    socket,
+                    session,
+                    &mut pane_number_message,
+                )?;
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::SelectPane(index)) => {
+                let _ = select_numbered_pane(socket, session, index)?;
+                pane_number_message = None;
                 if !redraw_paused {
                     write_live_snapshot_frame(socket, session)?;
                 }
@@ -525,7 +573,11 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !redraw_paused {
-                    write_live_snapshot_frame(socket, session)?;
+                    write_live_snapshot_frame_with_pane_number_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                    )?;
                     last_redraw = Instant::now();
                 }
             }
@@ -537,13 +589,76 @@ fn run_live_snapshot_attach(
     Ok(())
 }
 
-fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
+fn write_live_snapshot_frame_with_pane_number_message(
+    socket: &Path,
+    session: &str,
+    pane_number_message: &mut Option<(String, Instant)>,
+) -> io::Result<()> {
+    if pane_number_message
+        .as_ref()
+        .is_some_and(|(_, until)| Instant::now() >= *until)
+    {
+        *pane_number_message = None;
+    }
+
+    let message = pane_number_message
+        .as_ref()
+        .map(|(message, _)| message.as_str());
+    write_live_snapshot_frame_with_message(socket, session, message)
+}
+
+fn pane_entries(socket: &Path, session: &str) -> io::Result<Vec<PaneListEntry>> {
     let body = send_control_request(
         socket,
         &protocol::encode_list_panes(session, Some("#{pane.index}\t#{pane.active}")),
     )?;
     let listing = String::from_utf8_lossy(&body);
-    let next = next_pane_index_from_listing(&listing)?;
+    parse_pane_listing(&listing)
+}
+
+fn format_pane_number_message(entries: &[PaneListEntry]) -> String {
+    let indexes = entries
+        .iter()
+        .map(|entry| {
+            if entry.active {
+                format!("[{}]", entry.index)
+            } else {
+                entry.index.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("panes: {indexes}")
+}
+
+fn pane_number_message_text(socket: &Path, session: &str) -> io::Result<String> {
+    let entries = pane_entries(socket, session)?;
+    if entries.is_empty() {
+        return Err(io::Error::other("missing pane"));
+    }
+    Ok(format_pane_number_message(&entries))
+}
+
+fn pane_index_exists(entries: &[PaneListEntry], index: usize) -> bool {
+    entries.iter().any(|entry| entry.index == index)
+}
+
+fn select_numbered_pane(socket: &Path, session: &str, index: usize) -> io::Result<bool> {
+    let entries = pane_entries(socket, session)?;
+    if entries.is_empty() {
+        return Err(io::Error::other("missing pane"));
+    }
+    if !pane_index_exists(&entries, index) {
+        return Ok(false);
+    }
+
+    let _ = send_control_request(socket, &protocol::encode_select_pane(session, index))?;
+    Ok(true)
+}
+
+fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
+    let entries = pane_entries(socket, session)?;
+    let next = next_pane_index_from_entries(&entries)?;
     let _ = send_control_request(socket, &protocol::encode_select_pane(session, next))?;
     Ok(())
 }
@@ -1290,7 +1405,10 @@ mod tests {
         );
         let actions = translate_live_snapshot_input(b"x", &mut state);
 
-        assert_eq!(actions, vec![LiveSnapshotInputAction::Forward(b"x".to_vec())]);
+        assert_eq!(
+            actions,
+            vec![LiveSnapshotInputAction::Forward(b"x".to_vec())]
+        );
         assert!(!state.selecting_pane);
     }
 
@@ -1374,6 +1492,21 @@ mod tests {
     #[test]
     fn next_pane_index_rejects_missing_active_pane() {
         assert!(next_pane_index_from_listing("0\t0\n1\t0\n").is_err());
+    }
+
+    #[test]
+    fn pane_number_message_brackets_active_pane() {
+        let entries = parse_pane_listing("0\t0\n1\t1\n2\t0\n").unwrap();
+
+        assert_eq!(format_pane_number_message(&entries), "panes: 0 [1] 2");
+    }
+
+    #[test]
+    fn pane_index_exists_checks_listing() {
+        let entries = parse_pane_listing("0\t0\n1\t1\n").unwrap();
+
+        assert!(pane_index_exists(&entries, 1));
+        assert!(!pane_index_exists(&entries, 9));
     }
 
     #[test]

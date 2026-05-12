@@ -162,7 +162,7 @@ cargo test live_snapshot_input_
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit input state**
+- [x] **Step 5: Commit input state**
 
 Run:
 
@@ -177,7 +177,7 @@ git commit -m "feat: add attach pane number input state"
 - Modify: `src/client.rs`
 - Modify: `tests/phase1_cli.rs`
 
-- [ ] **Step 1: Write failing unit tests for pane-number formatting**
+- [x] **Step 1: Write failing unit tests for pane-number formatting**
 
 Add this test near the existing pane listing parser tests:
 
@@ -190,7 +190,7 @@ fn pane_number_message_brackets_active_pane() {
 }
 ```
 
-- [ ] **Step 2: Write failing integration test for attach selection**
+- [x] **Step 2: Write failing integration test for attach selection**
 
 Add this test after `attach_prefix_o_cycles_active_pane_for_live_input` in
 `tests/phase1_cli.rs`:
@@ -287,7 +287,7 @@ fn attach_prefix_q_selects_numbered_pane_for_live_input() {
 }
 ```
 
-- [ ] **Step 3: Run tests to verify RED**
+- [x] **Step 3: Run tests to verify RED**
 
 Run:
 
@@ -298,7 +298,7 @@ cargo test --test phase1_cli attach_prefix_q_selects_numbered_pane_for_live_inpu
 
 Expected: FAIL because pane-number message formatting and `C-b q` event handling do not exist.
 
-- [ ] **Step 4: Implement pane-number helpers and events**
+- [x] **Step 4: Implement pane-number helpers and events**
 
 In `src/client.rs`, add:
 
@@ -435,7 +435,7 @@ Ok(LiveSnapshotInputEvent::SelectPane(index)) => {
 Update timeout and forward-triggered redraw paths to call
 `write_live_snapshot_frame_with_message` while the message has not expired.
 
-- [ ] **Step 5: Run focused tests to verify GREEN**
+- [x] **Step 5: Run focused tests to verify GREEN**
 
 Run:
 
@@ -449,7 +449,7 @@ cargo test --test phase1_cli attach_prefix_bracket_copies_active_pane_line_in_mu
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit pane selection behavior**
+- [x] **Step 6: Commit pane selection behavior**
 
 Run:
 
@@ -466,7 +466,7 @@ git commit -m "feat: select attach panes by number"
 - Modify: `docs/superpowers/specs/2026-05-12-devmux-numbered-pane-selection-design.md`
 - Modify: `docs/superpowers/plans/2026-05-12-devmux-numbered-pane-selection.md`
 
-- [ ] **Step 1: Update README**
+- [x] **Step 1: Update README**
 
 In `README.md`, update the attach paragraph to mention `C-b q` numbered pane
 selection:
