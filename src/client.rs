@@ -419,6 +419,16 @@ fn translate_live_snapshot_input(
                 offset += consumed;
                 continue;
             }
+            if is_partial_sgr_mouse_prefix(remaining) {
+                if !output.is_empty() {
+                    actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                        &mut output,
+                    )));
+                }
+                clear_live_snapshot_command_state(state);
+                state.mouse_pending.extend_from_slice(remaining);
+                break;
+            }
             if is_incomplete_sgr_mouse_event(remaining) {
                 if !output.is_empty() {
                     actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
@@ -540,7 +550,12 @@ fn clear_live_snapshot_command_state(state: &mut LiveSnapshotInputState) {
 
 fn finish_live_snapshot_input(state: &mut LiveSnapshotInputState) -> Option<Vec<u8>> {
     state.selecting_pane = false;
-    state.mouse_pending.clear();
+    if !state.mouse_pending.is_empty() {
+        let pending = std::mem::take(&mut state.mouse_pending);
+        if is_partial_sgr_mouse_prefix(&pending) {
+            return Some(pending);
+        }
+    }
     if !state.saw_prefix {
         return None;
     }
@@ -553,7 +568,7 @@ fn live_mouse_press_position(event: SgrMouseEvent) -> Option<MousePosition> {
     if event.release || event.col == 0 || event.row == 0 {
         return None;
     }
-    if event.code & 64 != 0 || event.code & 32 != 0 || event.code & 3 != 0 {
+    if event.code != 0 {
         return None;
     }
     Some(MousePosition {
@@ -1150,6 +1165,11 @@ fn is_incomplete_sgr_mouse_event(input: &[u8]) -> bool {
             .all(|byte| byte.is_ascii_digit() || *byte == b';')
 }
 
+fn is_partial_sgr_mouse_prefix(input: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"\x1b[<";
+    input.len() < PREFIX.len() && PREFIX.starts_with(input)
+}
+
 fn complete_sgr_mouse_event_len(input: &[u8]) -> Option<usize> {
     if !input.starts_with(b"\x1b[<") {
         return None;
@@ -1660,12 +1680,56 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_input_buffers_sgr_mouse_event_split_inside_prefix() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert!(translate_live_snapshot_input(b"\x1b", &mut state).is_empty());
+        assert_eq!(
+            translate_live_snapshot_input(b"[<0;1;2M", &mut state),
+            vec![LiveSnapshotInputAction::MousePress(MousePosition {
+                col: 1,
+                row: 2
+            })]
+        );
+
+        let mut state = LiveSnapshotInputState::default();
+        assert!(translate_live_snapshot_input(b"\x1b[", &mut state).is_empty());
+        assert_eq!(
+            translate_live_snapshot_input(b"<0;1;2M", &mut state),
+            vec![LiveSnapshotInputAction::MousePress(MousePosition {
+                col: 1,
+                row: 2
+            })]
+        );
+    }
+
+    #[test]
+    fn live_snapshot_input_forwards_non_mouse_escape_after_prefix_split() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert!(translate_live_snapshot_input(b"\x1b", &mut state).is_empty());
+        assert_eq!(
+            translate_live_snapshot_input(b"x", &mut state),
+            vec![LiveSnapshotInputAction::Forward(b"\x1bx".to_vec())]
+        );
+    }
+
+    #[test]
     fn live_snapshot_input_consumes_non_press_mouse_events() {
         let mut state = LiveSnapshotInputState::default();
 
         assert!(translate_live_snapshot_input(b"\x1b[<0;1;2m", &mut state).is_empty());
         assert!(translate_live_snapshot_input(b"\x1b[<32;1;2M", &mut state).is_empty());
         assert!(translate_live_snapshot_input(b"\x1b[<64;1;2M", &mut state).is_empty());
+    }
+
+    #[test]
+    fn live_snapshot_input_consumes_modified_left_clicks() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert!(translate_live_snapshot_input(b"\x1b[<4;1;2M", &mut state).is_empty());
+        assert!(translate_live_snapshot_input(b"\x1b[<8;1;2M", &mut state).is_empty());
+        assert!(translate_live_snapshot_input(b"\x1b[<16;1;2M", &mut state).is_empty());
     }
 
     #[test]
