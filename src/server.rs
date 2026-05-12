@@ -640,6 +640,12 @@ struct RenderedAttachLayout {
     regions: Vec<PaneRegion>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedAttachSnapshot {
+    text: String,
+    regions: Vec<PaneRegion>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PaneRegion {
     pane: usize,
@@ -833,6 +839,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::Attach { session } => handle_attach(&state, stream, &session),
         Request::AttachSnapshot { session } => {
             handle_attach_snapshot(&state, &mut stream, &session)
+        }
+        Request::AttachLayoutSnapshot { session } => {
+            handle_attach_layout_snapshot(&state, &mut stream, &session)
         }
     }
 }
@@ -1580,7 +1589,33 @@ fn handle_attach_snapshot(
     Ok(())
 }
 
+fn handle_attach_layout_snapshot(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    if let Some(snapshot) = attach_pane_snapshot_with_regions(&session) {
+        stream.write_all(&format_attach_layout_snapshot_body(&snapshot))?;
+    }
+    Ok(())
+}
+
 fn attach_pane_snapshot(session: &Session) -> Option<String> {
+    attach_pane_snapshot_with_regions(session).map(|snapshot| snapshot.text)
+}
+
+fn attach_pane_snapshot_with_regions(session: &Session) -> Option<RenderedAttachSnapshot> {
     let snapshot = session.attach_layout_snapshot();
     if snapshot.panes.is_empty() {
         return None;
@@ -1595,14 +1630,58 @@ fn attach_pane_snapshot(session: &Session) -> Option<String> {
         })
         .collect::<Vec<_>>();
 
-    Some(render_attach_pane_snapshot(&snapshot.layout, &panes))
+    Some(render_attach_pane_snapshot_with_regions(
+        &snapshot.layout,
+        &panes,
+    ))
 }
 
+#[allow(dead_code)]
 fn render_attach_pane_snapshot(layout: &LayoutNode, panes: &[PaneSnapshot]) -> String {
+    render_attach_pane_snapshot_with_regions(layout, panes).text
+}
+
+fn render_attach_pane_snapshot_with_regions(
+    layout: &LayoutNode,
+    panes: &[PaneSnapshot],
+) -> RenderedAttachSnapshot {
     match render_attach_layout(layout, panes) {
-        Some(rendered) => render_client_lines(&rendered.lines),
-        None => render_ordered_pane_sections(panes),
+        Some(rendered) => RenderedAttachSnapshot {
+            text: render_client_lines(&rendered.lines),
+            regions: rendered.regions,
+        },
+        None => RenderedAttachSnapshot {
+            text: render_ordered_pane_sections(panes),
+            regions: Vec::new(),
+        },
     }
+}
+
+fn format_attach_layout_snapshot_body(snapshot: &RenderedAttachSnapshot) -> Vec<u8> {
+    let mut output = String::new();
+    output.push_str("REGIONS\t");
+    output.push_str(&snapshot.regions.len().to_string());
+    output.push('\n');
+    for region in &snapshot.regions {
+        output.push_str("REGION\t");
+        output.push_str(&region.pane.to_string());
+        output.push('\t');
+        output.push_str(&region.row_start.to_string());
+        output.push('\t');
+        output.push_str(&region.row_end.to_string());
+        output.push('\t');
+        output.push_str(&region.col_start.to_string());
+        output.push('\t');
+        output.push_str(&region.col_end.to_string());
+        output.push('\n');
+    }
+    output.push_str("SNAPSHOT\t");
+    output.push_str(&snapshot.text.as_bytes().len().to_string());
+    output.push('\n');
+
+    let mut bytes = output.into_bytes();
+    bytes.extend_from_slice(snapshot.text.as_bytes());
+    bytes
 }
 
 fn render_attach_layout(
@@ -2002,6 +2081,69 @@ mod tests {
                     col_end: 12,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn format_attach_layout_snapshot_response_includes_regions_and_snapshot() {
+        let snapshot = RenderedAttachSnapshot {
+            text: "left | right\r\n".to_string(),
+            regions: vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 4,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 7,
+                    col_end: 12,
+                },
+            ],
+        };
+
+        let body = String::from_utf8(format_attach_layout_snapshot_body(&snapshot)).unwrap();
+
+        assert_eq!(
+            body,
+            "REGIONS\t2\n\
+REGION\t0\t0\t1\t0\t4\n\
+REGION\t1\t0\t1\t7\t12\n\
+SNAPSHOT\t14\n\
+left | right\r\n"
+        );
+    }
+
+    #[test]
+    fn render_attach_pane_snapshot_with_regions_returns_fallback_without_regions() {
+        let layout = LayoutNode::Pane(0);
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "base-ready\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "split-ready\n".to_string(),
+            },
+        ];
+
+        let snapshot = render_attach_pane_snapshot_with_regions(&layout, &panes);
+
+        assert!(snapshot.regions.is_empty());
+        assert!(
+            snapshot.text.contains("-- pane 0 --"),
+            "{:?}",
+            snapshot.text
+        );
+        assert!(
+            snapshot.text.contains("-- pane 1 --"),
+            "{:?}",
+            snapshot.text
         );
     }
 

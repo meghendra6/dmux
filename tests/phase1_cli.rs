@@ -974,6 +974,238 @@ fn attach_live_input_routes_stdin_to_active_split_pane() {
 }
 
 #[test]
+fn attach_mouse_click_selects_pane_for_live_input() {
+    let socket = unique_socket("attach-mouse-focus");
+    let session = format!("attach-mouse-focus-{}", std::process::id());
+    let base_file = unique_temp_file("attach-mouse-focus-base");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; echo split-mouse:$line; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin
+            .write_all(b"\x1b[<0;1;2Mbase-mouse\n")
+            .expect("write mouse click and base input");
+        stdin.flush().expect("flush mouse input");
+    }
+
+    assert!(poll_file_contains(&base_file, "base-mouse"));
+    let panes = poll_active_pane(&socket, &session, 0);
+    assert!(panes.lines().any(|line| line == "0\t1"), "{panes:?}");
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_mouse_click_preserves_forwarded_input_before_focus_change() {
+    let socket = unique_socket("attach-mouse-order");
+    let session = format!("attach-mouse-order-{}", std::process::id());
+    let base_file = unique_temp_file("attach-mouse-order-base");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; echo split-before:$line; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin
+            .write_all(b"split\x0d\x1b[<0;1;2Mbase-after\n")
+            .expect("write coalesced split input mouse click and base input");
+        stdin.flush().expect("flush coalesced mouse input");
+    }
+
+    assert!(poll_file_contains(&base_file, "base-after"));
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "1"]));
+    let split = poll_capture(&socket, &session, "split-before:split");
+    assert!(split.contains("split-before:split"), "{split:?}");
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_mouse_click_on_separator_keeps_active_pane() {
+    let socket = unique_socket("attach-mouse-separator");
+    let session = format!("attach-mouse-separator-{}", std::process::id());
+    let base_file = unique_temp_file("attach-mouse-separator-base");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; echo split-separator:$line; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin
+            .write_all(b"\x1b[<0;1;2Mbase-before\n")
+            .expect("write base click and input");
+        stdin.flush().expect("flush base click input");
+    }
+
+    assert!(poll_file_contains(&base_file, "base-before"));
+    let panes = poll_active_pane(&socket, &session, 0);
+    assert!(panes.lines().any(|line| line == "0\t1"), "{panes:?}");
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin
+            .write_all(b"\x1b[<0;12;2Mbase-after\n")
+            .expect("write separator click and split input");
+        stdin.flush().expect("flush separator input");
+    }
+
+    let panes = poll_active_pane(&socket, &session, 0);
+    assert!(panes.lines().any(|line| line == "0\t1"), "{panes:?}");
+    assert!(poll_file_contains(&base_file, "base-after"));
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_prefix_o_cycles_active_pane_for_live_input() {
     let socket = unique_socket("attach-pane-cycle");
     let session = format!("attach-pane-cycle-{}", std::process::id());
@@ -1451,6 +1683,76 @@ fn attach_multi_pane_keeps_snapshot_handshake_for_client_compatibility() {
         .expect("write attach request");
 
     assert_eq!(read_socket_line(&mut stream), "OK\tSNAPSHOT\n");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_layout_snapshot_response_includes_regions_without_changing_plain_snapshot() {
+    let socket = unique_socket("attach-layout-regions");
+    let session = format!("attach-layout-regions-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(format!("ATTACH_LAYOUT_SNAPSHOT\t{session}\n").as_bytes())
+        .expect("write layout snapshot request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    let mut body = String::new();
+    stream.read_to_string(&mut body).expect("read layout body");
+
+    assert!(body.starts_with("REGIONS\t2\n"), "{body:?}");
+    assert!(body.contains("REGION\t0\t0\t1\t0\t10\n"), "{body:?}");
+    assert!(body.contains("REGION\t1\t0\t1\t13\t24\n"), "{body:?}");
+    assert!(body.contains("SNAPSHOT\t"), "{body:?}");
+    assert!(body.contains("base-ready | split-ready\r\n"), "{body:?}");
+
+    let mut plain = UnixStream::connect(&socket).expect("connect socket");
+    plain
+        .write_all(format!("ATTACH_SNAPSHOT\t{session}\n").as_bytes())
+        .expect("write plain snapshot request");
+    assert_eq!(read_socket_line(&mut plain), "OK\n");
+    let mut plain_body = String::new();
+    plain
+        .read_to_string(&mut plain_body)
+        .expect("read plain snapshot body");
+    assert!(!plain_body.contains("REGIONS\t"), "{plain_body:?}");
+    assert!(
+        plain_body.contains("base-ready | split-ready\r\n"),
+        "{plain_body:?}"
+    );
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
