@@ -225,7 +225,15 @@ enum LiveSnapshotInputAction {
     Forward(Vec<u8>),
     Detach,
     SelectNextPane,
+    ShowPaneNumbers,
+    SelectPane(usize),
     EnterCopyMode { initial_input: Vec<u8> },
+}
+
+#[derive(Default)]
+struct LiveSnapshotInputState {
+    saw_prefix: bool,
+    selecting_pane: bool,
 }
 
 fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAction {
@@ -263,14 +271,30 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAct
 
 fn translate_live_snapshot_input(
     input: &[u8],
-    saw_prefix: &mut bool,
+    state: &mut LiveSnapshotInputState,
 ) -> Vec<LiveSnapshotInputAction> {
     let mut output = Vec::with_capacity(input.len());
     let mut actions = Vec::new();
 
     for (index, byte) in input.iter().enumerate() {
-        if *saw_prefix {
-            *saw_prefix = false;
+        if state.selecting_pane {
+            state.selecting_pane = false;
+            if byte.is_ascii_digit() {
+                actions.push(LiveSnapshotInputAction::SelectPane(usize::from(
+                    *byte - b'0',
+                )));
+                continue;
+            }
+            if *byte == 0x02 {
+                state.saw_prefix = true;
+                continue;
+            }
+            output.push(*byte);
+            continue;
+        }
+
+        if state.saw_prefix {
+            state.saw_prefix = false;
             match *byte {
                 b'd' => {
                     if !output.is_empty() {
@@ -288,6 +312,16 @@ fn translate_live_snapshot_input(
                         )));
                     }
                     actions.push(LiveSnapshotInputAction::SelectNextPane);
+                    continue;
+                }
+                b'q' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    state.selecting_pane = true;
+                    actions.push(LiveSnapshotInputAction::ShowPaneNumbers);
                     continue;
                 }
                 b'[' => {
@@ -314,7 +348,7 @@ fn translate_live_snapshot_input(
         }
 
         if *byte == 0x02 {
-            *saw_prefix = true;
+            state.saw_prefix = true;
         } else {
             output.push(*byte);
         }
@@ -326,12 +360,13 @@ fn translate_live_snapshot_input(
     actions
 }
 
-fn finish_live_snapshot_input(saw_prefix: &mut bool) -> Option<Vec<u8>> {
-    if !*saw_prefix {
+fn finish_live_snapshot_input(state: &mut LiveSnapshotInputState) -> Option<Vec<u8>> {
+    state.selecting_pane = false;
+    if !state.saw_prefix {
         return None;
     }
 
-    *saw_prefix = false;
+    state.saw_prefix = false;
     Some(vec![0x02])
 }
 
@@ -392,12 +427,12 @@ fn spawn_live_snapshot_input_thread(
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut buf = [0_u8; 1024];
-        let mut saw_prefix = false;
+        let mut input_state = LiveSnapshotInputState::default();
 
         loop {
             let n = match stdin.read(&mut buf) {
                 Ok(0) => {
-                    if let Some(bytes) = finish_live_snapshot_input(&mut saw_prefix) {
+                    if let Some(bytes) = finish_live_snapshot_input(&mut input_state) {
                         let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
                     }
                     let _ = sender.send(LiveSnapshotInputEvent::Eof);
@@ -410,7 +445,7 @@ fn spawn_live_snapshot_input_thread(
                 }
             };
 
-            for action in translate_live_snapshot_input(&buf[..n], &mut saw_prefix) {
+            for action in translate_live_snapshot_input(&buf[..n], &mut input_state) {
                 match action {
                     LiveSnapshotInputAction::Forward(bytes) => {
                         let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
@@ -422,6 +457,8 @@ fn spawn_live_snapshot_input_thread(
                     LiveSnapshotInputAction::SelectNextPane => {
                         let _ = sender.send(LiveSnapshotInputEvent::SelectNextPane);
                     }
+                    LiveSnapshotInputAction::ShowPaneNumbers
+                    | LiveSnapshotInputAction::SelectPane(_) => {}
                     LiveSnapshotInputAction::EnterCopyMode { initial_input } => {
                         let (pause_ack, pause_ready) = mpsc::channel();
                         let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw(pause_ack));
@@ -1147,65 +1184,121 @@ mod tests {
 
     #[test]
     fn live_snapshot_input_forwards_arbitrary_bytes() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"hello\n", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"hello\n", &mut state);
 
         assert_eq!(
             actions,
             vec![LiveSnapshotInputAction::Forward(b"hello\n".to_vec())]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_detaches_on_prefix_d_without_forwarding_bytes() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02d", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02d", &mut state);
 
         assert_eq!(actions, vec![LiveSnapshotInputAction::Detach]);
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_forwards_literal_prefix_with_regular_key() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02x", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02x", &mut state);
 
         assert_eq!(
             actions,
             vec![LiveSnapshotInputAction::Forward(b"\x02x".to_vec())]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_forwards_single_literal_prefix_on_double_prefix() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02\x02", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02\x02", &mut state);
 
         assert_eq!(actions, vec![LiveSnapshotInputAction::Forward(vec![0x02])]);
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_selects_next_pane_on_prefix_o() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02o", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02o", &mut state);
 
         assert_eq!(actions, vec![LiveSnapshotInputAction::SelectNextPane]);
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_shows_pane_numbers_on_prefix_q() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"\x02q", &mut state);
+
+        assert_eq!(actions, vec![LiveSnapshotInputAction::ShowPaneNumbers]);
+        assert!(state.selecting_pane);
+    }
+
+    #[test]
+    fn live_snapshot_input_selects_numbered_pane_after_prefix_q_across_reads() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02q", &mut state),
+            vec![LiveSnapshotInputAction::ShowPaneNumbers]
+        );
+        let actions = translate_live_snapshot_input(b"0", &mut state);
+
+        assert_eq!(actions, vec![LiveSnapshotInputAction::SelectPane(0)]);
+        assert!(!state.selecting_pane);
+    }
+
+    #[test]
+    fn live_snapshot_input_preserves_order_for_coalesced_number_selection() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"abc\x02q0def", &mut state);
+
+        assert_eq!(
+            actions,
+            vec![
+                LiveSnapshotInputAction::Forward(b"abc".to_vec()),
+                LiveSnapshotInputAction::ShowPaneNumbers,
+                LiveSnapshotInputAction::SelectPane(0),
+                LiveSnapshotInputAction::Forward(b"def".to_vec()),
+            ]
+        );
+        assert!(!state.selecting_pane);
+    }
+
+    #[test]
+    fn live_snapshot_input_cancels_number_selection_on_non_digit() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02q", &mut state),
+            vec![LiveSnapshotInputAction::ShowPaneNumbers]
+        );
+        let actions = translate_live_snapshot_input(b"x", &mut state);
+
+        assert_eq!(actions, vec![LiveSnapshotInputAction::Forward(b"x".to_vec())]);
+        assert!(!state.selecting_pane);
     }
 
     #[test]
     fn live_snapshot_input_enters_copy_mode_on_prefix_bracket() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02[", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02[", &mut state);
 
         assert_eq!(
             actions,
@@ -1213,14 +1306,14 @@ mod tests {
                 initial_input: Vec::new(),
             }]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_passes_coalesced_copy_mode_keys_as_initial_input() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02[y", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"\x02[y", &mut state);
 
         assert_eq!(
             actions,
@@ -1228,14 +1321,14 @@ mod tests {
                 initial_input: vec![b'y'],
             }]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_forwards_bytes_before_copy_mode_prefix() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"abc\x02[y", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"abc\x02[y", &mut state);
 
         assert_eq!(
             actions,
@@ -1246,14 +1339,14 @@ mod tests {
                 },
             ]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
     fn live_snapshot_input_preserves_order_when_prefix_o_shares_a_read() {
-        let mut saw_prefix = false;
+        let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"abc\x02odef", &mut saw_prefix);
+        let actions = translate_live_snapshot_input(b"abc\x02odef", &mut state);
 
         assert_eq!(
             actions,
@@ -1263,7 +1356,7 @@ mod tests {
                 LiveSnapshotInputAction::Forward(b"def".to_vec()),
             ]
         );
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]
@@ -1285,12 +1378,15 @@ mod tests {
 
     #[test]
     fn live_snapshot_input_flushes_pending_prefix_on_eof() {
-        let mut saw_prefix = true;
+        let mut state = LiveSnapshotInputState {
+            saw_prefix: true,
+            selecting_pane: false,
+        };
 
-        let pending = finish_live_snapshot_input(&mut saw_prefix);
+        let pending = finish_live_snapshot_input(&mut state);
 
         assert_eq!(pending, Some(vec![0x02]));
-        assert!(!saw_prefix);
+        assert!(!state.saw_prefix);
     }
 
     #[test]

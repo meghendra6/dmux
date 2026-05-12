@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `src/client.rs`
 
-- [ ] **Step 1: Write failing unit tests**
+- [x] **Step 1: Write failing unit tests**
 
 Add these tests near the existing live snapshot input tests in `src/client.rs`:
 
@@ -77,7 +77,7 @@ fn live_snapshot_input_cancels_number_selection_on_non_digit() {
 }
 ```
 
-- [ ] **Step 2: Run unit tests to verify RED**
+- [x] **Step 2: Run unit tests to verify RED**
 
 Run:
 
@@ -90,7 +90,7 @@ cargo test live_snapshot_input_cancels_number_selection_on_non_digit
 
 Expected: FAIL because `LiveSnapshotInputState`, `ShowPaneNumbers`, and `SelectPane` do not exist.
 
-- [ ] **Step 3: Implement the input state and actions**
+- [x] **Step 3: Implement the input state and actions**
 
 In `src/client.rs`, replace the live snapshot translator boolean state with this struct:
 
@@ -152,7 +152,7 @@ instead of a `saw_prefix` boolean. Update `finish_live_snapshot_input` to accept
 `&mut LiveSnapshotInputState`, clear `selecting_pane`, and flush a pending
 literal prefix only when `state.saw_prefix` is true.
 
-- [ ] **Step 4: Run live snapshot unit tests to verify GREEN**
+- [x] **Step 4: Run live snapshot unit tests to verify GREEN**
 
 Run:
 
