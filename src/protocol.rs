@@ -127,11 +127,11 @@ pub fn encode_attach(session: &str) -> String {
     format!("ATTACH\t{session}\n")
 }
 
+#[allow(dead_code)]
 pub fn encode_attach_snapshot(session: &str) -> String {
     format!("ATTACH_SNAPSHOT\t{session}\n")
 }
 
-#[allow(dead_code)]
 pub fn encode_attach_layout_snapshot(session: &str) -> String {
     format!("ATTACH_LAYOUT_SNAPSHOT\t{session}\n")
 }

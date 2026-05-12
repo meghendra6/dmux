@@ -4,11 +4,12 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
+static MOUSE_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 const LIVE_SNAPSHOT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
@@ -40,6 +41,12 @@ struct AttachPaneRegion {
 struct AttachLayoutSnapshotResponse {
     snapshot: Vec<u8>,
     regions: Vec<AttachPaneRegion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveSnapshotFrame {
+    regions: Vec<AttachPaneRegion>,
+    header_rows: usize,
 }
 
 pub fn attach<F>(
@@ -109,10 +116,6 @@ fn copy_attach_output(output_stream: &mut UnixStream) {
 fn read_attach_status_line(socket: &Path, session: &str) -> io::Result<String> {
     let body = send_control_request(socket, &protocol::encode_status_line(session, None))?;
     Ok(String::from_utf8_lossy(&body).trim_end().to_string())
-}
-
-fn read_attach_pane_snapshot(socket: &Path, session: &str) -> io::Result<Vec<u8>> {
-    send_control_request(socket, &protocol::encode_attach_snapshot(session))
 }
 
 fn read_attach_layout_snapshot(
@@ -215,7 +218,7 @@ fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
     )))
 }
 
-fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<()> {
+fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<LiveSnapshotFrame> {
     write_live_snapshot_frame_with_message(socket, session, None)
 }
 
@@ -223,9 +226,10 @@ fn write_live_snapshot_frame_with_message(
     socket: &Path,
     session: &str,
     message: Option<&str>,
-) -> io::Result<()> {
+) -> io::Result<LiveSnapshotFrame> {
     let status = read_attach_status_line(socket, session)?;
-    let snapshot = read_attach_pane_snapshot(socket, session)?;
+    let snapshot = read_attach_layout_snapshot(socket, session)?;
+    let header_rows = usize::from(!status.is_empty()) + usize::from(message.is_some());
 
     let mut stdout = io::stdout().lock();
     stdout.write_all(CLEAR_SCREEN)?;
@@ -235,8 +239,13 @@ fn write_live_snapshot_frame_with_message(
     if let Some(message) = message {
         stdout.write_all(format!("{message}\r\n").as_bytes())?;
     }
-    stdout.write_all(&snapshot)?;
-    stdout.flush()
+    stdout.write_all(&snapshot.snapshot)?;
+    stdout.flush()?;
+
+    Ok(LiveSnapshotFrame {
+        regions: snapshot.regions,
+        header_rows,
+    })
 }
 
 pub fn detect_attach_size() -> Option<PtySize> {
@@ -599,6 +608,7 @@ fn parse_pane_listing(listing: &str) -> io::Result<Vec<PaneListEntry>> {
 #[derive(Debug)]
 enum LiveSnapshotInputEvent {
     Forward(Vec<u8>),
+    MousePress(MousePosition),
     SelectNextPane,
     ShowPaneNumbers,
     SelectPane(usize),
@@ -653,7 +663,9 @@ fn spawn_live_snapshot_input_thread(
                     LiveSnapshotInputAction::SelectPane(index) => {
                         let _ = sender.send(LiveSnapshotInputEvent::SelectPane(index));
                     }
-                    LiveSnapshotInputAction::MousePress(_) => {}
+                    LiveSnapshotInputAction::MousePress(position) => {
+                        let _ = sender.send(LiveSnapshotInputEvent::MousePress(position));
+                    }
                     LiveSnapshotInputAction::EnterCopyMode { initial_input } => {
                         let (pause_ack, pause_ready) = mpsc::channel();
                         let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw(pause_ack));
@@ -687,7 +699,8 @@ fn run_live_snapshot_attach(
     stream: &mut UnixStream,
 ) -> io::Result<()> {
     let input = spawn_live_snapshot_input_thread(socket.to_path_buf(), session.to_string());
-    write_live_snapshot_frame(socket, session)?;
+    let _mouse = MouseModeGuard::enable()?;
+    let mut frame = write_live_snapshot_frame(socket, session)?;
     let mut last_redraw = Instant::now();
     let mut redraw_paused = false;
     let mut pane_number_message = None;
@@ -697,7 +710,7 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
                 forward_live_snapshot_input(socket, session, &bytes)?;
                 if !redraw_paused && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL {
-                    write_live_snapshot_frame_with_pane_number_message(
+                    frame = write_live_snapshot_frame_with_pane_number_message(
                         socket,
                         session,
                         &mut pane_number_message,
@@ -709,7 +722,7 @@ fn run_live_snapshot_attach(
                 select_next_pane(socket, session)?;
                 pane_number_message = None;
                 if !redraw_paused {
-                    write_live_snapshot_frame(socket, session)?;
+                    frame = write_live_snapshot_frame(socket, session)?;
                 }
                 last_redraw = Instant::now();
             }
@@ -717,7 +730,7 @@ fn run_live_snapshot_attach(
                 let message = pane_number_message_text(socket, session)?;
                 pane_number_message =
                     Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
-                write_live_snapshot_frame_with_pane_number_message(
+                frame = write_live_snapshot_frame_with_pane_number_message(
                     socket,
                     session,
                     &mut pane_number_message,
@@ -728,9 +741,21 @@ fn run_live_snapshot_attach(
                 let _ = select_numbered_pane(socket, session, index)?;
                 pane_number_message = None;
                 if !redraw_paused {
-                    write_live_snapshot_frame(socket, session)?;
+                    frame = write_live_snapshot_frame(socket, session)?;
                 }
                 last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::MousePress(position)) => {
+                if let Some(pane) =
+                    pane_at_mouse_position(&frame.regions, frame.header_rows, position)
+                {
+                    let _ = select_numbered_pane(socket, session, pane)?;
+                    pane_number_message = None;
+                    if !redraw_paused {
+                        frame = write_live_snapshot_frame(socket, session)?;
+                    }
+                    last_redraw = Instant::now();
+                }
             }
             Ok(LiveSnapshotInputEvent::PauseRedraw(pause_ack)) => {
                 redraw_paused = true;
@@ -738,14 +763,14 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::RedrawNow) => {
                 redraw_paused = false;
-                write_live_snapshot_frame(socket, session)?;
+                frame = write_live_snapshot_frame(socket, session)?;
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::Error(message)) => return Err(io::Error::other(message)),
             Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if !redraw_paused {
-                    write_live_snapshot_frame_with_pane_number_message(
+                    frame = write_live_snapshot_frame_with_pane_number_message(
                         socket,
                         session,
                         &mut pane_number_message,
@@ -774,7 +799,7 @@ fn write_live_snapshot_frame_with_pane_number_message(
     socket: &Path,
     session: &str,
     pane_number_message: &mut Option<(String, Instant)>,
-) -> io::Result<()> {
+) -> io::Result<LiveSnapshotFrame> {
     if pane_number_message
         .as_ref()
         .is_some_and(|(_, until)| Instant::now() >= *until)
@@ -1334,18 +1359,28 @@ struct MouseModeGuard;
 
 impl MouseModeGuard {
     fn enable() -> io::Result<Self> {
-        let mut stdout = io::stdout().lock();
-        stdout.write_all(ENABLE_MOUSE_MODE)?;
-        stdout.flush()?;
+        if MOUSE_MODE_DEPTH.fetch_add(1, Ordering::SeqCst) == 0 {
+            let result = (|| {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(ENABLE_MOUSE_MODE)?;
+                stdout.flush()
+            })();
+            if let Err(error) = result {
+                MOUSE_MODE_DEPTH.fetch_sub(1, Ordering::SeqCst);
+                return Err(error);
+            }
+        }
         Ok(Self)
     }
 }
 
 impl Drop for MouseModeGuard {
     fn drop(&mut self) {
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(DISABLE_MOUSE_MODE);
-        let _ = stdout.flush();
+        if MOUSE_MODE_DEPTH.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let mut stdout = io::stdout().lock();
+            let _ = stdout.write_all(DISABLE_MOUSE_MODE);
+            let _ = stdout.flush();
+        }
     }
 }
 
