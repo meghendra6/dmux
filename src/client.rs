@@ -122,8 +122,22 @@ fn read_attach_layout_snapshot(
     socket: &Path,
     session: &str,
 ) -> io::Result<AttachLayoutSnapshotResponse> {
-    let body = send_control_request(socket, &protocol::encode_attach_layout_snapshot(session))?;
-    parse_attach_layout_snapshot_response(&body)
+    match send_control_request(socket, &protocol::encode_attach_layout_snapshot(session)) {
+        Ok(body) => parse_attach_layout_snapshot_response(&body),
+        Err(error) if is_unknown_request_error(&error) => {
+            let snapshot =
+                send_control_request(socket, &protocol::encode_attach_snapshot(session))?;
+            Ok(AttachLayoutSnapshotResponse {
+                snapshot,
+                regions: Vec::new(),
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_unknown_request_error(error: &io::Error) -> bool {
+    error.to_string().starts_with("unknown request line:")
 }
 
 fn parse_attach_layout_snapshot_response(body: &[u8]) -> io::Result<AttachLayoutSnapshotResponse> {
@@ -425,7 +439,6 @@ fn translate_live_snapshot_input(
                         &mut output,
                     )));
                 }
-                clear_live_snapshot_command_state(state);
                 state.mouse_pending.extend_from_slice(remaining);
                 break;
             }
@@ -435,7 +448,6 @@ fn translate_live_snapshot_input(
                         &mut output,
                     )));
                 }
-                clear_live_snapshot_command_state(state);
                 state.mouse_pending.extend_from_slice(remaining);
                 break;
             }
@@ -549,19 +561,20 @@ fn clear_live_snapshot_command_state(state: &mut LiveSnapshotInputState) {
 }
 
 fn finish_live_snapshot_input(state: &mut LiveSnapshotInputState) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    if state.saw_prefix {
+        state.saw_prefix = false;
+        output.push(0x02);
+    }
     state.selecting_pane = false;
     if !state.mouse_pending.is_empty() {
-        let pending = std::mem::take(&mut state.mouse_pending);
-        if is_partial_sgr_mouse_prefix(&pending) {
-            return Some(pending);
-        }
-    }
-    if !state.saw_prefix {
-        return None;
+        output.extend(std::mem::take(&mut state.mouse_pending));
     }
 
-    state.saw_prefix = false;
-    Some(vec![0x02])
+    if output.is_empty() {
+        return None;
+    }
+    Some(output)
 }
 
 fn live_mouse_press_position(event: SgrMouseEvent) -> Option<MousePosition> {
@@ -1583,6 +1596,41 @@ mod tests {
     }
 
     #[test]
+    fn read_attach_layout_snapshot_falls_back_to_plain_snapshot_for_unknown_request() {
+        let socket = std::env::temp_dir().join(format!(
+            "dmux-layout-fallback-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert_eq!(
+                read_line(&mut stream).unwrap(),
+                "ATTACH_LAYOUT_SNAPSHOT\tdev\n"
+            );
+            stream
+                .write_all(b"ERR unknown request line: \"ATTACH_LAYOUT_SNAPSHOT\\tdev\\n\"\n")
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            assert_eq!(read_line(&mut stream).unwrap(), "ATTACH_SNAPSHOT\tdev\n");
+            stream.write_all(b"OK\nplain snapshot\r\n").unwrap();
+        });
+
+        let snapshot = read_attach_layout_snapshot(&socket, "dev").unwrap();
+
+        assert_eq!(snapshot.snapshot, b"plain snapshot\r\n");
+        assert!(snapshot.regions.is_empty());
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[test]
     fn rejects_extra_bytes_after_attach_layout_snapshot_body() {
         let error =
             parse_attach_layout_snapshot_response(b"REGIONS\t0\nSNAPSHOT\t3\nabcd").unwrap_err();
@@ -1711,6 +1759,32 @@ mod tests {
         assert_eq!(
             translate_live_snapshot_input(b"x", &mut state),
             vec![LiveSnapshotInputAction::Forward(b"\x1bx".to_vec())]
+        );
+    }
+
+    #[test]
+    fn live_snapshot_input_preserves_prefix_when_partial_mouse_prefix_is_not_mouse() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert!(translate_live_snapshot_input(b"\x02", &mut state).is_empty());
+        assert!(translate_live_snapshot_input(b"\x1b", &mut state).is_empty());
+        assert_eq!(
+            translate_live_snapshot_input(b"x", &mut state),
+            vec![LiveSnapshotInputAction::Forward(b"\x02\x1bx".to_vec())]
+        );
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_flushes_unresolved_mouse_pending_on_eof() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert!(translate_live_snapshot_input(b"\x02", &mut state).is_empty());
+        assert!(translate_live_snapshot_input(b"\x1b[<0;1", &mut state).is_empty());
+
+        assert_eq!(
+            finish_live_snapshot_input(&mut state),
+            Some(b"\x02\x1b[<0;1".to_vec())
         );
     }
 
