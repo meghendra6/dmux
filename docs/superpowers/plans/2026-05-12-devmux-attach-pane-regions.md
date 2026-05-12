@@ -212,9 +212,11 @@ fn join_horizontal_layout(
     let rows = left.lines.len().max(right.lines.len()).max(1);
     let lines = join_horizontal(left.lines, right.lines);
 
-    let mut regions = expand_region_rows(left.regions, rows);
+    let left_height = left.lines.len().max(1);
+    let right_height = right.lines.len().max(1);
+    let mut regions = expand_boundary_region_rows(left.regions, left_height, rows);
     regions.extend(offset_regions(
-        expand_region_rows(right.regions, rows),
+        expand_boundary_region_rows(right.regions, right_height, rows),
         0,
         left_width + 3,
     ));
@@ -229,11 +231,13 @@ fn join_vertical_layout(
         .max(max_line_width(&bottom.lines))
         .max(1);
     let top_height = top.lines.len().max(1);
+    let top_width = max_line_width(&top.lines);
+    let bottom_width = max_line_width(&bottom.lines);
     let lines = join_vertical(top.lines, bottom.lines);
 
-    let mut regions = expand_region_cols(top.regions, width);
+    let mut regions = expand_boundary_region_cols(top.regions, top_width, width);
     regions.extend(offset_regions(
-        expand_region_cols(bottom.regions, width),
+        expand_boundary_region_cols(bottom.regions, bottom_width, width),
         top_height + 1,
         0,
     ));
@@ -241,16 +245,28 @@ fn join_vertical_layout(
     RenderedAttachLayout { lines, regions }
 }
 
-fn expand_region_rows(mut regions: Vec<PaneRegion>, row_end: usize) -> Vec<PaneRegion> {
+fn expand_boundary_region_rows(
+    mut regions: Vec<PaneRegion>,
+    current_row_end: usize,
+    target_row_end: usize,
+) -> Vec<PaneRegion> {
     for region in &mut regions {
-        region.row_end = row_end;
+        if region.row_end == current_row_end {
+            region.row_end = target_row_end;
+        }
     }
     regions
 }
 
-fn expand_region_cols(mut regions: Vec<PaneRegion>, col_end: usize) -> Vec<PaneRegion> {
+fn expand_boundary_region_cols(
+    mut regions: Vec<PaneRegion>,
+    current_col_end: usize,
+    target_col_end: usize,
+) -> Vec<PaneRegion> {
     for region in &mut regions {
-        region.col_end = col_end;
+        if region.col_end == current_col_end {
+            region.col_end = target_col_end;
+        }
     }
     regions
 }
@@ -394,8 +410,12 @@ Expected: PASS if Task 1 already implemented general recursion correctly; otherw
 - [ ] **Step 3: Fix nested/fallback behavior if needed**
 
 If nested offsets fail, adjust `join_horizontal_layout`, `join_vertical_layout`,
-`expand_region_rows`, `expand_region_cols`, or `offset_regions` so nested regions
-match the expected zero-based exclusive coordinate ranges.
+`expand_boundary_region_rows`, `expand_boundary_region_cols`, or `offset_regions`
+so nested regions match the expected zero-based exclusive coordinate ranges.
+
+Also add coverage for a vertical split on the left side of a horizontal split,
+for example `(pane0 over pane1) | pane2`, to prove top and bottom nested regions
+do not overlap when the horizontal join expands row padding.
 
 If fallback behavior fails, ensure `render_attach_layout` returns `None` when
 `layout_matches_panes(layout, panes)` is false and `render_attach_pane_snapshot`

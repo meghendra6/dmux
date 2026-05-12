@@ -90,16 +90,20 @@ For a horizontal split:
 - right child starts at row `0`, col `left_width + 3`
 - the three separator columns from `left_width` through `left_width + 2` are
   excluded from all regions
-- each child region's `row_end` is expanded to the joined row count so padded
-  blank rows still hit that pane
+- if a child is shorter than the joined row count, only descendant regions that
+  touch that child's bottom boundary have `row_end` expanded to the joined row
+  count. This maps bottom padding without making upper nested panes overlap
+  lower nested panes.
 
 For a vertical split:
 
 - first child starts at row `0`, col `0`
 - second child starts at row `first_height + 1`, col `0`
 - the separator row at `first_height` is excluded from all regions
-- each child region's `col_end` is expanded to the joined width so padded blank
-  columns still hit that pane
+- if a child is narrower than the joined width, only descendant regions that
+  touch that child's right boundary have `col_end` expanded to the joined width.
+  This maps right padding without making left nested panes overlap right nested
+  panes.
 
 For nested layouts, offsets accumulate recursively.
 
