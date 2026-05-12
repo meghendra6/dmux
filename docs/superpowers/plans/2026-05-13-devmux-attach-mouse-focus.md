@@ -1017,16 +1017,22 @@ Update `LiveSnapshotInputEvent`:
 MousePress(MousePosition),
 ```
 
-Send that event from `spawn_live_snapshot_input_thread`.
+Send that event from `spawn_live_snapshot_input_thread` only while live mouse
+focus is enabled for the latest frame. When the client falls back to plain
+`ATTACH_SNAPSHOT` against an older daemon or a frame has no regions, keep
+terminal mouse reporting disabled and forward SGR mouse bytes normally.
 
-In `run_live_snapshot_attach`, keep:
+In `run_live_snapshot_attach`, keep the latest frame and a shared
+`mouse_focus_enabled` flag:
 
 ```rust
-let _mouse = MouseModeGuard::enable()?;
 let mut frame = write_live_snapshot_frame(socket, session)?;
+let mut mouse_mode = None;
+sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
 ```
 
-Update every redraw call to assign `frame = ...?`.
+Update every redraw call to assign `frame = ...?` and then call
+`sync_live_mouse_mode`.
 
 Handle mouse press:
 
