@@ -1210,10 +1210,10 @@ fn attach_prefix_q_preserves_forwarded_input_before_number_selection() {
         stdin.flush().expect("flush coalesced input");
     }
 
+    assert!(poll_file_contains(&base_file, "base-after"));
     assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "1"]));
     let split = poll_capture(&socket, &session, "split-before:split");
     assert!(split.contains("split-before:split"), "{split:?}");
-    assert!(poll_file_contains(&base_file, "base-after"));
 
     {
         let stdin = child.stdin.as_mut().expect("attach stdin");
