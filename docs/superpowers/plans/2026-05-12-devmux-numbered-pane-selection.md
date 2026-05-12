@@ -489,7 +489,7 @@ Update current limits:
 - multi-pane attach live redraw is polling-based and routes input to the server active pane; mouse focus and composed-layout copy-mode are not implemented yet
 ```
 
-- [ ] **Step 2: Update HANDOFF progress**
+- [x] **Step 2: Update HANDOFF progress**
 
 Record branch, scope, tests run, PR number after creation, review findings, merge
 status, and retrospective notes. Do not stage or commit `HANDOFF.md`.
@@ -516,7 +516,7 @@ git add README.md src/client.rs tests/phase1_cli.rs docs/superpowers/specs/2026-
 git commit -m "docs: document attach pane number selection"
 ```
 
-- [ ] **Step 5: Push and open PR**
+- [x] **Step 5: Push and open PR**
 
 Run:
 
@@ -527,7 +527,7 @@ gh pr create --base main --head devmux-numbered-pane-selection --title "Select a
 
 The PR title and body must not contain the reserved assistant/project keyword requested by the user.
 
-- [ ] **Step 6: Run critical subagent review after PR creation**
+- [x] **Step 6: Run critical subagent review after PR creation**
 
 Dispatch a read-only review subagent against `git diff origin/main` and the PR
 metadata with this brief:

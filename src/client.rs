@@ -523,7 +523,7 @@ fn run_live_snapshot_attach(
     loop {
         match input.recv_timeout(LIVE_SNAPSHOT_REDRAW_INTERVAL) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
-                stream.write_all(&bytes)?;
+                forward_live_snapshot_input(socket, session, &bytes)?;
                 if !redraw_paused && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL {
                     write_live_snapshot_frame_with_pane_number_message(
                         socket,
@@ -586,6 +586,15 @@ fn run_live_snapshot_attach(
     }
 
     let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+fn forward_live_snapshot_input(socket: &Path, session: &str, bytes: &[u8]) -> io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let _ = send_control_request(socket, &protocol::encode_send(session, bytes))?;
     Ok(())
 }
 
