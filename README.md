@@ -47,8 +47,11 @@ saves the current line to a buffer, and `q` or Escape exits. Mouse click saves
 one rendered line; mouse drag saves an inclusive line range. Mouse selection is
 currently basic line-level selection. Unzoomed multi-pane attach routes input
 and copy-mode to the server active pane and handles `C-b d` to detach,
-`C-b o` to cycle the server active pane, and `C-b q` followed by a single
-digit to select a pane by number, and mouse click to select a pane.
+`C-b ?` to show attach help, `C-b o` to cycle the server active pane, and
+`C-b q` followed by a single digit to select a pane by number, and mouse click
+to select a pane. Pane splitting is currently command-driven with
+`dmux split-window -t <name> -h|-v [-- command...]`; use `dmux attach --help`
+or `dmux help attach` to list attach-time bindings.
 
 `save-buffer` currently stores captured active-pane text in an in-memory buffer
 with a 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name

@@ -404,6 +404,31 @@ fn poll_capture(socket: &std::path::Path, session: &str, needle: &str) -> String
     last
 }
 
+fn poll_capture_eventually(socket: &std::path::Path, session: &str, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(socket, &["capture-pane", "-t", session, "-p"]);
+        if output.status.success() {
+            last = String::from_utf8_lossy(&output.stdout).to_string();
+            if last.contains(needle) {
+                return last;
+            }
+        } else {
+            last = format!(
+                "status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    panic!("capture for {session:?} did not contain {needle:?}; last:\n{last}");
+}
+
 fn poll_active_pane(socket: &std::path::Path, session: &str, expected: usize) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut last = String::new();
@@ -514,6 +539,279 @@ fn list_sessions_reports_created_session() {
     assert_success(&output);
     let sessions = String::from_utf8_lossy(&output.stdout);
     assert!(sessions.lines().any(|line| line == session), "{sessions:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn cli_help_lists_attach_and_attach_help() {
+    let socket = unique_socket("cli-help");
+
+    let output = dmux(&socket, &["--help"]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("attach -t <name>"), "{stdout:?}");
+    assert!(stdout.contains("dmux help attach"), "{stdout:?}");
+
+    let output = dmux(&socket, &["attach", "--help"]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("C-b d"), "{stdout:?}");
+    assert!(stdout.contains("C-b ?"), "{stdout:?}");
+    assert!(stdout.contains("split-window"), "{stdout:?}");
+}
+
+#[test]
+fn interactive_new_attaches_and_detaches_created_session() {
+    let socket = unique_socket("interactive-new-attach");
+    let session = format!("interactive-new-attach-{}", std::process::id());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args([
+            "new",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf interactive-ready; sleep 30",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn interactive new");
+
+    let ready = poll_capture_eventually(&socket, &session, "interactive-ready");
+    assert!(ready.contains("interactive-ready"), "{ready:?}");
+    assert!(child.try_wait().expect("poll interactive new").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("interactive new stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("interactive-ready"), "{stdout:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn session_lifecycle_can_attach_detach_kill_shutdown_and_recreate() {
+    let socket = unique_socket("session-lifecycle-smoke");
+    let session = format!("session-lifecycle-smoke-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf smoke-ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "smoke-ready");
+    assert!(ready.contains("smoke-ready"), "{ready:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+    assert_success(&wait_for_child_exit(child));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    let listed = dmux(&socket, &["ls"]);
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(!listed.lines().any(|line| line == session), "{listed:?}");
+
+    assert_success(&dmux(&socket, &["kill-server"]));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf recreated-ready; sleep 30",
+        ],
+    ));
+    let recreated = poll_capture(&socket, &session, "recreated-ready");
+    assert!(recreated.contains("recreated-ready"), "{recreated:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn kill_server_removes_stale_socket_path() {
+    let socket = unique_socket("stale-kill-server");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale socket");
+    drop(listener);
+
+    let output = dmux(&socket, &["kill-server"]);
+
+    assert_success(&output);
+    assert!(!socket.exists(), "stale socket path should be removed");
+}
+
+#[test]
+fn kill_server_does_not_remove_non_socket_path() {
+    let socket = unique_socket("regular-file-kill-server");
+    std::fs::write(&socket, b"not a socket").expect("write regular file");
+
+    let output = dmux(&socket, &["kill-server"]);
+
+    assert!(!output.status.success());
+    assert!(socket.exists(), "regular file path should not be removed");
+    std::fs::remove_file(&socket).expect("remove regular file");
+}
+
+#[test]
+fn attach_prefix_question_prints_help_and_keeps_attach_running() {
+    let socket = unique_socket("attach-help");
+    let session = format!("attach-help-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf help-ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "help-ready");
+    assert!(ready.contains("help-ready"), "{ready:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02?").expect("write help");
+        stdin.flush().expect("flush help");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(child.try_wait().expect("poll attach after help").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("C-b d detach"), "{stdout:?}");
+    assert!(stdout.contains("split-window"), "{stdout:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_prefix_question_prints_multi_pane_help_and_keeps_attach_running() {
+    let socket = unique_socket("attach-multi-help");
+    let session = format!("attach-multi-help-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-help; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-help");
+    assert!(base.contains("base-help"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-help; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-help");
+    assert!(split.contains("split-help"), "{split:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02?").expect("write help");
+        stdin.flush().expect("flush help");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    assert!(child.try_wait().expect("poll attach after help").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("C-b d detach"), "{stdout:?}");
+    assert!(stdout.contains("C-b q pane numbers"), "{stdout:?}");
+    assert!(stdout.contains("split-window"), "{stdout:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

@@ -1,6 +1,11 @@
 use crate::protocol::{BufferSelection, CaptureMode, SplitDirection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelpTopic {
+    Attach,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     New {
         session: String,
@@ -91,6 +96,9 @@ pub enum Command {
         session: String,
     },
     KillServer,
+    Help {
+        topic: Option<HelpTopic>,
+    },
     Server,
 }
 
@@ -116,6 +124,8 @@ where
 
     match subcommand.as_str() {
         "__server" => Ok(Command::Server),
+        "-h" | "--help" => Ok(Command::Help { topic: None }),
+        "help" => parse_help(args),
         "new" | "new-session" => parse_new(args),
         "attach" | "attach-session" => parse_attach(args),
         "ls" | "list-sessions" => Ok(Command::ListSessions),
@@ -141,6 +151,17 @@ where
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
+    }
+}
+
+fn parse_help(args: Vec<String>) -> Result<Command, String> {
+    match args.as_slice() {
+        [] => Ok(Command::Help { topic: None }),
+        [topic] if topic == "attach" || topic == "attach-session" => Ok(Command::Help {
+            topic: Some(HelpTopic::Attach),
+        }),
+        [topic] => Err(format!("unknown help topic {topic:?}")),
+        _ => Err("help accepts at most one topic".to_string()),
     }
 }
 
@@ -185,9 +206,53 @@ fn parse_new(args: Vec<String>) -> Result<Command, String> {
 }
 
 fn parse_attach(args: Vec<String>) -> Result<Command, String> {
+    if matches!(args.as_slice(), [arg] if arg == "-h" || arg == "--help") {
+        return Ok(Command::Help {
+            topic: Some(HelpTopic::Attach),
+        });
+    }
+
     Ok(Command::Attach {
         session: parse_target(args, "attach")?.unwrap_or_else(|| "default".to_string()),
     })
+}
+
+pub fn general_help() -> &'static str {
+    "Usage: dmux <command> [options]\n\
+\n\
+Commands:\n\
+  new [-d] -s <name> [-- command...]    create a session; attach unless -d is used\n\
+  attach -t <name>                      attach to a session\n\
+  ls                                    list sessions\n\
+  split-window -t <name> -h|-v [-- command...]\n\
+  list-panes -t <name> [-F <format>]\n\
+  select-pane -t <name> -p <index>\n\
+  kill-session -t <name>\n\
+  kill-server\n\
+\n\
+Help:\n\
+  dmux help attach\n\
+  dmux attach --help\n"
+}
+
+pub fn attach_help() -> &'static str {
+    "Attach keys:\n\
+  C-b d       detach\n\
+  C-b ?       show this help\n\
+  C-b [       copy-mode for the active pane\n\
+  C-b o       cycle panes in multi-pane attach\n\
+  C-b q       show pane numbers; press a digit to select\n\
+  C-b C-b     send a literal prefix\n\
+  mouse click focus a pane in unzoomed multi-pane attach\n\
+\n\
+Pane commands:\n\
+  dmux split-window -t <name> -h [-- command...]  split left/right\n\
+  dmux split-window -t <name> -v [-- command...]  split top/bottom\n\
+  dmux select-pane -t <name> -p <index>\n"
+}
+
+pub fn attach_help_summary() -> &'static str {
+    "C-b d detach | C-b ? help | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | select: dmux select-pane -t <name> -p <index>"
 }
 
 fn parse_capture(args: Vec<String>) -> Result<Command, String> {
@@ -952,6 +1017,54 @@ mod tests {
                 command: vec!["sh".to_string(), "-c".to_string(), "echo ok".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn parses_top_level_help() {
+        assert_eq!(
+            parse_args(["dmux", "--help"]).unwrap(),
+            Command::Help { topic: None }
+        );
+        assert_eq!(
+            parse_args(["dmux", "help"]).unwrap(),
+            Command::Help { topic: None }
+        );
+    }
+
+    #[test]
+    fn parses_attach_help() {
+        assert_eq!(
+            parse_args(["dmux", "attach", "--help"]).unwrap(),
+            Command::Help {
+                topic: Some(HelpTopic::Attach),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "help", "attach"]).unwrap(),
+            Command::Help {
+                topic: Some(HelpTopic::Attach),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_attach_target_named_help_literal() {
+        assert_eq!(
+            parse_args(["dmux", "attach", "-t", "--help"]).unwrap(),
+            Command::Attach {
+                session: "--help".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn attach_help_lists_prefix_bindings_and_split_command() {
+        let help = attach_help();
+
+        assert!(help.contains("C-b d"), "{help}");
+        assert!(help.contains("C-b ?"), "{help}");
+        assert!(help.contains("C-b o"), "{help}");
+        assert!(help.contains("split-window"), "{help}");
     }
 
     #[test]

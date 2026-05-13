@@ -1,3 +1,4 @@
+use crate::cli;
 use crate::protocol;
 use crate::pty::PtySize;
 use std::io::{self, Read, Write};
@@ -344,10 +345,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttachInputAction {
     Forward(Vec<u8>),
-    EnterCopyMode {
-        forward: Vec<u8>,
-        initial_input: Vec<u8>,
-    },
+    EnterCopyMode { initial_input: Vec<u8> },
+    ShowHelp,
     Detach,
 }
 
@@ -358,6 +357,7 @@ enum LiveSnapshotInputAction {
     Detach,
     SelectNextPane,
     ShowPaneNumbers,
+    ShowHelp,
     SelectPane(usize),
     EnterCopyMode { initial_input: Vec<u8> },
 }
@@ -369,19 +369,36 @@ struct LiveSnapshotInputState {
     mouse_pending: Vec<u8>,
 }
 
-fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAction {
+fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> Vec<AttachInputAction> {
     let mut output = Vec::with_capacity(input.len());
+    let mut actions = Vec::new();
 
     for (index, byte) in input.iter().enumerate() {
         if *saw_prefix {
             *saw_prefix = false;
             match *byte {
-                b'd' => return AttachInputAction::Detach,
+                b'd' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::Detach);
+                    return actions;
+                }
                 b'[' => {
-                    return AttachInputAction::EnterCopyMode {
-                        forward: output,
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::EnterCopyMode {
                         initial_input: input[index + 1..].to_vec(),
-                    };
+                    });
+                    return actions;
+                }
+                b'?' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::ShowHelp);
+                    continue;
                 }
                 0x02 => {
                     output.push(0x02);
@@ -399,7 +416,10 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> AttachInputAct
         }
     }
 
-    AttachInputAction::Forward(output)
+    if !output.is_empty() {
+        actions.push(AttachInputAction::Forward(output));
+    }
+    actions
 }
 
 #[cfg(test)]
@@ -513,6 +533,16 @@ fn translate_live_snapshot_input_with_mouse(
                     }
                     state.selecting_pane = true;
                     actions.push(LiveSnapshotInputAction::ShowPaneNumbers);
+                    offset += 1;
+                    continue;
+                }
+                b'?' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::ShowHelp);
                     offset += 1;
                     continue;
                 }
@@ -639,6 +669,7 @@ enum LiveSnapshotInputEvent {
     MousePress(MousePosition),
     SelectNextPane,
     ShowPaneNumbers,
+    ShowHelp,
     SelectPane(usize),
     PauseRedraw(mpsc::Sender<()>),
     RedrawNow,
@@ -693,6 +724,9 @@ fn spawn_live_snapshot_input_thread(
                     }
                     LiveSnapshotInputAction::ShowPaneNumbers => {
                         let _ = sender.send(LiveSnapshotInputEvent::ShowPaneNumbers);
+                    }
+                    LiveSnapshotInputAction::ShowHelp => {
+                        let _ = sender.send(LiveSnapshotInputEvent::ShowHelp);
                     }
                     LiveSnapshotInputAction::SelectPane(index) => {
                         let _ = sender.send(LiveSnapshotInputEvent::SelectPane(index));
@@ -772,6 +806,19 @@ fn run_live_snapshot_attach(
                 let message = pane_number_message_text(socket, session)?;
                 pane_number_message =
                     Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
+                frame = write_live_snapshot_frame_with_pane_number_message(
+                    socket,
+                    session,
+                    &mut pane_number_message,
+                )?;
+                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::ShowHelp) => {
+                pane_number_message = Some((
+                    attach_help_message().to_string(),
+                    Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
+                ));
                 frame = write_live_snapshot_frame_with_pane_number_message(
                     socket,
                     session,
@@ -971,22 +1018,17 @@ where
             break;
         }
 
-        match translate_attach_input(&buf[..n], &mut saw_prefix) {
-            AttachInputAction::Forward(output) => {
-                if !output.is_empty() {
-                    stream.write_all(&output)?;
+        for action in translate_attach_input(&buf[..n], &mut saw_prefix) {
+            match action {
+                AttachInputAction::Forward(output) => stream.write_all(&output)?,
+                AttachInputAction::EnterCopyMode { initial_input } => {
+                    enter_copy_mode(&initial_input)?;
                 }
-            }
-            AttachInputAction::EnterCopyMode {
-                forward,
-                initial_input,
-            } => {
-                if !forward.is_empty() {
-                    stream.write_all(&forward)?;
+                AttachInputAction::ShowHelp => {
+                    write_attach_help_message()?;
                 }
-                enter_copy_mode(&initial_input)?;
+                AttachInputAction::Detach => return Ok(()),
             }
-            AttachInputAction::Detach => return Ok(()),
         }
     }
 
@@ -1114,6 +1156,16 @@ fn write_copy_mode_view(view: &CopyModeView) -> io::Result<()> {
 fn write_copy_mode_message(message: &str) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(format!("\r\n-- copy mode: {message} --\r\n").as_bytes())?;
+    stdout.flush()
+}
+
+fn attach_help_message() -> &'static str {
+    cli::attach_help_summary()
+}
+
+fn write_attach_help_message() -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(format!("\r\n-- dmux help: {} --\r\n", attach_help_message()).as_bytes())?;
     stdout.flush()
 }
 
@@ -2249,34 +2301,87 @@ mod tests {
 
     #[test]
     fn attach_input_dispatches_copy_mode_prefix_without_forwarding_bytes() {
-        let action = translate_attach_input(b"\x02[", &mut false);
+        let actions = translate_attach_input(b"\x02[", &mut false);
 
         assert_eq!(
-            action,
-            AttachInputAction::EnterCopyMode {
-                forward: Vec::new(),
+            actions,
+            vec![AttachInputAction::EnterCopyMode {
                 initial_input: Vec::new(),
-            }
+            }]
         );
+    }
+
+    #[test]
+    fn attach_input_shows_help_on_prefix_question() {
+        let actions = translate_attach_input(b"\x02?", &mut false);
+
+        assert_eq!(actions, vec![AttachInputAction::ShowHelp]);
     }
 
     #[test]
     fn attach_input_detaches_on_prefix_d_without_forwarding_bytes() {
-        let action = translate_attach_input(b"\x02d", &mut false);
+        let actions = translate_attach_input(b"\x02d", &mut false);
 
-        assert_eq!(action, AttachInputAction::Detach);
+        assert_eq!(actions, vec![AttachInputAction::Detach]);
     }
 
     #[test]
     fn attach_input_passes_coalesced_copy_mode_keys_as_initial_input() {
-        let action = translate_attach_input(b"\x02[y", &mut false);
+        let actions = translate_attach_input(b"\x02[y", &mut false);
 
         assert_eq!(
-            action,
-            AttachInputAction::EnterCopyMode {
-                forward: Vec::new(),
+            actions,
+            vec![AttachInputAction::EnterCopyMode {
                 initial_input: vec![b'y'],
-            }
+            }]
         );
+    }
+
+    #[test]
+    fn attach_input_preserves_order_when_prefix_question_shares_a_read() {
+        let actions = translate_attach_input(b"abc\x02?def", &mut false);
+
+        assert_eq!(
+            actions,
+            vec![
+                AttachInputAction::Forward(b"abc".to_vec()),
+                AttachInputAction::ShowHelp,
+                AttachInputAction::Forward(b"def".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_help_message_reuses_cli_summary() {
+        assert_eq!(attach_help_message(), crate::cli::attach_help_summary());
+        assert!(attach_help_message().contains("C-b C-b literal prefix"));
+        assert!(attach_help_message().contains("dmux select-pane"));
+    }
+
+    #[test]
+    fn live_snapshot_input_shows_help_on_prefix_question() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"\x02?", &mut state);
+
+        assert_eq!(actions, vec![LiveSnapshotInputAction::ShowHelp]);
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_preserves_order_when_prefix_question_shares_a_read() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"abc\x02?def", &mut state);
+
+        assert_eq!(
+            actions,
+            vec![
+                LiveSnapshotInputAction::Forward(b"abc".to_vec()),
+                LiveSnapshotInputAction::ShowHelp,
+                LiveSnapshotInputAction::Forward(b"def".to_vec()),
+            ]
+        );
+        assert!(!state.saw_prefix);
     }
 }
