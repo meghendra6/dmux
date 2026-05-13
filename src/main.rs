@@ -16,6 +16,13 @@ fn main() {
 fn run() -> Result<(), String> {
     match cli::parse_args(std::env::args())? {
         cli::Command::Server => server::run(paths::socket_path()).map_err(|err| err.to_string()),
+        cli::Command::Help { topic } => {
+            match topic {
+                Some(cli::HelpTopic::Attach) => print!("{}", cli::attach_help()),
+                None => print!("{}", cli::general_help()),
+            }
+            Ok(())
+        }
         cli::Command::New {
             session,
             detach,
@@ -27,7 +34,7 @@ fn run() -> Result<(), String> {
             if detach {
                 Ok(())
             } else {
-                Err("interactive attach is not implemented yet; use -d".to_string())
+                attach_session(&socket, &session)
             }
         }
         cli::Command::ListSessions => {
@@ -232,32 +239,67 @@ fn run() -> Result<(), String> {
             if !socket.exists() {
                 return Ok(());
             }
-            send_request(&socket, protocol::encode_kill_server(), false)?;
-            Ok(())
+            match send_request(&socket, protocol::encode_kill_server(), false) {
+                Ok(_) => Ok(()),
+                Err(error) if is_missing_socket_connect_error(&error) => Ok(()),
+                Err(error) if is_stale_socket_connect_error(&error) => {
+                    remove_stale_socket_path(&socket).map_err(|_| error)
+                }
+                Err(error) => Err(error),
+            }
         }
         cli::Command::Attach { session } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            let initial_size = client::detect_attach_size();
-            if let Some(size) = initial_size {
-                send_request(
-                    &socket,
-                    &protocol::encode_resize(&session, size.cols, size.rows),
-                    true,
-                )?;
-            }
-            client::attach(&socket, &session, initial_size, |size| {
-                send_request(
-                    &socket,
-                    &protocol::encode_resize(&session, size.cols, size.rows),
-                    true,
-                )
-                .map(|_| ())
-                .map_err(io_error)
-            })
-            .map_err(|err| err.to_string())
+            attach_session(&socket, &session)
         }
     }
+}
+
+fn is_missing_socket_connect_error(error: &str) -> bool {
+    error.starts_with("failed to connect to ") && error.contains("No such file or directory")
+}
+
+fn is_stale_socket_connect_error(error: &str) -> bool {
+    error.starts_with("failed to connect to ") && error.contains("Connection refused")
+}
+
+fn remove_stale_socket_path(socket: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let metadata = match std::fs::symlink_metadata(socket) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not a socket",
+        ));
+    }
+    std::fs::remove_file(socket)
+}
+
+fn attach_session(socket: &std::path::Path, session: &str) -> Result<(), String> {
+    let initial_size = client::detect_attach_size();
+    if let Some(size) = initial_size {
+        send_request(
+            socket,
+            &protocol::encode_resize(session, size.cols, size.rows),
+            true,
+        )?;
+    }
+    client::attach(socket, session, initial_size, |size| {
+        send_request(
+            socket,
+            &protocol::encode_resize(session, size.cols, size.rows),
+            true,
+        )
+        .map(|_| ())
+        .map_err(io_error)
+    })
+    .map_err(|err| err.to_string())
 }
 
 fn encode_key_tokens(keys: &[String]) -> Result<Vec<u8>, String> {
