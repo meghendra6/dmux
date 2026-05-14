@@ -1746,7 +1746,7 @@ where
                         pending_input: raw_pending_input(
                             &actions[index + 1..],
                             input_state.saw_prefix,
-                            RawPendingFocus::Drop,
+                            RawPendingFocus::Preserve,
                         ),
                     });
                 }
@@ -1756,7 +1756,7 @@ where
                         pending_input: raw_pending_input(
                             &actions[index + 1..],
                             input_state.saw_prefix,
-                            RawPendingFocus::Drop,
+                            RawPendingFocus::Preserve,
                         ),
                     });
                 }
@@ -3209,7 +3209,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_pending_input_drops_raw_focus_commands_after_layout_transition() {
+    fn raw_pending_input_preserves_focus_commands_after_layout_transition() {
         let pending = raw_pending_input(
             &[
                 AttachInputAction::PaneCommand(PaneCommand::FocusLeft),
@@ -3217,10 +3217,10 @@ mod tests {
                 AttachInputAction::Forward(b"tail".to_vec()),
             ],
             false,
-            RawPendingFocus::Drop,
+            RawPendingFocus::Preserve,
         );
 
-        assert_eq!(pending, b"tail");
+        assert_eq!(pending, b"\x02h\x02ltail");
     }
 
     #[test]

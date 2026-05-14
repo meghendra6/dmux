@@ -1861,9 +1861,10 @@ fn attach_prefix_percent_preserves_coalesced_input_after_raw_split() {
 }
 
 #[test]
-fn attach_prefix_percent_drops_coalesced_raw_focus_after_split() {
+fn attach_prefix_percent_applies_coalesced_raw_focus_after_split() {
     let socket = unique_socket("attach-prefix-percent-raw-focus");
     let session = format!("attach-prefix-percent-raw-focus-{}", std::process::id());
+    let base_file = unique_temp_file("attach-prefix-percent-raw-focus-base");
 
     assert_success(&dmux(
         &socket,
@@ -1875,7 +1876,7 @@ fn attach_prefix_percent_drops_coalesced_raw_focus_after_split() {
             "--",
             "sh",
             "-c",
-            "printf base-ready; sleep 30",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
         ],
     ));
     let base = poll_capture(&socket, &session, "base-ready");
@@ -1901,10 +1902,9 @@ fn attach_prefix_percent_drops_coalesced_raw_focus_after_split() {
 
     let panes = poll_pane_count(&socket, &session, 2);
     assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
-    let captured = poll_capture(&socket, &session, "focus-tail");
-    assert!(captured.contains("focus-tail"), "{captured:?}");
-    let active = poll_active_pane(&socket, &session, 1);
-    assert!(active.lines().any(|line| line == "1\t1"), "{active:?}");
+    assert!(poll_file_contains(&base_file, "focus-tail"));
+    let active = poll_active_pane(&socket, &session, 0);
+    assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
 
     {
         let stdin = child.stdin.as_mut().expect("attach stdin");
@@ -1914,6 +1914,79 @@ fn attach_prefix_percent_drops_coalesced_raw_focus_after_split() {
     let output = wait_for_child_exit(child);
     assert_success(&output);
 
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn active_live_attach_exits_when_remaining_pane_process_exits_after_collapse() {
+    let socket = unique_socket("active-live-attach-pane-exit-after-collapse");
+    let session = format!(
+        "active-live-attach-pane-exit-after-collapse-{}",
+        std::process::id()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; read line; echo done:$line; sleep 1",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "1"]));
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin
+            .write_all(b"exit-after-collapse\r")
+            .expect("write remaining pane input");
+        stdin.flush().expect("flush remaining pane input");
+    }
+    let remaining = poll_capture(&socket, &session, "done:exit-after-collapse");
+    assert!(
+        remaining.contains("done:exit-after-collapse"),
+        "{remaining:?}"
+    );
+
+    let output = assert_child_exits_within(
+        child,
+        "live attach after remaining pane process exits after collapse",
+    );
+    assert_success(&output);
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }

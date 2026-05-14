@@ -7,7 +7,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 const MAX_HISTORY_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
@@ -15,8 +15,8 @@ const MAX_BUFFERS: usize = 50;
 const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 + 4096;
 const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
 
-type AttachEventClients = Arc<Mutex<Vec<UnixStream>>>;
 type TrackedStreamClients = Arc<Mutex<Vec<TrackedStream>>>;
+type AttachEventClients = TrackedStreamClients;
 type AttachLifetimeStreams = TrackedStreamClients;
 
 struct TrackedStream {
@@ -230,6 +230,7 @@ struct Session {
     windows: Mutex<WindowSet>,
     attach_events: AttachEventClients,
     attach_streams: AttachLifetimeStreams,
+    next_attach_event_id: AtomicUsize,
     next_attach_stream_id: AtomicUsize,
 }
 
@@ -239,6 +240,7 @@ impl Session {
             windows: Mutex::new(WindowSet::new(Window::new(pane))),
             attach_events,
             attach_streams: Arc::new(Mutex::new(Vec::new())),
+            next_attach_event_id: AtomicUsize::new(0),
             next_attach_stream_id: AtomicUsize::new(0),
         }
     }
@@ -311,9 +313,16 @@ impl Session {
         register_tracked_stream(&self.attach_streams, &self.next_attach_stream_id, stream)
     }
 
+    fn register_attach_event_stream(
+        &self,
+        stream: &UnixStream,
+    ) -> io::Result<Option<StreamRegistration>> {
+        register_attach_event_client(&self.attach_events, &self.next_attach_event_id, stream)
+    }
+
     fn close_attach_streams(&self) {
         shutdown_tracked_clients(&self.attach_streams);
-        shutdown_clients(&self.attach_events);
+        shutdown_tracked_clients(&self.attach_events);
         for pane in self.panes() {
             shutdown_tracked_clients(&pane.clients);
         }
@@ -803,11 +812,24 @@ struct Pane {
     clients: TrackedStreamClients,
     next_client_id: AtomicUsize,
     attach_events: AttachEventClients,
+    session: Mutex<Option<Weak<Session>>>,
 }
 
 impl Pane {
     fn register_client(&self, stream: &UnixStream) -> io::Result<StreamRegistration> {
         register_tracked_stream(&self.clients, &self.next_client_id, stream)
+    }
+
+    fn set_session(&self, session: &Arc<Session>) {
+        *self.session.lock().unwrap() = Some(Arc::downgrade(session));
+    }
+
+    fn session(&self) -> Option<Arc<Session>> {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
     }
 }
 
@@ -974,7 +996,8 @@ fn handle_new(
         PtySize { cols: 80, rows: 24 },
         Arc::clone(&attach_events),
     )?;
-    let session = Arc::new(Session::new(pane, attach_events));
+    let session = Arc::new(Session::new(Arc::clone(&pane), attach_events));
+    pane.set_session(&session);
     sessions.insert(name, session);
     write_ok(stream)
 }
@@ -1003,6 +1026,7 @@ fn spawn_pane(
         clients: Arc::new(Mutex::new(Vec::new())),
         next_client_id: AtomicUsize::new(0),
         attach_events,
+        session: Mutex::new(None),
     });
 
     start_output_pump(reader, Arc::clone(&pane));
@@ -1311,6 +1335,7 @@ fn handle_split(
         size,
         session.attach_event_clients(),
     )?;
+    pane.set_session(&session);
     session.add_pane(direction, pane);
     session.notify_attach_redraw();
     write_ok(stream)
@@ -1553,6 +1578,7 @@ fn handle_new_window(
         size,
         session.attach_event_clients(),
     )?;
+    pane.set_session(&session);
     session.add_window(pane);
     session.notify_attach_redraw();
     write_ok(stream)
@@ -1793,7 +1819,10 @@ fn handle_attach_events(
     };
 
     write_ok(stream)?;
-    register_attach_event_client(&session.attach_event_clients(), stream)?;
+    let Some(_registration) = session.register_attach_event_stream(stream)? else {
+        return Ok(());
+    };
+    wait_for_attach_event_client_close(stream);
     Ok(())
 }
 
@@ -2108,7 +2137,19 @@ fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
             broadcast(&pane.clients, bytes);
         }
         shutdown_tracked_clients(&pane.clients);
+        close_attach_streams_if_only_visible_pane(&pane);
     });
+}
+
+fn close_attach_streams_if_only_visible_pane(pane: &Arc<Pane>) {
+    let Some(session) = pane.session() else {
+        return;
+    };
+
+    let panes = session.attach_panes();
+    if panes.len() == 1 && Arc::ptr_eq(&panes[0].pane, pane) {
+        session.close_attach_streams();
+    }
 }
 
 fn append_history(history: &Mutex<Vec<u8>>, bytes: &[u8]) {
@@ -2138,19 +2179,12 @@ fn notify_attach_redraw(clients: &AttachEventClients) {
     let mut live = Vec::with_capacity(clients.len());
 
     for mut client in clients.drain(..) {
-        if write_attach_redraw_event(&mut client) {
+        if write_attach_redraw_event(&mut client.stream) {
             live.push(client);
         }
     }
 
     *clients = live;
-}
-
-fn shutdown_clients(clients: &Mutex<Vec<UnixStream>>) {
-    let mut clients = clients.lock().unwrap();
-    for client in clients.drain(..) {
-        let _ = client.shutdown(std::net::Shutdown::Both);
-    }
 }
 
 fn shutdown_tracked_clients(clients: &TrackedStreamClients) {
@@ -2176,19 +2210,42 @@ fn register_tracked_stream(
 
 fn register_attach_event_client(
     clients: &AttachEventClients,
+    next_id: &AtomicUsize,
     stream: &UnixStream,
-) -> io::Result<()> {
+) -> io::Result<Option<StreamRegistration>> {
     let mut client = stream.try_clone()?;
     client.set_nonblocking(true)?;
-    let mut clients = clients.lock().unwrap();
-    if write_attach_redraw_event(&mut client) {
-        clients.push(client);
+    if !write_attach_redraw_event(&mut client) {
+        return Ok(None);
     }
-    Ok(())
+
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+    clients
+        .lock()
+        .unwrap()
+        .push(TrackedStream { id, stream: client });
+    Ok(Some(StreamRegistration {
+        clients: Arc::clone(clients),
+        id,
+    }))
 }
 
 fn write_attach_redraw_event(stream: &mut UnixStream) -> bool {
     matches!(stream.write(ATTACH_REDRAW_EVENT), Ok(n) if n == ATTACH_REDRAW_EVENT.len())
+}
+
+fn wait_for_attach_event_client_close(stream: &mut UnixStream) {
+    let mut buf = [0_u8; 1];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 fn write_ok(stream: &mut UnixStream) -> io::Result<()> {
@@ -2219,11 +2276,15 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    fn tracked_stream(id: usize, stream: UnixStream) -> TrackedStream {
+        TrackedStream { id, stream }
+    }
+
     #[test]
     fn notify_attach_redraw_writes_redraw_event() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let (server, mut client) = UnixStream::pair().unwrap();
-        events.lock().unwrap().push(server);
+        events.lock().unwrap().push(tracked_stream(0, server));
 
         notify_attach_redraw(&events);
 
@@ -2240,8 +2301,8 @@ mod tests {
         let (live_server, mut live_client) = UnixStream::pair().unwrap();
         {
             let mut events = events.lock().unwrap();
-            events.push(dead_server);
-            events.push(live_server);
+            events.push(tracked_stream(0, dead_server));
+            events.push(tracked_stream(1, live_server));
         }
 
         notify_attach_redraw(&events);
@@ -2255,27 +2316,73 @@ mod tests {
     #[test]
     fn notify_attach_redraw_registered_clients_are_nonblocking() {
         let events = Arc::new(Mutex::new(Vec::new()));
+        let next_id = AtomicUsize::new(0);
         let (server, _client) = UnixStream::pair().unwrap();
 
-        register_attach_event_client(&events, &server).unwrap();
+        let _registration = register_attach_event_client(&events, &next_id, &server)
+            .unwrap()
+            .unwrap();
 
         let mut registered = events.lock().unwrap().pop().unwrap();
         let mut buf = [0_u8; 1];
-        let err = registered.read(&mut buf).unwrap_err();
+        let err = registered.stream.read(&mut buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
     fn register_attach_event_client_sends_initial_redraw_to_new_client() {
         let events = Arc::new(Mutex::new(Vec::new()));
+        let next_id = AtomicUsize::new(0);
         let (server, mut client) = UnixStream::pair().unwrap();
 
-        register_attach_event_client(&events, &server).unwrap();
+        let _registration = register_attach_event_client(&events, &next_id, &server)
+            .unwrap()
+            .unwrap();
 
         let mut buf = [0_u8; 7];
         client.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"REDRAW\n");
         assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn handle_attach_events_removes_event_stream_after_client_disconnect() {
+        let attach_events = Arc::new(Mutex::new(Vec::new()));
+        let writer_path = std::env::temp_dir().join(format!(
+            "dmux-attach-events-lifetime-{}",
+            std::process::id()
+        ));
+        let writer = File::create(&writer_path).unwrap();
+        let pane = Arc::new(Pane {
+            child_pid: 0,
+            writer: Arc::new(Mutex::new(writer)),
+            size: Mutex::new(PtySize { cols: 80, rows: 24 }),
+            raw_history: Arc::new(Mutex::new(Vec::new())),
+            terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
+            clients: Arc::new(Mutex::new(Vec::new())),
+            next_client_id: AtomicUsize::new(0),
+            attach_events: Arc::clone(&attach_events),
+            session: Mutex::new(None),
+        });
+        let session = Arc::new(Session::new(Arc::clone(&pane), Arc::clone(&attach_events)));
+        let state = Arc::new(ServerState {
+            sessions: Mutex::new(HashMap::from([("test".to_string(), session)])),
+            buffers: Mutex::new(BufferStore::new()),
+            socket_path: writer_path.with_extension("sock"),
+        });
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let handle =
+            std::thread::spawn(move || handle_attach_events(&state, &mut server, "test").unwrap());
+
+        assert_eq!(read_socket_line(&mut client), "OK\n");
+        assert_eq!(read_socket_line(&mut client), "REDRAW\n");
+        assert_eq!(attach_events.lock().unwrap().len(), 1);
+
+        drop(client);
+        handle.join().unwrap();
+
+        assert_eq!(attach_events.lock().unwrap().len(), 0);
+        let _ = std::fs::remove_file(writer_path);
     }
 
     #[test]
@@ -2293,6 +2400,7 @@ mod tests {
             clients: Arc::new(Mutex::new(Vec::new())),
             next_client_id: AtomicUsize::new(0),
             attach_events: Arc::clone(&attach_events),
+            session: Mutex::new(None),
         });
         let session = Arc::new(Session::new(Arc::clone(&pane), attach_events));
         let state = Arc::new(ServerState {
