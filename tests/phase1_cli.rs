@@ -1923,7 +1923,7 @@ fn attach_prefix_q_ignores_invalid_digit_and_keeps_attach_running() {
 }
 
 #[test]
-fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
+fn attach_prefix_bracket_copies_composed_layout_line_in_multi_pane_attach() {
     let socket = unique_socket("attach-copy-mode");
     let session = format!("attach-copy-mode-{}", std::process::id());
 
@@ -1986,7 +1986,7 @@ fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
         listed = String::from_utf8_lossy(&output.stdout).to_string();
         if listed
             .lines()
-            .any(|line| line.ends_with("\t11\tsplit-copy"))
+            .any(saved_buffer_preview_contains_composed_copy)
         {
             break;
         }
@@ -1995,7 +1995,7 @@ fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
     assert!(
         listed
             .lines()
-            .any(|line| line.ends_with("\t11\tsplit-copy")),
+            .any(saved_buffer_preview_contains_composed_copy),
         "{listed:?}"
     );
 
@@ -2012,6 +2012,14 @@ fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+fn saved_buffer_preview_contains_composed_copy(line: &str) -> bool {
+    let Some(preview) = line.split('\t').nth(2) else {
+        return false;
+    };
+
+    preview.contains("base-copy") && preview.contains(" | ") && preview.contains("split-copy")
 }
 
 #[test]
