@@ -1740,7 +1740,6 @@ fn handle_attach_events(
     };
 
     write_ok(stream)?;
-    stream.write_all(ATTACH_REDRAW_EVENT)?;
     register_attach_event_client(&session.attach_event_clients(), stream)?;
     Ok(())
 }
@@ -2097,9 +2096,12 @@ fn register_attach_event_client(
     clients: &AttachEventClients,
     stream: &UnixStream,
 ) -> io::Result<()> {
-    let client = stream.try_clone()?;
+    let mut client = stream.try_clone()?;
     client.set_nonblocking(true)?;
-    clients.lock().unwrap().push(client);
+    let mut clients = clients.lock().unwrap();
+    if write_attach_redraw_event(&mut client) {
+        clients.push(client);
+    }
     Ok(())
 }
 
@@ -2163,6 +2165,19 @@ mod tests {
         let mut buf = [0_u8; 1];
         let err = registered.read(&mut buf).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn register_attach_event_client_sends_initial_redraw_to_new_client() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (server, mut client) = UnixStream::pair().unwrap();
+
+        register_attach_event_client(&events, &server).unwrap();
+
+        let mut buf = [0_u8; 7];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"REDRAW\n");
+        assert_eq!(events.lock().unwrap().len(), 1);
     }
 
     #[test]
