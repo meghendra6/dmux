@@ -93,6 +93,17 @@ fn read_socket_line(stream: &mut UnixStream) -> String {
     String::from_utf8(bytes).expect("utf8 socket response")
 }
 
+fn attach_events_stream(socket: &std::path::Path, session: &str) -> UnixStream {
+    let mut stream = UnixStream::connect(socket).expect("connect event stream");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .expect("set event stream timeout");
+    stream
+        .write_all(format!("ATTACH_EVENTS\t{session}\n").as_bytes())
+        .expect("write attach events request");
+    stream
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -2131,6 +2142,149 @@ fn attach_layout_snapshot_response_includes_regions_without_changing_plain_snaps
         plain_body.contains("base-ready | split-ready\r\n"),
         "{plain_body:?}"
     );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_events_stream_missing_session_errors() {
+    let socket = unique_socket("attach-events-missing");
+    let session = format!("attach-events-missing-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let missing = format!("{session}-missing");
+    let mut stream = attach_events_stream(&socket, &missing);
+    assert_eq!(read_socket_line(&mut stream), "ERR missing session\n");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_events_stream_sends_initial_redraw() {
+    let socket = unique_socket("attach-events-initial");
+    let session = format!("attach-events-initial-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let mut stream = attach_events_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "REDRAW\n");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_events_stream_redraws_after_pane_output() {
+    let socket = unique_socket("attach-events-output");
+    let session = format!("attach-events-output-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; echo late:$line; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut stream = attach_events_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "REDRAW\n");
+
+    assert_success(&dmux(&socket, &["send-keys", "-t", &session, "hello"]));
+    assert_eq!(read_socket_line(&mut stream), "REDRAW\n");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_events_stream_redraws_after_select_pane() {
+    let socket = unique_socket("attach-events-select-pane");
+    let session = format!("attach-events-select-pane-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut stream = attach_events_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "REDRAW\n");
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_eq!(read_socket_line(&mut stream), "REDRAW\n");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

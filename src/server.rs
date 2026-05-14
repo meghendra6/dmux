@@ -13,6 +13,8 @@ const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFERS: usize = 50;
 const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 + 4096;
 
+type AttachEventClients = Arc<Mutex<Vec<UnixStream>>>;
+
 pub fn run(socket_path: PathBuf) -> io::Result<()> {
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -203,12 +205,14 @@ fn join_selected_lines(lines: &[&str]) -> String {
 
 struct Session {
     windows: Mutex<WindowSet>,
+    attach_events: AttachEventClients,
 }
 
 impl Session {
-    fn new(pane: Arc<Pane>) -> Self {
+    fn new(pane: Arc<Pane>, attach_events: AttachEventClients) -> Self {
         Self {
             windows: Mutex::new(WindowSet::new(Window::new(pane))),
+            attach_events,
         }
     }
 
@@ -266,6 +270,14 @@ impl Session {
 
     fn attach_layout_snapshot(&self) -> AttachLayoutSnapshot {
         self.windows.lock().unwrap().attach_layout_snapshot()
+    }
+
+    fn attach_event_clients(&self) -> AttachEventClients {
+        Arc::clone(&self.attach_events)
+    }
+
+    fn notify_attach_redraw(&self) {
+        notify_attach_redraw(&self.attach_events);
     }
 }
 
@@ -750,6 +762,7 @@ struct Pane {
     raw_history: Arc<Mutex<Vec<u8>>>,
     terminal: Arc<Mutex<TerminalState>>,
     clients: Arc<Mutex<Vec<UnixStream>>>,
+    attach_events: AttachEventClients,
 }
 
 fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Result<()> {
@@ -854,6 +867,7 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::AttachLayoutSnapshot { session } => {
             handle_attach_layout_snapshot(&state, &mut stream, &session)
         }
+        Request::AttachEvents { session } => handle_attach_events(&state, &mut stream, &session),
     }
 }
 
@@ -903,8 +917,15 @@ fn handle_new(
     }
 
     let cwd = std::env::current_dir()?;
-    let pane = spawn_pane(name.clone(), command, cwd, PtySize { cols: 80, rows: 24 })?;
-    let session = Arc::new(Session::new(pane));
+    let attach_events = Arc::new(Mutex::new(Vec::new()));
+    let pane = spawn_pane(
+        name.clone(),
+        command,
+        cwd,
+        PtySize { cols: 80, rows: 24 },
+        Arc::clone(&attach_events),
+    )?;
+    let session = Arc::new(Session::new(pane, attach_events));
     sessions.insert(name, session);
     write_ok(stream)
 }
@@ -914,6 +935,7 @@ fn spawn_pane(
     command: Vec<String>,
     cwd: PathBuf,
     size: PtySize,
+    attach_events: AttachEventClients,
 ) -> io::Result<Arc<Pane>> {
     let mut spec = SpawnSpec::new(session_name, command, cwd);
     spec.size = size;
@@ -930,6 +952,7 @@ fn spawn_pane(
             10_000,
         ))),
         clients: Arc::new(Mutex::new(Vec::new())),
+        attach_events,
     });
 
     start_output_pump(reader, Arc::clone(&pane));
@@ -1180,7 +1203,9 @@ fn handle_resize(
         .unwrap()
         .resize(size.cols as usize, size.rows as usize);
 
-    write_ok(stream)
+    write_ok(stream)?;
+    session.notify_attach_redraw();
+    Ok(())
 }
 
 fn handle_send(
@@ -1230,9 +1255,17 @@ fn handle_split(
 
     let size = *active.size.lock().unwrap();
     let cwd = std::env::current_dir()?;
-    let pane = spawn_pane(name.to_string(), command, cwd, size)?;
+    let pane = spawn_pane(
+        name.to_string(),
+        command,
+        cwd,
+        size,
+        session.attach_event_clients(),
+    )?;
     session.add_pane(direction, pane);
-    write_ok(stream)
+    write_ok(stream)?;
+    session.notify_attach_redraw();
+    Ok(())
 }
 
 fn handle_list_panes(
@@ -1293,7 +1326,9 @@ fn handle_zoom_pane(
         return Ok(());
     }
 
-    write_ok(stream)
+    write_ok(stream)?;
+    session.notify_attach_redraw();
+    Ok(())
 }
 
 fn handle_status_line(
@@ -1409,7 +1444,9 @@ fn handle_select_pane(
         return Ok(());
     }
 
-    write_ok(stream)
+    write_ok(stream)?;
+    session.notify_attach_redraw();
+    Ok(())
 }
 
 fn handle_kill_pane(
@@ -1436,7 +1473,9 @@ fn handle_kill_pane(
         }
     };
 
-    write_ok(stream)
+    write_ok(stream)?;
+    session.notify_attach_redraw();
+    Ok(())
 }
 
 fn handle_new_window(
@@ -1461,9 +1500,17 @@ fn handle_new_window(
 
     let size = *active.size.lock().unwrap();
     let cwd = std::env::current_dir()?;
-    let pane = spawn_pane(name.to_string(), command, cwd, size)?;
+    let pane = spawn_pane(
+        name.to_string(),
+        command,
+        cwd,
+        size,
+        session.attach_event_clients(),
+    )?;
     session.add_window(pane);
-    write_ok(stream)
+    write_ok(stream)?;
+    session.notify_attach_redraw();
+    Ok(())
 }
 
 fn handle_list_windows(
@@ -1509,7 +1556,9 @@ fn handle_select_window(
         return Ok(());
     }
 
-    write_ok(stream)
+    write_ok(stream)?;
+    session.notify_attach_redraw();
+    Ok(())
 }
 
 fn handle_kill_window(
@@ -1533,7 +1582,9 @@ fn handle_kill_window(
         return Ok(());
     }
 
-    write_ok(stream)
+    write_ok(stream)?;
+    session.notify_attach_redraw();
+    Ok(())
 }
 
 fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {
@@ -1677,6 +1728,31 @@ fn handle_attach_layout_snapshot(
     if let Some(snapshot) = attach_pane_snapshot_with_regions(&session) {
         stream.write_all(&format_attach_layout_snapshot_body(&snapshot))?;
     }
+    Ok(())
+}
+
+fn handle_attach_events(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    session
+        .attach_event_clients()
+        .lock()
+        .unwrap()
+        .push(stream.try_clone()?);
+    session.notify_attach_redraw();
     Ok(())
 }
 
@@ -1987,6 +2063,7 @@ fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
             let bytes = &buf[..n];
             append_history(&pane.raw_history, bytes);
             pane.terminal.lock().unwrap().apply_bytes(bytes);
+            notify_attach_redraw(&pane.attach_events);
             broadcast(&pane.clients, bytes);
         }
     });
@@ -2014,6 +2091,19 @@ fn broadcast(clients: &Mutex<Vec<UnixStream>>, bytes: &[u8]) {
     *clients = live;
 }
 
+fn notify_attach_redraw(clients: &AttachEventClients) {
+    let mut clients = clients.lock().unwrap();
+    let mut live = Vec::with_capacity(clients.len());
+
+    for mut client in clients.drain(..) {
+        if client.write_all(b"REDRAW\n").is_ok() {
+            live.push(client);
+        }
+    }
+
+    *clients = live;
+}
+
 fn write_ok(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_all(b"OK\n")
 }
@@ -2025,6 +2115,39 @@ fn write_err(stream: &mut UnixStream, message: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_attach_redraw_writes_redraw_event() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        events.lock().unwrap().push(server);
+
+        notify_attach_redraw(&events);
+
+        let mut buf = [0_u8; 7];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"REDRAW\n");
+    }
+
+    #[test]
+    fn notify_attach_redraw_drops_dead_clients() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (dead_server, dead_client) = UnixStream::pair().unwrap();
+        drop(dead_client);
+        let (live_server, mut live_client) = UnixStream::pair().unwrap();
+        {
+            let mut events = events.lock().unwrap();
+            events.push(dead_server);
+            events.push(live_server);
+        }
+
+        notify_attach_redraw(&events);
+
+        let mut buf = [0_u8; 7];
+        live_client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"REDRAW\n");
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn pane_set_removes_active_and_selects_previous_pane() {
