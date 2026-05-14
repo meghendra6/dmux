@@ -71,48 +71,66 @@ where
 
     if attach_mode == AttachMode::Snapshot {
         let _guard = RawModeGuard::enable();
-        return run_live_snapshot_attach(socket, session, &mut stream);
+        return run_live_snapshot_attach(socket, session, &mut stream, Vec::new());
     }
 
-    write_attach_status_line(socket, session)?;
     let _guard = RawModeGuard::enable();
     install_winch_handler();
-    let mut output_stream = stream.try_clone()?;
-    let output = std::thread::spawn(move || copy_attach_output(&mut output_stream));
-
     let mut last_size = initial_size;
     let copy_mode_socket = socket.to_path_buf();
     let copy_mode_session = session.to_string();
-    let raw_exit = forward_stdin_until_detach(
-        &mut stream,
-        socket,
-        session,
-        || {
-            if take_winch_pending() {
-                maybe_emit_resize(detect_attach_size(), &mut last_size, &mut on_resize)?;
-            }
-            Ok(())
-        },
-        |initial_input| run_copy_mode(&copy_mode_socket, &copy_mode_session, initial_input),
-    )?;
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-    let _ = output.join();
+    let mut pending_input = Vec::new();
 
-    if raw_exit == RawAttachExit::Snapshot {
-        let mut stream = UnixStream::connect(socket)?;
+    loop {
+        write_attach_status_line(socket, session)?;
+        let mut output_stream = stream.try_clone()?;
+        let output = std::thread::spawn(move || copy_attach_output(&mut output_stream));
+
+        let raw_exit = forward_stdin_until_detach(
+            &mut stream,
+            socket,
+            session,
+            std::mem::take(&mut pending_input),
+            || {
+                if take_winch_pending() {
+                    maybe_emit_resize(detect_attach_size(), &mut last_size, &mut on_resize)?;
+                }
+                Ok(())
+            },
+            |initial_input| run_copy_mode(&copy_mode_socket, &copy_mode_session, initial_input),
+        )?;
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        let _ = output.join();
+
+        let RawAttachExit::Reconnect {
+            pending_input: pending_after_transition,
+        } = raw_exit
+        else {
+            return Ok(());
+        };
+
+        stream = UnixStream::connect(socket)?;
         stream.write_all(protocol::encode_attach(session).as_bytes())?;
         let response = read_line(&mut stream)?;
         if let Some(message) = response.strip_prefix("ERR ") {
             return Err(io::Error::other(message.trim_end().to_string()));
         }
-        let attach_mode = parse_attach_ok(&response)?;
-        if attach_mode != AttachMode::Snapshot {
-            return Err(io::Error::other("expected snapshot attach after split"));
+        match parse_attach_ok(&response)? {
+            AttachMode::Snapshot => {
+                return run_live_snapshot_attach(
+                    socket,
+                    session,
+                    &mut stream,
+                    pending_after_transition,
+                );
+            }
+            AttachMode::Live => {
+                // Continue the raw loop on the fresh stream; pending bytes must still
+                // pass through the raw prefix translator.
+                pending_input = pending_after_transition;
+            }
         }
-        return run_live_snapshot_attach(socket, session, &mut stream);
     }
-
-    Ok(())
 }
 
 fn copy_attach_output(output_stream: &mut UnixStream) {
@@ -450,6 +468,34 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> Vec<AttachInpu
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::SplitDown));
+                    continue;
+                }
+                b'h' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusLeft));
+                    continue;
+                }
+                b'j' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusDown));
+                    continue;
+                }
+                b'k' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusUp));
+                    continue;
+                }
+                b'l' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusRight));
                     continue;
                 }
                 b'x' => {
@@ -857,12 +903,27 @@ fn spawn_live_snapshot_input_thread(
     socket: PathBuf,
     session: String,
     mouse_focus_enabled: Arc<AtomicBool>,
+    initial_input: Vec<u8>,
     sender: mpsc::Sender<LiveSnapshotInputEvent>,
 ) {
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut buf = [0_u8; 1024];
         let mut input_state = LiveSnapshotInputState::default();
+        let mouse_enabled = mouse_focus_enabled.load(Ordering::SeqCst);
+        if !send_live_snapshot_input_actions(
+            &socket,
+            &session,
+            &sender,
+            &mut stdin,
+            translate_live_snapshot_input_with_mouse(
+                &initial_input,
+                &mut input_state,
+                mouse_enabled,
+            ),
+        ) {
+            return;
+        }
 
         loop {
             let n = match stdin.read(&mut buf) {
@@ -880,62 +941,75 @@ fn spawn_live_snapshot_input_thread(
                 }
             };
 
-            let mouse_focus_enabled = mouse_focus_enabled.load(Ordering::SeqCst);
-            for action in translate_live_snapshot_input_with_mouse(
-                &buf[..n],
-                &mut input_state,
-                mouse_focus_enabled,
+            let mouse_enabled = mouse_focus_enabled.load(Ordering::SeqCst);
+            if !send_live_snapshot_input_actions(
+                &socket,
+                &session,
+                &sender,
+                &mut stdin,
+                translate_live_snapshot_input_with_mouse(
+                    &buf[..n],
+                    &mut input_state,
+                    mouse_enabled,
+                ),
             ) {
-                match action {
-                    LiveSnapshotInputAction::Forward(bytes) => {
-                        let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
+                return;
+            }
+        }
+    });
+}
+
+fn send_live_snapshot_input_actions<R: Read>(
+    socket: &Path,
+    session: &str,
+    sender: &mpsc::Sender<LiveSnapshotInputEvent>,
+    stdin: &mut R,
+    actions: Vec<LiveSnapshotInputAction>,
+) -> bool {
+    for action in actions {
+        match action {
+            LiveSnapshotInputAction::Forward(bytes) => {
+                let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
+            }
+            LiveSnapshotInputAction::PaneCommand(command) => {
+                let _ = sender.send(LiveSnapshotInputEvent::PaneCommand(command));
+            }
+            LiveSnapshotInputAction::Detach => {
+                let _ = sender.send(LiveSnapshotInputEvent::Detach);
+                return false;
+            }
+            LiveSnapshotInputAction::SelectNextPane => {
+                let _ = sender.send(LiveSnapshotInputEvent::SelectNextPane);
+            }
+            LiveSnapshotInputAction::ShowPaneNumbers => {
+                let _ = sender.send(LiveSnapshotInputEvent::ShowPaneNumbers);
+            }
+            LiveSnapshotInputAction::ShowHelp => {
+                let _ = sender.send(LiveSnapshotInputEvent::ShowHelp);
+            }
+            LiveSnapshotInputAction::SelectPane(index) => {
+                let _ = sender.send(LiveSnapshotInputEvent::SelectPane(index));
+            }
+            LiveSnapshotInputAction::MousePress(position) => {
+                let _ = sender.send(LiveSnapshotInputEvent::MousePress(position));
+            }
+            LiveSnapshotInputAction::EnterCopyMode { initial_input } => {
+                let (pause_ack, pause_ready) = mpsc::channel();
+                let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw(pause_ack));
+                let _ = pause_ready.recv();
+                match run_composed_copy_mode_with_reader(socket, session, &initial_input, stdin) {
+                    Ok(()) => {
+                        let _ = sender.send(LiveSnapshotInputEvent::RedrawNow);
                     }
-                    LiveSnapshotInputAction::PaneCommand(command) => {
-                        let _ = sender.send(LiveSnapshotInputEvent::PaneCommand(command));
-                    }
-                    LiveSnapshotInputAction::Detach => {
-                        let _ = sender.send(LiveSnapshotInputEvent::Detach);
-                        return;
-                    }
-                    LiveSnapshotInputAction::SelectNextPane => {
-                        let _ = sender.send(LiveSnapshotInputEvent::SelectNextPane);
-                    }
-                    LiveSnapshotInputAction::ShowPaneNumbers => {
-                        let _ = sender.send(LiveSnapshotInputEvent::ShowPaneNumbers);
-                    }
-                    LiveSnapshotInputAction::ShowHelp => {
-                        let _ = sender.send(LiveSnapshotInputEvent::ShowHelp);
-                    }
-                    LiveSnapshotInputAction::SelectPane(index) => {
-                        let _ = sender.send(LiveSnapshotInputEvent::SelectPane(index));
-                    }
-                    LiveSnapshotInputAction::MousePress(position) => {
-                        let _ = sender.send(LiveSnapshotInputEvent::MousePress(position));
-                    }
-                    LiveSnapshotInputAction::EnterCopyMode { initial_input } => {
-                        let (pause_ack, pause_ready) = mpsc::channel();
-                        let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw(pause_ack));
-                        let _ = pause_ready.recv();
-                        match run_composed_copy_mode_with_reader(
-                            &socket,
-                            &session,
-                            &initial_input,
-                            &mut stdin,
-                        ) {
-                            Ok(()) => {
-                                let _ = sender.send(LiveSnapshotInputEvent::RedrawNow);
-                            }
-                            Err(error) => {
-                                let _ =
-                                    sender.send(LiveSnapshotInputEvent::Error(error.to_string()));
-                                return;
-                            }
-                        }
+                    Err(error) => {
+                        let _ = sender.send(LiveSnapshotInputEvent::Error(error.to_string()));
+                        return false;
                     }
                 }
             }
         }
-    });
+    }
+    true
 }
 
 fn spawn_live_snapshot_event_thread(
@@ -1040,6 +1114,7 @@ fn run_live_snapshot_attach(
     socket: &Path,
     session: &str,
     stream: &mut UnixStream,
+    initial_input: Vec<u8>,
 ) -> io::Result<()> {
     let mouse_focus_enabled = Arc::new(AtomicBool::new(false));
     let (sender, input) = mpsc::channel();
@@ -1047,6 +1122,7 @@ fn run_live_snapshot_attach(
         socket.to_path_buf(),
         session.to_string(),
         Arc::clone(&mouse_focus_enabled),
+        initial_input,
         sender.clone(),
     );
     let redraw_hint_pending = Arc::new(AtomicBool::new(false));
@@ -1434,16 +1510,46 @@ fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RawAttachExit {
     Detach,
-    Snapshot,
+    Reconnect { pending_input: Vec<u8> },
+}
+
+fn raw_pending_input(actions: &[AttachInputAction]) -> Vec<u8> {
+    let mut pending = Vec::new();
+    for action in actions {
+        match action {
+            AttachInputAction::Forward(bytes) => pending.extend_from_slice(bytes),
+            AttachInputAction::PaneCommand(command) => {
+                pending.push(0x02);
+                pending.push(match command {
+                    PaneCommand::SplitRight => b'%',
+                    PaneCommand::SplitDown => b'"',
+                    PaneCommand::FocusLeft => b'h',
+                    PaneCommand::FocusDown => b'j',
+                    PaneCommand::FocusUp => b'k',
+                    PaneCommand::FocusRight => b'l',
+                    PaneCommand::Close => b'x',
+                    PaneCommand::ToggleZoom => b'z',
+                });
+            }
+            AttachInputAction::EnterCopyMode { initial_input } => {
+                pending.extend_from_slice(b"\x02[");
+                pending.extend_from_slice(initial_input);
+            }
+            AttachInputAction::ShowHelp => pending.extend_from_slice(b"\x02?"),
+            AttachInputAction::Detach => pending.extend_from_slice(b"\x02d"),
+        }
+    }
+    pending
 }
 
 fn forward_stdin_until_detach<F, C>(
     stream: &mut UnixStream,
     socket: &Path,
     session: &str,
+    initial_input: Vec<u8>,
     mut tick: F,
     mut enter_copy_mode: C,
 ) -> io::Result<RawAttachExit>
@@ -1453,30 +1559,44 @@ where
 {
     let mut buf = [0_u8; 1024];
     let mut saw_prefix = false;
+    let mut initial_input = Some(initial_input);
 
     loop {
         tick()?;
-        let n = io::stdin().lock().read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
+        let actions = if let Some(input) = initial_input.take() {
+            translate_attach_input(&input, &mut saw_prefix)
+        } else {
+            let n = io::stdin().lock().read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            translate_attach_input(&buf[..n], &mut saw_prefix)
+        };
 
-        for action in translate_attach_input(&buf[..n], &mut saw_prefix) {
+        for (index, action) in actions.iter().enumerate() {
             match action {
                 AttachInputAction::Forward(output) => stream.write_all(&output)?,
                 AttachInputAction::PaneCommand(PaneCommand::SplitRight) => {
                     split_pane(socket, session, protocol::SplitDirection::Horizontal)?;
-                    return Ok(RawAttachExit::Snapshot);
+                    return Ok(RawAttachExit::Reconnect {
+                        pending_input: raw_pending_input(&actions[index + 1..]),
+                    });
                 }
                 AttachInputAction::PaneCommand(PaneCommand::SplitDown) => {
                     split_pane(socket, session, protocol::SplitDirection::Vertical)?;
-                    return Ok(RawAttachExit::Snapshot);
+                    return Ok(RawAttachExit::Reconnect {
+                        pending_input: raw_pending_input(&actions[index + 1..]),
+                    });
                 }
                 AttachInputAction::PaneCommand(PaneCommand::Close) => {
                     if let Err(error) =
                         send_control_request(socket, &protocol::encode_kill_pane(session, None))
                     {
                         write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(&actions[index + 1..]),
+                        });
                     }
                 }
                 AttachInputAction::PaneCommand(PaneCommand::ToggleZoom) => {
@@ -1484,6 +1604,10 @@ where
                         send_control_request(socket, &protocol::encode_zoom_pane(session, None))
                     {
                         write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(&actions[index + 1..]),
+                        });
                     }
                 }
                 AttachInputAction::PaneCommand(_) => {}
@@ -2796,22 +2920,23 @@ mod tests {
 
     #[test]
     fn attach_input_translates_pane_commands() {
-        assert_eq!(
-            translate_attach_input(b"\x02%", &mut false),
-            vec![AttachInputAction::PaneCommand(PaneCommand::SplitRight)]
-        );
-        assert_eq!(
-            translate_attach_input(b"\x02\"", &mut false),
-            vec![AttachInputAction::PaneCommand(PaneCommand::SplitDown)]
-        );
-        assert_eq!(
-            translate_attach_input(b"\x02x", &mut false),
-            vec![AttachInputAction::PaneCommand(PaneCommand::Close)]
-        );
-        assert_eq!(
-            translate_attach_input(b"\x02z", &mut false),
-            vec![AttachInputAction::PaneCommand(PaneCommand::ToggleZoom)]
-        );
+        let cases = [
+            (b'%', PaneCommand::SplitRight),
+            (b'"', PaneCommand::SplitDown),
+            (b'h', PaneCommand::FocusLeft),
+            (b'j', PaneCommand::FocusDown),
+            (b'k', PaneCommand::FocusUp),
+            (b'l', PaneCommand::FocusRight),
+            (b'x', PaneCommand::Close),
+            (b'z', PaneCommand::ToggleZoom),
+        ];
+
+        for (key, command) in cases {
+            assert_eq!(
+                translate_attach_input(&[0x02, key], &mut false),
+                vec![AttachInputAction::PaneCommand(command)]
+            );
+        }
     }
 
     #[test]
