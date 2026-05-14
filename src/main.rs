@@ -16,6 +16,20 @@ fn main() {
 fn run() -> Result<(), String> {
     match cli::parse_args(std::env::args())? {
         cli::Command::Server => server::run(paths::socket_path()).map_err(|err| err.to_string()),
+        cli::Command::OpenDefault => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let body = send_request(&socket, protocol::encode_list(), true)?;
+            let sessions = String::from_utf8_lossy(&body);
+            if !sessions.lines().any(|line| line == "default") {
+                match send_request(&socket, &protocol::encode_new("default", &[]), true) {
+                    Ok(_) => {}
+                    Err(error) if is_duplicate_default_create_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            attach_session(&socket, "default")
+        }
         cli::Command::Help { topic } => {
             match topic {
                 Some(cli::HelpTopic::Attach) => print!("{}", cli::attach_help()),
@@ -39,8 +53,8 @@ fn run() -> Result<(), String> {
         }
         cli::Command::ListSessions => {
             let socket = paths::socket_path();
-            ensure_server(&socket)?;
-            let body = send_request(&socket, protocol::encode_list(), true)?;
+            require_running_server(&socket)?;
+            let body = send_request(&socket, protocol::encode_list(), false)?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
@@ -230,8 +244,8 @@ fn run() -> Result<(), String> {
         }
         cli::Command::KillSession { session } => {
             let socket = paths::socket_path();
-            ensure_server(&socket)?;
-            send_request(&socket, &protocol::encode_kill(&session), true)?;
+            require_running_server(&socket)?;
+            send_request(&socket, &protocol::encode_kill(&session), false)?;
             Ok(())
         }
         cli::Command::KillServer => {
@@ -250,10 +264,18 @@ fn run() -> Result<(), String> {
         }
         cli::Command::Attach { session } => {
             let socket = paths::socket_path();
-            ensure_server(&socket)?;
+            require_running_server(&socket)?;
             attach_session(&socket, &session)
         }
     }
+}
+
+fn require_running_server(socket: &std::path::Path) -> Result<(), String> {
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        return Ok(());
+    }
+
+    Err("no dmux server running; create a session with dmux new -s <name>".to_string())
 }
 
 fn is_missing_socket_connect_error(error: &str) -> bool {
@@ -262,6 +284,10 @@ fn is_missing_socket_connect_error(error: &str) -> bool {
 
 fn is_stale_socket_connect_error(error: &str) -> bool {
     error.starts_with("failed to connect to ") && error.contains("Connection refused")
+}
+
+fn is_duplicate_default_create_error(error: &str) -> bool {
+    error == "session already exists; use dmux attach -t default"
 }
 
 fn remove_stale_socket_path(socket: &std::path::Path) -> std::io::Result<()> {
@@ -398,4 +424,20 @@ fn read_line(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<Str
     }
 
     Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_default_create_error_is_ignorable_for_open_default() {
+        assert!(is_duplicate_default_create_error(
+            "session already exists; use dmux attach -t default"
+        ));
+        assert!(!is_duplicate_default_create_error(
+            "session already exists; use dmux attach -t other"
+        ));
+        assert!(!is_duplicate_default_create_error("missing session"));
+    }
 }

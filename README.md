@@ -6,7 +6,8 @@ Implemented Phase 0/1 commands:
 
 - `dmux new -d -s <name> [-- command...]`
 - `dmux new -s <name> [-- command...]`
-- `dmux attach -t <name>`
+- `dmux`
+- `dmux attach [-t <name>]`
 - `dmux ls`
 - `dmux capture-pane -t <name> -p [--screen|--history|--all]`
 - `dmux copy-mode -t <name> [--screen|--history|--all] [--search <text>]`
@@ -41,6 +42,11 @@ capture sources as `capture-pane`; default and `--all` are combined history plus
 screen. Use `--search` to show only matching lines while preserving their
 original line numbers.
 
+Running `dmux` with no command opens the `default` session, creating it first
+when needed. `dmux attach` without `-t` also targets `default`. Explicit
+`dmux ls`, `dmux attach -t <name>`, and `dmux kill-session -t <name>` report
+when no server is running instead of starting an empty daemon.
+
 Attached clients can enter the current basic copy-mode view with `C-b [`.
 Inside copy-mode, `j`/`k` and `Ctrl-n`/`Ctrl-p` move the cursor, `y` or Enter
 saves the current line to a buffer, and `q` or Escape exits. Mouse click saves
@@ -49,9 +55,12 @@ currently basic line-level selection. In unzoomed multi-pane attach, copy-mode
 copies lines from the rendered composed layout, including pane separators and
 visible content from multiple panes, while input is routed to the server active
 pane. Unzoomed multi-pane attach handles `C-b d` to detach, `C-b ?` to show
-attach help, `C-b o` to cycle the server active pane, `C-b q` followed by a
-single digit to select a pane by number, and mouse click to select a pane. Pane
-splitting is currently command-driven with
+attach help, `C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` to
+focus by direction, `C-b o` to cycle the server active pane, `C-b q` followed by
+a single digit to select a pane by number, `C-b x` to close the active pane,
+`C-b z` to toggle zoom, and mouse click to select a pane. `C-b %` and `C-b "`
+also work from a fresh single-pane attach and transition automatically into the
+multi-pane layout view. Pane splitting is also available with
 `dmux split-window -t <name> -h|-v [-- command...]`; use `dmux attach --help`
 or `dmux help attach` to list attach-time bindings.
 Unzoomed multi-pane attach redraws from server change events and keeps a polling
