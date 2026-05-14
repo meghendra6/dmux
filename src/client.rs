@@ -1196,30 +1196,11 @@ fn save_copy_mode_range(
     start: usize,
     end: usize,
 ) -> io::Result<()> {
+    let request = encode_copy_mode_save_request(session, view, save_source, start, end)?;
     let body = match save_source {
-        CopyModeSaveSource::ActivePane => send_control_request(
-            socket,
-            &protocol::encode_save_buffer(
-                session,
-                None,
-                protocol::CaptureMode::All,
-                protocol::BufferSelection::LineRange { start, end },
-            ),
-        )?,
+        CopyModeSaveSource::ActivePane => send_control_request(socket, &request)?,
         CopyModeSaveSource::ComposedText => {
-            let text = view.selected_text_for_line_range(start, end)?;
-            match send_control_request(
-                socket,
-                &protocol::encode_save_buffer_text(session, None, &text),
-            ) {
-                Ok(body) => body,
-                Err(error) if is_unknown_request_error(&error) => {
-                    return Err(io::Error::other(
-                        "composed copy-mode requires an updated dmux server",
-                    ));
-                }
-                Err(error) => return Err(error),
-            }
+            send_control_request(socket, &request).map_err(map_composed_copy_mode_save_error)?
         }
     };
     let saved = String::from_utf8_lossy(&body);
@@ -1230,6 +1211,35 @@ fn save_copy_mode_range(
         write_copy_mode_message(&format!("copied to {saved}"))?;
     }
     Ok(())
+}
+
+fn encode_copy_mode_save_request(
+    session: &str,
+    view: &CopyModeView,
+    save_source: CopyModeSaveSource,
+    start: usize,
+    end: usize,
+) -> io::Result<String> {
+    match save_source {
+        CopyModeSaveSource::ActivePane => Ok(protocol::encode_save_buffer(
+            session,
+            None,
+            protocol::CaptureMode::All,
+            protocol::BufferSelection::LineRange { start, end },
+        )),
+        CopyModeSaveSource::ComposedText => {
+            let text = view.selected_text_for_line_range(start, end)?;
+            Ok(protocol::encode_save_buffer_text(session, None, &text))
+        }
+    }
+}
+
+fn map_composed_copy_mode_save_error(error: io::Error) -> io::Error {
+    if is_unknown_request_error(&error) {
+        io::Error::other("composed copy-mode requires an updated dmux server")
+    } else {
+        error
+    }
 }
 
 fn write_copy_mode_view(view: &CopyModeView) -> io::Result<()> {
@@ -2289,6 +2299,45 @@ mod tests {
         let view = CopyModeView::from_plain_text("top\r\n\r\nbottom\r\n").unwrap();
 
         assert_eq!(view.selected_text_for_line_range(2, 2).unwrap(), "\n");
+    }
+
+    #[test]
+    fn active_copy_mode_save_request_uses_active_pane_line_range() {
+        let view = CopyModeView::from_numbered_output("7\tactive\n8\tpane\n").unwrap();
+
+        assert_eq!(
+            encode_copy_mode_save_request("dev", &view, CopyModeSaveSource::ActivePane, 7, 8)
+                .unwrap(),
+            protocol::encode_save_buffer(
+                "dev",
+                None,
+                protocol::CaptureMode::All,
+                protocol::BufferSelection::LineRange { start: 7, end: 8 }
+            )
+        );
+    }
+
+    #[test]
+    fn composed_copy_mode_save_request_uses_selected_plain_text() {
+        let view = CopyModeView::from_plain_text("base | split\r\nsecond\r\n").unwrap();
+
+        assert_eq!(
+            encode_copy_mode_save_request("dev", &view, CopyModeSaveSource::ComposedText, 1, 1)
+                .unwrap(),
+            protocol::encode_save_buffer_text("dev", None, "base | split\n")
+        );
+    }
+
+    #[test]
+    fn composed_copy_mode_save_maps_unknown_request_to_unsupported() {
+        let err = map_composed_copy_mode_save_error(io::Error::other(
+            "unknown request line: \"SAVE_BUFFER_TEXT\"",
+        ));
+
+        assert_eq!(
+            err.to_string(),
+            "composed copy-mode requires an updated dmux server"
+        );
     }
 
     #[test]
