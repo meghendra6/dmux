@@ -12,6 +12,9 @@ const MAX_HISTORY_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFERS: usize = 50;
 const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 + 4096;
+const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
+
+type AttachEventClients = Arc<Mutex<Vec<UnixStream>>>;
 
 pub fn run(socket_path: PathBuf) -> io::Result<()> {
     if let Some(parent) = socket_path.parent() {
@@ -203,12 +206,14 @@ fn join_selected_lines(lines: &[&str]) -> String {
 
 struct Session {
     windows: Mutex<WindowSet>,
+    attach_events: AttachEventClients,
 }
 
 impl Session {
-    fn new(pane: Arc<Pane>) -> Self {
+    fn new(pane: Arc<Pane>, attach_events: AttachEventClients) -> Self {
         Self {
             windows: Mutex::new(WindowSet::new(Window::new(pane))),
+            attach_events,
         }
     }
 
@@ -266,6 +271,14 @@ impl Session {
 
     fn attach_layout_snapshot(&self) -> AttachLayoutSnapshot {
         self.windows.lock().unwrap().attach_layout_snapshot()
+    }
+
+    fn attach_event_clients(&self) -> AttachEventClients {
+        Arc::clone(&self.attach_events)
+    }
+
+    fn notify_attach_redraw(&self) {
+        notify_attach_redraw(&self.attach_events);
     }
 }
 
@@ -750,6 +763,7 @@ struct Pane {
     raw_history: Arc<Mutex<Vec<u8>>>,
     terminal: Arc<Mutex<TerminalState>>,
     clients: Arc<Mutex<Vec<UnixStream>>>,
+    attach_events: AttachEventClients,
 }
 
 fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Result<()> {
@@ -854,6 +868,7 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::AttachLayoutSnapshot { session } => {
             handle_attach_layout_snapshot(&state, &mut stream, &session)
         }
+        Request::AttachEvents { session } => handle_attach_events(&state, &mut stream, &session),
     }
 }
 
@@ -903,8 +918,15 @@ fn handle_new(
     }
 
     let cwd = std::env::current_dir()?;
-    let pane = spawn_pane(name.clone(), command, cwd, PtySize { cols: 80, rows: 24 })?;
-    let session = Arc::new(Session::new(pane));
+    let attach_events = Arc::new(Mutex::new(Vec::new()));
+    let pane = spawn_pane(
+        name.clone(),
+        command,
+        cwd,
+        PtySize { cols: 80, rows: 24 },
+        Arc::clone(&attach_events),
+    )?;
+    let session = Arc::new(Session::new(pane, attach_events));
     sessions.insert(name, session);
     write_ok(stream)
 }
@@ -914,6 +936,7 @@ fn spawn_pane(
     command: Vec<String>,
     cwd: PathBuf,
     size: PtySize,
+    attach_events: AttachEventClients,
 ) -> io::Result<Arc<Pane>> {
     let mut spec = SpawnSpec::new(session_name, command, cwd);
     spec.size = size;
@@ -930,6 +953,7 @@ fn spawn_pane(
             10_000,
         ))),
         clients: Arc::new(Mutex::new(Vec::new())),
+        attach_events,
     });
 
     start_output_pump(reader, Arc::clone(&pane));
@@ -1180,6 +1204,7 @@ fn handle_resize(
         .unwrap()
         .resize(size.cols as usize, size.rows as usize);
 
+    session.notify_attach_redraw();
     write_ok(stream)
 }
 
@@ -1230,8 +1255,15 @@ fn handle_split(
 
     let size = *active.size.lock().unwrap();
     let cwd = std::env::current_dir()?;
-    let pane = spawn_pane(name.to_string(), command, cwd, size)?;
+    let pane = spawn_pane(
+        name.to_string(),
+        command,
+        cwd,
+        size,
+        session.attach_event_clients(),
+    )?;
     session.add_pane(direction, pane);
+    session.notify_attach_redraw();
     write_ok(stream)
 }
 
@@ -1293,6 +1325,7 @@ fn handle_zoom_pane(
         return Ok(());
     }
 
+    session.notify_attach_redraw();
     write_ok(stream)
 }
 
@@ -1409,6 +1442,7 @@ fn handle_select_pane(
         return Ok(());
     }
 
+    session.notify_attach_redraw();
     write_ok(stream)
 }
 
@@ -1436,6 +1470,7 @@ fn handle_kill_pane(
         }
     };
 
+    session.notify_attach_redraw();
     write_ok(stream)
 }
 
@@ -1461,8 +1496,15 @@ fn handle_new_window(
 
     let size = *active.size.lock().unwrap();
     let cwd = std::env::current_dir()?;
-    let pane = spawn_pane(name.to_string(), command, cwd, size)?;
+    let pane = spawn_pane(
+        name.to_string(),
+        command,
+        cwd,
+        size,
+        session.attach_event_clients(),
+    )?;
     session.add_window(pane);
+    session.notify_attach_redraw();
     write_ok(stream)
 }
 
@@ -1509,6 +1551,7 @@ fn handle_select_window(
         return Ok(());
     }
 
+    session.notify_attach_redraw();
     write_ok(stream)
 }
 
@@ -1533,6 +1576,7 @@ fn handle_kill_window(
         return Ok(());
     }
 
+    session.notify_attach_redraw();
     write_ok(stream)
 }
 
@@ -1677,6 +1721,26 @@ fn handle_attach_layout_snapshot(
     if let Some(snapshot) = attach_pane_snapshot_with_regions(&session) {
         stream.write_all(&format_attach_layout_snapshot_body(&snapshot))?;
     }
+    Ok(())
+}
+
+fn handle_attach_events(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    register_attach_event_client(&session.attach_event_clients(), stream)?;
     Ok(())
 }
 
@@ -1987,6 +2051,7 @@ fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
             let bytes = &buf[..n];
             append_history(&pane.raw_history, bytes);
             pane.terminal.lock().unwrap().apply_bytes(bytes);
+            notify_attach_redraw(&pane.attach_events);
             broadcast(&pane.clients, bytes);
         }
     });
@@ -2014,6 +2079,36 @@ fn broadcast(clients: &Mutex<Vec<UnixStream>>, bytes: &[u8]) {
     *clients = live;
 }
 
+fn notify_attach_redraw(clients: &AttachEventClients) {
+    let mut clients = clients.lock().unwrap();
+    let mut live = Vec::with_capacity(clients.len());
+
+    for mut client in clients.drain(..) {
+        if write_attach_redraw_event(&mut client) {
+            live.push(client);
+        }
+    }
+
+    *clients = live;
+}
+
+fn register_attach_event_client(
+    clients: &AttachEventClients,
+    stream: &UnixStream,
+) -> io::Result<()> {
+    let mut client = stream.try_clone()?;
+    client.set_nonblocking(true)?;
+    let mut clients = clients.lock().unwrap();
+    if write_attach_redraw_event(&mut client) {
+        clients.push(client);
+    }
+    Ok(())
+}
+
+fn write_attach_redraw_event(stream: &mut UnixStream) -> bool {
+    matches!(stream.write(ATTACH_REDRAW_EVENT), Ok(n) if n == ATTACH_REDRAW_EVENT.len())
+}
+
 fn write_ok(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_all(b"OK\n")
 }
@@ -2025,6 +2120,65 @@ fn write_err(stream: &mut UnixStream, message: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_attach_redraw_writes_redraw_event() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        events.lock().unwrap().push(server);
+
+        notify_attach_redraw(&events);
+
+        let mut buf = [0_u8; 7];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"REDRAW\n");
+    }
+
+    #[test]
+    fn notify_attach_redraw_drops_dead_clients() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (dead_server, dead_client) = UnixStream::pair().unwrap();
+        drop(dead_client);
+        let (live_server, mut live_client) = UnixStream::pair().unwrap();
+        {
+            let mut events = events.lock().unwrap();
+            events.push(dead_server);
+            events.push(live_server);
+        }
+
+        notify_attach_redraw(&events);
+
+        let mut buf = [0_u8; 7];
+        live_client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"REDRAW\n");
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn notify_attach_redraw_registered_clients_are_nonblocking() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (server, _client) = UnixStream::pair().unwrap();
+
+        register_attach_event_client(&events, &server).unwrap();
+
+        let mut registered = events.lock().unwrap().pop().unwrap();
+        let mut buf = [0_u8; 1];
+        let err = registered.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn register_attach_event_client_sends_initial_redraw_to_new_client() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (server, mut client) = UnixStream::pair().unwrap();
+
+        register_attach_event_client(&events, &server).unwrap();
+
+        let mut buf = [0_u8; 7];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"REDRAW\n");
+        assert_eq!(events.lock().unwrap().len(), 1);
+    }
 
     #[test]
     fn pane_set_removes_active_and_selects_previous_pane() {

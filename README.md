@@ -54,6 +54,8 @@ single digit to select a pane by number, and mouse click to select a pane. Pane
 splitting is currently command-driven with
 `dmux split-window -t <name> -h|-v [-- command...]`; use `dmux attach --help`
 or `dmux help attach` to list attach-time bindings.
+Unzoomed multi-pane attach redraws from server change events and keeps a polling
+fallback for mixed-version daemons or missed events.
 
 `save-buffer` currently stores captured active-pane text in an in-memory buffer
 with a 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name
@@ -87,20 +89,20 @@ Implemented Phase 2 groundwork:
 - attach-time basic copy-mode mouse selection for line ranges
 - attach-time statusline snapshot rendering
 - attach-time split-pane layout snapshot rendering
-- polling-based live redraw for multi-pane attach
-- active-pane input routing for polling multi-pane attach
-- attach-time pane cycling for polling multi-pane attach
-- attach-time numbered pane selection for polling multi-pane attach
-- attach-time mouse focus for polling multi-pane attach
+- event-driven live redraw for multi-pane attach with polling fallback
+- active-pane input routing for multi-pane attach
+- attach-time pane cycling for multi-pane attach
+- attach-time numbered pane selection for multi-pane attach
+- attach-time mouse focus for multi-pane attach
 - multi-pane attach copy-mode over the rendered composed layout
 - attach layout pane-region mapping foundation
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
 
-- multi-pane attach live redraw is polling-based and routes input to the server active pane
+- multi-pane attach routes input to the server active pane
 - zoomed panes are tracked server-side and keep single-pane live attach behavior
-- attach-time statusline rendering is snapshot-only for raw single-pane attach and polled during multi-pane live redraw; event-driven live status redraw is not implemented yet
+- attach-time statusline rendering is snapshot-only for raw single-pane attach
 - in-memory screen and scrollback only
 - copy-mode selection is line-based only
 - buffer contents are in-memory only
