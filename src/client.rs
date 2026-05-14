@@ -780,6 +780,7 @@ fn spawn_live_snapshot_event_thread(
     socket: PathBuf,
     session: String,
     sender: mpsc::Sender<LiveSnapshotInputEvent>,
+    redraw_hint_pending: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let mut stream = match UnixStream::connect(socket) {
@@ -822,9 +823,7 @@ fn spawn_live_snapshot_event_thread(
 
             match parse_live_snapshot_event_line(&line) {
                 Ok(LiveSnapshotServerEvent::Redraw) => {
-                    if sender.send(LiveSnapshotInputEvent::RedrawHint).is_err() {
-                        return;
-                    }
+                    let _ = send_live_snapshot_redraw_hint(&sender, &redraw_hint_pending);
                 }
                 Err(_) => {}
             }
@@ -832,8 +831,28 @@ fn spawn_live_snapshot_event_thread(
     });
 }
 
+fn send_live_snapshot_redraw_hint(
+    sender: &mpsc::Sender<LiveSnapshotInputEvent>,
+    pending: &AtomicBool,
+) -> bool {
+    if pending
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+
+    if sender.send(LiveSnapshotInputEvent::RedrawHint).is_ok() {
+        return true;
+    }
+
+    pending.store(false, Ordering::SeqCst);
+    false
+}
+
 fn live_snapshot_redraw_timeout(
     event_stream_active: bool,
+    redraw_paused: bool,
     message_expiry: Option<Instant>,
     now: Instant,
 ) -> Duration {
@@ -844,6 +863,7 @@ fn live_snapshot_redraw_timeout(
     };
 
     match message_expiry {
+        _ if redraw_paused => base,
         Some(expiry) if expiry <= now => Duration::ZERO,
         Some(expiry) => base.min(expiry.duration_since(now)),
         None => base,
@@ -863,7 +883,13 @@ fn run_live_snapshot_attach(
         Arc::clone(&mouse_focus_enabled),
         sender.clone(),
     );
-    spawn_live_snapshot_event_thread(socket.to_path_buf(), session.to_string(), sender);
+    let redraw_hint_pending = Arc::new(AtomicBool::new(false));
+    spawn_live_snapshot_event_thread(
+        socket.to_path_buf(),
+        session.to_string(),
+        sender,
+        Arc::clone(&redraw_hint_pending),
+    );
     let mut frame = write_live_snapshot_frame(socket, session)?;
     let mut mouse_mode = None;
     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
@@ -874,8 +900,12 @@ fn run_live_snapshot_attach(
 
     loop {
         let message_expiry = pane_number_message.as_ref().map(|(_, until)| *until);
-        let timeout =
-            live_snapshot_redraw_timeout(event_stream_active, message_expiry, Instant::now());
+        let timeout = live_snapshot_redraw_timeout(
+            event_stream_active,
+            redraw_paused,
+            message_expiry,
+            Instant::now(),
+        );
         match input.recv_timeout(timeout) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
                 forward_live_snapshot_input(socket, session, &bytes)?;
@@ -956,6 +986,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::RedrawHint) => {
+                redraw_hint_pending.store(false, Ordering::SeqCst);
                 if !redraw_paused {
                     frame = write_live_snapshot_frame_with_pane_number_message(
                         socket,
@@ -2017,7 +2048,7 @@ mod tests {
     #[test]
     fn live_snapshot_timeout_uses_polling_when_events_are_inactive() {
         assert_eq!(
-            live_snapshot_redraw_timeout(false, None, Instant::now()),
+            live_snapshot_redraw_timeout(false, false, None, Instant::now()),
             LIVE_SNAPSHOT_REDRAW_INTERVAL
         );
     }
@@ -2025,7 +2056,7 @@ mod tests {
     #[test]
     fn live_snapshot_timeout_uses_safety_interval_when_events_are_active() {
         assert_eq!(
-            live_snapshot_redraw_timeout(true, None, Instant::now()),
+            live_snapshot_redraw_timeout(true, false, None, Instant::now()),
             LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL
         );
     }
@@ -2035,7 +2066,7 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            live_snapshot_redraw_timeout(true, Some(now + Duration::from_millis(25)), now),
+            live_snapshot_redraw_timeout(true, false, Some(now + Duration::from_millis(25)), now),
             Duration::from_millis(25)
         );
     }
@@ -2045,9 +2076,41 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            live_snapshot_redraw_timeout(true, Some(now), now),
+            live_snapshot_redraw_timeout(true, false, Some(now), now),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn live_snapshot_timeout_ignores_message_expiry_while_paused() {
+        let now = Instant::now();
+
+        assert_eq!(
+            live_snapshot_redraw_timeout(true, true, Some(now), now),
+            LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL
+        );
+    }
+
+    #[test]
+    fn live_snapshot_redraw_hint_coalesces_until_pending_clears() {
+        let (sender, receiver) = mpsc::channel();
+        let pending = AtomicBool::new(false);
+
+        assert!(send_live_snapshot_redraw_hint(&sender, &pending));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            LiveSnapshotInputEvent::RedrawHint
+        ));
+        assert!(!send_live_snapshot_redraw_hint(&sender, &pending));
+        assert!(receiver.try_recv().is_err());
+
+        pending.store(false, Ordering::SeqCst);
+
+        assert!(send_live_snapshot_redraw_hint(&sender, &pending));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            LiveSnapshotInputEvent::RedrawHint
+        ));
     }
 
     #[test]
