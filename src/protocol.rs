@@ -1,4 +1,5 @@
 pub const ARG_SEPARATOR: char = '\u{1f}';
+pub const MAX_SAVE_BUFFER_TEXT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitDirection {
@@ -357,7 +358,12 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["SAVE_BUFFER_TEXT", session, buffer, text] => Ok(Request::SaveBufferText {
             session: (*session).to_string(),
             buffer: decode_optional_text(buffer, "SAVE_BUFFER_TEXT")?,
-            text: decode_utf8_hex(text, "SAVE_BUFFER_TEXT")?,
+            text: decode_utf8_hex_limited(
+                text,
+                "SAVE_BUFFER_TEXT",
+                MAX_SAVE_BUFFER_TEXT_BYTES,
+                "SAVE_BUFFER_TEXT exceeds maximum buffer size",
+            )?,
         }),
         ["COPY_MODE", session, mode, search] => Ok(Request::CopyMode {
             session: (*session).to_string(),
@@ -542,6 +548,18 @@ fn decode_utf8_hex(hex: &str, command: &str) -> Result<String, String> {
     String::from_utf8(decode_hex(hex)?).map_err(|_| format!("{command} has non-utf8 format"))
 }
 
+fn decode_utf8_hex_limited(
+    hex: &str,
+    command: &str,
+    max_decoded_bytes: usize,
+    too_large_message: &str,
+) -> Result<String, String> {
+    if hex.len() > max_decoded_bytes.saturating_mul(2) {
+        return Err(too_large_message.to_string());
+    }
+    decode_utf8_hex(hex, command)
+}
+
 fn encode_optional_text(value: Option<&str>) -> String {
     value
         .map(|value| encode_hex(value.as_bytes()))
@@ -723,6 +741,17 @@ mod tests {
                 buffer: Some("picked".to_string()),
                 text: "first\tline\nsecond line".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_save_buffer_text_before_hex_decode() {
+        let oversized = "zz".repeat(MAX_SAVE_BUFFER_TEXT_BYTES + 1);
+        let line = format!("SAVE_BUFFER_TEXT\tdev\t\t{oversized}\n");
+
+        assert_eq!(
+            decode_request(&line).unwrap_err(),
+            "SAVE_BUFFER_TEXT exceeds maximum buffer size"
         );
     }
 
