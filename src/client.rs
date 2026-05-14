@@ -687,6 +687,13 @@ enum LiveSnapshotServerEvent {
     Redraw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveSnapshotRedrawHintStatus {
+    Sent,
+    Coalesced,
+    Disconnected,
+}
+
 fn parse_live_snapshot_event_line(line: &str) -> io::Result<LiveSnapshotServerEvent> {
     match line {
         "REDRAW\n" => Ok(LiveSnapshotServerEvent::Redraw),
@@ -823,7 +830,11 @@ fn spawn_live_snapshot_event_thread(
 
             match parse_live_snapshot_event_line(&line) {
                 Ok(LiveSnapshotServerEvent::Redraw) => {
-                    let _ = send_live_snapshot_redraw_hint(&sender, &redraw_hint_pending);
+                    if send_live_snapshot_redraw_hint(&sender, &redraw_hint_pending)
+                        == LiveSnapshotRedrawHintStatus::Disconnected
+                    {
+                        return;
+                    }
                 }
                 Err(_) => {}
             }
@@ -834,20 +845,20 @@ fn spawn_live_snapshot_event_thread(
 fn send_live_snapshot_redraw_hint(
     sender: &mpsc::Sender<LiveSnapshotInputEvent>,
     pending: &AtomicBool,
-) -> bool {
+) -> LiveSnapshotRedrawHintStatus {
     if pending
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return false;
+        return LiveSnapshotRedrawHintStatus::Coalesced;
     }
 
     if sender.send(LiveSnapshotInputEvent::RedrawHint).is_ok() {
-        return true;
+        return LiveSnapshotRedrawHintStatus::Sent;
     }
 
     pending.store(false, Ordering::SeqCst);
-    false
+    LiveSnapshotRedrawHintStatus::Disconnected
 }
 
 fn live_snapshot_redraw_timeout(
@@ -2096,21 +2107,43 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let pending = AtomicBool::new(false);
 
-        assert!(send_live_snapshot_redraw_hint(&sender, &pending));
+        assert_eq!(
+            send_live_snapshot_redraw_hint(&sender, &pending),
+            LiveSnapshotRedrawHintStatus::Sent
+        );
         assert!(matches!(
             receiver.try_recv().unwrap(),
             LiveSnapshotInputEvent::RedrawHint
         ));
-        assert!(!send_live_snapshot_redraw_hint(&sender, &pending));
+        assert_eq!(
+            send_live_snapshot_redraw_hint(&sender, &pending),
+            LiveSnapshotRedrawHintStatus::Coalesced
+        );
         assert!(receiver.try_recv().is_err());
 
         pending.store(false, Ordering::SeqCst);
 
-        assert!(send_live_snapshot_redraw_hint(&sender, &pending));
+        assert_eq!(
+            send_live_snapshot_redraw_hint(&sender, &pending),
+            LiveSnapshotRedrawHintStatus::Sent
+        );
         assert!(matches!(
             receiver.try_recv().unwrap(),
             LiveSnapshotInputEvent::RedrawHint
         ));
+    }
+
+    #[test]
+    fn live_snapshot_redraw_hint_reports_disconnected_receiver() {
+        let (sender, receiver) = mpsc::channel();
+        let pending = AtomicBool::new(false);
+        drop(receiver);
+
+        assert_eq!(
+            send_live_snapshot_redraw_hint(&sender, &pending),
+            LiveSnapshotRedrawHintStatus::Disconnected
+        );
+        assert!(!pending.load(Ordering::SeqCst));
     }
 
     #[test]
