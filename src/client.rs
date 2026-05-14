@@ -184,7 +184,6 @@ where
             || Ok(()),
             enter_copy_mode,
         );
-        let _ = input_stream.shutdown(std::net::Shutdown::Both);
         let _ = sender.send(result);
     });
 
@@ -1594,11 +1593,26 @@ enum RawAttachExit {
     Reconnect { pending_input: Vec<u8> },
 }
 
-fn raw_pending_input(actions: &[AttachInputAction]) -> Vec<u8> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawPendingFocus {
+    Drop,
+    Preserve,
+}
+
+fn raw_pending_input(
+    actions: &[AttachInputAction],
+    saw_prefix: bool,
+    focus: RawPendingFocus,
+) -> Vec<u8> {
     let mut pending = Vec::new();
     for action in actions {
         match action {
             AttachInputAction::Forward(bytes) => pending.extend_from_slice(bytes),
+            AttachInputAction::PaneCommand(PaneCommand::FocusLeft)
+            | AttachInputAction::PaneCommand(PaneCommand::FocusDown)
+            | AttachInputAction::PaneCommand(PaneCommand::FocusUp)
+            | AttachInputAction::PaneCommand(PaneCommand::FocusRight)
+                if focus == RawPendingFocus::Drop => {}
             AttachInputAction::PaneCommand(command) => {
                 pending.push(0x02);
                 pending.push(match command {
@@ -1619,6 +1633,9 @@ fn raw_pending_input(actions: &[AttachInputAction]) -> Vec<u8> {
             AttachInputAction::ShowHelp => pending.extend_from_slice(b"\x02?"),
             AttachInputAction::Detach => pending.extend_from_slice(b"\x02d"),
         }
+    }
+    if saw_prefix {
+        pending.push(0x02);
     }
     pending
 }
@@ -1657,13 +1674,21 @@ where
                 AttachInputAction::PaneCommand(PaneCommand::SplitRight) => {
                     split_pane(socket, session, protocol::SplitDirection::Horizontal)?;
                     return Ok(RawAttachExit::Reconnect {
-                        pending_input: raw_pending_input(&actions[index + 1..]),
+                        pending_input: raw_pending_input(
+                            &actions[index + 1..],
+                            saw_prefix,
+                            RawPendingFocus::Drop,
+                        ),
                     });
                 }
                 AttachInputAction::PaneCommand(PaneCommand::SplitDown) => {
                     split_pane(socket, session, protocol::SplitDirection::Vertical)?;
                     return Ok(RawAttachExit::Reconnect {
-                        pending_input: raw_pending_input(&actions[index + 1..]),
+                        pending_input: raw_pending_input(
+                            &actions[index + 1..],
+                            saw_prefix,
+                            RawPendingFocus::Drop,
+                        ),
                     });
                 }
                 AttachInputAction::PaneCommand(PaneCommand::Close) => {
@@ -1673,7 +1698,11 @@ where
                         write_attach_transient_message(&error.to_string())?;
                     } else {
                         return Ok(RawAttachExit::Reconnect {
-                            pending_input: raw_pending_input(&actions[index + 1..]),
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                saw_prefix,
+                                RawPendingFocus::Preserve,
+                            ),
                         });
                     }
                 }
@@ -1684,7 +1713,11 @@ where
                         write_attach_transient_message(&error.to_string())?;
                     } else {
                         return Ok(RawAttachExit::Reconnect {
-                            pending_input: raw_pending_input(&actions[index + 1..]),
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                saw_prefix,
+                                RawPendingFocus::Preserve,
+                            ),
                         });
                     }
                 }
@@ -3029,6 +3062,42 @@ mod tests {
                 AttachInputAction::Forward(b"def".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn raw_pending_input_drops_raw_focus_commands_after_layout_transition() {
+        let pending = raw_pending_input(
+            &[
+                AttachInputAction::PaneCommand(PaneCommand::FocusLeft),
+                AttachInputAction::PaneCommand(PaneCommand::FocusRight),
+                AttachInputAction::Forward(b"tail".to_vec()),
+            ],
+            false,
+            RawPendingFocus::Drop,
+        );
+
+        assert_eq!(pending, b"tail");
+    }
+
+    #[test]
+    fn raw_pending_input_preserves_focus_commands_after_zoom_transition() {
+        let pending = raw_pending_input(
+            &[
+                AttachInputAction::PaneCommand(PaneCommand::FocusLeft),
+                AttachInputAction::Forward(b"tail".to_vec()),
+            ],
+            false,
+            RawPendingFocus::Preserve,
+        );
+
+        assert_eq!(pending, b"\x02htail");
+    }
+
+    #[test]
+    fn raw_pending_input_preserves_trailing_prefix_after_layout_transition() {
+        let pending = raw_pending_input(&[], true, RawPendingFocus::Drop);
+
+        assert_eq!(pending, b"\x02");
     }
 
     #[test]
