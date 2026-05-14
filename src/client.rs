@@ -738,7 +738,7 @@ fn spawn_live_snapshot_input_thread(
                         let (pause_ack, pause_ready) = mpsc::channel();
                         let _ = sender.send(LiveSnapshotInputEvent::PauseRedraw(pause_ack));
                         let _ = pause_ready.recv();
-                        match run_copy_mode_with_reader(
+                        match run_composed_copy_mode_with_reader(
                             &socket,
                             &session,
                             &initial_input,
