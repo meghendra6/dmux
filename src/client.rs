@@ -83,10 +83,9 @@ where
 
     loop {
         write_attach_status_line(socket, session)?;
-        let mut output_stream = stream.try_clone()?;
-        let output = std::thread::spawn(move || copy_attach_output(&mut output_stream));
-
-        let raw_exit = forward_stdin_until_detach(
+        let worker_copy_mode_socket = copy_mode_socket.clone();
+        let worker_copy_mode_session = copy_mode_session.clone();
+        let raw_exit = run_raw_attach_session(
             &mut stream,
             socket,
             session,
@@ -97,10 +96,15 @@ where
                 }
                 Ok(())
             },
-            |initial_input| run_copy_mode(&copy_mode_socket, &copy_mode_session, initial_input),
+            move |initial_input| {
+                run_copy_mode(
+                    &worker_copy_mode_socket,
+                    &worker_copy_mode_session,
+                    initial_input,
+                )
+            },
         )?;
         let _ = stream.shutdown(std::net::Shutdown::Both);
-        let _ = output.join();
 
         let RawAttachExit::Reconnect {
             pending_input: pending_after_transition,
@@ -133,20 +137,71 @@ where
     }
 }
 
-fn copy_attach_output(output_stream: &mut UnixStream) {
+fn copy_attach_output_once(output_stream: &mut UnixStream) -> io::Result<bool> {
     let mut buf = [0_u8; 8192];
-    loop {
-        let n = match output_stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-
-        let mut stdout = io::stdout().lock();
-        if stdout.write_all(&buf[..n]).is_err() {
-            break;
+    let n = match output_stream.read(&mut buf) {
+        Ok(0) => return Ok(false),
+        Ok(n) => n,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(true);
         }
-        let _ = stdout.flush();
+        Err(error) => return Err(error),
+    };
+
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&buf[..n])?;
+    stdout.flush()?;
+    Ok(true)
+}
+
+fn run_raw_attach_session<F, C>(
+    stream: &mut UnixStream,
+    socket: &Path,
+    session: &str,
+    initial_input: Vec<u8>,
+    mut tick: F,
+    enter_copy_mode: C,
+) -> io::Result<RawAttachExit>
+where
+    F: FnMut() -> io::Result<()>,
+    C: FnMut(&[u8]) -> io::Result<()> + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let mut input_stream = stream.try_clone()?;
+    let input_socket = socket.to_path_buf();
+    let input_session = session.to_string();
+    std::thread::spawn(move || {
+        let result = forward_stdin_until_detach(
+            &mut input_stream,
+            &input_socket,
+            &input_session,
+            initial_input,
+            || Ok(()),
+            enter_copy_mode,
+        );
+        let _ = input_stream.shutdown(std::net::Shutdown::Both);
+        let _ = sender.send(result);
+    });
+
+    stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+    loop {
+        tick()?;
+        if let Ok(result) = receiver.try_recv() {
+            stream.set_read_timeout(None)?;
+            return result;
+        }
+        if !copy_attach_output_once(stream)? {
+            stream.set_read_timeout(None)?;
+            return match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(result) => result,
+                Err(_) => Ok(RawAttachExit::Detach),
+            };
+        }
     }
 }
 
@@ -1071,6 +1126,28 @@ fn spawn_live_snapshot_event_thread(
     });
 }
 
+fn spawn_live_snapshot_lifetime_thread(
+    mut stream: UnixStream,
+    sender: mpsc::Sender<LiveSnapshotInputEvent>,
+) {
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 1];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    let _ = sender.send(LiveSnapshotInputEvent::Eof);
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = sender.send(LiveSnapshotInputEvent::Eof);
+                    return;
+                }
+            }
+        }
+    });
+}
+
 fn send_live_snapshot_redraw_hint(
     sender: &mpsc::Sender<LiveSnapshotInputEvent>,
     pending: &AtomicBool,
@@ -1129,9 +1206,10 @@ fn run_live_snapshot_attach(
     spawn_live_snapshot_event_thread(
         socket.to_path_buf(),
         session.to_string(),
-        sender,
+        sender.clone(),
         Arc::clone(&redraw_hint_pending),
     );
+    spawn_live_snapshot_lifetime_thread(stream.try_clone()?, sender);
     let mut frame = write_live_snapshot_frame(socket, session)?;
     let mut mouse_mode = None;
     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;

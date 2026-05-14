@@ -15,6 +15,7 @@ const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 +
 const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
 
 type AttachEventClients = Arc<Mutex<Vec<UnixStream>>>;
+type AttachLifetimeStreams = Arc<Mutex<Vec<UnixStream>>>;
 
 pub fn run(socket_path: PathBuf) -> io::Result<()> {
     if let Some(parent) = socket_path.parent() {
@@ -207,6 +208,7 @@ fn join_selected_lines(lines: &[&str]) -> String {
 struct Session {
     windows: Mutex<WindowSet>,
     attach_events: AttachEventClients,
+    attach_streams: AttachLifetimeStreams,
 }
 
 impl Session {
@@ -214,6 +216,7 @@ impl Session {
         Self {
             windows: Mutex::new(WindowSet::new(Window::new(pane))),
             attach_events,
+            attach_streams: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -279,6 +282,22 @@ impl Session {
 
     fn notify_attach_redraw(&self) {
         notify_attach_redraw(&self.attach_events);
+    }
+
+    fn register_attach_stream(&self, stream: &UnixStream) -> io::Result<()> {
+        self.attach_streams
+            .lock()
+            .unwrap()
+            .push(stream.try_clone()?);
+        Ok(())
+    }
+
+    fn close_attach_streams(&self) {
+        shutdown_clients(&self.attach_streams);
+        shutdown_clients(&self.attach_events);
+        for pane in self.panes() {
+            shutdown_clients(&pane.clients);
+        }
     }
 }
 
@@ -1591,6 +1610,7 @@ fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) ->
         return Ok(());
     };
 
+    session.close_attach_streams();
     for pane in session.panes() {
         let _ = pty::terminate(pane.child_pid);
     }
@@ -1606,6 +1626,7 @@ fn handle_kill_server(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::
         .map(|(_, session)| session)
         .collect::<Vec<_>>();
     for session in sessions {
+        session.close_attach_streams();
         for pane in session.panes() {
             let _ = pty::terminate(pane.child_pid);
         }
@@ -1632,6 +1653,7 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
         return Ok(());
     };
 
+    session.register_attach_stream(&stream)?;
     if has_attach_pane_snapshot(&session) {
         write_attach_snapshot_ok(&mut stream)?;
         return forward_multi_pane_attach_input(&session, &mut stream);
@@ -2058,6 +2080,7 @@ fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
             notify_attach_redraw(&pane.attach_events);
             broadcast(&pane.clients, bytes);
         }
+        shutdown_clients(&pane.clients);
     });
 }
 
@@ -2094,6 +2117,13 @@ fn notify_attach_redraw(clients: &AttachEventClients) {
     }
 
     *clients = live;
+}
+
+fn shutdown_clients(clients: &Mutex<Vec<UnixStream>>) {
+    let mut clients = clients.lock().unwrap();
+    for client in clients.drain(..) {
+        let _ = client.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 fn register_attach_event_client(
