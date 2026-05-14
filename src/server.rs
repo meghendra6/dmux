@@ -785,6 +785,11 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             mode,
             &selection,
         ),
+        Request::SaveBufferText {
+            session,
+            buffer,
+            text,
+        } => handle_save_buffer_text(&state, &mut stream, &session, buffer.as_deref(), text),
         Request::CopyMode {
             session,
             mode,
@@ -974,6 +979,31 @@ fn handle_save_buffer(
         }
     };
     let saved_name = match state.buffers.lock().unwrap().save(buffer, selected) {
+        Ok(name) => name,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+
+    write_ok(stream)?;
+    writeln!(stream, "{saved_name}")
+}
+
+fn handle_save_buffer_text(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    buffer: Option<&str>,
+    text: String,
+) -> io::Result<()> {
+    let session_exists = state.sessions.lock().unwrap().contains_key(name);
+    if !session_exists {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    }
+
+    let saved_name = match state.buffers.lock().unwrap().save(buffer, text) {
         Ok(name) => name,
         Err(message) => {
             write_err(stream, &message)?;

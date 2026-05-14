@@ -46,6 +46,11 @@ pub enum Request {
         mode: CaptureMode,
         selection: BufferSelection,
     },
+    SaveBufferText {
+        session: String,
+        buffer: Option<String>,
+        text: String,
+    },
     CopyMode {
         session: String,
         mode: CaptureMode,
@@ -164,6 +169,15 @@ pub fn encode_save_buffer(
             )
         }
     }
+}
+
+#[allow(dead_code)]
+pub fn encode_save_buffer_text(session: &str, buffer: Option<&str>, text: &str) -> String {
+    format!(
+        "SAVE_BUFFER_TEXT\t{session}\t{}\t{}\n",
+        encode_optional_text(buffer),
+        encode_hex(text.as_bytes())
+    )
 }
 
 pub fn encode_list_buffers() -> &'static str {
@@ -339,6 +353,11 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             buffer: decode_optional_text(buffer, "SAVE_BUFFER_SEARCH")?,
             mode: decode_capture_mode(mode)?,
             selection: BufferSelection::Search(decode_utf8_hex(needle, "SAVE_BUFFER_SEARCH")?),
+        }),
+        ["SAVE_BUFFER_TEXT", session, buffer, text] => Ok(Request::SaveBufferText {
+            session: (*session).to_string(),
+            buffer: decode_optional_text(buffer, "SAVE_BUFFER_TEXT")?,
+            text: decode_utf8_hex(text, "SAVE_BUFFER_TEXT")?,
         }),
         ["COPY_MODE", session, mode, search] => Ok(Request::CopyMode {
             session: (*session).to_string(),
@@ -690,6 +709,19 @@ mod tests {
                 buffer: Some("match".to_string()),
                 mode: CaptureMode::All,
                 selection: BufferSelection::Search("needle".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_save_buffer_text_request() {
+        let line = encode_save_buffer_text("dev", Some("picked"), "first\tline\nsecond line");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::SaveBufferText {
+                session: "dev".to_string(),
+                buffer: Some("picked".to_string()),
+                text: "first\tline\nsecond line".to_string(),
             }
         );
     }

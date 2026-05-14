@@ -93,6 +93,16 @@ fn read_socket_line(stream: &mut UnixStream) -> String {
     String::from_utf8(bytes).expect("utf8 socket response")
 }
 
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[test]
 fn detached_session_keeps_process_output_available_for_capture() {
     let socket = unique_socket("capture");
@@ -237,6 +247,72 @@ fn buffers_save_capture_list_paste_and_delete() {
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &source]));
     assert_success(&dmux(&socket, &["kill-session", "-t", &sink]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn save_buffer_text_stores_literal_text_and_lists_preview() {
+    let socket = unique_socket("save-buffer-text");
+    let session = format!("save-buffer-text-{}", std::process::id());
+    let text = "alpha\tbeta\nsecond line";
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(
+            format!(
+                "SAVE_BUFFER_TEXT\t{session}\t{}\t{}\n",
+                encode_hex(b"composed"),
+                encode_hex(text.as_bytes())
+            )
+            .as_bytes(),
+        )
+        .expect("write save buffer text request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "composed\n");
+
+    let listed = dmux(&socket, &["list-buffers"]);
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed
+            .lines()
+            .any(|line| line == "composed\t22\talpha beta"),
+        "{listed:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn save_buffer_text_missing_session_returns_error() {
+    let socket = unique_socket("save-buffer-text-missing");
+    let session = format!("save-buffer-text-base-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(
+            format!(
+                "SAVE_BUFFER_TEXT\tmissing-session\t{}\t{}\n",
+                encode_hex(b"composed"),
+                encode_hex(b"selected")
+            )
+            .as_bytes(),
+        )
+        .expect("write save buffer text request");
+    assert_eq!(read_socket_line(&mut stream), "ERR missing session\n");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
 
