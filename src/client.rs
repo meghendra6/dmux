@@ -14,6 +14,7 @@ static MOUSE_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 const LIVE_SNAPSHOT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
+const LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL: Duration = Duration::from_millis(1000);
 const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 
@@ -673,17 +674,32 @@ enum LiveSnapshotInputEvent {
     SelectPane(usize),
     PauseRedraw(mpsc::Sender<()>),
     RedrawNow,
+    RedrawHint,
+    EventStreamReady,
+    EventStreamClosed,
     Error(String),
     Detach,
     Eof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveSnapshotServerEvent {
+    Redraw,
+}
+
+fn parse_live_snapshot_event_line(line: &str) -> io::Result<LiveSnapshotServerEvent> {
+    match line {
+        "REDRAW\n" => Ok(LiveSnapshotServerEvent::Redraw),
+        _ => Err(io::Error::other("unknown attach event")),
+    }
 }
 
 fn spawn_live_snapshot_input_thread(
     socket: PathBuf,
     session: String,
     mouse_focus_enabled: Arc<AtomicBool>,
-) -> mpsc::Receiver<LiveSnapshotInputEvent> {
-    let (sender, receiver) = mpsc::channel();
+    sender: mpsc::Sender<LiveSnapshotInputEvent>,
+) {
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         let mut buf = [0_u8; 1024];
@@ -758,7 +774,80 @@ fn spawn_live_snapshot_input_thread(
             }
         }
     });
-    receiver
+}
+
+fn spawn_live_snapshot_event_thread(
+    socket: PathBuf,
+    session: String,
+    sender: mpsc::Sender<LiveSnapshotInputEvent>,
+) {
+    std::thread::spawn(move || {
+        let mut stream = match UnixStream::connect(socket) {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        if stream
+            .write_all(protocol::encode_attach_events(&session).as_bytes())
+            .is_err()
+        {
+            return;
+        }
+
+        let response = match read_line(&mut stream) {
+            Ok(response) => response,
+            Err(_) => return,
+        };
+        if response != "OK\n" {
+            return;
+        }
+        if sender
+            .send(LiveSnapshotInputEvent::EventStreamReady)
+            .is_err()
+        {
+            return;
+        }
+
+        loop {
+            let line = match read_line(&mut stream) {
+                Ok(line) => line,
+                Err(_) => {
+                    let _ = sender.send(LiveSnapshotInputEvent::EventStreamClosed);
+                    return;
+                }
+            };
+            if line.is_empty() {
+                let _ = sender.send(LiveSnapshotInputEvent::EventStreamClosed);
+                return;
+            }
+
+            match parse_live_snapshot_event_line(&line) {
+                Ok(LiveSnapshotServerEvent::Redraw) => {
+                    if sender.send(LiveSnapshotInputEvent::RedrawHint).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    });
+}
+
+fn live_snapshot_redraw_timeout(
+    event_stream_active: bool,
+    message_expiry: Option<Instant>,
+    now: Instant,
+) -> Duration {
+    let base = if event_stream_active {
+        LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL
+    } else {
+        LIVE_SNAPSHOT_REDRAW_INTERVAL
+    };
+
+    match message_expiry {
+        Some(expiry) if expiry <= now => Duration::ZERO,
+        Some(expiry) => base.min(expiry.duration_since(now)),
+        None => base,
+    }
 }
 
 fn run_live_snapshot_attach(
@@ -767,20 +856,27 @@ fn run_live_snapshot_attach(
     stream: &mut UnixStream,
 ) -> io::Result<()> {
     let mouse_focus_enabled = Arc::new(AtomicBool::new(false));
-    let input = spawn_live_snapshot_input_thread(
+    let (sender, input) = mpsc::channel();
+    spawn_live_snapshot_input_thread(
         socket.to_path_buf(),
         session.to_string(),
         Arc::clone(&mouse_focus_enabled),
+        sender.clone(),
     );
+    spawn_live_snapshot_event_thread(socket.to_path_buf(), session.to_string(), sender);
     let mut frame = write_live_snapshot_frame(socket, session)?;
     let mut mouse_mode = None;
     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
     let mut last_redraw = Instant::now();
     let mut redraw_paused = false;
+    let mut event_stream_active = false;
     let mut pane_number_message = None;
 
     loop {
-        match input.recv_timeout(LIVE_SNAPSHOT_REDRAW_INTERVAL) {
+        let message_expiry = pane_number_message.as_ref().map(|(_, until)| *until);
+        let timeout =
+            live_snapshot_redraw_timeout(event_stream_active, message_expiry, Instant::now());
+        match input.recv_timeout(timeout) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
                 forward_live_snapshot_input(socket, session, &bytes)?;
                 if !redraw_paused && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL {
@@ -858,6 +954,23 @@ fn run_live_snapshot_attach(
                 frame = write_live_snapshot_frame(socket, session)?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::RedrawHint) => {
+                if !redraw_paused {
+                    frame = write_live_snapshot_frame_with_pane_number_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                    )?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    last_redraw = Instant::now();
+                }
+            }
+            Ok(LiveSnapshotInputEvent::EventStreamReady) => {
+                event_stream_active = true;
+            }
+            Ok(LiveSnapshotInputEvent::EventStreamClosed) => {
+                event_stream_active = false;
             }
             Ok(LiveSnapshotInputEvent::Error(message)) => return Err(io::Error::other(message)),
             Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
@@ -1885,6 +1998,55 @@ mod tests {
         assert_eq!(
             pane_at_mouse_position(&regions, 2, MousePosition { col: 14, row: 2 }),
             None
+        );
+    }
+
+    #[test]
+    fn parses_live_snapshot_redraw_event() {
+        assert_eq!(
+            parse_live_snapshot_event_line("REDRAW\n").unwrap(),
+            LiveSnapshotServerEvent::Redraw
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_live_snapshot_event() {
+        assert!(parse_live_snapshot_event_line("OTHER\n").is_err());
+    }
+
+    #[test]
+    fn live_snapshot_timeout_uses_polling_when_events_are_inactive() {
+        assert_eq!(
+            live_snapshot_redraw_timeout(false, None, Instant::now()),
+            LIVE_SNAPSHOT_REDRAW_INTERVAL
+        );
+    }
+
+    #[test]
+    fn live_snapshot_timeout_uses_safety_interval_when_events_are_active() {
+        assert_eq!(
+            live_snapshot_redraw_timeout(true, None, Instant::now()),
+            LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL
+        );
+    }
+
+    #[test]
+    fn live_snapshot_timeout_shortens_for_message_expiry() {
+        let now = Instant::now();
+
+        assert_eq!(
+            live_snapshot_redraw_timeout(true, Some(now + Duration::from_millis(25)), now),
+            Duration::from_millis(25)
+        );
+    }
+
+    #[test]
+    fn live_snapshot_timeout_redraws_immediately_for_expired_message() {
+        let now = Instant::now();
+
+        assert_eq!(
+            live_snapshot_redraw_timeout(true, Some(now), now),
+            Duration::ZERO
         );
     }
 
