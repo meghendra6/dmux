@@ -16,6 +16,16 @@ fn main() {
 fn run() -> Result<(), String> {
     match cli::parse_args(std::env::args())? {
         cli::Command::Server => server::run(paths::socket_path()).map_err(|err| err.to_string()),
+        cli::Command::OpenDefault => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let body = send_request(&socket, protocol::encode_list(), true)?;
+            let sessions = String::from_utf8_lossy(&body);
+            if !sessions.lines().any(|line| line == "default") {
+                send_request(&socket, &protocol::encode_new("default", &[]), true)?;
+            }
+            attach_session(&socket, "default")
+        }
         cli::Command::Help { topic } => {
             match topic {
                 Some(cli::HelpTopic::Attach) => print!("{}", cli::attach_help()),
@@ -39,7 +49,7 @@ fn run() -> Result<(), String> {
         }
         cli::Command::ListSessions => {
             let socket = paths::socket_path();
-            ensure_server(&socket)?;
+            require_running_server(&socket)?;
             let body = send_request(&socket, protocol::encode_list(), true)?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
@@ -230,7 +240,7 @@ fn run() -> Result<(), String> {
         }
         cli::Command::KillSession { session } => {
             let socket = paths::socket_path();
-            ensure_server(&socket)?;
+            require_running_server(&socket)?;
             send_request(&socket, &protocol::encode_kill(&session), true)?;
             Ok(())
         }
@@ -250,10 +260,18 @@ fn run() -> Result<(), String> {
         }
         cli::Command::Attach { session } => {
             let socket = paths::socket_path();
-            ensure_server(&socket)?;
+            require_running_server(&socket)?;
             attach_session(&socket, &session)
         }
     }
+}
+
+fn require_running_server(socket: &std::path::Path) -> Result<(), String> {
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        return Ok(());
+    }
+
+    Err("no dmux server running; create a session with dmux new -s <name>".to_string())
 }
 
 fn is_missing_socket_connect_error(error: &str) -> bool {

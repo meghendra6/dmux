@@ -7,6 +7,7 @@ pub enum HelpTopic {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    OpenDefault,
     New {
         session: String,
         detach: bool,
@@ -109,16 +110,12 @@ where
 {
     let mut args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     if args.is_empty() {
-        return Ok(Command::Attach {
-            session: "default".to_string(),
-        });
+        return Ok(Command::OpenDefault);
     }
 
     let program = args.remove(0);
     let Some(subcommand) = args.first().cloned() else {
-        return Ok(Command::Attach {
-            session: "default".to_string(),
-        });
+        return Ok(Command::OpenDefault);
     };
     args.remove(0);
 
@@ -222,7 +219,7 @@ pub fn general_help() -> &'static str {
 \n\
 Commands:\n\
   new [-d] -s <name> [-- command...]    create a session; attach unless -d is used\n\
-  attach -t <name>                      attach to a session\n\
+  attach [-t <name>]                    attach to a session; defaults to default\n\
   ls                                    list sessions\n\
   split-window -t <name> -h|-v [-- command...]\n\
   list-panes -t <name> [-F <format>]\n\
@@ -236,12 +233,21 @@ Help:\n\
 }
 
 pub fn attach_help() -> &'static str {
-    "Attach keys:\n\
+    "Usage: dmux attach [-t <name>]\n\
+\n\
+If -t is omitted, attach targets default.\n\
+\n\
+Attach keys:\n\
   C-b d       detach\n\
+  C-b %       split right\n\
+  C-b \"       split down\n\
   C-b ?       show this help\n\
   C-b [       copy-mode for the active pane\n\
   C-b o       cycle panes in multi-pane attach\n\
+  C-b h/j/k/l focus left/down/up/right\n\
   C-b q       show pane numbers; press a digit to select\n\
+  C-b x       close the active pane\n\
+  C-b z       toggle zoom for the active pane\n\
   C-b C-b     send a literal prefix\n\
   mouse click focus a pane in unzoomed multi-pane attach\n\
 \n\
@@ -252,7 +258,7 @@ Pane commands:\n\
 }
 
 pub fn attach_help_summary() -> &'static str {
-    "C-b d detach | C-b ? help | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | select: dmux select-pane -t <name> -p <index>"
+    "C-b d detach | C-b ? help | C-b % split right | C-b \" split down | C-b h/j/k/l focus | C-b x close | C-b z zoom | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | select: dmux select-pane -t <name> -p <index>"
 }
 
 fn parse_capture(args: Vec<String>) -> Result<Command, String> {
@@ -1032,6 +1038,11 @@ mod tests {
     }
 
     #[test]
+    fn parses_no_subcommand_as_open_default() {
+        assert_eq!(parse_args(["dmux"]).unwrap(), Command::OpenDefault);
+    }
+
+    #[test]
     fn parses_attach_help() {
         assert_eq!(
             parse_args(["dmux", "attach", "--help"]).unwrap(),
@@ -1062,6 +1073,13 @@ mod tests {
         let help = attach_help();
 
         assert!(help.contains("C-b d"), "{help}");
+        assert!(help.contains("Usage: dmux attach [-t <name>]"), "{help}");
+        assert!(help.contains("omitted"), "{help}");
+        assert!(help.contains("C-b %"), "{help}");
+        assert!(help.contains("C-b \""), "{help}");
+        assert!(help.contains("C-b h/j/k/l"), "{help}");
+        assert!(help.contains("C-b x"), "{help}");
+        assert!(help.contains("C-b z"), "{help}");
         assert!(help.contains("C-b ?"), "{help}");
         assert!(help.contains("C-b o"), "{help}");
         assert!(help.contains("split-window"), "{help}");

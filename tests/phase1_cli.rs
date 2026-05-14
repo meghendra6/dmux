@@ -491,6 +491,31 @@ fn poll_capture(socket: &std::path::Path, session: &str, needle: &str) -> String
     last
 }
 
+fn poll_list_sessions(socket: &std::path::Path, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(socket, &["ls"]);
+        if output.status.success() {
+            last = String::from_utf8_lossy(&output.stdout).to_string();
+            if last.lines().any(|line| line == needle) {
+                return last;
+            }
+        } else {
+            last = format!(
+                "status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
+}
+
 fn poll_capture_eventually(socket: &std::path::Path, session: &str, needle: &str) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut last = String::new();
@@ -632,19 +657,153 @@ fn list_sessions_reports_created_session() {
 }
 
 #[test]
+fn dmux_without_args_creates_default_and_detaches() {
+    let socket = unique_socket("open-default");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn bare dmux");
+
+    let listed = poll_list_sessions(&socket, "default");
+    assert!(listed.lines().any(|line| line == "default"), "{listed:?}");
+    assert!(child.try_wait().expect("poll bare dmux").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("bare dmux stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", "default"]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn dmux_without_args_attaches_existing_default_without_duplicate_session() {
+    let socket = unique_socket("open-existing-default");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            "default",
+            "--",
+            "sh",
+            "-c",
+            "printf existing-default; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, "default", "existing-default");
+    assert!(ready.contains("existing-default"), "{ready:?}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn bare dmux");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll bare dmux").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("bare dmux stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("existing-default"), "{stdout:?}");
+
+    let listed = dmux(&socket, &["ls"]);
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(listed.lines().filter(|line| *line == "default").count(), 1);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", "default"]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn without_server_does_not_start_daemon_for_explicit_read_or_kill_commands() {
+    for (name, args) in [
+        ("ls", vec!["ls"]),
+        ("attach", vec!["attach", "-t", "missing"]),
+        ("kill-session", vec!["kill-session", "-t", "missing"]),
+    ] {
+        let socket = unique_socket(name);
+        let output = dmux(&socket, &args);
+
+        assert!(!output.status.success(), "{name} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no dmux server running; create a session with dmux new -s <name>"),
+            "{name} stderr: {stderr:?}"
+        );
+        assert!(!socket.exists(), "{name} left socket behind at {socket:?}");
+    }
+}
+
+#[test]
+fn new_existing_session_reports_attach_hint() {
+    let socket = unique_socket("duplicate-new");
+    let session = format!("duplicate-new-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let output = dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("session already exists"), "{stderr:?}");
+    assert!(
+        stderr.contains(&format!("dmux attach -t {session}")),
+        "{stderr:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn cli_help_lists_attach_and_attach_help() {
     let socket = unique_socket("cli-help");
 
     let output = dmux(&socket, &["--help"]);
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("attach -t <name>"), "{stdout:?}");
+    assert!(stdout.contains("attach [-t <name>]"), "{stdout:?}");
     assert!(stdout.contains("dmux help attach"), "{stdout:?}");
 
     let output = dmux(&socket, &["attach", "--help"]);
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Usage: dmux attach [-t <name>]"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains("If -t is omitted, attach targets default."),
+        "{stdout:?}"
+    );
     assert!(stdout.contains("C-b d"), "{stdout:?}");
+    assert!(stdout.contains("C-b %"), "{stdout:?}");
+    assert!(stdout.contains("C-b \""), "{stdout:?}");
+    assert!(stdout.contains("C-b h/j/k/l"), "{stdout:?}");
+    assert!(stdout.contains("C-b x"), "{stdout:?}");
+    assert!(stdout.contains("C-b z"), "{stdout:?}");
     assert!(stdout.contains("C-b ?"), "{stdout:?}");
     assert!(stdout.contains("split-window"), "{stdout:?}");
 }
@@ -907,13 +1066,19 @@ fn attach_prefix_question_prints_multi_pane_help_and_keeps_attach_running() {
 #[test]
 fn attach_reports_missing_session() {
     let socket = unique_socket("missing-attach");
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", "present", "--", "sh", "-c", "sleep 30"],
+    ));
+
     let output = dmux(&socket, &["attach", "-t", "missing"]);
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("missing session"), "{stderr:?}");
 
-    let _ = dmux(&socket, &["kill-server"]);
+    assert_success(&dmux(&socket, &["kill-session", "-t", "present"]));
+    assert_success(&dmux(&socket, &["kill-server"]));
 }
 
 #[test]
@@ -1075,6 +1240,7 @@ fn attach_renders_status_line_snapshot() {
         stdout.contains(&format!("{session} [0] pane 0")),
         "{stdout:?}"
     );
+    assert!(stdout.contains("C-b ? help"), "{stdout:?}");
 
     let captured = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
     assert_success(&captured);
@@ -3736,6 +3902,15 @@ fn status_line_uses_default_format() {
     assert_success(&output);
     let line = String::from_utf8_lossy(&output.stdout);
     assert_eq!(line.trim_end(), format!("{session} [0] pane 0"));
+    assert!(!line.contains("C-b ? help"), "{line:?}");
+
+    let output = dmux(
+        &socket,
+        &["status-line", "-t", &session, "-F", "#{status.help}"],
+    );
+    assert_success(&output);
+    let line = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(line.trim_end(), "C-b ? help");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

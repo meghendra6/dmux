@@ -913,7 +913,10 @@ fn handle_new(
 ) -> io::Result<()> {
     let mut sessions = state.sessions.lock().unwrap();
     if sessions.contains_key(&name) {
-        write_err(stream, "session already exists")?;
+        write_err(
+            stream,
+            &format!("session already exists; use dmux attach -t {name}"),
+        )?;
         return Ok(());
     }
 
@@ -1384,6 +1387,7 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{pane.index}", pane_index.as_str()),
         ("#{pane.zoomed}", pane_zoomed),
         ("#{window.zoomed_flag}", window_zoomed),
+        ("#{status.help}", "C-b ? help"),
     ];
     let mut output = String::with_capacity(format.len());
     let mut remaining = format;

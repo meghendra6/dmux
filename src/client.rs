@@ -116,7 +116,13 @@ fn copy_attach_output(output_stream: &mut UnixStream) {
 }
 
 fn read_attach_status_line(socket: &Path, session: &str) -> io::Result<String> {
-    let body = send_control_request(socket, &protocol::encode_status_line(session, None))?;
+    let body = send_control_request(
+        socket,
+        &protocol::encode_status_line(
+            session,
+            Some("#{session.name} #{window.list} pane #{pane.index} | #{status.help}"),
+        ),
+    )?;
     Ok(String::from_utf8_lossy(&body).trim_end().to_string())
 }
 
