@@ -58,8 +58,9 @@ pane. Unzoomed multi-pane attach handles `C-b d` to detach, `C-b ?` to show
 attach help, `C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` to
 focus by direction, `C-b o` to cycle the server active pane, `C-b q` followed by
 a single digit to select a pane by number, `C-b x` to close the active pane,
-`C-b z` to toggle zoom, and mouse click to select a pane. Pane splitting is
-currently command-driven with
+`C-b z` to toggle zoom, and mouse click to select a pane. `C-b %` and `C-b "`
+also work from a fresh single-pane attach and transition automatically into the
+multi-pane layout view. Pane splitting is also available with
 `dmux split-window -t <name> -h|-v [-- command...]`; use `dmux attach --help`
 or `dmux help attach` to list attach-time bindings.
 Unzoomed multi-pane attach redraws from server change events and keeps a polling

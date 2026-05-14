@@ -83,8 +83,10 @@ where
     let mut last_size = initial_size;
     let copy_mode_socket = socket.to_path_buf();
     let copy_mode_session = session.to_string();
-    forward_stdin_until_detach(
+    let raw_exit = forward_stdin_until_detach(
         &mut stream,
+        socket,
+        session,
         || {
             if take_winch_pending() {
                 maybe_emit_resize(detect_attach_size(), &mut last_size, &mut on_resize)?;
@@ -95,6 +97,21 @@ where
     )?;
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = output.join();
+
+    if raw_exit == RawAttachExit::Snapshot {
+        let mut stream = UnixStream::connect(socket)?;
+        stream.write_all(protocol::encode_attach(session).as_bytes())?;
+        let response = read_line(&mut stream)?;
+        if let Some(message) = response.strip_prefix("ERR ") {
+            return Err(io::Error::other(message.trim_end().to_string()));
+        }
+        let attach_mode = parse_attach_ok(&response)?;
+        if attach_mode != AttachMode::Snapshot {
+            return Err(io::Error::other("expected snapshot attach after split"));
+        }
+        return run_live_snapshot_attach(socket, session, &mut stream);
+    }
+
     Ok(())
 }
 
@@ -349,9 +366,22 @@ where
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneCommand {
+    SplitRight,
+    SplitDown,
+    FocusLeft,
+    FocusDown,
+    FocusUp,
+    FocusRight,
+    Close,
+    ToggleZoom,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttachInputAction {
     Forward(Vec<u8>),
+    PaneCommand(PaneCommand),
     EnterCopyMode { initial_input: Vec<u8> },
     ShowHelp,
     Detach,
@@ -361,6 +391,7 @@ enum AttachInputAction {
 enum LiveSnapshotInputAction {
     Forward(Vec<u8>),
     MousePress(MousePosition),
+    PaneCommand(PaneCommand),
     Detach,
     SelectNextPane,
     ShowPaneNumbers,
@@ -405,6 +436,34 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> Vec<AttachInpu
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::ShowHelp);
+                    continue;
+                }
+                b'%' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::SplitRight));
+                    continue;
+                }
+                b'"' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::SplitDown));
+                    continue;
+                }
+                b'x' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::Close));
+                    continue;
+                }
+                b'z' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::ToggleZoom));
                     continue;
                 }
                 0x02 => {
@@ -564,6 +623,92 @@ fn translate_live_snapshot_input_with_mouse(
                     });
                     return actions;
                 }
+                b'%' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(
+                        PaneCommand::SplitRight,
+                    ));
+                    offset += 1;
+                    continue;
+                }
+                b'"' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::SplitDown));
+                    offset += 1;
+                    continue;
+                }
+                b'h' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::FocusLeft));
+                    offset += 1;
+                    continue;
+                }
+                b'j' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::FocusDown));
+                    offset += 1;
+                    continue;
+                }
+                b'k' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::FocusUp));
+                    offset += 1;
+                    continue;
+                }
+                b'l' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(
+                        PaneCommand::FocusRight,
+                    ));
+                    offset += 1;
+                    continue;
+                }
+                b'x' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::Close));
+                    offset += 1;
+                    continue;
+                }
+                b'z' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(
+                        PaneCommand::ToggleZoom,
+                    ));
+                    offset += 1;
+                    continue;
+                }
                 0x02 => {
                     output.push(0x02);
                     offset += 1;
@@ -674,6 +819,7 @@ fn parse_pane_listing(listing: &str) -> io::Result<Vec<PaneListEntry>> {
 enum LiveSnapshotInputEvent {
     Forward(Vec<u8>),
     MousePress(MousePosition),
+    PaneCommand(PaneCommand),
     SelectNextPane,
     ShowPaneNumbers,
     ShowHelp,
@@ -743,6 +889,9 @@ fn spawn_live_snapshot_input_thread(
                 match action {
                     LiveSnapshotInputAction::Forward(bytes) => {
                         let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
+                    }
+                    LiveSnapshotInputAction::PaneCommand(command) => {
+                        let _ = sender.send(LiveSnapshotInputEvent::PaneCommand(command));
                     }
                     LiveSnapshotInputAction::Detach => {
                         let _ = sender.send(LiveSnapshotInputEvent::Detach);
@@ -936,6 +1085,25 @@ fn run_live_snapshot_attach(
                     last_redraw = Instant::now();
                 }
             }
+            Ok(LiveSnapshotInputEvent::PaneCommand(command)) => {
+                let result = apply_live_pane_command(socket, session, command, &frame);
+                pane_number_message = match result {
+                    Ok(()) => None,
+                    Err(error) => Some((
+                        error.to_string(),
+                        Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
+                    )),
+                };
+                if !redraw_paused {
+                    frame = write_live_snapshot_frame_with_pane_number_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                    )?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                }
+                last_redraw = Instant::now();
+            }
             Ok(LiveSnapshotInputEvent::SelectNextPane) => {
                 select_next_pane(socket, session)?;
                 pane_number_message = None;
@@ -1122,6 +1290,112 @@ fn pane_index_exists(entries: &[PaneListEntry], index: usize) -> bool {
     entries.iter().any(|entry| entry.index == index)
 }
 
+fn apply_live_pane_command(
+    socket: &Path,
+    session: &str,
+    command: PaneCommand,
+    frame: &LiveSnapshotFrame,
+) -> io::Result<()> {
+    match command {
+        PaneCommand::SplitRight => {
+            split_pane(socket, session, protocol::SplitDirection::Horizontal)
+        }
+        PaneCommand::SplitDown => split_pane(socket, session, protocol::SplitDirection::Vertical),
+        PaneCommand::FocusLeft
+        | PaneCommand::FocusDown
+        | PaneCommand::FocusUp
+        | PaneCommand::FocusRight => select_directional_pane(socket, session, command, frame),
+        PaneCommand::Close => {
+            let _ = send_control_request(socket, &protocol::encode_kill_pane(session, None))?;
+            Ok(())
+        }
+        PaneCommand::ToggleZoom => {
+            let _ = send_control_request(socket, &protocol::encode_zoom_pane(session, None))?;
+            Ok(())
+        }
+    }
+}
+
+fn split_pane(socket: &Path, session: &str, direction: protocol::SplitDirection) -> io::Result<()> {
+    let _ = send_control_request(socket, &protocol::encode_split(session, direction, &[]))?;
+    Ok(())
+}
+
+fn select_directional_pane(
+    socket: &Path,
+    session: &str,
+    command: PaneCommand,
+    frame: &LiveSnapshotFrame,
+) -> io::Result<()> {
+    let entries = pane_entries(socket, session)?;
+    let active = entries
+        .iter()
+        .find(|entry| entry.active)
+        .ok_or_else(|| io::Error::other("missing active pane"))?;
+    let Some(target) = directional_focus_target(frame, active.index, command) else {
+        return Ok(());
+    };
+
+    let _ = send_control_request(socket, &protocol::encode_select_pane(session, target))?;
+    Ok(())
+}
+
+fn directional_focus_target(
+    frame: &LiveSnapshotFrame,
+    active_index: usize,
+    command: PaneCommand,
+) -> Option<usize> {
+    let active = frame
+        .regions
+        .iter()
+        .find(|region| region.pane == active_index)?;
+
+    frame
+        .regions
+        .iter()
+        .filter(|region| region.pane != active_index)
+        .filter_map(|region| {
+            directional_focus_score(active, region, command).map(|score| (score, region.pane))
+        })
+        .min_by_key(|(score, pane)| (*score, *pane))
+        .map(|(_, pane)| pane)
+}
+
+fn directional_focus_score(
+    active: &AttachPaneRegion,
+    candidate: &AttachPaneRegion,
+    command: PaneCommand,
+) -> Option<(usize, usize)> {
+    let active_row = region_center(active.row_start, active.row_end);
+    let active_col = region_center(active.col_start, active.col_end);
+    let candidate_row = region_center(candidate.row_start, candidate.row_end);
+    let candidate_col = region_center(candidate.col_start, candidate.col_end);
+
+    match command {
+        PaneCommand::FocusLeft if candidate.col_end <= active.col_start => Some((
+            active.col_start - candidate.col_end,
+            active_row.abs_diff(candidate_row),
+        )),
+        PaneCommand::FocusRight if candidate.col_start >= active.col_end => Some((
+            candidate.col_start - active.col_end,
+            active_row.abs_diff(candidate_row),
+        )),
+        PaneCommand::FocusUp if candidate.row_end <= active.row_start => Some((
+            active.row_start - candidate.row_end,
+            active_col.abs_diff(candidate_col),
+        )),
+        PaneCommand::FocusDown if candidate.row_start >= active.row_end => Some((
+            candidate.row_start - active.row_end,
+            active_col.abs_diff(candidate_col),
+        )),
+        _ => None,
+    }
+}
+
+fn region_center(start: usize, end: usize) -> usize {
+    start + end.saturating_sub(start) / 2
+}
+
 fn pane_at_mouse_position(
     regions: &[AttachPaneRegion],
     header_rows: usize,
@@ -1160,11 +1434,19 @@ fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawAttachExit {
+    Detach,
+    Snapshot,
+}
+
 fn forward_stdin_until_detach<F, C>(
     stream: &mut UnixStream,
+    socket: &Path,
+    session: &str,
     mut tick: F,
     mut enter_copy_mode: C,
-) -> io::Result<()>
+) -> io::Result<RawAttachExit>
 where
     F: FnMut() -> io::Result<()>,
     C: FnMut(&[u8]) -> io::Result<()>,
@@ -1182,13 +1464,36 @@ where
         for action in translate_attach_input(&buf[..n], &mut saw_prefix) {
             match action {
                 AttachInputAction::Forward(output) => stream.write_all(&output)?,
+                AttachInputAction::PaneCommand(PaneCommand::SplitRight) => {
+                    split_pane(socket, session, protocol::SplitDirection::Horizontal)?;
+                    return Ok(RawAttachExit::Snapshot);
+                }
+                AttachInputAction::PaneCommand(PaneCommand::SplitDown) => {
+                    split_pane(socket, session, protocol::SplitDirection::Vertical)?;
+                    return Ok(RawAttachExit::Snapshot);
+                }
+                AttachInputAction::PaneCommand(PaneCommand::Close) => {
+                    if let Err(error) =
+                        send_control_request(socket, &protocol::encode_kill_pane(session, None))
+                    {
+                        write_attach_transient_message(&error.to_string())?;
+                    }
+                }
+                AttachInputAction::PaneCommand(PaneCommand::ToggleZoom) => {
+                    if let Err(error) =
+                        send_control_request(socket, &protocol::encode_zoom_pane(session, None))
+                    {
+                        write_attach_transient_message(&error.to_string())?;
+                    }
+                }
+                AttachInputAction::PaneCommand(_) => {}
                 AttachInputAction::EnterCopyMode { initial_input } => {
                     enter_copy_mode(&initial_input)?;
                 }
                 AttachInputAction::ShowHelp => {
                     write_attach_help_message()?;
                 }
-                AttachInputAction::Detach => return Ok(()),
+                AttachInputAction::Detach => return Ok(RawAttachExit::Detach),
             }
         }
     }
@@ -1197,7 +1502,7 @@ where
         stream.write_all(&[0x02])?;
     }
 
-    Ok(())
+    Ok(RawAttachExit::Detach)
 }
 
 fn run_copy_mode(socket: &Path, session: &str, initial_input: &[u8]) -> io::Result<()> {
@@ -1422,6 +1727,12 @@ fn attach_help_message() -> &'static str {
 fn write_attach_help_message() -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(format!("\r\n-- dmux help: {} --\r\n", attach_help_message()).as_bytes())?;
+    stdout.flush()
+}
+
+fn write_attach_transient_message(message: &str) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(format!("\r\n-- dmux: {message} --\r\n").as_bytes())?;
     stdout.flush()
 }
 
@@ -2330,11 +2641,11 @@ mod tests {
     fn live_snapshot_input_forwards_literal_prefix_with_regular_key() {
         let mut state = LiveSnapshotInputState::default();
 
-        let actions = translate_live_snapshot_input(b"\x02x", &mut state);
+        let actions = translate_live_snapshot_input(b"\x02a", &mut state);
 
         assert_eq!(
             actions,
-            vec![LiveSnapshotInputAction::Forward(b"\x02x".to_vec())]
+            vec![LiveSnapshotInputAction::Forward(b"\x02a".to_vec())]
         );
         assert!(!state.saw_prefix);
     }
@@ -2477,6 +2788,79 @@ mod tests {
             vec![
                 LiveSnapshotInputAction::Forward(b"abc".to_vec()),
                 LiveSnapshotInputAction::SelectNextPane,
+                LiveSnapshotInputAction::Forward(b"def".to_vec()),
+            ]
+        );
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn attach_input_translates_pane_commands() {
+        assert_eq!(
+            translate_attach_input(b"\x02%", &mut false),
+            vec![AttachInputAction::PaneCommand(PaneCommand::SplitRight)]
+        );
+        assert_eq!(
+            translate_attach_input(b"\x02\"", &mut false),
+            vec![AttachInputAction::PaneCommand(PaneCommand::SplitDown)]
+        );
+        assert_eq!(
+            translate_attach_input(b"\x02x", &mut false),
+            vec![AttachInputAction::PaneCommand(PaneCommand::Close)]
+        );
+        assert_eq!(
+            translate_attach_input(b"\x02z", &mut false),
+            vec![AttachInputAction::PaneCommand(PaneCommand::ToggleZoom)]
+        );
+    }
+
+    #[test]
+    fn attach_input_preserves_forwarded_bytes_before_pane_command() {
+        let actions = translate_attach_input(b"abc\x02%def", &mut false);
+
+        assert_eq!(
+            actions,
+            vec![
+                AttachInputAction::Forward(b"abc".to_vec()),
+                AttachInputAction::PaneCommand(PaneCommand::SplitRight),
+                AttachInputAction::Forward(b"def".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_snapshot_input_translates_pane_commands() {
+        let cases = [
+            (b'%', PaneCommand::SplitRight),
+            (b'"', PaneCommand::SplitDown),
+            (b'h', PaneCommand::FocusLeft),
+            (b'j', PaneCommand::FocusDown),
+            (b'k', PaneCommand::FocusUp),
+            (b'l', PaneCommand::FocusRight),
+            (b'x', PaneCommand::Close),
+            (b'z', PaneCommand::ToggleZoom),
+        ];
+
+        for (key, command) in cases {
+            let mut state = LiveSnapshotInputState::default();
+            let actions = translate_live_snapshot_input(&[0x02, key], &mut state);
+
+            assert_eq!(actions, vec![LiveSnapshotInputAction::PaneCommand(command)]);
+            assert!(!state.saw_prefix);
+        }
+    }
+
+    #[test]
+    fn live_snapshot_input_preserves_forwarded_bytes_before_pane_command() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"abc\x02ldef", &mut state);
+
+        assert_eq!(
+            actions,
+            vec![
+                LiveSnapshotInputAction::Forward(b"abc".to_vec()),
+                LiveSnapshotInputAction::PaneCommand(PaneCommand::FocusRight),
                 LiveSnapshotInputAction::Forward(b"def".to_vec()),
             ]
         );
