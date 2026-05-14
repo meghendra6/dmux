@@ -45,11 +45,13 @@ Attached clients can enter the current basic copy-mode view with `C-b [`.
 Inside copy-mode, `j`/`k` and `Ctrl-n`/`Ctrl-p` move the cursor, `y` or Enter
 saves the current line to a buffer, and `q` or Escape exits. Mouse click saves
 one rendered line; mouse drag saves an inclusive line range. Mouse selection is
-currently basic line-level selection. Unzoomed multi-pane attach routes input
-and copy-mode to the server active pane and handles `C-b d` to detach,
-`C-b ?` to show attach help, `C-b o` to cycle the server active pane, and
-`C-b q` followed by a single digit to select a pane by number, and mouse click
-to select a pane. Pane splitting is currently command-driven with
+currently basic line-level selection. In unzoomed multi-pane attach, copy-mode
+copies lines from the rendered composed layout, including pane separators and
+visible content from multiple panes, while input is routed to the server active
+pane. Unzoomed multi-pane attach handles `C-b d` to detach, `C-b ?` to show
+attach help, `C-b o` to cycle the server active pane, `C-b q` followed by a
+single digit to select a pane by number, and mouse click to select a pane. Pane
+splitting is currently command-driven with
 `dmux split-window -t <name> -h|-v [-- command...]`; use `dmux attach --help`
 or `dmux help attach` to list attach-time bindings.
 
@@ -90,13 +92,13 @@ Implemented Phase 2 groundwork:
 - attach-time pane cycling for polling multi-pane attach
 - attach-time numbered pane selection for polling multi-pane attach
 - attach-time mouse focus for polling multi-pane attach
-- multi-pane attach copy-mode entry for the active pane
+- multi-pane attach copy-mode over the rendered composed layout
 - attach layout pane-region mapping foundation
 - `DEVMUX_ATTACH_SIZE=<cols>x<rows>` override for tests and automation
 
 Current limits:
 
-- multi-pane attach live redraw is polling-based and routes input to the server active pane; composed-layout copy-mode is not implemented yet
+- multi-pane attach live redraw is polling-based and routes input to the server active pane
 - zoomed panes are tracked server-side and keep single-pane live attach behavior
 - attach-time statusline rendering is snapshot-only for raw single-pane attach and polled during multi-pane live redraw; event-driven live status redraw is not implemented yet
 - in-memory screen and scrollback only

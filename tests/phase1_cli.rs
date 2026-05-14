@@ -93,6 +93,16 @@ fn read_socket_line(stream: &mut UnixStream) -> String {
     String::from_utf8(bytes).expect("utf8 socket response")
 }
 
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[test]
 fn detached_session_keeps_process_output_available_for_capture() {
     let socket = unique_socket("capture");
@@ -237,6 +247,72 @@ fn buffers_save_capture_list_paste_and_delete() {
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &source]));
     assert_success(&dmux(&socket, &["kill-session", "-t", &sink]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn save_buffer_text_stores_literal_text_and_lists_preview() {
+    let socket = unique_socket("save-buffer-text");
+    let session = format!("save-buffer-text-{}", std::process::id());
+    let text = "alpha\tbeta\nsecond line";
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(
+            format!(
+                "SAVE_BUFFER_TEXT\t{session}\t{}\t{}\n",
+                encode_hex(b"composed"),
+                encode_hex(text.as_bytes())
+            )
+            .as_bytes(),
+        )
+        .expect("write save buffer text request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "composed\n");
+
+    let listed = dmux(&socket, &["list-buffers"]);
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed
+            .lines()
+            .any(|line| line == "composed\t22\talpha beta"),
+        "{listed:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn save_buffer_text_missing_session_returns_error() {
+    let socket = unique_socket("save-buffer-text-missing");
+    let session = format!("save-buffer-text-base-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(
+            format!(
+                "SAVE_BUFFER_TEXT\tmissing-session\t{}\t{}\n",
+                encode_hex(b"composed"),
+                encode_hex(b"selected")
+            )
+            .as_bytes(),
+        )
+        .expect("write save buffer text request");
+    assert_eq!(read_socket_line(&mut stream), "ERR missing session\n");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
 
@@ -1847,7 +1923,7 @@ fn attach_prefix_q_ignores_invalid_digit_and_keeps_attach_running() {
 }
 
 #[test]
-fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
+fn attach_prefix_bracket_copies_composed_layout_line_in_multi_pane_attach() {
     let socket = unique_socket("attach-copy-mode");
     let session = format!("attach-copy-mode-{}", std::process::id());
 
@@ -1910,7 +1986,7 @@ fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
         listed = String::from_utf8_lossy(&output.stdout).to_string();
         if listed
             .lines()
-            .any(|line| line.ends_with("\t11\tsplit-copy"))
+            .any(saved_buffer_preview_contains_composed_copy)
         {
             break;
         }
@@ -1919,7 +1995,7 @@ fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
     assert!(
         listed
             .lines()
-            .any(|line| line.ends_with("\t11\tsplit-copy")),
+            .any(saved_buffer_preview_contains_composed_copy),
         "{listed:?}"
     );
 
@@ -1936,6 +2012,10 @@ fn attach_prefix_bracket_copies_active_pane_line_in_multi_pane_attach() {
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+fn saved_buffer_preview_contains_composed_copy(line: &str) -> bool {
+    line.ends_with("\t23\tbase-copy | split-copy")
 }
 
 #[test]
@@ -2262,6 +2342,99 @@ fn attach_keeps_zoomed_split_pane_live() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("-- pane 0 --"), "{stdout:?}");
     assert!(!stdout.contains("-- pane 1 --"), "{stdout:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_prefix_bracket_copies_active_pane_line_when_zoomed() {
+    let socket = unique_socket("attach-zoomed-copy-mode");
+    let session = format!("attach-zoomed-copy-mode-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-zoom-copy; printf '\\n'; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-zoom-copy");
+    assert!(base.contains("base-zoom-copy"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-zoom-copy; printf '\\n'; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-zoom-copy");
+    assert!(split.contains("split-zoom-copy"), "{split:?}");
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session]));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn attach");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(child.try_wait().expect("poll attach").is_none());
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin
+            .write_all(b"\x02[y")
+            .expect("write copy-mode entry and copy key");
+        stdin.flush().expect("flush copy-mode input");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut listed = String::new();
+    while std::time::Instant::now() < deadline {
+        let output = dmux(&socket, &["list-buffers"]);
+        assert_success(&output);
+        listed = String::from_utf8_lossy(&output.stdout).to_string();
+        if listed
+            .lines()
+            .any(|line| line.ends_with("\t16\tsplit-zoom-copy"))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.ends_with("\t16\tsplit-zoom-copy")),
+        "{listed:?}"
+    );
+
+    {
+        let stdin = child.stdin.as_mut().expect("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("-- copy mode --"), "{stdout:?}");
+    assert!(stdout.contains("-- copy mode: copied to "), "{stdout:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

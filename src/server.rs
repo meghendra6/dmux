@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 const MAX_HISTORY_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFERS: usize = 50;
+const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 + 4096;
 
 pub fn run(socket_path: PathBuf) -> io::Result<()> {
     if let Some(parent) = socket_path.parent() {
@@ -752,13 +753,18 @@ struct Pane {
 }
 
 fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Result<()> {
-    let mut line = String::new();
-    {
+    let line = {
         let mut reader = io::BufReader::new(stream.try_clone()?);
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(());
+        match read_control_line(&mut reader) {
+            Ok(Some(line)) => line,
+            Ok(None) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                write_err(&mut stream, &error.to_string())?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         }
-    }
+    };
 
     let request = match protocol::decode_request(&line) {
         Ok(request) => request,
@@ -785,6 +791,11 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             mode,
             &selection,
         ),
+        Request::SaveBufferText {
+            session,
+            buffer,
+            text,
+        } => handle_save_buffer_text(&state, &mut stream, &session, buffer.as_deref(), text),
         Request::CopyMode {
             session,
             mode,
@@ -844,6 +855,39 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             handle_attach_layout_snapshot(&state, &mut stream, &session)
         }
     }
+}
+
+fn read_control_line<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut line = Vec::new();
+
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > MAX_CONTROL_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request line too long",
+            ));
+        }
+
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            break;
+        }
+    }
+
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "request line is not utf-8"))
 }
 
 fn handle_new(
@@ -974,6 +1018,31 @@ fn handle_save_buffer(
         }
     };
     let saved_name = match state.buffers.lock().unwrap().save(buffer, selected) {
+        Ok(name) => name,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+
+    write_ok(stream)?;
+    writeln!(stream, "{saved_name}")
+}
+
+fn handle_save_buffer_text(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    buffer: Option<&str>,
+    text: String,
+) -> io::Result<()> {
+    let session_exists = state.sessions.lock().unwrap().contains_key(name);
+    if !session_exists {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    }
+
+    let saved_name = match state.buffers.lock().unwrap().save(buffer, text) {
         Ok(name) => name,
         Err(message) => {
             write_err(stream, &message)?;
@@ -2417,6 +2486,17 @@ left | right\r\n"
                 .is_some()
         );
         assert_eq!(store.list().len(), MAX_BUFFERS);
+    }
+
+    #[test]
+    fn read_control_line_rejects_oversized_line() {
+        let bytes = vec![b'a'; MAX_CONTROL_LINE_BYTES + 1];
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(bytes));
+
+        let err = read_control_line(&mut reader).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "request line too long");
     }
 
     #[test]
