@@ -150,6 +150,17 @@ fn copy_attach_output_once(output_stream: &mut UnixStream) -> io::Result<bool> {
         {
             return Ok(true);
         }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(false);
+        }
         Err(error) => return Err(error),
     };
 
@@ -191,11 +202,11 @@ where
     loop {
         tick()?;
         if let Ok(result) = receiver.try_recv() {
-            stream.set_read_timeout(None)?;
+            let _ = stream.set_read_timeout(None);
             return result;
         }
         if !copy_attach_output_once(stream)? {
-            stream.set_read_timeout(None)?;
+            let _ = stream.set_read_timeout(None);
             return match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(result) => result,
                 Err(_) => Ok(RawAttachExit::Detach),
@@ -454,6 +465,9 @@ enum PaneCommand {
 enum AttachInputAction {
     Forward(Vec<u8>),
     PaneCommand(PaneCommand),
+    SelectNextPane,
+    ShowPaneNumbers,
+    SelectPane(usize),
     EnterCopyMode { initial_input: Vec<u8> },
     ShowHelp,
     Detach,
@@ -479,13 +493,47 @@ struct LiveSnapshotInputState {
     mouse_pending: Vec<u8>,
 }
 
+#[derive(Default)]
+struct RawAttachInputState {
+    saw_prefix: bool,
+    selecting_pane: bool,
+}
+
+#[cfg(test)]
 fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> Vec<AttachInputAction> {
+    let mut state = RawAttachInputState {
+        saw_prefix: *saw_prefix,
+        selecting_pane: false,
+    };
+    let actions = translate_attach_input_with_state(input, &mut state);
+    *saw_prefix = state.saw_prefix;
+    actions
+}
+
+fn translate_attach_input_with_state(
+    input: &[u8],
+    state: &mut RawAttachInputState,
+) -> Vec<AttachInputAction> {
     let mut output = Vec::with_capacity(input.len());
     let mut actions = Vec::new();
 
     for (index, byte) in input.iter().enumerate() {
-        if *saw_prefix {
-            *saw_prefix = false;
+        if state.selecting_pane {
+            state.selecting_pane = false;
+            if byte.is_ascii_digit() {
+                actions.push(AttachInputAction::SelectPane(usize::from(*byte - b'0')));
+                continue;
+            }
+            if *byte == 0x02 {
+                state.saw_prefix = true;
+                continue;
+            }
+            output.push(*byte);
+            continue;
+        }
+
+        if state.saw_prefix {
+            state.saw_prefix = false;
             match *byte {
                 b'd' => {
                     if !output.is_empty() {
@@ -502,6 +550,21 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> Vec<AttachInpu
                         initial_input: input[index + 1..].to_vec(),
                     });
                     return actions;
+                }
+                b'o' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::SelectNextPane);
+                    continue;
+                }
+                b'q' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    state.selecting_pane = true;
+                    actions.push(AttachInputAction::ShowPaneNumbers);
+                    continue;
                 }
                 b'?' => {
                     if !output.is_empty() {
@@ -568,7 +631,6 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> Vec<AttachInpu
                 }
                 0x02 => {
                     output.push(0x02);
-                    *saw_prefix = true;
                     continue;
                 }
                 _ => output.push(0x02),
@@ -576,7 +638,7 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> Vec<AttachInpu
         }
 
         if *byte == 0x02 {
-            *saw_prefix = true;
+            state.saw_prefix = true;
         } else {
             output.push(*byte);
         }
@@ -1630,6 +1692,13 @@ fn raw_pending_input(
                 pending.extend_from_slice(b"\x02[");
                 pending.extend_from_slice(initial_input);
             }
+            AttachInputAction::SelectNextPane => pending.extend_from_slice(b"\x02o"),
+            AttachInputAction::ShowPaneNumbers => pending.extend_from_slice(b"\x02q"),
+            AttachInputAction::SelectPane(index) => {
+                if *index < 10 {
+                    pending.push(b'0' + *index as u8);
+                }
+            }
             AttachInputAction::ShowHelp => pending.extend_from_slice(b"\x02?"),
             AttachInputAction::Detach => pending.extend_from_slice(b"\x02d"),
         }
@@ -1653,19 +1722,19 @@ where
     C: FnMut(&[u8]) -> io::Result<()>,
 {
     let mut buf = [0_u8; 1024];
-    let mut saw_prefix = false;
+    let mut input_state = RawAttachInputState::default();
     let mut initial_input = Some(initial_input);
 
     loop {
         tick()?;
         let actions = if let Some(input) = initial_input.take() {
-            translate_attach_input(&input, &mut saw_prefix)
+            translate_attach_input_with_state(&input, &mut input_state)
         } else {
             let n = io::stdin().lock().read(&mut buf)?;
             if n == 0 {
                 break;
             }
-            translate_attach_input(&buf[..n], &mut saw_prefix)
+            translate_attach_input_with_state(&buf[..n], &mut input_state)
         };
 
         for (index, action) in actions.iter().enumerate() {
@@ -1676,7 +1745,7 @@ where
                     return Ok(RawAttachExit::Reconnect {
                         pending_input: raw_pending_input(
                             &actions[index + 1..],
-                            saw_prefix,
+                            input_state.saw_prefix,
                             RawPendingFocus::Drop,
                         ),
                     });
@@ -1686,7 +1755,7 @@ where
                     return Ok(RawAttachExit::Reconnect {
                         pending_input: raw_pending_input(
                             &actions[index + 1..],
-                            saw_prefix,
+                            input_state.saw_prefix,
                             RawPendingFocus::Drop,
                         ),
                     });
@@ -1700,7 +1769,7 @@ where
                         return Ok(RawAttachExit::Reconnect {
                             pending_input: raw_pending_input(
                                 &actions[index + 1..],
-                                saw_prefix,
+                                input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
                             ),
                         });
@@ -1715,13 +1784,47 @@ where
                         return Ok(RawAttachExit::Reconnect {
                             pending_input: raw_pending_input(
                                 &actions[index + 1..],
-                                saw_prefix,
+                                input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
                             ),
                         });
                     }
                 }
                 AttachInputAction::PaneCommand(_) => {}
+                AttachInputAction::SelectNextPane => {
+                    if let Err(error) = select_next_pane(socket, session) {
+                        write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                input_state.saw_prefix,
+                                RawPendingFocus::Preserve,
+                            ),
+                        });
+                    }
+                }
+                AttachInputAction::ShowPaneNumbers => {
+                    match pane_number_message_text(socket, session) {
+                        Ok(message) => write_attach_transient_message(&message)?,
+                        Err(error) => write_attach_transient_message(&error.to_string())?,
+                    }
+                }
+                AttachInputAction::SelectPane(pane) => {
+                    match select_numbered_pane(socket, session, *pane) {
+                        Ok(true) => {
+                            return Ok(RawAttachExit::Reconnect {
+                                pending_input: raw_pending_input(
+                                    &actions[index + 1..],
+                                    input_state.saw_prefix,
+                                    RawPendingFocus::Preserve,
+                                ),
+                            });
+                        }
+                        Ok(false) => {}
+                        Err(error) => write_attach_transient_message(&error.to_string())?,
+                    }
+                }
                 AttachInputAction::EnterCopyMode { initial_input } => {
                     enter_copy_mode(&initial_input)?;
                 }
@@ -1733,7 +1836,7 @@ where
         }
     }
 
-    if saw_prefix {
+    if input_state.saw_prefix {
         stream.write_all(&[0x02])?;
     }
 
@@ -3061,6 +3164,47 @@ mod tests {
                 AttachInputAction::PaneCommand(PaneCommand::SplitRight),
                 AttachInputAction::Forward(b"def".to_vec()),
             ]
+        );
+    }
+
+    #[test]
+    fn attach_input_sends_literal_prefix_without_retaining_prefix() {
+        let actions = translate_attach_input(b"\x02\x02d", &mut false);
+
+        assert_eq!(actions, vec![AttachInputAction::Forward(b"\x02d".to_vec())]);
+    }
+
+    #[test]
+    fn attach_input_consumes_select_next_prefix_without_forwarding() {
+        let actions = translate_attach_input(b"\x02o", &mut false);
+
+        assert_eq!(actions, vec![AttachInputAction::SelectNextPane]);
+    }
+
+    #[test]
+    fn attach_input_consumes_pane_number_selection_without_forwarding() {
+        let actions = translate_attach_input(b"\x02q0", &mut false);
+
+        assert_eq!(
+            actions,
+            vec![
+                AttachInputAction::ShowPaneNumbers,
+                AttachInputAction::SelectPane(0)
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_input_selects_numbered_pane_after_prefix_q_across_reads() {
+        let mut state = RawAttachInputState::default();
+
+        assert_eq!(
+            translate_attach_input_with_state(b"\x02q", &mut state),
+            vec![AttachInputAction::ShowPaneNumbers]
+        );
+        assert_eq!(
+            translate_attach_input_with_state(b"0", &mut state),
+            vec![AttachInputAction::SelectPane(0)]
         );
     }
 
