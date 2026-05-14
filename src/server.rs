@@ -12,6 +12,7 @@ const MAX_HISTORY_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFERS: usize = 50;
 const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 + 4096;
+const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
 
 type AttachEventClients = Arc<Mutex<Vec<UnixStream>>>;
 
@@ -1203,9 +1204,8 @@ fn handle_resize(
         .unwrap()
         .resize(size.cols as usize, size.rows as usize);
 
-    write_ok(stream)?;
     session.notify_attach_redraw();
-    Ok(())
+    write_ok(stream)
 }
 
 fn handle_send(
@@ -1263,9 +1263,8 @@ fn handle_split(
         session.attach_event_clients(),
     )?;
     session.add_pane(direction, pane);
-    write_ok(stream)?;
     session.notify_attach_redraw();
-    Ok(())
+    write_ok(stream)
 }
 
 fn handle_list_panes(
@@ -1326,9 +1325,8 @@ fn handle_zoom_pane(
         return Ok(());
     }
 
-    write_ok(stream)?;
     session.notify_attach_redraw();
-    Ok(())
+    write_ok(stream)
 }
 
 fn handle_status_line(
@@ -1444,9 +1442,8 @@ fn handle_select_pane(
         return Ok(());
     }
 
-    write_ok(stream)?;
     session.notify_attach_redraw();
-    Ok(())
+    write_ok(stream)
 }
 
 fn handle_kill_pane(
@@ -1473,9 +1470,8 @@ fn handle_kill_pane(
         }
     };
 
-    write_ok(stream)?;
     session.notify_attach_redraw();
-    Ok(())
+    write_ok(stream)
 }
 
 fn handle_new_window(
@@ -1508,9 +1504,8 @@ fn handle_new_window(
         session.attach_event_clients(),
     )?;
     session.add_window(pane);
-    write_ok(stream)?;
     session.notify_attach_redraw();
-    Ok(())
+    write_ok(stream)
 }
 
 fn handle_list_windows(
@@ -1556,9 +1551,8 @@ fn handle_select_window(
         return Ok(());
     }
 
-    write_ok(stream)?;
     session.notify_attach_redraw();
-    Ok(())
+    write_ok(stream)
 }
 
 fn handle_kill_window(
@@ -1582,9 +1576,8 @@ fn handle_kill_window(
         return Ok(());
     }
 
-    write_ok(stream)?;
     session.notify_attach_redraw();
-    Ok(())
+    write_ok(stream)
 }
 
 fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {
@@ -1747,12 +1740,8 @@ fn handle_attach_events(
     };
 
     write_ok(stream)?;
-    session
-        .attach_event_clients()
-        .lock()
-        .unwrap()
-        .push(stream.try_clone()?);
-    session.notify_attach_redraw();
+    stream.write_all(ATTACH_REDRAW_EVENT)?;
+    register_attach_event_client(&session.attach_event_clients(), stream)?;
     Ok(())
 }
 
@@ -2096,12 +2085,26 @@ fn notify_attach_redraw(clients: &AttachEventClients) {
     let mut live = Vec::with_capacity(clients.len());
 
     for mut client in clients.drain(..) {
-        if client.write_all(b"REDRAW\n").is_ok() {
+        if write_attach_redraw_event(&mut client) {
             live.push(client);
         }
     }
 
     *clients = live;
+}
+
+fn register_attach_event_client(
+    clients: &AttachEventClients,
+    stream: &UnixStream,
+) -> io::Result<()> {
+    let client = stream.try_clone()?;
+    client.set_nonblocking(true)?;
+    clients.lock().unwrap().push(client);
+    Ok(())
+}
+
+fn write_attach_redraw_event(stream: &mut UnixStream) -> bool {
+    matches!(stream.write(ATTACH_REDRAW_EVENT), Ok(n) if n == ATTACH_REDRAW_EVENT.len())
 }
 
 fn write_ok(stream: &mut UnixStream) -> io::Result<()> {
@@ -2147,6 +2150,19 @@ mod tests {
         live_client.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"REDRAW\n");
         assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn notify_attach_redraw_registered_clients_are_nonblocking() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (server, _client) = UnixStream::pair().unwrap();
+
+        register_attach_event_client(&events, &server).unwrap();
+
+        let mut registered = events.lock().unwrap().pop().unwrap();
+        let mut buf = [0_u8; 1];
+        let err = registered.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]

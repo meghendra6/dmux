@@ -2195,6 +2195,50 @@ fn attach_events_stream_sends_initial_redraw() {
 }
 
 #[test]
+fn attach_events_stream_initial_redraw_goes_only_to_new_subscriber() {
+    let socket = unique_socket("attach-events-initial-single");
+    let session = format!("attach-events-initial-single-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let mut first = attach_events_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut first), "OK\n");
+    assert_eq!(read_socket_line(&mut first), "REDRAW\n");
+
+    let mut second = attach_events_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut second), "OK\n");
+    assert_eq!(read_socket_line(&mut second), "REDRAW\n");
+
+    let err = first
+        .read(&mut [0_u8; 1])
+        .expect_err("first subscriber should not receive second subscriber initial redraw");
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "{err:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_events_stream_redraws_after_pane_output() {
     let socket = unique_socket("attach-events-output");
     let session = format!("attach-events-output-{}", std::process::id());
