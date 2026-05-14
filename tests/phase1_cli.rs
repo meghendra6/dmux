@@ -2015,11 +2015,7 @@ fn attach_prefix_bracket_copies_composed_layout_line_in_multi_pane_attach() {
 }
 
 fn saved_buffer_preview_contains_composed_copy(line: &str) -> bool {
-    let Some(preview) = line.split('\t').nth(2) else {
-        return false;
-    };
-
-    preview.contains("base-copy") && preview.contains(" | ") && preview.contains("split-copy")
+    line.ends_with("\t23\tbase-copy | split-copy")
 }
 
 #[test]
