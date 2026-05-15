@@ -1,9 +1,47 @@
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::raw::{c_char, c_int, c_ulong, c_void};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const SIGWINCH: c_int = 28;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TIOCSWINSZ: c_ulong = 0x5414;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const TIOCSWINSZ: c_ulong = 0x80087467;
+
+#[repr(C)]
+struct TestWinSize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+unsafe extern "C" {
+    fn openpty(
+        amaster: *mut c_int,
+        aslave: *mut c_int,
+        name: *mut c_char,
+        termp: *const c_void,
+        winp: *const TestWinSize,
+    ) -> c_int;
+    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    fn kill(pid: c_int, signal: c_int) -> c_int;
+}
 
 fn dmux(socket: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_dmux"))
@@ -810,6 +848,102 @@ impl TestChildProcess for CapturedDmuxChild {
     }
 }
 
+struct PtyDmuxChild {
+    child: Child,
+    master: File,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stdout_reader: Option<JoinHandle<std::io::Result<()>>>,
+}
+
+impl PtyDmuxChild {
+    fn resize(&self, cols: u16, rows: u16) {
+        set_pty_size(self.master.as_raw_fd(), cols, rows);
+        let result = unsafe { kill(self.child.id() as c_int, SIGWINCH) };
+        assert_eq!(
+            result,
+            0,
+            "send SIGWINCH: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn write_all(&mut self, input: &[u8]) {
+        self.master.write_all(input).expect("write pty input");
+        self.master.flush().expect("flush pty input");
+    }
+
+    fn assert_running(&mut self, context: &str) {
+        if let Some(status) = self.child.try_wait().expect("poll pty dmux child") {
+            self.join_reader();
+            panic!(
+                "{context}: child exited unexpectedly with {status:?}\nstdout:\n{}",
+                self.stdout_text()
+            );
+        }
+    }
+
+    fn wait_for_stdout_contains_all(&mut self, needles: &[&str], context: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let stdout = self.stdout_text();
+            if needles.iter().all(|needle| stdout.contains(needle)) {
+                self.assert_running(context);
+                return;
+            }
+            if let Some(status) = self.child.try_wait().expect("poll pty dmux child") {
+                self.join_reader();
+                panic!(
+                    "{context}: child exited before stdout contained {needles:?} with {status:?}\nstdout:\n{}",
+                    self.stdout_text()
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                self.join_reader();
+                panic!(
+                    "{context}: stdout did not contain {needles:?} before timeout\nstdout:\n{}",
+                    self.stdout_text()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn join_reader(&mut self) {
+        if let Some(reader) = self.stdout_reader.take() {
+            reader
+                .join()
+                .expect("join pty stdout reader")
+                .expect("read pty stdout");
+        }
+    }
+
+    fn stdout_text(&self) -> String {
+        String::from_utf8_lossy(&self.stdout.lock().expect("lock pty stdout")).to_string()
+    }
+}
+
+impl TestChildProcess for PtyDmuxChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    fn wait_with_output(mut self) -> std::io::Result<Output> {
+        let status = self.child.wait()?;
+        self.join_reader();
+        Ok(Output {
+            status,
+            stdout: self.stdout.lock().expect("lock pty stdout").clone(),
+            stderr: Vec::new(),
+        })
+    }
+}
+
 fn spawn_attached_dmux(
     socket: &std::path::Path,
     args: &[&str],
@@ -835,6 +969,41 @@ fn spawn_attached_dmux(
         stderr,
     };
     child.wait_for_stdout_contains_all(readiness_needles, "attach readiness");
+    child
+}
+
+fn spawn_pty_attached_dmux(
+    socket: &std::path::Path,
+    args: &[&str],
+    cols: u16,
+    rows: u16,
+    readiness_needles: &[&str],
+) -> PtyDmuxChild {
+    let (master, slave) = open_test_pty(cols, rows);
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stdout_reader = spawn_pty_output_reader(
+        master.try_clone().expect("clone pty master"),
+        Arc::clone(&stdout),
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", socket)
+        .args(args)
+        .stdin(Stdio::from(
+            slave.try_clone().expect("clone pty slave stdin"),
+        ))
+        .stdout(Stdio::from(
+            slave.try_clone().expect("clone pty slave stdout"),
+        ))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("spawn pty attached dmux");
+    let mut child = PtyDmuxChild {
+        child,
+        master,
+        stdout,
+        stdout_reader: Some(stdout_reader),
+    };
+    child.wait_for_stdout_contains_all(readiness_needles, "pty attach readiness");
     child
 }
 
@@ -866,6 +1035,66 @@ where
                 .extend_from_slice(&buffer[..n]);
         }
     })
+}
+
+fn spawn_pty_output_reader(
+    mut reader: File,
+    output: Arc<Mutex<Vec<u8>>>,
+) -> JoinHandle<std::io::Result<()>> {
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(n) => output
+                    .lock()
+                    .expect("lock captured pty output")
+                    .extend_from_slice(&buffer[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.raw_os_error() == Some(5) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    })
+}
+
+fn open_test_pty(cols: u16, rows: u16) -> (File, File) {
+    let mut master: c_int = -1;
+    let mut slave: c_int = -1;
+    let winsize = TestWinSize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe {
+        openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &winsize,
+        )
+    };
+    assert_eq!(result, 0, "openpty: {}", std::io::Error::last_os_error());
+
+    unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
+}
+
+fn set_pty_size(fd: c_int, cols: u16, rows: u16) {
+    let winsize = TestWinSize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let result = unsafe { ioctl(fd, TIOCSWINSZ, &winsize) };
+    assert_eq!(
+        result,
+        0,
+        "resize pty to {cols}x{rows}: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 #[test]
@@ -1395,6 +1624,507 @@ fn attach_resizes_session_before_passthrough() {
 
     let resized = poll_capture(&socket, &session, "43 132");
     assert!(resized.contains("43 132"), "{resized:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn split_window_resizes_child_ptys_to_horizontal_layout_regions() {
+    let socket = unique_socket("split-pty-size");
+    let session = format!("split-pty-size-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "while true; do printf 'base:%s\\n' \"$(stty size)\"; sleep 0.1; done",
+        ],
+    ));
+    let initial = poll_capture(&socket, &session, "base:24 80");
+    assert!(initial.contains("base:24 80"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
+    ));
+    let resized = poll_capture(&socket, &session, "base:24 83");
+    assert!(resized.contains("base:24 83"), "{resized:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "while true; do printf 'split:%s\\n' \"$(stty size)\"; sleep 0.1; done",
+        ],
+    ));
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+
+    let split = poll_capture(&socket, &session, "split:24 40");
+    assert!(split.contains("split:24 40"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    let base = poll_capture(&socket, &session, "base:24 40");
+    assert!(base.contains("base:24 40"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn split_window_starts_child_pty_with_horizontal_layout_region_size() {
+    let socket = unique_socket("split-initial-pty-size");
+    let session = format!("split-initial-pty-size-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf 'initial-split-size:'; stty size; sleep 30",
+        ],
+    ));
+
+    let split = poll_capture(&socket, &session, "initial-split-size:");
+    assert!(split.contains("initial-split-size:24 40"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn split_window_resizes_child_ptys_to_vertical_layout_regions() {
+    let socket = unique_socket("split-vertical-pty-size");
+    let session = format!("split-vertical-pty-size-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; while read line; do printf 'base-%s:%s\\n' \"$line\" \"$(stty size)\"; done",
+        ],
+    ));
+    let initial = poll_capture(&socket, &session, "base-ready");
+    assert!(initial.contains("base-ready"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "80", "-y", "25"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "before-split", "Enter"],
+    ));
+    let resized = poll_capture(&socket, &session, "base-before-split:25 80");
+    assert!(resized.contains("base-before-split:25 80"), "{resized:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; while read line; do printf 'split-%s:%s\\n' \"$line\" \"$(stty size)\"; done",
+        ],
+    ));
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-split", "Enter"],
+    ));
+    let split = poll_capture(&socket, &session, "split-after-split:12 80");
+    assert!(split.contains("split-after-split:12 80"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-select", "Enter"],
+    ));
+    let base = poll_capture(&socket, &session, "base-after-select:12 80");
+    assert!(base.contains("base-after-select:12 80"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "1"]));
+    let panes = poll_pane_count(&socket, &session, 1);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-kill", "Enter"],
+    ));
+    let base = poll_capture(&socket, &session, "base-after-kill:25 80");
+    assert!(base.contains("base-after-kill:25 80"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_resize_updates_all_split_child_ptys() {
+    let socket = unique_socket("attach-resize-split-ptys");
+    let session = format!("attach-resize-split-ptys-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "while true; do printf 'base:%s\\n' \"$(stty size)\"; sleep 0.1; done",
+        ],
+    ));
+    let initial = poll_capture(&socket, &session, "base:24 80");
+    assert!(initial.contains("base:24 80"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "while true; do printf 'split:%s\\n' \"$(stty size)\"; sleep 0.1; done",
+        ],
+    ));
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .env("DEVMUX_ATTACH_SIZE", "83x24")
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run attach");
+    assert_success(&output);
+
+    let split = poll_capture(&socket, &session, "split:24 40");
+    assert!(split.contains("split:24 40"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    let base = poll_capture(&socket, &session, "base:24 40");
+    assert!(base.contains("base:24 40"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn snapshot_attach_forwards_live_terminal_resize_to_split_child_ptys() {
+    let socket = unique_socket("snapshot-attach-live-resize");
+    let session = format!("snapshot-attach-live-resize-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "while true; do printf 'base:%s\\n' \"$(stty size)\"; sleep 0.1; done",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base:24 80");
+    assert!(base.contains("base:24 80"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "while true; do printf 'split:%s\\n' \"$(stty size)\"; sleep 0.1; done",
+        ],
+    ));
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+
+    let mut child = spawn_pty_attached_dmux(
+        &socket,
+        &["attach", "-t", &session],
+        80,
+        24,
+        &["base:", "split:"],
+    );
+
+    child.resize(100, 30);
+    let split = poll_capture(&socket, &session, "split:30 49");
+    assert!(split.contains("split:30 49"), "{split:?}");
+
+    child.write_all(b"\x02d");
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn kill_pane_resizes_remaining_child_pty_to_full_layout_region() {
+    let socket = unique_socket("kill-resize-remaining-pty");
+    let session = format!("kill-resize-remaining-pty-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; while read line; do printf 'base-%s:%s\\n' \"$line\" \"$(stty size)\"; done",
+        ],
+    ));
+    let initial = poll_capture(&socket, &session, "base-ready");
+    assert!(initial.contains("base-ready"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "before-split", "Enter"],
+    ));
+    let resized = poll_capture(&socket, &session, "base-before-split:24 83");
+    assert!(resized.contains("base-before-split:24 83"), "{resized:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; while read line; do printf 'split-%s:%s\\n' \"$line\" \"$(stty size)\"; done",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-split", "Enter"],
+    ));
+    let split = poll_capture(&socket, &session, "split-after-split:24 40");
+    assert!(split.contains("split-after-split:24 40"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "1"]));
+    let panes = poll_pane_count(&socket, &session, 1);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
+
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-kill", "Enter"],
+    ));
+    let base = poll_capture(&socket, &session, "base-after-kill:24 83");
+    assert!(base.contains("base-after-kill:24 83"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn zoom_pane_resizes_child_pty_between_full_and_split_layout_regions() {
+    let socket = unique_socket("zoom-resize-pty");
+    let session = format!("zoom-resize-pty-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; while read line; do printf 'base-%s:%s\\n' \"$line\" \"$(stty size)\"; done",
+        ],
+    ));
+    let initial = poll_capture(&socket, &session, "base-ready");
+    assert!(initial.contains("base-ready"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "before-split", "Enter"],
+    ));
+    let resized = poll_capture(&socket, &session, "base-before-split:24 83");
+    assert!(resized.contains("base-before-split:24 83"), "{resized:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; while read line; do printf 'split-%s:%s\\n' \"$line\" \"$(stty size)\"; done",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-split", "Enter"],
+    ));
+    let split = poll_capture(&socket, &session, "split-after-split:24 40");
+    assert!(split.contains("split-after-split:24 40"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session]));
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-zoom", "Enter"],
+    ));
+    let zoomed = poll_capture(&socket, &session, "split-after-zoom:24 83");
+    assert!(zoomed.contains("split-after-zoom:24 83"), "{zoomed:?}");
+
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session]));
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-unzoom", "Enter"],
+    ));
+    let unzoomed = poll_capture(&socket, &session, "split-after-unzoom:24 40");
+    assert!(
+        unzoomed.contains("split-after-unzoom:24 40"),
+        "{unzoomed:?}"
+    );
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-unzoom", "Enter"],
+    ));
+    let base = poll_capture(&socket, &session, "base-after-unzoom:24 40");
+    assert!(base.contains("base-after-unzoom:24 40"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn select_pane_while_zoomed_resizes_new_visible_child_pty_to_full_region() {
+    let socket = unique_socket("zoom-select-resize-pty");
+    let session = format!("zoom-select-resize-pty-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; while read line; do printf 'base-%s:%s\\n' \"$line\" \"$(stty size)\"; done",
+        ],
+    ));
+    let initial = poll_capture(&socket, &session, "base-ready");
+    assert!(initial.contains("base-ready"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; while read line; do printf 'split-%s:%s\\n' \"$line\" \"$(stty size)\"; done",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session]));
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-zoom-select", "Enter"],
+    ));
+    let base = poll_capture(&socket, &session, "base-after-zoom-select:24 83");
+    assert!(base.contains("base-after-zoom-select:24 83"), "{base:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -2797,6 +3527,76 @@ fn attach_mouse_click_on_separator_keeps_active_pane() {
 }
 
 #[test]
+fn attach_mouse_click_in_blank_split_region_selects_pane() {
+    let socket = unique_socket("attach-mouse-blank-region");
+    let session = format!("attach-mouse-blank-region-{}", std::process::id());
+    let base_file = unique_temp_file("attach-mouse-blank-region-base");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; echo split-blank:$line; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    let mut child = spawn_attached_to_session(&socket, &session, &["base-ready", "split-ready"]);
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"\x1b[<0;45;2Mblank-click\r")
+            .expect("write blank-region click and split input");
+        stdin.flush().expect("flush blank-region click input");
+    }
+
+    let split = poll_capture(&socket, &session, "split-blank:blank-click");
+    assert!(split.contains("split-blank:blank-click"), "{split:?}");
+    let panes = poll_active_pane(&socket, &session, 1);
+    assert!(panes.lines().any(|line| line == "1\t1"), "{panes:?}");
+    assert!(
+        !poll_file_contains(&base_file, "blank-click"),
+        "blank-region click should route input to the split pane"
+    );
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_prefix_o_cycles_active_pane_for_live_input() {
     let socket = unique_socket("attach-pane-cycle");
     let session = format!("attach-pane-cycle-{}", std::process::id());
@@ -3107,6 +3907,8 @@ fn attach_prefix_q_ignores_invalid_digit_and_keeps_attach_running() {
 fn attach_prefix_bracket_copies_composed_layout_line_in_multi_pane_attach() {
     let socket = unique_socket("attach-copy-mode");
     let session = format!("attach-copy-mode-{}", std::process::id());
+    let sink = format!("attach-copy-mode-sink-{}", std::process::id());
+    let pasted_file = unique_temp_file("attach-copy-mode-paste");
 
     assert_success(&dmux(
         &socket,
@@ -3150,26 +3952,28 @@ fn attach_prefix_bracket_copies_composed_layout_line_in_multi_pane_attach() {
         stdin.flush().expect("flush copy-mode input");
     }
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut listed = String::new();
-    while std::time::Instant::now() < deadline {
-        let output = dmux(&socket, &["list-buffers"]);
-        assert_success(&output);
-        listed = String::from_utf8_lossy(&output.stdout).to_string();
-        if listed
-            .lines()
-            .any(saved_buffer_preview_contains_composed_copy)
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    let listed = poll_list_buffers_contains(&socket, "\t81\t");
     assert!(
-        listed
-            .lines()
-            .any(saved_buffer_preview_contains_composed_copy),
+        listed.lines().any(|line| line.contains("\t81\t")),
         "{listed:?}"
     );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &sink,
+            "--",
+            "sh",
+            "-c",
+            &format!("cat > {}; sleep 30", pasted_file.display()),
+        ],
+    ));
+    assert_success(&dmux(&socket, &["paste-buffer", "-t", &sink]));
+    assert!(poll_file_contains(&pasted_file, "base-copy"));
+    assert!(poll_file_contains(&pasted_file, "split-copy"));
 
     {
         let stdin = child.stdin_mut("attach stdin");
@@ -3183,11 +3987,26 @@ fn attach_prefix_bracket_copies_composed_layout_line_in_multi_pane_attach() {
     assert!(stdout.contains("-- copy mode: copied to "), "{stdout:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &sink]));
     assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(&pasted_file);
 }
 
-fn saved_buffer_preview_contains_composed_copy(line: &str) -> bool {
-    line.ends_with("\t23\tbase-copy | split-copy")
+fn poll_list_buffers_contains(socket: &std::path::Path, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(socket, &["list-buffers"]);
+        assert_success(&output);
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if last.contains(needle) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
 }
 
 #[test]
@@ -3284,10 +4103,11 @@ fn attach_layout_snapshot_response_includes_regions_without_changing_plain_snaps
     stream.read_to_string(&mut body).expect("read layout body");
 
     assert!(body.starts_with("REGIONS\t2\n"), "{body:?}");
-    assert!(body.contains("REGION\t0\t0\t1\t0\t10\n"), "{body:?}");
-    assert!(body.contains("REGION\t1\t0\t1\t13\t24\n"), "{body:?}");
+    assert!(body.contains("REGION\t0\t0\t24\t0\t38\n"), "{body:?}");
+    assert!(body.contains("REGION\t1\t0\t24\t41\t80\n"), "{body:?}");
     assert!(body.contains("SNAPSHOT\t"), "{body:?}");
-    assert!(body.contains("base-ready | split-ready\r\n"), "{body:?}");
+    let composed_line = format!("base-ready{} | split-ready", " ".repeat(28));
+    assert!(body.contains(&composed_line), "{body:?}");
 
     let mut plain = UnixStream::connect(&socket).expect("connect socket");
     plain
@@ -3299,10 +4119,7 @@ fn attach_layout_snapshot_response_includes_regions_without_changing_plain_snaps
         .read_to_string(&mut plain_body)
         .expect("read plain snapshot body");
     assert!(!plain_body.contains("REGIONS\t"), "{plain_body:?}");
-    assert!(
-        plain_body.contains("base-ready | split-ready\r\n"),
-        "{plain_body:?}"
-    );
+    assert!(plain_body.contains(&composed_line), "{plain_body:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -4173,6 +4990,71 @@ fn new_window_creates_second_active_window() {
     let selected = poll_capture(&socket, &session, "base-window");
     assert!(selected.contains("base-window"), "{selected:?}");
     assert!(!selected.contains("second-window"), "{selected:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn new_window_after_split_uses_full_window_pty_size() {
+    let socket = unique_socket("new-window-full-size");
+    let session = format!("new-window-full-size-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new-window",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf new-window-size:; stty size; sleep 30",
+        ],
+    ));
+
+    let new_window = poll_capture(&socket, &session, "new-window-size:24 83");
+    assert!(
+        new_window.contains("new-window-size:24 83"),
+        "{new_window:?}"
+    );
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
