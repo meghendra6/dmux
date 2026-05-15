@@ -71,7 +71,16 @@ where
 
     if attach_mode == AttachMode::Snapshot {
         let _guard = RawModeGuard::enable();
-        return run_live_snapshot_attach(socket, session, &mut stream, Vec::new());
+        install_winch_handler();
+        let mut last_size = initial_size;
+        return run_live_snapshot_attach(
+            socket,
+            session,
+            &mut stream,
+            Vec::new(),
+            &mut last_size,
+            &mut on_resize,
+        );
     }
 
     let _guard = RawModeGuard::enable();
@@ -121,11 +130,14 @@ where
         }
         match parse_attach_ok(&response)? {
             AttachMode::Snapshot => {
+                install_winch_handler();
                 return run_live_snapshot_attach(
                     socket,
                     session,
                     &mut stream,
                     pending_after_transition,
+                    &mut last_size,
+                    &mut on_resize,
                 );
             }
             AttachMode::Live => {
@@ -447,6 +459,22 @@ where
     emit(size)?;
     *last = Some(size);
     Ok(())
+}
+
+fn maybe_handle_live_snapshot_resize<F>(
+    last_size: &mut Option<PtySize>,
+    on_resize: &mut F,
+) -> io::Result<bool>
+where
+    F: FnMut(PtySize) -> io::Result<()>,
+{
+    if !take_winch_pending() {
+        return Ok(false);
+    }
+
+    let before = *last_size;
+    maybe_emit_resize(detect_attach_size(), last_size, on_resize)?;
+    Ok(*last_size != before)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1253,6 +1281,8 @@ fn run_live_snapshot_attach(
     session: &str,
     stream: &mut UnixStream,
     initial_input: Vec<u8>,
+    last_size: &mut Option<PtySize>,
+    on_resize: &mut impl FnMut(PtySize) -> io::Result<()>,
 ) -> io::Result<()> {
     let mouse_focus_enabled = Arc::new(AtomicBool::new(false));
     let (sender, input) = mpsc::channel();
@@ -1289,8 +1319,11 @@ fn run_live_snapshot_attach(
         );
         match input.recv_timeout(timeout) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
+                let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 forward_live_snapshot_input(socket, session, &bytes)?;
-                if !redraw_paused && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL {
+                if !redraw_paused
+                    && (resized || last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL)
+                {
                     frame = write_live_snapshot_frame_with_pane_number_message(
                         socket,
                         session,
@@ -1301,6 +1334,7 @@ fn run_live_snapshot_attach(
                 }
             }
             Ok(LiveSnapshotInputEvent::PaneCommand(command)) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 let result = apply_live_pane_command(socket, session, command, &frame);
                 pane_number_message = match result {
                     Ok(()) => None,
@@ -1320,6 +1354,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::SelectNextPane) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 select_next_pane(socket, session)?;
                 pane_number_message = None;
                 if !redraw_paused {
@@ -1329,6 +1364,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::ShowPaneNumbers) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 let message = pane_number_message_text(socket, session)?;
                 pane_number_message =
                     Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
@@ -1341,6 +1377,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::ShowHelp) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 pane_number_message = Some((
                     attach_help_message().to_string(),
                     Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
@@ -1354,6 +1391,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::SelectPane(index)) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 let _ = select_numbered_pane(socket, session, index)?;
                 pane_number_message = None;
                 if !redraw_paused {
@@ -1363,6 +1401,12 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::MousePress(position)) => {
+                let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                if resized && !redraw_paused {
+                    frame = write_live_snapshot_frame(socket, session)?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    last_redraw = Instant::now();
+                }
                 if let Some(pane) =
                     pane_at_mouse_position(&frame.regions, frame.header_rows, position)
                 {
@@ -1380,12 +1424,14 @@ fn run_live_snapshot_attach(
                 let _ = pause_ack.send(());
             }
             Ok(LiveSnapshotInputEvent::RedrawNow) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 redraw_paused = false;
                 frame = write_live_snapshot_frame(socket, session)?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::RedrawHint) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 redraw_hint_pending.store(false, Ordering::SeqCst);
                 if !redraw_paused {
                     frame = write_live_snapshot_frame_with_pane_number_message(
@@ -1406,6 +1452,7 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::Error(message)) => return Err(io::Error::other(message)),
             Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 if !redraw_paused {
                     frame = write_live_snapshot_frame_with_pane_number_message(
                         socket,

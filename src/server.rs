@@ -253,6 +253,24 @@ impl Session {
         self.windows.lock().unwrap().add_pane(direction, pane);
     }
 
+    fn next_split_pane_size(&self, direction: SplitDirection) -> Option<PtySize> {
+        self.windows.lock().unwrap().next_split_pane_size(direction)
+    }
+
+    fn resize_visible_panes(&self, size: PtySize) -> io::Result<bool> {
+        let pane_resizes = self.windows.lock().unwrap().resize_visible_panes(size);
+        resize_panes(pane_resizes)
+    }
+
+    fn resize_current_visible_panes(&self) -> io::Result<bool> {
+        let pane_resizes = self.windows.lock().unwrap().visible_pane_resizes();
+        resize_panes(pane_resizes)
+    }
+
+    fn active_window_size(&self) -> Option<PtySize> {
+        self.windows.lock().unwrap().active_window_size()
+    }
+
     fn select_pane(&self, index: usize) -> bool {
         self.windows.lock().unwrap().select_pane(index)
     }
@@ -332,6 +350,7 @@ impl Session {
 struct Window {
     panes: PaneSet<Arc<Pane>>,
     layout: LayoutNode,
+    size: PtySize,
     zoomed: Option<usize>,
 }
 
@@ -395,9 +414,11 @@ impl LayoutNode {
 
 impl Window {
     fn new(pane: Arc<Pane>) -> Self {
+        let size = *pane.size.lock().unwrap();
         Self {
             panes: PaneSet::new(pane),
             layout: LayoutNode::Pane(0),
+            size,
             zoomed: None,
         }
     }
@@ -414,6 +435,29 @@ impl Window {
         if self.zoomed.is_some() {
             self.zoomed = Some(self.panes.active_index());
         }
+    }
+
+    fn next_split_pane_size(&self, direction: SplitDirection) -> Option<PtySize> {
+        if self.zoomed.is_some() {
+            return Some(self.size);
+        }
+
+        let new_index = self.panes.len();
+        let mut layout = self.layout.clone();
+        if !layout.split_pane(self.panes.active_index(), direction, new_index) {
+            return None;
+        }
+
+        layout_regions_for_size(&layout, self.size)
+            .into_iter()
+            .find(|region| region.pane == new_index)
+            .and_then(|region| {
+                PtySize::new(
+                    (region.col_end - region.col_start) as u16,
+                    (region.row_end - region.row_start) as u16,
+                )
+                .ok()
+            })
     }
 
     fn select_pane(&mut self, index: usize) -> bool {
@@ -484,6 +528,7 @@ impl Window {
             return AttachLayoutSnapshot {
                 layout: LayoutNode::Pane(index),
                 panes,
+                size: self.size,
             };
         }
 
@@ -497,7 +542,33 @@ impl Window {
                         .map(|pane| IndexedPane { index, pane })
                 })
                 .collect(),
+            size: self.size,
         }
+    }
+
+    fn resize_visible_panes(&mut self, size: PtySize) -> Vec<(Arc<Pane>, PtySize)> {
+        self.size = size;
+        self.visible_pane_resizes()
+    }
+
+    fn visible_pane_resizes(&self) -> Vec<(Arc<Pane>, PtySize)> {
+        let layout = self
+            .zoomed
+            .map_or_else(|| self.layout.clone(), LayoutNode::Pane);
+        layout_regions_for_size(&layout, self.size)
+            .into_iter()
+            .filter_map(|region| {
+                let size = PtySize::new(
+                    (region.col_end - region.col_start) as u16,
+                    (region.row_end - region.row_start) as u16,
+                )
+                .ok()?;
+                self.panes
+                    .get(region.pane)
+                    .cloned()
+                    .map(|pane| (pane, size))
+            })
+            .collect()
     }
 
     fn active_pane_index(&self) -> usize {
@@ -588,6 +659,10 @@ impl WindowSet {
         }
     }
 
+    fn next_split_pane_size(&self, direction: SplitDirection) -> Option<PtySize> {
+        self.active_window()?.next_split_pane_size(direction)
+    }
+
     fn select_pane(&mut self, index: usize) -> bool {
         self.active_window_mut()
             .is_some_and(|window| window.select_pane(index))
@@ -619,6 +694,20 @@ impl WindowSet {
     fn attach_layout_snapshot(&self) -> AttachLayoutSnapshot {
         self.active_window()
             .map_or_else(AttachLayoutSnapshot::empty, Window::attach_layout_snapshot)
+    }
+
+    fn resize_visible_panes(&mut self, size: PtySize) -> Vec<(Arc<Pane>, PtySize)> {
+        self.active_window_mut()
+            .map_or_else(Vec::new, |window| window.resize_visible_panes(size))
+    }
+
+    fn visible_pane_resizes(&self) -> Vec<(Arc<Pane>, PtySize)> {
+        self.active_window()
+            .map_or_else(Vec::new, Window::visible_pane_resizes)
+    }
+
+    fn active_window_size(&self) -> Option<PtySize> {
+        self.active_window().map(|window| window.size)
     }
 
     fn status_context(&self, session_name: &str) -> Option<StatusContext> {
@@ -679,6 +768,7 @@ struct IndexedPane {
 struct AttachLayoutSnapshot {
     layout: LayoutNode,
     panes: Vec<IndexedPane>,
+    size: PtySize,
 }
 
 impl AttachLayoutSnapshot {
@@ -686,6 +776,7 @@ impl AttachLayoutSnapshot {
         Self {
             layout: LayoutNode::Pane(0),
             panes: Vec::new(),
+            size: PtySize { cols: 1, rows: 1 },
         }
     }
 }
@@ -1262,20 +1353,10 @@ fn handle_resize(
         write_err(stream, "missing session")?;
         return Ok(());
     };
-    let Some(pane) = session.active_pane() else {
+    if !session.resize_visible_panes(size)? {
         write_err(stream, "missing pane")?;
         return Ok(());
-    };
-
-    {
-        let writer = pane.writer.lock().unwrap();
-        pty::resize(&writer, size)?;
     }
-    *pane.size.lock().unwrap() = size;
-    pane.terminal
-        .lock()
-        .unwrap()
-        .resize(size.cols as usize, size.rows as usize);
 
     session.notify_attach_redraw();
     write_ok(stream)
@@ -1321,12 +1402,10 @@ fn handle_split(
         write_err(stream, "missing session")?;
         return Ok(());
     };
-    let Some(active) = session.active_pane() else {
+    let Some(size) = session.next_split_pane_size(direction) else {
         write_err(stream, "missing pane")?;
         return Ok(());
     };
-
-    let size = *active.size.lock().unwrap();
     let cwd = std::env::current_dir()?;
     let pane = spawn_pane(
         name.to_string(),
@@ -1337,6 +1416,10 @@ fn handle_split(
     )?;
     pane.set_session(&session);
     session.add_pane(direction, pane);
+    if !session.resize_current_visible_panes()? {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    }
     session.notify_attach_redraw();
     write_ok(stream)
 }
@@ -1398,6 +1481,7 @@ fn handle_zoom_pane(
         write_err(stream, &message)?;
         return Ok(());
     }
+    session.resize_current_visible_panes()?;
 
     session.notify_attach_redraw();
     write_ok(stream)
@@ -1516,6 +1600,7 @@ fn handle_select_pane(
         write_err(stream, "missing pane")?;
         return Ok(());
     }
+    session.resize_current_visible_panes()?;
 
     session.notify_attach_redraw();
     write_ok(stream)
@@ -1544,6 +1629,7 @@ fn handle_kill_pane(
             return Ok(());
         }
     };
+    session.resize_current_visible_panes()?;
 
     session.notify_attach_redraw();
     write_ok(stream)
@@ -1564,12 +1650,11 @@ fn handle_new_window(
         write_err(stream, "missing session")?;
         return Ok(());
     };
-    let Some(active) = session.active_pane() else {
-        write_err(stream, "missing pane")?;
+    let Some(size) = session.active_window_size() else {
+        write_err(stream, "missing window")?;
         return Ok(());
     };
 
-    let size = *active.size.lock().unwrap();
     let cwd = std::env::current_dir()?;
     let pane = spawn_pane(
         name.to_string(),
@@ -1845,9 +1930,10 @@ fn attach_pane_snapshot_with_regions(session: &Session) -> Option<RenderedAttach
         })
         .collect::<Vec<_>>();
 
-    Some(render_attach_pane_snapshot_with_regions(
+    Some(render_attach_pane_snapshot_with_regions_for_size(
         &snapshot.layout,
         &panes,
+        snapshot.size,
     ))
 }
 
@@ -1861,6 +1947,23 @@ fn render_attach_pane_snapshot_with_regions(
     panes: &[PaneSnapshot],
 ) -> RenderedAttachSnapshot {
     match render_attach_layout(layout, panes) {
+        Some(rendered) => RenderedAttachSnapshot {
+            text: render_client_lines(&rendered.lines),
+            regions: rendered.regions,
+        },
+        None => RenderedAttachSnapshot {
+            text: render_ordered_pane_sections(panes),
+            regions: Vec::new(),
+        },
+    }
+}
+
+fn render_attach_pane_snapshot_with_regions_for_size(
+    layout: &LayoutNode,
+    panes: &[PaneSnapshot],
+    size: PtySize,
+) -> RenderedAttachSnapshot {
+    match render_attach_layout_for_size(layout, panes, size) {
         Some(rendered) => RenderedAttachSnapshot {
             text: render_client_lines(&rendered.lines),
             regions: rendered.regions,
@@ -1913,6 +2016,30 @@ fn render_attach_layout(
         .collect::<HashMap<_, _>>();
 
     render_layout(layout, &screens)
+}
+
+fn render_attach_layout_for_size(
+    layout: &LayoutNode,
+    panes: &[PaneSnapshot],
+    size: PtySize,
+) -> Option<RenderedAttachLayout> {
+    if !layout_matches_panes(layout, panes) {
+        return None;
+    }
+
+    let screens = panes
+        .iter()
+        .map(|pane| (pane.index, pane.screen.as_str()))
+        .collect::<HashMap<_, _>>();
+
+    render_sized_layout(
+        layout,
+        &screens,
+        0,
+        size.rows as usize,
+        0,
+        size.cols as usize,
+    )
 }
 
 fn layout_matches_panes(layout: &LayoutNode, panes: &[PaneSnapshot]) -> bool {
@@ -1969,6 +2096,104 @@ fn render_layout(
             })
         }
     }
+}
+
+fn render_sized_layout(
+    layout: &LayoutNode,
+    screens: &HashMap<usize, &str>,
+    row_start: usize,
+    row_end: usize,
+    col_start: usize,
+    col_end: usize,
+) -> Option<RenderedAttachLayout> {
+    match layout {
+        LayoutNode::Pane(index) => {
+            let width = col_end.saturating_sub(col_start);
+            let height = row_end.saturating_sub(row_start);
+            Some(RenderedAttachLayout {
+                lines: fit_screen_lines_to_region(screens.get(index)?, width, height),
+                regions: vec![PaneRegion {
+                    pane: *index,
+                    row_start,
+                    row_end,
+                    col_start,
+                    col_end,
+                }],
+            })
+        }
+        LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first,
+            second,
+        } => {
+            let ((first_start, first_end), (second_start, second_end)) =
+                split_extent(col_start, col_end, 3);
+            let left =
+                render_sized_layout(first, screens, row_start, row_end, first_start, first_end)?;
+            let right = render_sized_layout(
+                second,
+                screens,
+                row_start,
+                row_end,
+                second_start,
+                second_end,
+            )?;
+            Some(join_sized_horizontal_layout(left, right))
+        }
+        LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first,
+            second,
+        } => {
+            let ((first_start, first_end), (second_start, second_end)) =
+                split_extent(row_start, row_end, 1);
+            let top =
+                render_sized_layout(first, screens, first_start, first_end, col_start, col_end)?;
+            let bottom = render_sized_layout(
+                second,
+                screens,
+                second_start,
+                second_end,
+                col_start,
+                col_end,
+            )?;
+            Some(join_sized_vertical_layout(top, bottom))
+        }
+    }
+}
+
+fn join_sized_horizontal_layout(
+    left: RenderedAttachLayout,
+    right: RenderedAttachLayout,
+) -> RenderedAttachLayout {
+    let separator_width = layout_column_gap(&left.regions, &right.regions).unwrap_or(0);
+    let lines = join_horizontal_with_separator_width(left.lines, right.lines, separator_width);
+    let mut regions = left.regions;
+    regions.extend(right.regions);
+    RenderedAttachLayout { lines, regions }
+}
+
+fn join_sized_vertical_layout(
+    top: RenderedAttachLayout,
+    bottom: RenderedAttachLayout,
+) -> RenderedAttachLayout {
+    let separator_height = layout_row_gap(&top.regions, &bottom.regions).unwrap_or(0);
+    let lines = join_vertical_with_separator_height(top.lines, bottom.lines, separator_height);
+    let mut regions = top.regions;
+    regions.extend(bottom.regions);
+    RenderedAttachLayout { lines, regions }
+}
+
+fn layout_column_gap(left: &[PaneRegion], right: &[PaneRegion]) -> Option<usize> {
+    let left_end = left.iter().map(|region| region.col_end).max()?;
+    let right_start = right.iter().map(|region| region.col_start).min()?;
+    Some(right_start.saturating_sub(left_end))
+}
+
+fn layout_row_gap(top: &[PaneRegion], bottom: &[PaneRegion]) -> Option<usize> {
+    let top_end = top.iter().map(|region| region.row_end).max()?;
+    let bottom_start = bottom.iter().map(|region| region.row_start).min()?;
+    Some(bottom_start.saturating_sub(top_end))
 }
 
 fn join_horizontal_layout(
@@ -2052,6 +2277,121 @@ fn offset_regions(
     regions
 }
 
+fn layout_regions_for_size(layout: &LayoutNode, size: PtySize) -> Vec<PaneRegion> {
+    let mut regions = Vec::new();
+    collect_sized_layout_regions(
+        layout,
+        0,
+        size.rows as usize,
+        0,
+        size.cols as usize,
+        &mut regions,
+    );
+    regions
+}
+
+fn collect_sized_layout_regions(
+    layout: &LayoutNode,
+    row_start: usize,
+    row_end: usize,
+    col_start: usize,
+    col_end: usize,
+    regions: &mut Vec<PaneRegion>,
+) {
+    match layout {
+        LayoutNode::Pane(index) => regions.push(PaneRegion {
+            pane: *index,
+            row_start,
+            row_end,
+            col_start,
+            col_end,
+        }),
+        LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first,
+            second,
+        } => {
+            let ((first_start, first_end), (second_start, second_end)) =
+                split_extent(col_start, col_end, 3);
+            collect_sized_layout_regions(
+                first,
+                row_start,
+                row_end,
+                first_start,
+                first_end,
+                regions,
+            );
+            collect_sized_layout_regions(
+                second,
+                row_start,
+                row_end,
+                second_start,
+                second_end,
+                regions,
+            );
+        }
+        LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first,
+            second,
+        } => {
+            let ((first_start, first_end), (second_start, second_end)) =
+                split_extent(row_start, row_end, 1);
+            collect_sized_layout_regions(
+                first,
+                first_start,
+                first_end,
+                col_start,
+                col_end,
+                regions,
+            );
+            collect_sized_layout_regions(
+                second,
+                second_start,
+                second_end,
+                col_start,
+                col_end,
+                regions,
+            );
+        }
+    }
+}
+
+fn split_extent(start: usize, end: usize, separator: usize) -> ((usize, usize), (usize, usize)) {
+    let total = end.saturating_sub(start);
+    if total <= 1 {
+        return ((start, start), (start, end));
+    }
+
+    let gap = if total >= separator + 2 { separator } else { 0 };
+    let content = total - gap;
+    let first = content / 2;
+    let second = content - first;
+
+    ((start, start + first), (end - second, end))
+}
+
+fn resize_panes(pane_resizes: Vec<(Arc<Pane>, PtySize)>) -> io::Result<bool> {
+    let resized_any = !pane_resizes.is_empty();
+    for (pane, size) in pane_resizes {
+        resize_pane(&pane, size)?;
+    }
+    Ok(resized_any)
+}
+
+fn resize_pane(pane: &Pane, size: PtySize) -> io::Result<()> {
+    {
+        let writer = pane.writer.lock().unwrap();
+        pty::resize(&writer, size)?;
+    }
+    *pane.size.lock().unwrap() = size;
+    pane.terminal
+        .lock()
+        .unwrap()
+        .resize(size.cols as usize, size.rows as usize);
+    Ok(())
+}
+
 fn screen_lines(screen: &str) -> Vec<String> {
     let lines = screen.lines().map(str::to_string).collect::<Vec<_>>();
     if lines.is_empty() {
@@ -2061,22 +2401,59 @@ fn screen_lines(screen: &str) -> Vec<String> {
     }
 }
 
+fn fit_screen_lines_to_region(screen: &str, width: usize, height: usize) -> Vec<String> {
+    let lines = screen_lines(screen);
+    (0..height)
+        .map(|row| fit_line_to_width(lines.get(row).map_or("", String::as_str), width))
+        .collect()
+}
+
+fn fit_line_to_width(line: &str, width: usize) -> String {
+    let truncated = line.chars().take(width).collect::<String>();
+    pad_to_width(&truncated, width)
+}
+
 fn join_horizontal(left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    join_horizontal_with_separator_width(left, right, 3)
+}
+
+fn join_horizontal_with_separator_width(
+    left: Vec<String>,
+    right: Vec<String>,
+    separator_width: usize,
+) -> Vec<String> {
     let width = max_line_width(&left);
     let rows = left.len().max(right.len());
     (0..rows)
         .map(|index| {
             let mut line = pad_to_width(left.get(index).map_or("", String::as_str), width);
-            line.push_str(" | ");
+            line.push_str(&horizontal_separator(separator_width));
             line.push_str(right.get(index).map_or("", String::as_str));
             line
         })
         .collect()
 }
 
-fn join_vertical(mut top: Vec<String>, bottom: Vec<String>) -> Vec<String> {
+fn horizontal_separator(width: usize) -> String {
+    match width {
+        0 => String::new(),
+        1 => "|".to_string(),
+        2 => " |".to_string(),
+        _ => " | ".to_string(),
+    }
+}
+
+fn join_vertical(top: Vec<String>, bottom: Vec<String>) -> Vec<String> {
+    join_vertical_with_separator_height(top, bottom, 1)
+}
+
+fn join_vertical_with_separator_height(
+    mut top: Vec<String>,
+    bottom: Vec<String>,
+    separator_height: usize,
+) -> Vec<String> {
     let width = max_line_width(&top).max(max_line_width(&bottom)).max(1);
-    top.push("-".repeat(width));
+    top.extend(std::iter::repeat_n("-".repeat(width), separator_height));
     top.extend(bottom);
     top
 }
@@ -2276,6 +2653,20 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    fn wait_for_tracked_stream_count(clients: &TrackedStreamClients, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let len = clients.lock().unwrap().len();
+            if len == expected {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                assert_eq!(len, expected);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn tracked_stream(id: usize, stream: UnixStream) -> TrackedStream {
         TrackedStream { id, stream }
     }
@@ -2376,12 +2767,12 @@ mod tests {
 
         assert_eq!(read_socket_line(&mut client), "OK\n");
         assert_eq!(read_socket_line(&mut client), "REDRAW\n");
-        assert_eq!(attach_events.lock().unwrap().len(), 1);
+        wait_for_tracked_stream_count(&attach_events, 1);
 
         drop(client);
         handle.join().unwrap();
 
-        assert_eq!(attach_events.lock().unwrap().len(), 0);
+        wait_for_tracked_stream_count(&attach_events, 0);
         let _ = std::fs::remove_file(writer_path);
     }
 
@@ -2542,6 +2933,283 @@ mod tests {
                     row_end: 1,
                     col_start: 7,
                     col_end: 12,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_for_size_uses_allocated_regions_and_padding() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "left\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "right\n".to_string(),
+            },
+        ];
+
+        let rendered =
+            render_attach_layout_for_size(&layout, &panes, PtySize { cols: 20, rows: 3 }).unwrap();
+
+        assert_eq!(
+            rendered.lines,
+            vec![
+                "left     | right    ".to_string(),
+                "         |          ".to_string(),
+                "         |          ".to_string(),
+            ]
+        );
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 3,
+                    col_start: 0,
+                    col_end: 8,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 3,
+                    col_start: 11,
+                    col_end: 20,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_for_size_omits_horizontal_separator_when_space_is_too_narrow() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "left\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "right\n".to_string(),
+            },
+        ];
+
+        let rendered =
+            render_attach_layout_for_size(&layout, &panes, PtySize { cols: 4, rows: 1 }).unwrap();
+
+        assert_eq!(rendered.lines, vec!["leri".to_string()]);
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 2,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 2,
+                    col_end: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_attach_layout_for_size_omits_vertical_separator_when_space_is_too_short() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let panes = vec![
+            PaneSnapshot {
+                index: 0,
+                screen: "top\n".to_string(),
+            },
+            PaneSnapshot {
+                index: 1,
+                screen: "bottom\n".to_string(),
+            },
+        ];
+
+        let one_row =
+            render_attach_layout_for_size(&layout, &panes, PtySize { cols: 10, rows: 1 }).unwrap();
+        assert_eq!(one_row.lines, vec!["bottom    ".to_string()]);
+        assert_eq!(
+            one_row.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 0,
+                    col_start: 0,
+                    col_end: 10,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 10,
+                },
+            ]
+        );
+
+        let two_rows =
+            render_attach_layout_for_size(&layout, &panes, PtySize { cols: 10, rows: 2 }).unwrap();
+        assert_eq!(
+            two_rows.lines,
+            vec!["top       ".to_string(), "bottom    ".to_string()]
+        );
+        assert_eq!(
+            two_rows.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 10,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 1,
+                    row_end: 2,
+                    col_start: 0,
+                    col_end: 10,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sized_layout_regions_do_not_overlap_when_horizontal_space_is_one_column() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+
+        assert_eq!(
+            layout_regions_for_size(&layout, PtySize { cols: 1, rows: 1 }),
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 0,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sized_layout_regions_do_not_overlap_when_vertical_space_is_one_row() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+
+        assert_eq!(
+            layout_regions_for_size(&layout, PtySize { cols: 1, rows: 1 }),
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 0,
+                    col_start: 0,
+                    col_end: 1,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sized_layout_regions_split_horizontal_panes_around_separator() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+
+        assert_eq!(
+            layout_regions_for_size(&layout, PtySize { cols: 83, rows: 24 }),
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 24,
+                    col_start: 0,
+                    col_end: 40,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 24,
+                    col_start: 43,
+                    col_end: 83,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sized_layout_regions_split_vertical_panes_around_separator() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+
+        assert_eq!(
+            layout_regions_for_size(&layout, PtySize { cols: 80, rows: 24 }),
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 11,
+                    col_start: 0,
+                    col_end: 80,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 12,
+                    row_end: 24,
+                    col_start: 0,
+                    col_end: 80,
                 },
             ]
         );
