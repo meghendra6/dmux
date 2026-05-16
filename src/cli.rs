@@ -1,4 +1,7 @@
-use crate::protocol::{BufferSelection, CaptureMode, PaneResizeDirection, SplitDirection};
+use crate::protocol::{
+    BufferSelection, CaptureMode, PaneDirection, PaneResizeDirection, PaneSelectTarget,
+    SplitDirection,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelpTopic {
@@ -71,7 +74,7 @@ pub enum Command {
     },
     SelectPane {
         session: String,
-        pane: usize,
+        target: PaneSelectTarget,
     },
     KillPane {
         session: String,
@@ -238,7 +241,7 @@ Commands:\n\
   ls                                    list sessions\n\
   split-window -t <name> -h|-v [-- command...]\n\
   list-panes -t <name> [-F <format>]\n\
-  select-pane -t <name> -p <index>\n\
+  select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D\n\
   new-tab -t <name> [-- command...]      alias for new-window\n\
   list-tabs -t <name>                    alias for list-windows\n\
   select-tab -t <name> -i <index>        alias for select-window\n\
@@ -275,7 +278,7 @@ Pane commands:\n\
   dmux split-window -t <name> -h [-- command...]  split left/right\n\
   dmux split-window -t <name> -v [-- command...]  split top/bottom\n\
   dmux resize-pane -t <name> -L|-R|-U|-D [amount]\n\
-  dmux select-pane -t <name> -p <index>\n"
+  dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D\n"
 }
 
 pub fn attach_help_summary() -> &'static str {
@@ -752,7 +755,7 @@ fn parse_list_panes(args: Vec<String>) -> Result<Command, String> {
 
 fn parse_select_pane(args: Vec<String>) -> Result<Command, String> {
     let mut session = None;
-    let mut pane = None;
+    let mut target = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -768,11 +771,36 @@ fn parse_select_pane(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "select-pane requires a pane index after -p".to_string())?;
-                pane =
-                    Some(value.parse::<usize>().map_err(|_| {
+                set_pane_select_target(
+                    &mut target,
+                    PaneSelectTarget::Index(value.parse::<usize>().map_err(|_| {
                         "select-pane -p must be a non-negative integer".to_string()
-                    })?);
+                    })?),
+                )?;
                 i += 2;
+            }
+            "--pane-id" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "select-pane requires a pane id after --pane-id".to_string())?;
+                set_pane_select_target(
+                    &mut target,
+                    PaneSelectTarget::Id(value.parse::<usize>().map_err(|_| {
+                        "select-pane --pane-id must be a non-negative integer".to_string()
+                    })?),
+                )?;
+                i += 2;
+            }
+            "-L" | "-R" | "-U" | "-D" => {
+                let direction = match args[i].as_str() {
+                    "-L" => PaneDirection::Left,
+                    "-R" => PaneDirection::Right,
+                    "-U" => PaneDirection::Up,
+                    "-D" => PaneDirection::Down,
+                    _ => unreachable!(),
+                };
+                set_pane_select_target(&mut target, PaneSelectTarget::Direction(direction))?;
+                i += 1;
             }
             value => return Err(format!("select-pane does not support argument {value:?}")),
         }
@@ -780,8 +808,21 @@ fn parse_select_pane(args: Vec<String>) -> Result<Command, String> {
 
     Ok(Command::SelectPane {
         session: session.ok_or_else(|| "select-pane requires -t <session>".to_string())?,
-        pane: pane.ok_or_else(|| "select-pane requires -p <index>".to_string())?,
+        target: target.ok_or_else(|| {
+            "select-pane requires one of -p <index>, --pane-id <id>, or -L/-R/-U/-D".to_string()
+        })?,
     })
+}
+
+fn set_pane_select_target(
+    target: &mut Option<PaneSelectTarget>,
+    value: PaneSelectTarget,
+) -> Result<(), String> {
+    if target.replace(value).is_some() {
+        Err("select-pane accepts only one pane target".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_kill_pane(args: Vec<String>) -> Result<Command, String> {
@@ -1561,9 +1602,58 @@ mod tests {
             command,
             Command::SelectPane {
                 session: "dev".to_string(),
-                pane: 1,
+                target: PaneSelectTarget::Index(1),
             }
         );
+    }
+
+    #[test]
+    fn parses_select_pane_target_and_pane_id() {
+        let command = parse_args(["dmux", "select-pane", "-t", "dev", "--pane-id", "42"]).unwrap();
+        assert_eq!(
+            command,
+            Command::SelectPane {
+                session: "dev".to_string(),
+                target: PaneSelectTarget::Id(42),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_select_pane_direction() {
+        let command = parse_args(["dmux", "select-pane", "-t", "dev", "-L"]).unwrap();
+        assert_eq!(
+            command,
+            Command::SelectPane {
+                session: "dev".to_string(),
+                target: PaneSelectTarget::Direction(PaneDirection::Left),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_select_pane_conflicting_targets() {
+        let err = parse_args([
+            "dmux",
+            "select-pane",
+            "-t",
+            "dev",
+            "-p",
+            "1",
+            "--pane-id",
+            "42",
+        ])
+        .unwrap_err();
+        assert!(err.contains("only one pane target"), "{err}");
+
+        let err = parse_args(["dmux", "select-pane", "-t", "dev", "-p", "1", "-L"]).unwrap_err();
+        assert!(err.contains("only one pane target"), "{err}");
+    }
+
+    #[test]
+    fn rejects_select_pane_without_target() {
+        let err = parse_args(["dmux", "select-pane", "-t", "dev"]).unwrap_err();
+        assert!(err.contains("requires one of"), "{err}");
     }
 
     #[test]

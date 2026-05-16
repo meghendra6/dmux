@@ -903,6 +903,130 @@ fn save_buffer_command_uses_current_active_pane_after_split() {
 }
 
 #[test]
+fn select_pane_direction_moves_focus_using_nested_layout_geometry() {
+    let socket = unique_socket("select-direction");
+    let session = format!("select-direction-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf top-left; printf '\\n'; sleep 30",
+        ],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf right; printf '\\n'; sleep 30",
+        ],
+    ));
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "--",
+            "sh",
+            "-c",
+            "printf bottom-left; printf '\\n'; sleep 30",
+        ],
+    ));
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-D"]));
+    assert_eq!(active_pane_index_and_id(&socket, &session).0, 2);
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-U"]));
+    assert_eq!(active_pane_index_and_id(&socket, &session).0, 0);
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-R"]));
+    assert_eq!(active_pane_index_and_id(&socket, &session).0, 1);
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    let failed = dmux(&socket, &["select-pane", "-t", &session, "-U"]);
+    assert!(!failed.status.success());
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("missing adjacent pane"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert_eq!(active_pane_index_and_id(&socket, &session).0, 0);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn select_pane_by_id_survives_index_reassignment() {
+    let socket = unique_socket("select-pane-id");
+    let session = format!("select-pane-id-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "sleep 30",
+        ],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "--",
+            "sh",
+            "-c",
+            "sleep 30",
+        ],
+    ));
+    let stable_id = pane_id_at_index(&socket, &session, 2);
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "1"]));
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "select-pane",
+            "-t",
+            &session,
+            "--pane-id",
+            &stable_id.to_string(),
+        ],
+    ));
+
+    assert_eq!(active_pane_index_and_id(&socket, &session), (1, stable_id));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn copy_mode_prints_numbered_lines_and_search_matches() {
     let socket = unique_socket("copy-mode");
     let session = format!("copy-mode-{}", std::process::id());
@@ -1000,6 +1124,56 @@ fn poll_capture_screen(socket: &std::path::Path, session: &str, needle: &str) ->
     }
 
     last
+}
+
+fn active_pane_index_and_id(socket: &std::path::Path, session: &str) -> (usize, usize) {
+    let output = dmux(
+        socket,
+        &[
+            "list-panes",
+            "-t",
+            session,
+            "-F",
+            "#{pane.index}:#{pane.id}:#{pane.active}",
+        ],
+    );
+    assert_success(&output);
+    let listed = String::from_utf8_lossy(&output.stdout);
+    listed
+        .lines()
+        .find_map(|line| {
+            let parts = line.split(':').collect::<Vec<_>>();
+            match parts.as_slice() {
+                [index, id, "1"] => Some((
+                    index.parse::<usize>().expect("pane index"),
+                    id.parse::<usize>().expect("pane id"),
+                )),
+                _ => None,
+            }
+        })
+        .unwrap_or_else(|| panic!("missing active pane in {listed:?}"))
+}
+
+fn pane_id_at_index(socket: &std::path::Path, session: &str, target_index: usize) -> usize {
+    let output = dmux(
+        socket,
+        &[
+            "list-panes",
+            "-t",
+            session,
+            "-F",
+            "#{pane.index}:#{pane.id}",
+        ],
+    );
+    assert_success(&output);
+    let listed = String::from_utf8_lossy(&output.stdout);
+    listed
+        .lines()
+        .find_map(|line| {
+            let (index, id) = line.split_once(':')?;
+            (index.parse::<usize>().ok()? == target_index).then(|| id.parse::<usize>().unwrap())
+        })
+        .unwrap_or_else(|| panic!("missing pane index {target_index} in {listed:?}"))
 }
 
 fn poll_list_sessions(socket: &std::path::Path, needle: &str) -> String {

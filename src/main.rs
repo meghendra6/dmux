@@ -168,10 +168,14 @@ fn run() -> Result<(), String> {
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
-        cli::Command::SelectPane { session, pane } => {
+        cli::Command::SelectPane { session, target } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            send_request(&socket, &protocol::encode_select_pane(&session, pane), true)?;
+            send_request(
+                &socket,
+                &protocol::encode_select_pane_target(&session, target),
+                true,
+            )?;
             Ok(())
         }
         cli::Command::KillPane { session, pane } => {
