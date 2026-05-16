@@ -19,6 +19,8 @@ const LIVE_SNAPSHOT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL: Duration = Duration::from_millis(1000);
 const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
+const CURSOR_HOME: &[u8] = b"\x1b[H";
+const CLEAR_LINE: &[u8] = b"\x1b[2K";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachMode {
@@ -45,6 +47,12 @@ struct AttachPaneRegion {
 struct AttachLayoutSnapshotResponse {
     snapshot: Vec<u8>,
     regions: Vec<AttachPaneRegion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachRenderFrame {
+    status: String,
+    layout: AttachLayoutSnapshotResponse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,8 +279,49 @@ fn read_attach_layout_frame(
     }
 }
 
+fn read_attach_render_frame(stream: &mut UnixStream) -> io::Result<AttachRenderFrame> {
+    let header = read_line(stream)?;
+    let Some(len) = header
+        .strip_prefix("FRAME\t")
+        .and_then(|line| line.strip_suffix('\n'))
+    else {
+        return Err(io::Error::other("invalid attach render frame header"));
+    };
+    let len = len
+        .parse::<usize>()
+        .map_err(|_| io::Error::other("invalid attach render frame length"))?;
+    let mut body = vec![0_u8; len];
+    stream.read_exact(&mut body)?;
+    parse_attach_render_frame_body(&body)
+}
+
 fn is_unknown_request_error(error: &io::Error) -> bool {
     error.to_string().starts_with("unknown request line:")
+}
+
+fn parse_attach_render_frame_body(body: &[u8]) -> io::Result<AttachRenderFrame> {
+    let mut cursor = 0;
+    let header = read_body_line(body, &mut cursor)?;
+    let Some(len) = header.strip_prefix("STATUS\t") else {
+        return Err(io::Error::other("missing status header"));
+    };
+    let len = len
+        .parse::<usize>()
+        .map_err(|_| io::Error::other("invalid status length"))?;
+    if body.len().saturating_sub(cursor) < len + 1 {
+        return Err(io::Error::other("truncated status body"));
+    }
+    let status = std::str::from_utf8(&body[cursor..cursor + len])
+        .map_err(|_| io::Error::other("non-utf8 status body"))?
+        .to_string();
+    cursor += len;
+    if body.get(cursor) != Some(&b'\n') {
+        return Err(io::Error::other("missing status terminator"));
+    }
+    cursor += 1;
+
+    let layout = parse_attach_layout_snapshot_response(&body[cursor..])?;
+    Ok(AttachRenderFrame { status, layout })
 }
 
 fn parse_attach_layout_snapshot_response(body: &[u8]) -> io::Result<AttachLayoutSnapshotResponse> {
@@ -367,6 +416,13 @@ fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
     )))
 }
 
+fn write_initial_live_snapshot_frame(
+    socket: &Path,
+    session: &str,
+) -> io::Result<LiveSnapshotFrame> {
+    write_live_snapshot_frame_with_message_and_clear(socket, session, None, true)
+}
+
 fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<LiveSnapshotFrame> {
     write_live_snapshot_frame_with_message(socket, session, None)
 }
@@ -376,28 +432,69 @@ fn write_live_snapshot_frame_with_message(
     session: &str,
     message: Option<&str>,
 ) -> io::Result<LiveSnapshotFrame> {
+    write_live_snapshot_frame_with_message_and_clear(socket, session, message, false)
+}
+
+fn write_live_snapshot_frame_with_message_and_clear(
+    socket: &Path,
+    session: &str,
+    message: Option<&str>,
+    clear: bool,
+) -> io::Result<LiveSnapshotFrame> {
     let status = read_attach_status_line(socket, session)?;
     let snapshot = read_attach_layout_frame(socket, session)?;
+    write_live_frame_to_stdout(&status, message, &snapshot, clear)
+}
+
+fn write_live_render_frame_with_message(
+    render_frame: &AttachRenderFrame,
+    message: Option<&str>,
+) -> io::Result<LiveSnapshotFrame> {
+    write_live_frame_to_stdout(&render_frame.status, message, &render_frame.layout, false)
+}
+
+fn write_live_frame_to_stdout(
+    status: &str,
+    message: Option<&str>,
+    snapshot: &AttachLayoutSnapshotResponse,
+    clear: bool,
+) -> io::Result<LiveSnapshotFrame> {
     let header_rows = usize::from(!status.is_empty()) + usize::from(message.is_some());
     let snapshot_rows = detect_attach_size()
         .map(|size| usize::from(size.rows).saturating_sub(header_rows))
         .unwrap_or(usize::MAX);
 
     let mut stdout = io::stdout().lock();
-    stdout.write_all(CLEAR_SCREEN)?;
+    if clear {
+        stdout.write_all(CLEAR_SCREEN)?;
+    } else {
+        stdout.write_all(CURSOR_HOME)?;
+    }
     if !status.is_empty() {
-        stdout.write_all(format!("{status}\r\n").as_bytes())?;
+        write_repaint_line(&mut stdout, status.as_bytes(), !clear)?;
     }
     if let Some(message) = message {
-        stdout.write_all(format!("{message}\r\n").as_bytes())?;
+        write_repaint_line(&mut stdout, message.as_bytes(), !clear)?;
     }
-    write_snapshot_rows(&mut stdout, &snapshot.snapshot, snapshot_rows)?;
+    if clear {
+        write_snapshot_rows(&mut stdout, &snapshot.snapshot, snapshot_rows)?;
+    } else {
+        write_snapshot_rows_for_repaint(&mut stdout, &snapshot.snapshot, snapshot_rows)?;
+    }
     stdout.flush()?;
 
     Ok(LiveSnapshotFrame {
-        regions: snapshot.regions,
+        regions: snapshot.regions.clone(),
         header_rows,
     })
+}
+
+fn write_repaint_line(stdout: &mut impl Write, line: &[u8], clear_line: bool) -> io::Result<()> {
+    if clear_line {
+        stdout.write_all(CLEAR_LINE)?;
+    }
+    stdout.write_all(line)?;
+    stdout.write_all(b"\r\n")
 }
 
 fn write_snapshot_rows(
@@ -425,6 +522,44 @@ fn write_snapshot_rows(
         if rows > 0 {
             stdout.write_all(b"\r\n")?;
         }
+        stdout.write_all(&snapshot[start..content_end])?;
+        rows += 1;
+
+        if line_end == snapshot.len() {
+            break;
+        }
+        start = line_end + 1;
+    }
+
+    Ok(())
+}
+
+fn write_snapshot_rows_for_repaint(
+    stdout: &mut impl Write,
+    snapshot: &[u8],
+    max_rows: usize,
+) -> io::Result<()> {
+    if max_rows == 0 {
+        return Ok(());
+    }
+
+    let mut rows = 0;
+    let mut start = 0;
+    while start < snapshot.len() && rows < max_rows {
+        let line_end = snapshot[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(snapshot.len(), |offset| start + offset);
+        let content_end = if line_end > start && snapshot[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+
+        if rows > 0 {
+            stdout.write_all(b"\r\n")?;
+        }
+        stdout.write_all(CLEAR_LINE)?;
         stdout.write_all(&snapshot[start..content_end])?;
         rows += 1;
 
@@ -1072,6 +1207,10 @@ enum LiveSnapshotInputEvent {
     PauseRedraw(mpsc::Sender<()>),
     RedrawNow,
     RedrawHint,
+    RenderFrame(AttachRenderFrame),
+    RenderStreamReady,
+    RenderStreamUnavailable,
+    RenderStreamClosed,
     EventStreamReady,
     EventStreamClosed,
     Error(String),
@@ -1270,6 +1409,64 @@ fn spawn_live_snapshot_event_thread(
     });
 }
 
+fn spawn_live_snapshot_render_thread(
+    socket: PathBuf,
+    session: String,
+    sender: mpsc::Sender<LiveSnapshotInputEvent>,
+) {
+    std::thread::spawn(move || {
+        let mut stream = match UnixStream::connect(socket) {
+            Ok(stream) => stream,
+            Err(_) => {
+                let _ = sender.send(LiveSnapshotInputEvent::RenderStreamUnavailable);
+                return;
+            }
+        };
+        if stream
+            .write_all(protocol::encode_attach_render(&session).as_bytes())
+            .is_err()
+        {
+            let _ = sender.send(LiveSnapshotInputEvent::RenderStreamUnavailable);
+            return;
+        }
+
+        let response = match read_line(&mut stream) {
+            Ok(response) => response,
+            Err(_) => {
+                let _ = sender.send(LiveSnapshotInputEvent::RenderStreamUnavailable);
+                return;
+            }
+        };
+        if response != "OK\n" {
+            let _ = sender.send(LiveSnapshotInputEvent::RenderStreamUnavailable);
+            return;
+        }
+        if sender
+            .send(LiveSnapshotInputEvent::RenderStreamReady)
+            .is_err()
+        {
+            return;
+        }
+
+        loop {
+            match read_attach_render_frame(&mut stream) {
+                Ok(frame) => {
+                    if sender
+                        .send(LiveSnapshotInputEvent::RenderFrame(frame))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let _ = sender.send(LiveSnapshotInputEvent::RenderStreamClosed);
+                    return;
+                }
+            }
+        }
+    });
+}
+
 fn spawn_live_snapshot_lifetime_thread(
     mut stream: UnixStream,
     sender: mpsc::Sender<LiveSnapshotInputEvent>,
@@ -1349,20 +1546,17 @@ fn run_live_snapshot_attach(
         sender.clone(),
     );
     let redraw_hint_pending = Arc::new(AtomicBool::new(false));
-    spawn_live_snapshot_event_thread(
-        socket.to_path_buf(),
-        session.to_string(),
-        sender.clone(),
-        Arc::clone(&redraw_hint_pending),
-    );
+    spawn_live_snapshot_render_thread(socket.to_path_buf(), session.to_string(), sender.clone());
+    let fallback_sender = sender.clone();
     spawn_live_snapshot_lifetime_thread(stream.try_clone()?, sender);
     let _screen_guard = AlternateScreenGuard::enter()?;
-    let mut frame = write_live_snapshot_frame(socket, session)?;
+    let mut frame = write_initial_live_snapshot_frame(socket, session)?;
     let mut mouse_mode = None;
     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
     let mut last_redraw = Instant::now();
     let mut redraw_paused = false;
     let mut event_stream_active = false;
+    let mut fallback_event_stream_started = false;
     let mut pane_number_message = None;
 
     loop {
@@ -1499,6 +1693,43 @@ fn run_live_snapshot_attach(
                     last_redraw = Instant::now();
                 }
             }
+            Ok(LiveSnapshotInputEvent::RenderFrame(render_frame)) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                if !redraw_paused {
+                    frame = write_live_render_frame_with_pane_number_message(
+                        &render_frame,
+                        &mut pane_number_message,
+                    )?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    last_redraw = Instant::now();
+                }
+            }
+            Ok(LiveSnapshotInputEvent::RenderStreamReady) => {
+                event_stream_active = true;
+            }
+            Ok(LiveSnapshotInputEvent::RenderStreamUnavailable) => {
+                if !fallback_event_stream_started {
+                    spawn_live_snapshot_event_thread(
+                        socket.to_path_buf(),
+                        session.to_string(),
+                        fallback_sender.clone(),
+                        Arc::clone(&redraw_hint_pending),
+                    );
+                    fallback_event_stream_started = true;
+                }
+            }
+            Ok(LiveSnapshotInputEvent::RenderStreamClosed) => {
+                event_stream_active = false;
+                if !fallback_event_stream_started {
+                    spawn_live_snapshot_event_thread(
+                        socket.to_path_buf(),
+                        session.to_string(),
+                        fallback_sender.clone(),
+                        Arc::clone(&redraw_hint_pending),
+                    );
+                    fallback_event_stream_started = true;
+                }
+            }
             Ok(LiveSnapshotInputEvent::EventStreamReady) => {
                 event_stream_active = true;
             }
@@ -1573,6 +1804,23 @@ fn write_live_snapshot_frame_with_pane_number_message(
         .as_ref()
         .map(|(message, _)| message.as_str());
     write_live_snapshot_frame_with_message(socket, session, message)
+}
+
+fn write_live_render_frame_with_pane_number_message(
+    render_frame: &AttachRenderFrame,
+    pane_number_message: &mut Option<(String, Instant)>,
+) -> io::Result<LiveSnapshotFrame> {
+    if pane_number_message
+        .as_ref()
+        .is_some_and(|(_, until)| Instant::now() >= *until)
+    {
+        *pane_number_message = None;
+    }
+
+    let message = pane_number_message
+        .as_ref()
+        .map(|(message, _)| message.as_str());
+    write_live_render_frame_with_message(render_frame, message)
 }
 
 fn pane_entries(socket: &Path, session: &str) -> io::Result<Vec<PaneListEntry>> {
