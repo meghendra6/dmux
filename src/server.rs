@@ -307,6 +307,28 @@ impl Session {
         self.windows.lock().unwrap().kill_pane(target)
     }
 
+    fn remove_exited_pane(self: &Arc<Self>, pane: &Arc<Pane>) {
+        let (removal, pane_resizes) = {
+            let mut windows = self.windows.lock().unwrap();
+            let removal = windows.remove_exited_pane(pane);
+            let pane_resizes = if removal.needs_layout_redraw() {
+                windows.visible_pane_resizes()
+            } else {
+                Vec::new()
+            };
+            (removal, pane_resizes)
+        };
+
+        match removal {
+            ExitedPaneRemoval::Removed => {
+                let _ = resize_panes(pane_resizes);
+                self.notify_attach_redraw_immediate();
+            }
+            ExitedPaneRemoval::LastPane => self.close_attach_streams(),
+            ExitedPaneRemoval::NotFound => {}
+        }
+    }
+
     fn pane_descriptions(&self) -> Vec<PaneDescription> {
         self.windows.lock().unwrap().pane_descriptions()
     }
@@ -614,10 +636,37 @@ impl Window {
 
     fn kill_pane(&mut self, target: Option<usize>) -> Result<Arc<Pane>, String> {
         let index = self.panes.kill_index(target).map_err(str::to_string)?;
+        Ok(self.remove_pane_at(index))
+    }
+
+    fn remove_exited_pane(&mut self, target: &Arc<Pane>) -> bool {
+        let Some(index) = self
+            .panes
+            .panes
+            .iter()
+            .position(|pane| Arc::ptr_eq(pane, target))
+        else {
+            return false;
+        };
+        if self.panes.len() <= 1 {
+            return false;
+        }
+        self.remove_pane_at(index);
+        true
+    }
+
+    fn remove_pane_at(&mut self, index: usize) -> Arc<Pane> {
         let pane = self.panes.kill_at(index);
         self.layout.remove_pane(index);
         self.adjust_zoom_after_pane_removal(index);
-        Ok(pane)
+        pane
+    }
+
+    fn contains_pane(&self, target: &Arc<Pane>) -> bool {
+        self.panes
+            .panes
+            .iter()
+            .any(|pane| Arc::ptr_eq(pane, target))
     }
 
     fn panes(&self) -> Vec<Arc<Pane>> {
@@ -761,6 +810,19 @@ struct WindowSet {
     active: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitedPaneRemoval {
+    Removed,
+    LastPane,
+    NotFound,
+}
+
+impl ExitedPaneRemoval {
+    fn needs_layout_redraw(self) -> bool {
+        matches!(self, Self::Removed)
+    }
+}
+
 impl WindowSet {
     fn new(window: Window) -> Self {
         Self {
@@ -813,6 +875,32 @@ impl WindowSet {
         self.active_window_mut()
             .ok_or_else(|| "missing window".to_string())?
             .kill_pane(target)
+    }
+
+    fn remove_exited_pane(&mut self, target: &Arc<Pane>) -> ExitedPaneRemoval {
+        let Some(window_index) = self
+            .windows
+            .iter()
+            .position(|window| window.contains_pane(target))
+        else {
+            return ExitedPaneRemoval::NotFound;
+        };
+
+        if self.windows[window_index].remove_exited_pane(target) {
+            return ExitedPaneRemoval::Removed;
+        }
+
+        if self.windows.len() <= 1 {
+            return ExitedPaneRemoval::LastPane;
+        }
+
+        self.windows.remove(window_index);
+        if self.active == window_index {
+            self.active = window_index.saturating_sub(1).min(self.windows.len() - 1);
+        } else if self.active > window_index {
+            self.active -= 1;
+        }
+        ExitedPaneRemoval::Removed
     }
 
     fn panes(&self) -> Vec<Arc<Pane>> {
@@ -3160,19 +3248,15 @@ fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
             broadcast(&pane.clients, bytes);
         }
         shutdown_tracked_clients(&pane.clients);
-        close_attach_streams_if_only_visible_pane(&pane);
+        remove_exited_pane_from_session(&pane);
     });
 }
 
-fn close_attach_streams_if_only_visible_pane(pane: &Arc<Pane>) {
+fn remove_exited_pane_from_session(pane: &Arc<Pane>) {
     let Some(session) = pane.session() else {
         return;
     };
-
-    let panes = session.attach_panes();
-    if panes.len() == 1 && Arc::ptr_eq(&panes[0].pane, pane) {
-        session.close_attach_streams();
-    }
+    session.remove_exited_pane(pane);
 }
 
 fn terminate_pane_async(child_pid: i32) {
