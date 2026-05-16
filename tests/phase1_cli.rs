@@ -7591,6 +7591,80 @@ fn tab_alias_commands_share_window_state() {
 }
 
 #[test]
+fn tab_ids_remain_stable_after_index_reassignment() {
+    let socket = unique_socket("stable-tab-ids");
+    let session = format!("stable-tab-ids-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-tab-id; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-tab-id");
+    assert!(base.contains("base-tab-id"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new-tab",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf second-tab-id; sleep 30",
+        ],
+    ));
+    let second = poll_capture(&socket, &session, "second-tab-id");
+    assert!(second.contains("second-tab-id"), "{second:?}");
+
+    let status = dmux(
+        &socket,
+        &[
+            "status-line",
+            "-t",
+            &session,
+            "-F",
+            "#{window.index}:#{window.id}:#{tab.index}:#{tab.id}",
+        ],
+    );
+    assert_success(&status);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert_eq!(status.trim_end(), "1:1:1:1");
+
+    assert_success(&dmux(&socket, &["kill-tab", "-t", &session, "-i", "0"]));
+
+    let status = dmux(
+        &socket,
+        &[
+            "status-line",
+            "-t",
+            &session,
+            "-F",
+            "#{window.index}:#{window.id}:#{tab.index}:#{tab.id}",
+        ],
+    );
+    assert_success(&status);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert_eq!(status.trim_end(), "0:1:0:1");
+
+    let active = poll_capture(&socket, &session, "second-tab-id");
+    assert!(active.contains("second-tab-id"), "{active:?}");
+    assert!(!active.contains("base-tab-id"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn new_window_after_split_uses_full_window_pty_size() {
     let socket = unique_socket("new-window-full-size");
     let session = format!("new-window-full-size-{}", std::process::id());

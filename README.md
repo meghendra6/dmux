@@ -97,6 +97,7 @@ Implemented Phase 2 groundwork:
 - pane zoom state while keeping all panes alive
 - server-side statusline format expansion
 - stable pane IDs exposed as `#{pane.id}` in pane/status formats
+- stable tab/window IDs exposed as `#{tab.id}` and `#{window.id}` in status formats
 - in-memory buffers backed by pane capture and paste into active panes
 - command-driven line range and search selection for buffer saves
 - command-driven line-numbered copy-mode inspection with search filtering

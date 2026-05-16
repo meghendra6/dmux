@@ -241,6 +241,7 @@ struct Session {
     name: String,
     windows: Mutex<WindowSet>,
     next_pane_id: AtomicUsize,
+    next_tab_id: AtomicUsize,
     attach_events: AttachEventClients,
     attach_streams: AttachLifetimeStreams,
     attach_render_clients: AttachRenderClients,
@@ -260,8 +261,9 @@ impl Session {
         let next_pane_id = pane.id.as_usize() + 1;
         Self {
             name,
-            windows: Mutex::new(WindowSet::new(Window::new(pane))),
+            windows: Mutex::new(WindowSet::new(Window::new(TabId(0), pane))),
             next_pane_id: AtomicUsize::new(next_pane_id),
+            next_tab_id: AtomicUsize::new(1),
             attach_events,
             attach_streams: Arc::new(Mutex::new(Vec::new())),
             attach_render_clients: Arc::new(Mutex::new(Vec::new())),
@@ -279,6 +281,10 @@ impl Session {
 
     fn next_pane_id(&self) -> PaneId {
         PaneId(self.next_pane_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn next_tab_id(&self) -> TabId {
+        TabId(self.next_tab_id.fetch_add(1, Ordering::SeqCst))
     }
 
     fn active_pane(&self) -> Option<Arc<Pane>> {
@@ -346,7 +352,10 @@ impl Session {
     }
 
     fn add_window(&self, pane: Arc<Pane>) {
-        self.windows.lock().unwrap().add(Window::new(pane));
+        self.windows
+            .lock()
+            .unwrap()
+            .add(Window::new(self.next_tab_id(), pane));
     }
 
     fn select_window(&self, index: usize) -> bool {
@@ -522,6 +531,7 @@ impl Session {
 }
 
 struct Window {
+    id: TabId,
     panes: PaneSet<Arc<Pane>>,
     layout: LayoutNode,
     size: PtySize,
@@ -532,6 +542,15 @@ struct Window {
 struct PaneId(usize);
 
 impl PaneId {
+    fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct TabId(usize);
+
+impl TabId {
     fn as_usize(self) -> usize {
         self.0
     }
@@ -596,9 +615,10 @@ impl LayoutNode {
 }
 
 impl Window {
-    fn new(pane: Arc<Pane>) -> Self {
+    fn new(id: TabId, pane: Arc<Pane>) -> Self {
         let size = *pane.size.lock().unwrap();
         Self {
+            id,
             panes: PaneSet::new(pane),
             layout: LayoutNode::Pane(0),
             size,
@@ -970,6 +990,7 @@ impl WindowSet {
         Some(StatusContext {
             session_name: session_name.to_string(),
             window_index: self.active,
+            window_id: window.id,
             window_count: self.windows.len(),
             pane_index: window.active_pane_index(),
             pane_id: window.active_pane_id()?,
@@ -1083,6 +1104,7 @@ struct PaneRegion {
 struct StatusContext {
     session_name: String,
     window_index: usize,
+    window_id: TabId,
     window_count: usize,
     pane_index: usize,
     pane_id: PaneId,
@@ -1829,6 +1851,7 @@ fn status_context(state: &Arc<ServerState>, name: &str) -> Option<StatusContext>
 
 fn format_status_line(format: &str, context: &StatusContext) -> String {
     let window_index = context.window_index.to_string();
+    let window_id = context.window_id.as_usize().to_string();
     let window_list = format_window_list(context);
     let pane_index = context.pane_index.to_string();
     let pane_id = context.pane_id.as_usize().to_string();
@@ -1836,9 +1859,11 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
     let window_zoomed = if context.window_zoomed { "1" } else { "0" };
     let replacements = [
         ("#{session.name}", context.session_name.as_str()),
+        ("#{window.id}", window_id.as_str()),
         ("#{window.index}", window_index.as_str()),
         ("#{window.list}", window_list.as_str()),
         ("#{tab.index}", window_index.as_str()),
+        ("#{tab.id}", window_id.as_str()),
         ("#{tab.list}", window_list.as_str()),
         ("#{pane.id}", pane_id.as_str()),
         ("#{pane.index}", pane_index.as_str()),
