@@ -9187,3 +9187,419 @@ fn status_line_and_display_message_report_missing_session() {
 
     assert_success(&dmux(&socket, &["kill-server"]));
 }
+
+#[test]
+fn session_lifecycle_lists_renames_and_preserves_state() {
+    let socket = unique_socket("session-lifecycle");
+    let session = format!("session-lifecycle-{}", std::process::id());
+    let renamed = format!("session-lifecycle-renamed-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let legacy = dmux(&socket, &["ls"]);
+    assert_success(&legacy);
+    assert_eq!(
+        String::from_utf8_lossy(&legacy.stdout),
+        format!("{session}\n")
+    );
+
+    let listed = dmux(
+        &socket,
+        &[
+            "list-sessions",
+            "-F",
+            "#{session.name} #{session.windows} #{session.attached} #{client.count}",
+        ],
+    );
+    assert_success(&listed);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        format!("{session} 1 0 0\n")
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["rename-session", "-t", &session, &renamed],
+    ));
+
+    let old_capture = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
+    assert!(!old_capture.status.success());
+    assert!(String::from_utf8_lossy(&old_capture.stderr).contains("missing session"));
+
+    let new_capture = dmux(&socket, &["capture-pane", "-t", &renamed, "-p"]);
+    assert_success(&new_capture);
+    assert!(String::from_utf8_lossy(&new_capture.stdout).contains("ready"));
+
+    let display = dmux(
+        &socket,
+        &[
+            "display-message",
+            "-t",
+            &renamed,
+            "-p",
+            "#{session.name} #{session.attached_count}",
+        ],
+    );
+    assert_success(&display);
+    assert_eq!(
+        String::from_utf8_lossy(&display.stdout),
+        format!("{renamed} 0\n")
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &renamed]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn concurrent_new_allows_only_one_session_with_a_name() {
+    let socket = unique_socket("concurrent-new");
+    let bootstrap = format!("concurrent-new-bootstrap-{}", std::process::id());
+    let target = format!("concurrent-new-target-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &bootstrap, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let handles = (0..8)
+        .map(|_| {
+            let socket = socket.clone();
+            let target = target.clone();
+            std::thread::spawn(move || {
+                dmux(
+                    &socket,
+                    &["new", "-d", "-s", &target, "--", "sh", "-c", "sleep 30"],
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let outputs = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("join concurrent new"))
+        .collect::<Vec<_>>();
+    let successes = outputs
+        .iter()
+        .filter(|output| output.status.success())
+        .count();
+    assert_eq!(successes, 1, "outputs: {outputs:?}");
+    for output in outputs.iter().filter(|output| !output.status.success()) {
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("already exists"),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let listed = dmux(&socket, &["list-sessions", "-F", "#{session.name}"]);
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(listed.lines().filter(|line| *line == target).count(), 1);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &target]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &bootstrap]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn list_clients_and_detach_client_close_attach_without_killing_session() {
+    let socket = unique_socket("client-lifecycle");
+    let session = format!("client-lifecycle-{}", std::process::id());
+    let renamed = format!("client-lifecycle-renamed-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let child = spawn_attached_to_session(&socket, &session, &["ready"]);
+
+    let clients = dmux(
+        &socket,
+        &[
+            "list-clients",
+            "-t",
+            &session,
+            "-F",
+            "#{client.id} #{client.session} #{client.type} #{client.attached}",
+        ],
+    );
+    assert_success(&clients);
+    let clients_text = String::from_utf8_lossy(&clients.stdout);
+    assert_eq!(clients_text.lines().count(), 1, "{clients_text:?}");
+    let line = clients_text.lines().next().expect("client line");
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(parts[1], session);
+    assert_eq!(parts[2], "raw");
+    assert_eq!(parts[3], "1");
+
+    assert_success(&dmux(
+        &socket,
+        &["rename-session", "-t", &session, &renamed],
+    ));
+    assert_success(&dmux(&socket, &["detach-client", "-c", parts[0]]));
+    let output = assert_child_exits_within(child, "attach after detach-client");
+    assert_success(&output);
+
+    let old_capture = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
+    assert!(!old_capture.status.success());
+    assert!(String::from_utf8_lossy(&old_capture.stderr).contains("missing session"));
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let capture = dmux(&socket, &["capture-pane", "-t", &renamed, "-p"]);
+    assert_success(&capture);
+    assert!(String::from_utf8_lossy(&capture.stdout).contains("ready"));
+
+    let clients = dmux(&socket, &["list-clients", "-t", &renamed]);
+    assert_success(&clients);
+    assert_eq!(String::from_utf8_lossy(&clients.stdout), "");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &renamed]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn rename_alias_expires_when_layout_reconnect_is_abandoned() {
+    let socket = unique_socket("rename-alias-abandoned-reconnect");
+    let session = format!("rename-alias-abandoned-reconnect-{}", std::process::id());
+    let renamed = format!(
+        "rename-alias-abandoned-reconnect-new-{}",
+        std::process::id()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let mut raw_attach = UnixStream::connect(&socket).expect("connect raw attach stream");
+    raw_attach
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set raw attach read timeout");
+    raw_attach
+        .write_all(format!("ATTACH\t{session}\n").as_bytes())
+        .expect("write raw attach request");
+    let response = read_socket_line(&mut raw_attach);
+    assert!(response.starts_with("OK\tLIVE\t"), "{response:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["rename-session", "-t", &session, &renamed],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &renamed,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "sleep 30",
+        ],
+    ));
+    let _ = try_read_socket_line(&mut raw_attach);
+    drop(raw_attach);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut last_stderr = String::new();
+    loop {
+        let output = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
+        if !output.status.success() {
+            last_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if last_stderr.contains("missing session") {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("old session alias did not expire; last stderr:\n{last_stderr}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &renamed]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attached_client_commands_survive_session_rename() {
+    let socket = unique_socket("attached-rename");
+    let session = format!("attached-rename-{}", std::process::id());
+    let renamed = format!("attached-rename-new-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["ready"]);
+    assert_success(&dmux(
+        &socket,
+        &["rename-session", "-t", &session, &renamed],
+    ));
+
+    let listed = dmux(&socket, &["ls"]);
+    assert_success(&listed);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        format!("{renamed}\n")
+    );
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02%").expect("write split prefix");
+        stdin.flush().expect("flush split prefix");
+    }
+    let panes = poll_pane_count(&socket, &renamed, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    let old_capture = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
+    assert!(!old_capture.status.success());
+    assert!(String::from_utf8_lossy(&old_capture.stderr).contains("missing session"));
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &renamed]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn status_line_reports_attached_count_for_current_session() {
+    let socket = unique_socket("status-attached-count");
+    let session = format!("status-attached-count-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+    let child = spawn_attached_to_session(&socket, &session, &["ready"]);
+
+    let status = dmux(
+        &socket,
+        &[
+            "status-line",
+            "-t",
+            &session,
+            "-F",
+            "#{session.attached} #{session.attached_count} #{client.count}",
+        ],
+    );
+    assert_success(&status);
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "1 1 1\n");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    let output = assert_child_exits_within(child, "attach after kill-session");
+    assert_success(&output);
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn rename_session_rejects_invalid_and_duplicate_names() {
+    let socket = unique_socket("rename-session-validation");
+    let first = format!("rename-session-first-{}", std::process::id());
+    let second = format!("rename-session-second-{}", std::process::id());
+
+    assert_success(&dmux(&socket, &["new", "-d", "-s", &first]));
+    assert_success(&dmux(&socket, &["new", "-d", "-s", &second]));
+
+    let duplicate = dmux(&socket, &["rename-session", "-t", &first, &second]);
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already exists"));
+
+    let empty = dmux(&socket, &["rename-session", "-t", &first, ""]);
+    assert!(!empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("cannot be empty"));
+
+    let control = dmux(&socket, &["rename-session", "-t", &first, "bad\u{1}name"]);
+    assert!(!control.status.success());
+    assert!(String::from_utf8_lossy(&control.stderr).contains("control characters"));
+
+    let bad_new = dmux(&socket, &["new", "-d", "-s", "bad\u{1}name"]);
+    assert!(!bad_new.status.success());
+    assert!(String::from_utf8_lossy(&bad_new.stderr).contains("control characters"));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &first]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &second]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}

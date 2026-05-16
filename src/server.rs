@@ -25,6 +25,7 @@ const ATTACH_RENDER_STATUS_FORMAT: &str =
     "#{session.name} #{window.list} pane #{pane.index} | #{status.help}";
 const ATTACH_RENDER_RESPONSE: &[u8] = b"OK\tRENDER_OUTPUT_META\n";
 const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(16);
+const RAW_ATTACH_RECONNECT_ALIAS_GRACE: Duration = Duration::from_millis(500);
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
@@ -35,9 +36,38 @@ type AttachEventClients = TrackedStreamClients;
 type AttachLifetimeStreams = TrackedStreamClients;
 type AttachRenderClients = TrackedStreamClients;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientType {
+    Raw,
+    Event,
+    Render,
+}
+
+impl ClientType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Event => "event",
+            Self::Render => "render",
+        }
+    }
+}
+
 struct TrackedStream {
     id: usize,
+    client_id: usize,
+    client_type: ClientType,
     stream: UnixStream,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientDescription {
+    id: usize,
+    session: String,
+    client_type: ClientType,
+    attached: bool,
+    width: u16,
+    height: u16,
 }
 
 struct StreamRegistration {
@@ -65,8 +95,11 @@ pub fn run(socket_path: PathBuf) -> io::Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     let state = Arc::new(ServerState {
         sessions: Mutex::new(HashMap::new()),
+        session_aliases: Mutex::new(HashMap::new()),
         buffers: Mutex::new(BufferStore::new()),
         socket_path,
+        next_session_created_id: AtomicUsize::new(1),
+        next_client_id: AtomicUsize::new(1),
     });
 
     for stream in listener.incoming() {
@@ -86,8 +119,11 @@ pub fn run(socket_path: PathBuf) -> io::Result<()> {
 
 struct ServerState {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    session_aliases: Mutex<HashMap<String, String>>,
     buffers: Mutex<BufferStore>,
     socket_path: PathBuf,
+    next_session_created_id: AtomicUsize,
+    next_client_id: AtomicUsize,
 }
 
 struct Buffer {
@@ -243,7 +279,8 @@ fn join_selected_lines(lines: &[&str]) -> String {
 }
 
 struct Session {
-    name: String,
+    name: Mutex<String>,
+    created_at: usize,
     windows: Mutex<WindowSet>,
     current_size: Mutex<PtySize>,
     next_pane_id: AtomicUsize,
@@ -263,11 +300,17 @@ struct Session {
 }
 
 impl Session {
-    fn new(name: String, pane: Arc<Pane>, attach_events: AttachEventClients) -> Self {
+    fn new(
+        name: String,
+        created_at: usize,
+        pane: Arc<Pane>,
+        attach_events: AttachEventClients,
+    ) -> Self {
         let next_pane_id = pane.id.as_usize() + 1;
         let current_size = *pane.size.lock().unwrap();
         Self {
-            name,
+            name: Mutex::new(name),
+            created_at,
             windows: Mutex::new(WindowSet::new(Window::new(
                 TabId::new(0),
                 "0".to_string(),
@@ -289,6 +332,14 @@ impl Session {
             next_attach_stream_id: AtomicUsize::new(0),
             next_attach_render_id: AtomicUsize::new(0),
         }
+    }
+
+    fn name(&self) -> String {
+        self.name.lock().unwrap().clone()
+    }
+
+    fn rename(&self, new_name: String) {
+        *self.name.lock().unwrap() = new_name;
     }
 
     fn next_pane_id(&self) -> PaneId {
@@ -414,8 +465,40 @@ impl Session {
         self.windows.lock().unwrap().zoom_pane(target)
     }
 
-    fn status_context(&self, name: &str) -> Option<StatusContext> {
-        self.windows.lock().unwrap().status_context(name)
+    fn status_context(&self) -> Option<StatusContext> {
+        let mut context = self.windows.lock().unwrap().status_context(&self.name())?;
+        let attached_count = self.attached_count();
+        context.session_attached_count = attached_count;
+        context.session_created_at = self.created_at;
+        Some(context)
+    }
+
+    fn window_count(&self) -> usize {
+        self.windows.lock().unwrap().window_count()
+    }
+
+    fn attached_count(&self) -> usize {
+        self.attach_streams.lock().unwrap().len()
+    }
+
+    fn client_descriptions(&self) -> Vec<ClientDescription> {
+        let size = *self.current_size.lock().unwrap();
+        let name = self.name();
+        let mut clients = Vec::new();
+        collect_client_descriptions(&mut clients, &self.attach_streams, &name, size);
+        clients.sort_by_key(|client| client.id);
+        clients
+    }
+
+    fn detach_client(&self, client_id: usize) -> bool {
+        detach_tracked_client(&self.attach_streams, client_id)
+    }
+
+    fn detach_all_clients(&self) -> usize {
+        let count = detach_all_tracked_clients(&self.attach_streams);
+        shutdown_tracked_clients(&self.attach_events);
+        shutdown_tracked_clients(&self.attach_render_clients);
+        count
     }
 
     fn attach_panes(&self) -> Vec<IndexedPane> {
@@ -486,25 +569,43 @@ impl Session {
         std::thread::spawn(move || run_attach_render_immediate_scheduler(session));
     }
 
-    fn register_attach_stream(&self, stream: &UnixStream) -> io::Result<StreamRegistration> {
-        register_tracked_stream(&self.attach_streams, &self.next_attach_stream_id, stream)
+    fn register_attach_stream(
+        &self,
+        stream: &UnixStream,
+        client_id: usize,
+    ) -> io::Result<StreamRegistration> {
+        register_tracked_stream(
+            &self.attach_streams,
+            &self.next_attach_stream_id,
+            stream,
+            client_id,
+            ClientType::Raw,
+        )
     }
 
     fn register_attach_event_stream(
         &self,
         stream: &UnixStream,
+        client_id: usize,
     ) -> io::Result<Option<StreamRegistration>> {
-        register_attach_event_client(&self.attach_events, &self.next_attach_event_id, stream)
+        register_attach_event_client(
+            &self.attach_events,
+            &self.next_attach_event_id,
+            stream,
+            client_id,
+        )
     }
 
     fn register_attach_render_stream(
         &self,
         stream: &UnixStream,
+        client_id: usize,
     ) -> io::Result<Option<StreamRegistration>> {
         register_attach_render_client(
             &self.attach_render_clients,
             &self.next_attach_render_id,
             stream,
+            client_id,
             self.attach_render_frame(),
         )
     }
@@ -1096,7 +1197,13 @@ impl WindowSet {
             pane_id: window.active_pane_id()?,
             pane_zoomed: window.active_pane_zoomed(),
             window_zoomed: window.is_zoomed(),
+            session_attached_count: 0,
+            session_created_at: 0,
         })
+    }
+
+    fn window_count(&self) -> usize {
+        self.windows.len()
     }
 
     fn kill_window(&mut self, target: Option<usize>) -> Result<(), String> {
@@ -1277,6 +1384,8 @@ struct RenderedCursor {
 
 struct StatusContext {
     session_name: String,
+    session_attached_count: usize,
+    session_created_at: usize,
     window_index: usize,
     window_id: TabId,
     window_name: String,
@@ -1389,7 +1498,13 @@ struct Pane {
 
 impl Pane {
     fn register_client(&self, stream: &UnixStream) -> io::Result<StreamRegistration> {
-        register_tracked_stream(&self.clients, &self.next_client_id, stream)
+        register_tracked_stream(
+            &self.clients,
+            &self.next_client_id,
+            stream,
+            self.next_client_id.load(Ordering::Relaxed),
+            ClientType::Raw,
+        )
     }
 
     fn set_session(&self, session: &Arc<Session>) {
@@ -1430,6 +1545,18 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
     match request {
         Request::New { session, command } => handle_new(&state, &mut stream, session, command),
         Request::List => handle_list(&state, &mut stream),
+        Request::ListSessions { format } => {
+            handle_list_sessions(&state, &mut stream, format.as_deref())
+        }
+        Request::RenameSession { old_name, new_name } => {
+            handle_rename_session(&state, &mut stream, &old_name, new_name)
+        }
+        Request::ListClients { session, format } => {
+            handle_list_clients(&state, &mut stream, session.as_deref(), format.as_deref())
+        }
+        Request::DetachClient { session, client_id } => {
+            handle_detach_client(&state, &mut stream, session.as_deref(), client_id)
+        }
         Request::Capture { session, mode } => handle_capture(&state, &mut stream, &session, mode),
         Request::SaveBuffer {
             session,
@@ -1575,8 +1702,11 @@ fn handle_new(
     name: String,
     command: Vec<String>,
 ) -> io::Result<()> {
-    let mut sessions = state.sessions.lock().unwrap();
-    if sessions.contains_key(&name) {
+    if let Err(message) = validate_session_name(&name) {
+        write_err(stream, &message)?;
+        return Ok(());
+    }
+    if session_name_exists(state, &name) {
         write_err(
             stream,
             &format!("session already exists; use dmux attach -t {name}"),
@@ -1595,9 +1725,22 @@ fn handle_new(
         Arc::clone(&attach_events),
         None,
     )?;
-    let session = Arc::new(Session::new(name.clone(), Arc::clone(&pane), attach_events));
+    let created_at = state.next_session_created_id.fetch_add(1, Ordering::SeqCst);
+    let session = Arc::new(Session::new(
+        name.clone(),
+        created_at,
+        Arc::clone(&pane),
+        attach_events,
+    ));
     pane.set_session(&session);
-    sessions.insert(name, session);
+    if !insert_session_if_name_available(state, &name, session) {
+        terminate_pane_async(pane.child_pid);
+        write_err(
+            stream,
+            &format!("session already exists; use dmux attach -t {name}"),
+        )?;
+        return Ok(());
+    }
     write_ok(stream)
 }
 
@@ -1653,16 +1796,320 @@ fn handle_list(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::Result<
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionDescription {
+    name: String,
+    windows: usize,
+    attached_count: usize,
+    created_at: usize,
+}
+
+fn session_descriptions(state: &Arc<ServerState>) -> Vec<SessionDescription> {
+    let mut sessions = state
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .map(|session| SessionDescription {
+            name: session.name(),
+            windows: session.window_count(),
+            attached_count: session.attached_count(),
+            created_at: session.created_at,
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| left.name.cmp(&right.name));
+    sessions
+}
+
+fn handle_list_sessions(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    format: Option<&str>,
+) -> io::Result<()> {
+    match format {
+        Some(format) => {
+            write_ok(stream)?;
+            for session in session_descriptions(state) {
+                writeln!(stream, "{}", format_session_line(format, &session))?;
+            }
+            Ok(())
+        }
+        None => handle_list(state, stream),
+    }
+}
+
+fn format_session_line(format: &str, session: &SessionDescription) -> String {
+    let windows = session.windows.to_string();
+    let attached_count = session.attached_count.to_string();
+    let attached = if session.attached_count > 0 { "1" } else { "0" };
+    let created_at = session.created_at.to_string();
+    let replacements = [
+        ("#{session.name}", session.name.as_str()),
+        ("#{session.windows}", windows.as_str()),
+        ("#{session.window_count}", windows.as_str()),
+        ("#{session.attached}", attached),
+        ("#{session.attached_count}", attached_count.as_str()),
+        ("#{session.created_at}", created_at.as_str()),
+        ("#{client.count}", attached_count.as_str()),
+    ];
+    apply_replacements(format, &replacements)
+}
+
+fn validate_session_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("session name cannot be empty".to_string());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("session name cannot contain control characters".to_string());
+    }
+    Ok(())
+}
+
+fn session_name_exists(state: &Arc<ServerState>, name: &str) -> bool {
+    let alias_exists = state.session_aliases.lock().unwrap().contains_key(name);
+    alias_exists || state.sessions.lock().unwrap().contains_key(name)
+}
+
+fn insert_session_if_name_available(
+    state: &Arc<ServerState>,
+    name: &str,
+    session: Arc<Session>,
+) -> bool {
+    let aliases = state.session_aliases.lock().unwrap();
+    let mut sessions = state.sessions.lock().unwrap();
+    if aliases.contains_key(name) || sessions.contains_key(name) {
+        return false;
+    }
+    sessions.insert(name.to_string(), session);
+    true
+}
+
+fn resolve_session(state: &Arc<ServerState>, name: &str) -> Option<Arc<Session>> {
+    let canonical_name = state.session_aliases.lock().unwrap().get(name).cloned();
+    let sessions = state.sessions.lock().unwrap();
+    sessions
+        .get(name)
+        .or_else(|| {
+            canonical_name
+                .as_ref()
+                .and_then(|alias| sessions.get(alias))
+        })
+        .cloned()
+}
+
+fn remove_session(state: &Arc<ServerState>, name: &str) -> Option<Arc<Session>> {
+    let alias_target = state.session_aliases.lock().unwrap().get(name).cloned();
+    let canonical_name = if state.sessions.lock().unwrap().contains_key(name) {
+        name.to_string()
+    } else {
+        alias_target?
+    };
+    let session = state.sessions.lock().unwrap().remove(&canonical_name);
+    state
+        .session_aliases
+        .lock()
+        .unwrap()
+        .retain(|alias, target| {
+            alias != name && alias != &canonical_name && target != &canonical_name
+        });
+    session
+}
+
+fn cleanup_rename_aliases_if_detached(state: &Arc<ServerState>, session: &Session) {
+    if session.attached_count() > 0 {
+        return;
+    }
+
+    let canonical_name = session.name();
+    state
+        .session_aliases
+        .lock()
+        .unwrap()
+        .retain(|_, target| target != &canonical_name);
+}
+
+fn schedule_rename_alias_cleanup_if_detached(state: &Arc<ServerState>, session: &Arc<Session>) {
+    let state = Arc::clone(state);
+    let session = Arc::clone(session);
+    std::thread::spawn(move || {
+        std::thread::sleep(RAW_ATTACH_RECONNECT_ALIAS_GRACE);
+        cleanup_rename_aliases_if_detached(&state, &session);
+    });
+}
+
+fn handle_rename_session(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    old_name: &str,
+    new_name: String,
+) -> io::Result<()> {
+    if let Err(message) = validate_session_name(&new_name) {
+        write_err(stream, &message)?;
+        return Ok(());
+    }
+    let session = {
+        let mut aliases = state.session_aliases.lock().unwrap();
+        let mut sessions = state.sessions.lock().unwrap();
+        if !sessions.contains_key(old_name) {
+            write_err(stream, "missing session")?;
+            return Ok(());
+        }
+        if aliases.contains_key(&new_name) || sessions.contains_key(&new_name) {
+            write_err(stream, "session name already exists")?;
+            return Ok(());
+        }
+        let session = sessions.remove(old_name).expect("checked session exists");
+        session.rename(new_name.clone());
+        for target in aliases.values_mut() {
+            if target == old_name {
+                *target = session.name();
+            }
+        }
+        aliases.remove(old_name);
+        if session.attached_count() > 0 {
+            aliases.insert(old_name.to_string(), session.name());
+        }
+        sessions.insert(new_name, Arc::clone(&session));
+        session
+    };
+    session.notify_attach_redraw_immediate();
+    write_ok(stream)
+}
+
+fn client_descriptions(
+    state: &Arc<ServerState>,
+    session_name: Option<&str>,
+) -> Result<Vec<ClientDescription>, String> {
+    let mut clients = Vec::new();
+    match session_name {
+        Some(name) => {
+            let Some(session) = resolve_session(state, name) else {
+                return Err("missing session".to_string());
+            };
+            clients.extend(session.client_descriptions());
+        }
+        None => {
+            let sessions = state.sessions.lock().unwrap();
+            for session in sessions.values() {
+                clients.extend(session.client_descriptions());
+            }
+        }
+    }
+    clients.sort_by_key(|client| client.id);
+    Ok(clients)
+}
+
+fn handle_list_clients(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    session_name: Option<&str>,
+    format: Option<&str>,
+) -> io::Result<()> {
+    let clients = match client_descriptions(state, session_name) {
+        Ok(clients) => clients,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    let format = format.unwrap_or("#{client.id}\t#{client.session}\t#{client.type}\t#{client.attached}\t#{client.width}x#{client.height}");
+    write_ok(stream)?;
+    for client in clients {
+        writeln!(stream, "{}", format_client_line(format, &client))?;
+    }
+    Ok(())
+}
+
+fn format_client_line(format: &str, client: &ClientDescription) -> String {
+    let id = client.id.to_string();
+    let attached = if client.attached { "1" } else { "0" };
+    let width = client.width.to_string();
+    let height = client.height.to_string();
+    let replacements = [
+        ("#{client.id}", id.as_str()),
+        ("#{client.session}", client.session.as_str()),
+        ("#{client.type}", client.client_type.as_str()),
+        ("#{client.attached}", attached),
+        ("#{client.width}", width.as_str()),
+        ("#{client.height}", height.as_str()),
+    ];
+    apply_replacements(format, &replacements)
+}
+
+fn handle_detach_client(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    session_name: Option<&str>,
+    client_id: Option<usize>,
+) -> io::Result<()> {
+    if session_name.is_none() && client_id.is_none() {
+        write_err(
+            stream,
+            "detach-client requires -t <session> or -c <client-id>",
+        )?;
+        return Ok(());
+    }
+    let (detached, cleanup_session) = match (session_name, client_id) {
+        (Some(name), Some(id)) => {
+            let Some(session) = resolve_session(state, name) else {
+                write_err(stream, "missing session")?;
+                return Ok(());
+            };
+            (usize::from(session.detach_client(id)), Some(session))
+        }
+        (Some(name), None) => {
+            let Some(session) = resolve_session(state, name) else {
+                write_err(stream, "missing session")?;
+                return Ok(());
+            };
+            (session.detach_all_clients(), Some(session))
+        }
+        (None, Some(id)) => {
+            let matches = state
+                .sessions
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|session| {
+                    session
+                        .client_descriptions()
+                        .iter()
+                        .any(|client| client.id == id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if matches.len() > 1 {
+                write_err(stream, "ambiguous client id")?;
+                return Ok(());
+            }
+            let Some(session) = matches.first() else {
+                write_err(stream, "missing client")?;
+                return Ok(());
+            };
+            (
+                usize::from(session.detach_client(id)),
+                Some(Arc::clone(session)),
+            )
+        }
+        (None, None) => (0, None),
+    };
+    if detached == 0 {
+        write_err(stream, "missing client")?;
+        return Ok(());
+    }
+    if let Some(session) = cleanup_session {
+        cleanup_rename_aliases_if_detached(state, &session);
+    }
+    write_ok(stream)
+}
+
 fn handle_capture(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     name: &str,
     mode: CaptureMode,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -1695,10 +2142,7 @@ fn handle_save_buffer(
     mode: CaptureMode,
     selection: &BufferSelection,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -1736,7 +2180,7 @@ fn handle_save_buffer_text(
     buffer: Option<&str>,
     text: String,
 ) -> io::Result<()> {
-    let session_exists = state.sessions.lock().unwrap().contains_key(name);
+    let session_exists = resolve_session(state, name).is_some();
     if !session_exists {
         write_err(stream, "missing session")?;
         return Ok(());
@@ -1775,10 +2219,7 @@ fn handle_copy_mode(
     mode: CaptureMode,
     search: Option<&str>,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -1801,10 +2242,7 @@ fn handle_paste_buffer(
     name: &str,
     buffer: Option<&str>,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -1856,10 +2294,7 @@ fn handle_resize(
             return Ok(());
         }
     };
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -1881,10 +2316,7 @@ fn handle_resize_pane(
     direction: PaneResizeDirection,
     amount: usize,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -1913,10 +2345,7 @@ fn handle_send(
     name: &str,
     bytes: &[u8],
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -1938,10 +2367,7 @@ fn handle_split(
     direction: SplitDirection,
     command: Vec<String>,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -1955,7 +2381,7 @@ fn handle_split(
     let cwd = std::env::current_dir()?;
     let pane = spawn_pane(
         session.next_pane_id(),
-        name.to_string(),
+        session.name(),
         command,
         cwd,
         size,
@@ -1982,10 +2408,7 @@ fn handle_list_panes(
     name: &str,
     _format: Option<&str>,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2020,10 +2443,7 @@ fn handle_zoom_pane(
     name: &str,
     pane: Option<usize>,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2074,15 +2494,19 @@ fn handle_display_message(
 }
 
 fn status_context(state: &Arc<ServerState>, name: &str) -> Option<StatusContext> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    }?;
+    let session = resolve_session(state, name)?;
 
-    session.status_context(name)
+    session.status_context()
 }
 
 fn format_status_line(format: &str, context: &StatusContext) -> String {
+    let session_attached_count = context.session_attached_count.to_string();
+    let session_attached = if context.session_attached_count > 0 {
+        "1"
+    } else {
+        "0"
+    };
+    let session_created_at = context.session_created_at.to_string();
     let window_index = context.window_index.to_string();
     let window_id = context.window_id.as_usize().to_string();
     let window_count = context.window_count.to_string();
@@ -2093,6 +2517,10 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
     let window_zoomed = if context.window_zoomed { "1" } else { "0" };
     let replacements = [
         ("#{session.name}", context.session_name.as_str()),
+        ("#{session.attached}", session_attached),
+        ("#{session.attached_count}", session_attached_count.as_str()),
+        ("#{session.created_at}", session_created_at.as_str()),
+        ("#{client.count}", session_attached_count.as_str()),
         ("#{window.id}", window_id.as_str()),
         ("#{window.index}", window_index.as_str()),
         ("#{window.name}", context.window_name.as_str()),
@@ -2157,10 +2585,7 @@ fn handle_select_pane(
     name: &str,
     target: PaneSelectTarget,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2183,10 +2608,7 @@ fn handle_kill_pane(
     name: &str,
     pane: Option<usize>,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2217,10 +2639,7 @@ fn handle_new_window(
     name: &str,
     command: Vec<String>,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2234,7 +2653,7 @@ fn handle_new_window(
     let cwd = std::env::current_dir()?;
     let pane = spawn_pane(
         session.next_pane_id(),
-        name.to_string(),
+        session.name(),
         command,
         cwd,
         size,
@@ -2255,10 +2674,7 @@ fn handle_list_windows(
     name: &str,
     format: Option<&str>,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2301,10 +2717,7 @@ fn handle_select_window(
     name: &str,
     target: WindowTarget,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2333,10 +2746,7 @@ fn handle_rename_window(
     target: WindowTarget,
     new_name: String,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2364,10 +2774,7 @@ fn handle_cycle_window(
     name: &str,
     cycle: WindowCycle,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2399,10 +2806,7 @@ fn handle_kill_window(
     name: &str,
     window: Option<usize>,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2425,7 +2829,7 @@ fn handle_kill_window(
 }
 
 fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {
-    let session = state.sessions.lock().unwrap().remove(name);
+    let session = remove_session(state, name);
     let Some(session) = session else {
         write_err(stream, "missing session")?;
         return Ok(());
@@ -2460,10 +2864,7 @@ fn handle_kill_server(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::
 }
 
 fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(&mut stream, "missing session")?;
@@ -2474,29 +2875,37 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
         return Ok(());
     };
 
-    let _attach_registration = session.register_attach_stream(&stream)?;
-    if has_attach_pane_snapshot(&session) {
+    let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
+    let raw_layout_epoch = session.raw_attach_layout_epoch();
+    let _attach_registration = session.register_attach_stream(&stream, client_id)?;
+    let result = if has_attach_pane_snapshot(&session) {
         write_attach_snapshot_ok(&mut stream)?;
-        return forward_multi_pane_attach_input(&session, &mut stream);
-    }
-
-    write_attach_live_ok(&mut stream, session.raw_attach_layout_epoch())?;
-    {
-        let history = pane.raw_history.lock().unwrap();
-        stream.write_all(&history)?;
-    }
-    let _pane_client_registration = pane.register_client(&stream)?;
-
-    let mut buf = [0_u8; 8192];
-    loop {
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            break;
+        forward_multi_pane_attach_input(&session, &mut stream)
+    } else {
+        write_attach_live_ok(&mut stream, session.raw_attach_layout_epoch())?;
+        {
+            let history = pane.raw_history.lock().unwrap();
+            stream.write_all(&history)?;
         }
-        pane.writer.lock().unwrap().write_all(&buf[..n])?;
-    }
+        let _pane_client_registration = pane.register_client(&stream)?;
 
-    Ok(())
+        let mut buf = [0_u8; 8192];
+        loop {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            pane.writer.lock().unwrap().write_all(&buf[..n])?;
+        }
+        Ok(())
+    };
+    drop(_attach_registration);
+    if session.raw_attach_layout_epoch() == raw_layout_epoch {
+        cleanup_rename_aliases_if_detached(state, &session);
+    } else {
+        schedule_rename_alias_cleanup_if_detached(state, &session);
+    }
+    result
 }
 
 fn handle_attach_raw_state(
@@ -2504,10 +2913,7 @@ fn handle_attach_raw_state(
     stream: &mut UnixStream,
     name: &str,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2559,10 +2965,7 @@ fn handle_attach_snapshot(
     stream: &mut UnixStream,
     name: &str,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2581,10 +2984,7 @@ fn handle_attach_layout_snapshot(
     stream: &mut UnixStream,
     name: &str,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2603,10 +3003,7 @@ fn handle_attach_layout_frame(
     stream: &mut UnixStream,
     name: &str,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2625,10 +3022,7 @@ fn handle_attach_events(
     stream: &mut UnixStream,
     name: &str,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2636,7 +3030,8 @@ fn handle_attach_events(
     };
 
     write_ok(stream)?;
-    let Some(_registration) = session.register_attach_event_stream(stream)? else {
+    let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
+    let Some(_registration) = session.register_attach_event_stream(stream, client_id)? else {
         return Ok(());
     };
     wait_for_attach_event_client_close(stream);
@@ -2648,10 +3043,7 @@ fn handle_attach_render(
     stream: &mut UnixStream,
     name: &str,
 ) -> io::Result<()> {
-    let session = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.get(name).cloned()
-    };
+    let session = resolve_session(state, name);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2659,7 +3051,8 @@ fn handle_attach_render(
     };
 
     stream.write_all(ATTACH_RENDER_RESPONSE)?;
-    let Some(_registration) = session.register_attach_render_stream(stream)? else {
+    let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
+    let Some(_registration) = session.register_attach_render_stream(stream, client_id)? else {
         return Ok(());
     };
     wait_for_attach_event_client_close(stream);
@@ -2789,7 +3182,7 @@ fn format_attach_layout_snapshot_body(snapshot: &RenderedAttachSnapshot) -> Vec<
 }
 
 fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
-    let context = session.status_context(&session.name)?;
+    let context = session.status_context()?;
     let status = format_status_line(ATTACH_RENDER_STATUS_FORMAT, &context);
     let header_rows = usize::from(!status.is_empty());
     let snapshot_rows = session
@@ -3708,14 +4101,65 @@ fn shutdown_tracked_clients(clients: &TrackedStreamClients) {
     }
 }
 
+fn detach_all_tracked_clients(clients: &TrackedStreamClients) -> usize {
+    let mut clients = clients.lock().unwrap();
+    let count = clients.len();
+    for client in clients.drain(..) {
+        let _ = client.stream.shutdown(std::net::Shutdown::Both);
+    }
+    count
+}
+
+fn detach_tracked_client(clients: &TrackedStreamClients, client_id: usize) -> bool {
+    let mut clients = clients.lock().unwrap();
+    let Some(index) = clients
+        .iter()
+        .position(|client| client.client_id == client_id)
+    else {
+        return false;
+    };
+    let client = clients.remove(index);
+    let _ = client.stream.shutdown(std::net::Shutdown::Both);
+    true
+}
+
+fn collect_client_descriptions(
+    output: &mut Vec<ClientDescription>,
+    clients: &TrackedStreamClients,
+    session: &str,
+    size: PtySize,
+) {
+    output.extend(
+        clients
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|client| ClientDescription {
+                id: client.client_id,
+                session: session.to_string(),
+                client_type: client.client_type,
+                attached: true,
+                width: size.cols,
+                height: size.rows,
+            }),
+    );
+}
+
 fn register_tracked_stream(
     clients: &TrackedStreamClients,
     next_id: &AtomicUsize,
     stream: &UnixStream,
+    client_id: usize,
+    client_type: ClientType,
 ) -> io::Result<StreamRegistration> {
     let stream = stream.try_clone()?;
     let id = next_id.fetch_add(1, Ordering::Relaxed);
-    clients.lock().unwrap().push(TrackedStream { id, stream });
+    clients.lock().unwrap().push(TrackedStream {
+        id,
+        client_id,
+        client_type,
+        stream,
+    });
     Ok(StreamRegistration {
         clients: Arc::clone(clients),
         id,
@@ -3726,6 +4170,7 @@ fn register_attach_event_client(
     clients: &AttachEventClients,
     next_id: &AtomicUsize,
     stream: &UnixStream,
+    client_id: usize,
 ) -> io::Result<Option<StreamRegistration>> {
     let mut client = stream.try_clone()?;
     client.set_nonblocking(true)?;
@@ -3734,10 +4179,12 @@ fn register_attach_event_client(
     }
 
     let id = next_id.fetch_add(1, Ordering::Relaxed);
-    clients
-        .lock()
-        .unwrap()
-        .push(TrackedStream { id, stream: client });
+    clients.lock().unwrap().push(TrackedStream {
+        id,
+        client_id,
+        client_type: ClientType::Event,
+        stream: client,
+    });
     Ok(Some(StreamRegistration {
         clients: Arc::clone(clients),
         id,
@@ -3748,6 +4195,7 @@ fn register_attach_render_client(
     clients: &AttachRenderClients,
     next_id: &AtomicUsize,
     stream: &UnixStream,
+    client_id: usize,
     frame: Option<Vec<u8>>,
 ) -> io::Result<Option<StreamRegistration>> {
     let Some(frame) = frame else {
@@ -3762,10 +4210,12 @@ fn register_attach_render_client(
     }
 
     let id = next_id.fetch_add(1, Ordering::Relaxed);
-    clients
-        .lock()
-        .unwrap()
-        .push(TrackedStream { id, stream: client });
+    clients.lock().unwrap().push(TrackedStream {
+        id,
+        client_id,
+        client_type: ClientType::Render,
+        stream: client,
+    });
     Ok(Some(StreamRegistration {
         clients: Arc::clone(clients),
         id,
@@ -3879,7 +4329,57 @@ mod tests {
     }
 
     fn tracked_stream(id: usize, stream: UnixStream) -> TrackedStream {
-        TrackedStream { id, stream }
+        TrackedStream {
+            id,
+            client_id: id,
+            client_type: ClientType::Event,
+            stream,
+        }
+    }
+
+    #[test]
+    fn validates_session_names_for_rename() {
+        assert_eq!(
+            validate_session_name(""),
+            Err("session name cannot be empty".to_string())
+        );
+        assert_eq!(
+            validate_session_name("bad\u{1}name"),
+            Err("session name cannot contain control characters".to_string())
+        );
+        assert!(validate_session_name("good").is_ok());
+    }
+
+    #[test]
+    fn formats_session_and_client_lifecycle_tokens() {
+        let session = SessionDescription {
+            name: "dev".to_string(),
+            windows: 2,
+            attached_count: 3,
+            created_at: 7,
+        };
+        assert_eq!(
+            format_session_line(
+                "#{session.name} #{session.window_count} #{session.attached} #{client.count} #{session.created_at}",
+                &session,
+            ),
+            "dev 2 1 3 7"
+        );
+        let client = ClientDescription {
+            id: 9,
+            session: "dev".to_string(),
+            client_type: ClientType::Raw,
+            attached: true,
+            width: 80,
+            height: 24,
+        };
+        assert_eq!(
+            format_client_line(
+                "#{client.id} #{client.session} #{client.type} #{client.attached} #{client.width}x#{client.height}",
+                &client
+            ),
+            "9 dev raw 1 80x24"
+        );
     }
 
     #[test]
@@ -3938,12 +4438,13 @@ mod tests {
         let (pane, writer_path) = test_pane();
         let session = Arc::new(Session::new(
             "test".to_string(),
+            1,
             Arc::clone(&pane),
             Arc::new(Mutex::new(Vec::new())),
         ));
         let (server, mut client) = UnixStream::pair().unwrap();
         let _registration = session
-            .register_attach_render_stream(&server)
+            .register_attach_render_stream(&server, 1)
             .unwrap()
             .unwrap();
         let _initial = read_attach_render_frame_body(&mut client);
@@ -3964,12 +4465,13 @@ mod tests {
         let (pane, writer_path) = test_pane();
         let session = Arc::new(Session::new(
             "test".to_string(),
+            1,
             Arc::clone(&pane),
             Arc::new(Mutex::new(Vec::new())),
         ));
         let (server, mut client) = UnixStream::pair().unwrap();
         let _registration = session
-            .register_attach_render_stream(&server)
+            .register_attach_render_stream(&server, 1)
             .unwrap()
             .unwrap();
         let _initial = read_attach_render_frame_body(&mut client);
@@ -3997,12 +4499,13 @@ mod tests {
         let (pane, writer_path) = test_pane();
         let session = Arc::new(Session::new(
             "test".to_string(),
+            1,
             Arc::clone(&pane),
             Arc::new(Mutex::new(Vec::new())),
         ));
         let (server, mut client) = UnixStream::pair().unwrap();
         let _registration = session
-            .register_attach_render_stream(&server)
+            .register_attach_render_stream(&server, 1)
             .unwrap()
             .unwrap();
         let _initial = read_attach_render_frame_body(&mut client);
@@ -4030,12 +4533,13 @@ mod tests {
         let (pane, writer_path) = test_pane();
         let session = Arc::new(Session::new(
             "test".to_string(),
+            1,
             Arc::clone(&pane),
             Arc::new(Mutex::new(Vec::new())),
         ));
         let (server, mut client) = UnixStream::pair().unwrap();
         let _registration = session
-            .register_attach_render_stream(&server)
+            .register_attach_render_stream(&server, 1)
             .unwrap()
             .unwrap();
         let _initial = read_attach_render_frame_body(&mut client);
@@ -4060,6 +4564,7 @@ mod tests {
         let (pane, writer_path) = test_pane();
         let session = Arc::new(Session::new(
             "test".to_string(),
+            1,
             Arc::clone(&pane),
             Arc::new(Mutex::new(Vec::new())),
         ));
@@ -4134,7 +4639,7 @@ mod tests {
         let next_id = AtomicUsize::new(0);
         let (server, _client) = UnixStream::pair().unwrap();
 
-        let _registration = register_attach_event_client(&events, &next_id, &server)
+        let _registration = register_attach_event_client(&events, &next_id, &server, 1)
             .unwrap()
             .unwrap();
 
@@ -4150,7 +4655,7 @@ mod tests {
         let next_id = AtomicUsize::new(0);
         let (server, mut client) = UnixStream::pair().unwrap();
 
-        let _registration = register_attach_event_client(&events, &next_id, &server)
+        let _registration = register_attach_event_client(&events, &next_id, &server, 1)
             .unwrap()
             .unwrap();
 
@@ -4183,13 +4688,17 @@ mod tests {
         });
         let session = Arc::new(Session::new(
             "test".to_string(),
+            1,
             Arc::clone(&pane),
             Arc::clone(&attach_events),
         ));
         let state = Arc::new(ServerState {
             sessions: Mutex::new(HashMap::from([("test".to_string(), session)])),
+            session_aliases: Mutex::new(HashMap::new()),
             buffers: Mutex::new(BufferStore::new()),
             socket_path: writer_path.with_extension("sock"),
+            next_session_created_id: AtomicUsize::new(1),
+            next_client_id: AtomicUsize::new(1),
         });
         let (mut server, mut client) = UnixStream::pair().unwrap();
         let handle =
@@ -4227,13 +4736,17 @@ mod tests {
         });
         let session = Arc::new(Session::new(
             "test".to_string(),
+            1,
             Arc::clone(&pane),
             attach_events,
         ));
         let state = Arc::new(ServerState {
             sessions: Mutex::new(HashMap::from([("test".to_string(), Arc::clone(&session))])),
+            session_aliases: Mutex::new(HashMap::new()),
             buffers: Mutex::new(BufferStore::new()),
             socket_path: writer_path.with_extension("sock"),
+            next_session_created_id: AtomicUsize::new(1),
+            next_client_id: AtomicUsize::new(1),
         });
         let (server, mut client) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || handle_attach(&state, server, "test").unwrap());
