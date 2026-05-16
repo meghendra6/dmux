@@ -1,5 +1,5 @@
 use crate::ids::{PaneId, TabId};
-use crate::layout::LayoutNode;
+use crate::layout::{LayoutNode, PaneRegion, layout_regions_for_size, split_extent};
 use crate::protocol::{self, BufferSelection, CaptureMode, Request, SplitDirection};
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::{TerminalChanges, TerminalState};
@@ -1016,15 +1016,6 @@ struct RenderedCursor {
     row: usize,
     col: usize,
     visible: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PaneRegion {
-    pane: usize,
-    row_start: usize,
-    row_end: usize,
-    col_start: usize,
-    col_end: usize,
 }
 
 struct StatusContext {
@@ -2998,100 +2989,6 @@ fn offset_regions(
         region.col_end += col_offset;
     }
     regions
-}
-
-fn layout_regions_for_size(layout: &LayoutNode, size: PtySize) -> Vec<PaneRegion> {
-    let mut regions = Vec::new();
-    collect_sized_layout_regions(
-        layout,
-        0,
-        size.rows as usize,
-        0,
-        size.cols as usize,
-        &mut regions,
-    );
-    regions
-}
-
-fn collect_sized_layout_regions(
-    layout: &LayoutNode,
-    row_start: usize,
-    row_end: usize,
-    col_start: usize,
-    col_end: usize,
-    regions: &mut Vec<PaneRegion>,
-) {
-    match layout {
-        LayoutNode::Pane(index) => regions.push(PaneRegion {
-            pane: *index,
-            row_start,
-            row_end,
-            col_start,
-            col_end,
-        }),
-        LayoutNode::Split {
-            direction: SplitDirection::Horizontal,
-            first,
-            second,
-        } => {
-            let ((first_start, first_end), (second_start, second_end)) =
-                split_extent(col_start, col_end, 3);
-            collect_sized_layout_regions(
-                first,
-                row_start,
-                row_end,
-                first_start,
-                first_end,
-                regions,
-            );
-            collect_sized_layout_regions(
-                second,
-                row_start,
-                row_end,
-                second_start,
-                second_end,
-                regions,
-            );
-        }
-        LayoutNode::Split {
-            direction: SplitDirection::Vertical,
-            first,
-            second,
-        } => {
-            let ((first_start, first_end), (second_start, second_end)) =
-                split_extent(row_start, row_end, 1);
-            collect_sized_layout_regions(
-                first,
-                first_start,
-                first_end,
-                col_start,
-                col_end,
-                regions,
-            );
-            collect_sized_layout_regions(
-                second,
-                second_start,
-                second_end,
-                col_start,
-                col_end,
-                regions,
-            );
-        }
-    }
-}
-
-fn split_extent(start: usize, end: usize, separator: usize) -> ((usize, usize), (usize, usize)) {
-    let total = end.saturating_sub(start);
-    if total <= 1 {
-        return ((start, start), (start, end));
-    }
-
-    let gap = if total >= separator + 2 { separator } else { 0 };
-    let content = total - gap;
-    let first = content / 2;
-    let second = content - first;
-
-    ((start, start + first), (end - second, end))
 }
 
 fn resize_panes(pane_resizes: Vec<(Arc<Pane>, PtySize)>) -> io::Result<bool> {
