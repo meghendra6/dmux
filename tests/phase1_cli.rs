@@ -1765,6 +1765,10 @@ fn live_snapshot_attach_repaints_pane_output_without_repeating_full_clear() {
         !pushed_redraw_output.contains("\x1b[2J"),
         "pushed redraw repeated a full-screen clear:\n{pushed_redraw_output:?}"
     );
+    assert!(
+        !pushed_redraw_output.contains(&session),
+        "pushed redraw repeated the unchanged status line:\n{pushed_redraw_output:?}"
+    );
 }
 
 #[test]
@@ -1933,6 +1937,42 @@ fn live_snapshot_frame_output_fits_attach_pty_rows() {
         rendered_rows <= 24,
         "snapshot frame rendered {rendered_rows} rows in a 24-row PTY:\n{frame:?}"
     );
+
+    child.write_all(b"\x02d");
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn live_snapshot_attach_repaints_after_resize_with_render_diff_cache() {
+    let socket = unique_socket("live-snapshot-diff-cache-resize");
+    let session = format!("live-snapshot-diff-cache-resize-{}", std::process::id());
+
+    let mut child = spawn_pty_attached_dmux_with_env(
+        &socket,
+        &["new", "-s", &session],
+        80,
+        24,
+        &[&session, "C-b ? help"],
+        &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
+    );
+
+    child.write_all(b"\x02%");
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+    child.wait_for_stdout_contains_all(&["│"], "split redraw before resize");
+    child.wait_for_stdout_idle(Duration::from_millis(250), "settle split redraw");
+    child.clear_stdout();
+
+    child.resize(100, 30);
+    child.wait_for_stdout_contains_all(&[&session, "│"], "resize redraw with diff cache");
+
+    child.clear_stdout();
+    child.write_all(b"printf after-resize\\n\r");
+    let captured = poll_capture_eventually(&socket, &session, "after-resize");
+    assert!(captured.contains("after-resize"), "{captured:?}");
+    child.wait_for_stdout_contains_all(&["after-resize"], "post-resize pane output");
 
     child.write_all(b"\x02d");
     assert_success(&wait_for_child_exit(child));
