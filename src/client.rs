@@ -2145,7 +2145,6 @@ where
     let mut buf = [0_u8; 1024];
     let mut input_state = RawAttachInputState::default();
     let mut initial_input = Some(initial_input);
-    let _nonblocking_stdin = NonBlockingFdGuard::enable(STDIN_FILENO)?;
 
     loop {
         tick()?;
@@ -2161,7 +2160,11 @@ where
         let actions = if let Some(input) = initial_input.take() {
             translate_attach_input_with_state(&input, &mut input_state)
         } else {
-            let n = match io::stdin().read(&mut buf) {
+            let read_result = {
+                let _nonblocking_stdin = NonBlockingFdGuard::enable(STDIN_FILENO)?;
+                io::stdin().read(&mut buf)
+            };
+            let n = match read_result {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,

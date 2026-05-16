@@ -3497,6 +3497,75 @@ fn raw_attach_reconnects_when_external_split_creates_first_layout() {
 }
 
 #[test]
+fn raw_attach_copy_mode_waits_for_later_input() {
+    let socket = unique_socket("raw-attach-copy-mode-later-input");
+    let session = format!("raw-attach-copy-mode-later-input-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf raw-copy-later; printf '\\n'; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "raw-copy-later");
+    assert!(base.contains("raw-copy-later"), "{base:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["raw-copy-later"]);
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02[").expect("write copy-mode entry");
+        stdin.flush().expect("flush copy-mode entry");
+    }
+
+    child.wait_for_stdout_contains_all(&["-- copy mode --"], "raw attach copy-mode entry");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"y").expect("write delayed copy key");
+        stdin.flush().expect("flush delayed copy key");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut listed = String::new();
+    while std::time::Instant::now() < deadline {
+        let output = dmux(&socket, &["list-buffers"]);
+        assert_success(&output);
+        listed = String::from_utf8_lossy(&output.stdout).to_string();
+        if listed
+            .lines()
+            .any(|line| line.ends_with("\t15\traw-copy-later"))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.ends_with("\t15\traw-copy-later")),
+        "{listed:?}"
+    );
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_prefix_l_uses_regions_from_external_split_render_frame() {
     let socket = unique_socket("attach-prefix-external-split-focus");
     let session = format!("attach-prefix-external-split-focus-{}", std::process::id());
