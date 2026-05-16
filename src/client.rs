@@ -676,7 +676,7 @@ fn diff_live_render_output(
 ) -> Vec<u8> {
     let Some(parsed) = parse_live_render_output(&frame.output) else {
         reset_live_render_output_state(state);
-        return frame.output.clone();
+        return full_live_render_output(&frame.output);
     };
     let geometry = LiveRenderOutputGeometry {
         header_rows: frame.header_rows,
@@ -685,7 +685,7 @@ fn diff_live_render_output(
 
     let Some(previous_rows) = state.rows.as_ref() else {
         store_live_render_output_state(state, geometry, parsed);
-        return frame.output.clone();
+        return full_live_render_output(&frame.output);
     };
     if previous_rows.len() != parsed.rows.len()
         || state
@@ -694,7 +694,7 @@ fn diff_live_render_output(
             .is_none_or(|stored| stored != &geometry)
     {
         store_live_render_output_state(state, geometry, parsed);
-        return frame.output.clone();
+        return full_live_render_output(&frame.output);
     }
 
     let mut output = Vec::new();
@@ -715,6 +715,13 @@ fn diff_live_render_output(
     }
     store_live_render_output_state(state, geometry, parsed);
     output
+}
+
+fn full_live_render_output(output: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(RESET_STYLE.len() + output.len());
+    framed.extend_from_slice(RESET_STYLE);
+    framed.extend_from_slice(output);
+    framed
 }
 
 fn store_live_render_output_state(
@@ -3396,7 +3403,7 @@ mod tests {
 
         let output = diff_live_render_output(&render_frame(frame), &mut state);
 
-        assert_eq!(output, frame);
+        assert_eq!(output, b"\x1b[0m\x1b[H\x1b[2Kstatus\r\n\x1b[2Kold\x1b[2;4H");
     }
 
     #[test]
@@ -3449,7 +3456,7 @@ mod tests {
         reset_live_render_output_state(&mut state);
         let output = diff_live_render_output(&render_frame(second), &mut state);
 
-        assert_eq!(output, second);
+        assert_eq!(output, b"\x1b[0m\x1b[H\x1b[2Kstatus\r\n\x1b[2Knew");
     }
 
     #[test]
@@ -3500,7 +3507,7 @@ mod tests {
 
         let output = diff_live_render_output(&second, &mut state);
 
-        assert_eq!(output, second.output);
+        assert_eq!(output, b"\x1b[0m\x1b[H\x1b[2Kstatus\r\n\x1b[2Knew");
     }
 
     #[test]

@@ -422,9 +422,9 @@ fn detached_session_sets_color_capable_terminal_environment() {
             "printf 'TERM=%s COLORTERM=%s\\n' \"$TERM\" \"$COLORTERM\"; sleep 30",
         ],
     ));
-    let captured = poll_capture(&socket, &session, "TERM=screen-256color");
+    let captured = poll_capture(&socket, &session, "TERM=xterm-256color");
     assert!(
-        captured.contains("TERM=screen-256color COLORTERM=truecolor"),
+        captured.contains("TERM=xterm-256color COLORTERM=truecolor"),
         "{captured:?}"
     );
 

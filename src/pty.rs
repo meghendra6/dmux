@@ -209,7 +209,7 @@ fn configure_child_terminal_environment() {
     // process's terminal. A weak inherited TERM such as "dumb" causes full-screen
     // programs to choose degraded color output.
     unsafe {
-        std::env::set_var("TERM", "screen-256color");
+        std::env::set_var("TERM", "xterm-256color");
         std::env::set_var("COLORTERM", "truecolor");
     }
 }
