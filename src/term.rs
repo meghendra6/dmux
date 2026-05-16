@@ -60,6 +60,10 @@ impl TerminalState {
         self.active_screen().render_ansi_lines(width, height)
     }
 
+    pub fn cursor_position(&self) -> (usize, usize) {
+        self.active_screen().cursor_position()
+    }
+
     pub fn resize(&mut self, width: usize, height: usize) {
         self.screen.resize(width, height);
         if let Some(screen) = &mut self.alternate_screen {
@@ -482,6 +486,10 @@ impl TerminalScreen {
             self.cursor_row = row.min(self.height - 1);
             self.cursor_col = col.min(self.width - 1);
         }
+    }
+
+    fn cursor_position(&self) -> (usize, usize) {
+        (self.cursor_row, self.cursor_col)
     }
 
     fn non_empty_lines(&self) -> Vec<String> {

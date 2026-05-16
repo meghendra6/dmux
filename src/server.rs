@@ -602,6 +602,7 @@ impl Window {
                 layout: LayoutNode::Pane(index),
                 panes,
                 size: self.size,
+                active_pane_index: index,
             };
         }
 
@@ -616,6 +617,7 @@ impl Window {
                 })
                 .collect(),
             size: self.size,
+            active_pane_index: self.panes.active_index(),
         }
     }
 
@@ -842,6 +844,7 @@ struct AttachLayoutSnapshot {
     layout: LayoutNode,
     panes: Vec<IndexedPane>,
     size: PtySize,
+    active_pane_index: usize,
 }
 
 impl AttachLayoutSnapshot {
@@ -850,6 +853,7 @@ impl AttachLayoutSnapshot {
             layout: LayoutNode::Pane(0),
             panes: Vec::new(),
             size: PtySize { cols: 1, rows: 1 },
+            active_pane_index: 0,
         }
     }
 }
@@ -875,6 +879,13 @@ struct RenderedAttachLayout {
 struct RenderedAttachSnapshot {
     text: String,
     regions: Vec<PaneRegion>,
+    cursor: Option<RenderedCursor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderedCursor {
+    row: usize,
+    col: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2124,7 +2135,12 @@ fn attach_pane_frame_with_regions(session: &Session) -> Option<RenderedAttachSna
         })
         .collect::<Vec<_>>();
 
-    render_attach_frame_for_size(&snapshot.layout, &panes, snapshot.size)
+    render_attach_frame_for_size_with_active(
+        &snapshot.layout,
+        &panes,
+        snapshot.size,
+        Some(snapshot.active_pane_index),
+    )
 }
 
 #[allow(dead_code)]
@@ -2140,10 +2156,12 @@ fn render_attach_pane_snapshot_with_regions(
         Some(rendered) => RenderedAttachSnapshot {
             text: render_client_lines(&rendered.lines),
             regions: rendered.regions,
+            cursor: None,
         },
         None => RenderedAttachSnapshot {
             text: render_ordered_pane_sections(panes),
             regions: Vec::new(),
+            cursor: None,
         },
     }
 }
@@ -2157,10 +2175,12 @@ fn render_attach_pane_snapshot_with_regions_for_size(
         Some(rendered) => RenderedAttachSnapshot {
             text: render_client_lines(&rendered.lines),
             regions: rendered.regions,
+            cursor: None,
         },
         None => RenderedAttachSnapshot {
             text: render_ordered_pane_sections(panes),
             regions: Vec::new(),
+            cursor: None,
         },
     }
 }
@@ -2219,6 +2239,14 @@ fn format_attach_render_frame_body(
         write_render_output_line(&mut output, status.as_bytes(), true);
     }
     write_render_output_rows(&mut output, snapshot.text.as_bytes(), snapshot_rows);
+    if let Some(cursor) = snapshot.cursor {
+        write_cursor_position(
+            &mut output,
+            cursor,
+            usize::from(!status.is_empty()),
+            snapshot_rows,
+        );
+    }
 
     let mut header = String::new();
     header.push_str("HEADER_ROWS\t");
@@ -2247,6 +2275,20 @@ fn format_attach_render_frame_body(
     let mut bytes = header.into_bytes();
     bytes.extend_from_slice(&output);
     bytes
+}
+
+fn write_cursor_position(
+    output: &mut Vec<u8>,
+    cursor: RenderedCursor,
+    header_rows: usize,
+    snapshot_rows: usize,
+) {
+    if snapshot_rows == 0 {
+        return;
+    }
+    let row = header_rows + cursor.row.min(snapshot_rows - 1) + 1;
+    let col = cursor.col + 1;
+    output.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
 }
 
 fn write_render_output_line(output: &mut Vec<u8>, line: &[u8], clear_line: bool) {
@@ -2343,6 +2385,15 @@ fn render_attach_frame_for_size(
     panes: &[PaneRenderSnapshot<'_>],
     size: PtySize,
 ) -> Option<RenderedAttachSnapshot> {
+    render_attach_frame_for_size_with_active(layout, panes, size, None)
+}
+
+fn render_attach_frame_for_size_with_active(
+    layout: &LayoutNode,
+    panes: &[PaneRenderSnapshot<'_>],
+    size: PtySize,
+    active_pane: Option<usize>,
+) -> Option<RenderedAttachSnapshot> {
     if !layout_matches_render_panes(layout, panes) {
         return None;
     }
@@ -2352,17 +2403,40 @@ fn render_attach_frame_for_size(
         .map(|pane| (pane.index, pane.terminal))
         .collect::<HashMap<_, _>>();
 
-    render_styled_sized_layout(
+    let rendered = render_styled_sized_layout(
         layout,
         &terminals,
         0,
         size.rows as usize,
         0,
         size.cols as usize,
-    )
-    .map(|rendered| RenderedAttachSnapshot {
+    )?;
+    let cursor = rendered_cursor_for_active_pane(&rendered.regions, &terminals, active_pane);
+    Some(RenderedAttachSnapshot {
         text: render_client_lines(&rendered.lines),
         regions: rendered.regions,
+        cursor,
+    })
+}
+
+fn rendered_cursor_for_active_pane(
+    regions: &[PaneRegion],
+    terminals: &HashMap<usize, &TerminalState>,
+    active_pane: Option<usize>,
+) -> Option<RenderedCursor> {
+    let active_pane = active_pane?;
+    let region = regions.iter().find(|region| region.pane == active_pane)?;
+    let width = region.col_end.checked_sub(region.col_start)?;
+    let height = region.row_end.checked_sub(region.row_start)?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let terminal = terminals.get(&active_pane)?;
+    let (row, col) = terminal.cursor_position();
+    Some(RenderedCursor {
+        row: region.row_start + row.min(height - 1),
+        col: region.col_start + col.min(width - 1),
     })
 }
 
@@ -2571,7 +2645,7 @@ fn join_styled_vertical_with_separator_height(
     separator_width: usize,
 ) -> Vec<String> {
     top.extend(std::iter::repeat_n(
-        "-".repeat(separator_width),
+        "─".repeat(separator_width),
         separator_height,
     ));
     top.extend(bottom);
@@ -2927,9 +3001,9 @@ fn join_horizontal_with_separator_width(
 fn horizontal_separator(width: usize) -> String {
     match width {
         0 => String::new(),
-        1 => "|".to_string(),
-        2 => " |".to_string(),
-        _ => " | ".to_string(),
+        1 => "│".to_string(),
+        2 => " │".to_string(),
+        _ => " │ ".to_string(),
     }
 }
 
@@ -2943,7 +3017,7 @@ fn join_vertical_with_separator_height(
     separator_height: usize,
 ) -> Vec<String> {
     let width = max_line_width(&top).max(max_line_width(&bottom)).max(1);
-    top.extend(std::iter::repeat_n("-".repeat(width), separator_height));
+    top.extend(std::iter::repeat_n("─".repeat(width), separator_height));
     top.extend(bottom);
     top
 }
@@ -3503,7 +3577,7 @@ mod tests {
 
         let rendered = render_attach_pane_snapshot(&layout, &panes);
 
-        assert_eq!(rendered, "base-ready | split-ready\r\n");
+        assert_eq!(rendered, "base-ready │ split-ready\r\n");
     }
 
     #[test]
@@ -3571,9 +3645,9 @@ mod tests {
         assert_eq!(
             rendered.lines,
             vec![
-                "left     | right    ".to_string(),
-                "         |          ".to_string(),
-                "         |          ".to_string(),
+                "left     │ right    ".to_string(),
+                "         │          ".to_string(),
+                "         │          ".to_string(),
             ]
         );
         assert_eq!(
@@ -3844,6 +3918,7 @@ mod tests {
                     col_end: 12,
                 },
             ],
+            cursor: None,
         };
 
         let body = String::from_utf8(format_attach_layout_snapshot_body(&snapshot)).unwrap();
@@ -3878,6 +3953,7 @@ left | right\r\n"
                     col_end: 12,
                 },
             ],
+            cursor: None,
         };
 
         let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 10))
@@ -3892,6 +3968,56 @@ left | right\r\n"
         assert!(body.contains("\x1b[H\x1b[2Kstatus\r\n"), "{body:?}");
         assert!(body.contains("\x1b[2Kleft | right"), "{body:?}");
         assert!(!body.contains("SNAPSHOT\t"), "{body:?}");
+    }
+
+    #[test]
+    fn format_attach_render_frame_places_cursor_after_output() {
+        let snapshot = RenderedAttachSnapshot {
+            text: "left │ right\r\n".to_string(),
+            regions: vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 4,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 7,
+                    col_end: 12,
+                },
+            ],
+            cursor: Some(RenderedCursor { row: 0, col: 9 }),
+        };
+
+        let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 10))
+            .expect("render frame utf8");
+
+        assert!(body.contains("\x1b[2Kleft │ right\x1b[2;10H"), "{body:?}");
+    }
+
+    #[test]
+    fn format_attach_render_frame_clamps_cursor_to_visible_snapshot_rows() {
+        let snapshot = RenderedAttachSnapshot {
+            text: "top\r\nbottom\r\n".to_string(),
+            regions: vec![PaneRegion {
+                pane: 0,
+                row_start: 0,
+                row_end: 2,
+                col_start: 0,
+                col_end: 10,
+            }],
+            cursor: Some(RenderedCursor { row: 1, col: 2 }),
+        };
+
+        let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 1))
+            .expect("render frame utf8");
+
+        assert!(body.contains("\x1b[2;3H"), "{body:?}");
+        assert!(!body.contains("\x1b[3;3H"), "{body:?}");
     }
 
     #[test]
@@ -3943,7 +4069,7 @@ left | right\r\n"
 
         let rendered = render_attach_pane_snapshot(&layout, &panes);
 
-        assert_eq!(rendered, "base-ready\r\n-----------\r\nsplit-ready\r\n");
+        assert_eq!(rendered, "base-ready\r\n───────────\r\nsplit-ready\r\n");
     }
 
     #[test]
@@ -4203,7 +4329,7 @@ left | right\r\n"
 
         assert_eq!(
             rendered.text,
-            "\x1b[31mleft\x1b[0m     | \x1b[1;38;2;1;2;3mright\x1b[0m    \r\n"
+            "\x1b[31mleft\x1b[0m     │ \x1b[1;38;2;1;2;3mright\x1b[0m    \r\n"
         );
         assert_eq!(
             rendered.regions,
@@ -4251,7 +4377,7 @@ left | right\r\n"
         let rendered =
             render_attach_frame_for_size(&layout, &panes, PtySize { cols: 10, rows: 1 }).unwrap();
 
-        assert_eq!(rendered.text, "\x1b[31mabc\x1b[0m | righ\r\n");
+        assert_eq!(rendered.text, "\x1b[31mabc\x1b[0m │ righ\r\n");
         assert_eq!(
             rendered.regions,
             vec![
@@ -4298,7 +4424,40 @@ left | right\r\n"
         let rendered =
             render_attach_frame_for_size(&layout, &panes, PtySize { cols: 10, rows: 1 }).unwrap();
 
-        assert_eq!(rendered.text, "한  | righ\r\n");
+        assert_eq!(rendered.text, "한  │ righ\r\n");
+    }
+
+    #[test]
+    fn render_attach_frame_for_size_maps_active_pane_cursor() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let mut left = TerminalState::new(20, 1, 100);
+        left.apply_bytes(b"left");
+        let mut right = TerminalState::new(20, 1, 100);
+        right.apply_bytes(b"ab");
+        let panes = vec![
+            PaneRenderSnapshot {
+                index: 0,
+                terminal: &left,
+            },
+            PaneRenderSnapshot {
+                index: 1,
+                terminal: &right,
+            },
+        ];
+
+        let rendered = render_attach_frame_for_size_with_active(
+            &layout,
+            &panes,
+            PtySize { cols: 20, rows: 1 },
+            Some(1),
+        )
+        .unwrap();
+
+        assert_eq!(rendered.cursor, Some(RenderedCursor { row: 0, col: 13 }));
     }
 
     #[test]
@@ -4328,7 +4487,7 @@ left | right\r\n"
 
         assert_eq!(
             rendered.text,
-            "\x1b[31mt\x1b[0m     \r\n------\r\nbottom\r\n"
+            "\x1b[31mt\x1b[0m     \r\n──────\r\nbottom\r\n"
         );
         assert_eq!(
             rendered.regions,

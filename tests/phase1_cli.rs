@@ -184,7 +184,7 @@ fn assert_vertical_layout(text: &str, top: &str, bottom: &str) {
     assert!(
         lines[top_index + 1..bottom_index]
             .iter()
-            .any(|line| !line.is_empty() && line.chars().all(|ch| ch == '-')),
+            .any(|line| !line.is_empty() && line.chars().all(|ch| ch == '─')),
         "{text:?}"
     );
 }
@@ -1680,7 +1680,7 @@ fn interactive_split_preserves_unsubmitted_input_in_original_pane() {
     child.write_all(b"\x02%");
     let panes = poll_pane_count(&socket, &session, 2);
     assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
-    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+    child.wait_for_stdout_contains_all(&["│"], "pty split redraw");
 
     child.write_all(b"\x02h\r");
     let base = poll_capture_eventually(&socket, &session, "base-preserved");
@@ -1711,7 +1711,7 @@ fn live_snapshot_attach_does_not_spam_idle_full_frame_redraws() {
     child.write_all(b"\x02%");
     let panes = poll_pane_count(&socket, &session, 2);
     assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
-    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+    child.wait_for_stdout_contains_all(&["│"], "pty split redraw");
     child.wait_for_stdout_idle(Duration::from_millis(250), "settle split redraw");
     child.clear_stdout();
 
@@ -1745,7 +1745,7 @@ fn live_snapshot_attach_repaints_pane_output_without_repeating_full_clear() {
     child.write_all(b"\x02%");
     let panes = poll_pane_count(&socket, &session, 2);
     assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
-    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+    child.wait_for_stdout_contains_all(&["│"], "pty split redraw");
     child.wait_for_stdout_idle(Duration::from_millis(250), "settle split redraw");
     child.clear_stdout();
 
@@ -1784,7 +1784,7 @@ fn live_snapshot_attach_does_not_repaint_stale_frame_before_forwarded_input_echo
     child.write_all(b"\x02%");
     let panes = poll_pane_count(&socket, &session, 2);
     assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
-    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+    child.wait_for_stdout_contains_all(&["│"], "pty split redraw");
     child.wait_for_stdout_idle(Duration::from_millis(250), "settle split redraw");
     child.clear_stdout();
 
@@ -1825,7 +1825,7 @@ fn live_snapshot_attach_renders_utf8_output_after_split() {
     child.write_all(b"\x02%");
     let panes = poll_pane_count(&socket, &session, 2);
     assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
-    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+    child.wait_for_stdout_contains_all(&["│"], "pty split redraw");
     child.clear_stdout();
 
     child.write_all("printf '한글 ✓\\n'\r".as_bytes());
@@ -1856,7 +1856,7 @@ fn live_snapshot_attach_applies_cursor_restore_output_after_split() {
     child.write_all(b"\x02%");
     let panes = poll_pane_count(&socket, &session, 2);
     assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
-    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+    child.wait_for_stdout_contains_all(&["│"], "pty split redraw");
     child.clear_stdout();
 
     child.write_all(b"printf 'ab\\0337cd\\0338Z\\n'\r");
@@ -1921,7 +1921,7 @@ fn live_snapshot_frame_output_fits_attach_pty_rows() {
     child.write_all(b"\x02%");
     let panes = poll_pane_count(&socket, &session, 2);
     assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
-    child.wait_for_stdout_contains_all(&["|"], "snapshot frame");
+    child.wait_for_stdout_contains_all(&["│"], "snapshot frame");
 
     let stdout = child.stdout_text();
     let frame = stdout
@@ -2917,14 +2917,14 @@ fn attach_renders_split_pane_snapshot() {
         .expect("run attach");
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_contains_ordered_line(&stdout, "base-ready", " | ", "split-ready");
+    assert_contains_ordered_line(&stdout, "base-ready", " │ ", "split-ready");
     assert!(!stdout.contains("-- pane 0 --"), "{stdout:?}");
     assert!(!stdout.contains("-- pane 1 --"), "{stdout:?}");
 
     let captured = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
     assert_success(&captured);
     let captured = String::from_utf8_lossy(&captured.stdout);
-    assert!(!captured.contains(" | "), "{captured:?}");
+    assert!(!captured.contains(" │ "), "{captured:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -3098,7 +3098,7 @@ fn attach_live_redraws_split_pane_output_after_attach_starts() {
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("base-ready"), "{stdout:?}");
-    assert!(stdout.contains(" | "), "{stdout:?}");
+    assert!(stdout.contains(" │ "), "{stdout:?}");
     assert!(stdout.contains("late:hello"), "{stdout:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
@@ -3360,7 +3360,7 @@ fn attach_prefix_percent_splits_right_from_single_pane() {
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("base-ready"), "{stdout:?}");
-    assert!(stdout.contains(" | "), "{stdout:?}");
+    assert!(stdout.contains(" │ "), "{stdout:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -3626,7 +3626,7 @@ fn attach_prefix_quote_splits_down_from_single_pane() {
     assert!(
         stdout
             .lines()
-            .any(|line| !line.is_empty() && line.chars().all(|ch| ch == '-')),
+            .any(|line| !line.is_empty() && line.chars().all(|ch| ch == '─')),
         "{stdout:?}"
     );
 
@@ -4580,7 +4580,7 @@ fn attach_detach_reattach_preserves_split_layout_and_active_input() {
     let active = poll_active_pane(&socket, &session, 0);
     assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
 
-    let mut child = spawn_attached_to_session(&socket, &session, &["base-ready", " | "]);
+    let mut child = spawn_attached_to_session(&socket, &session, &["base-ready", " │ "]);
 
     {
         let stdin = child.stdin_mut("attach stdin");
@@ -4594,7 +4594,7 @@ fn attach_detach_reattach_preserves_split_layout_and_active_input() {
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("base-ready"), "{stdout:?}");
-    assert!(stdout.contains(" | "), "{stdout:?}");
+    assert!(stdout.contains(" │ "), "{stdout:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -5231,9 +5231,11 @@ fn attach_prefix_bracket_copies_composed_layout_line_in_multi_pane_attach() {
         stdin.flush().expect("flush copy-mode input");
     }
 
-    let listed = poll_list_buffers_contains(&socket, "\t81\t");
+    let listed = poll_list_buffers_contains(&socket, "base-copy");
     assert!(
-        listed.lines().any(|line| line.contains("\t81\t")),
+        listed
+            .lines()
+            .any(|line| line.contains("base-copy") && line.contains("│")),
         "{listed:?}"
     );
 
@@ -5385,7 +5387,7 @@ fn attach_layout_snapshot_response_includes_regions_without_changing_plain_snaps
     assert!(body.contains("REGION\t0\t0\t24\t0\t38\n"), "{body:?}");
     assert!(body.contains("REGION\t1\t0\t24\t41\t80\n"), "{body:?}");
     assert!(body.contains("SNAPSHOT\t"), "{body:?}");
-    let composed_line = format!("base-ready{} | split-ready", " ".repeat(28));
+    let composed_line = format!("base-ready{} │ split-ready", " ".repeat(28));
     assert!(body.contains(&composed_line), "{body:?}");
 
     let mut plain = UnixStream::connect(&socket).expect("connect socket");
@@ -5903,7 +5905,7 @@ fn attach_layout_snapshot_reindexes_after_killing_middle_pane() {
         .expect("run attach");
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_contains_ordered_line(&stdout, "base-ready", " | ", "third-ready");
+    assert_contains_ordered_line(&stdout, "base-ready", " │ ", "third-ready");
     assert!(!stdout.contains("second-ready"), "{stdout:?}");
     assert!(!stdout.contains("-- pane 0 --"), "{stdout:?}");
     assert!(!stdout.contains("-- pane 1 --"), "{stdout:?}");
