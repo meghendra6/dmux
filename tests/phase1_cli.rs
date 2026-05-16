@@ -523,6 +523,40 @@ fn detached_session_sets_color_capable_terminal_environment() {
 }
 
 #[test]
+fn pane_primary_device_attributes_query_gets_local_reply() {
+    if !command_exists("python3") {
+        return;
+    }
+
+    let socket = unique_socket("primary-da-query");
+    let session = format!("primary-da-query-{}", std::process::id());
+    let script = concat!(
+        "import os,select,termios,time,tty;",
+        "saved=termios.tcgetattr(0);",
+        "tty.setraw(0);",
+        "os.write(1,b'probe-before\\x1b[c');",
+        "r,_,_=select.select([0],[],[],0.25);",
+        "reply=os.read(0,64) if r else b'';",
+        "os.write(1,b'probe-reply:'+reply.hex().encode()+b'\\n');",
+        "termios.tcsetattr(0,termios.TCSANOW,saved);",
+        "time.sleep(30)",
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "python3", "-c", script],
+    ));
+    let captured = poll_capture(&socket, &session, "probe-reply:");
+    assert!(
+        captured.contains("probe-reply:1b5b3f313b3263"),
+        "{captured:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn buffers_save_capture_list_paste_and_delete() {
     let socket = unique_socket("buffers");
     let source = format!("buffer-source-{}", std::process::id());
