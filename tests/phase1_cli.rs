@@ -4,9 +4,12 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SIGWINCH: c_int = 28;
 
@@ -39,16 +42,87 @@ unsafe extern "C" {
         termp: *const c_void,
         winp: *const TestWinSize,
     ) -> c_int;
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn kill(pid: c_int, signal: c_int) -> c_int;
 }
 
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NONBLOCK: c_int = 0o4000;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const O_NONBLOCK: c_int = 0x0004;
+
 fn dmux(socket: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_dmux"))
-        .env("DEVMUX_SOCKET", socket)
-        .args(args)
-        .output()
-        .expect("run dmux")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dmux"));
+    command.env("DEVMUX_SOCKET", socket).args(args);
+    output_with_timeout(command, "run dmux", Duration::from_secs(5))
+}
+
+fn output_with_timeout(mut command: Command, context: &str, timeout: Duration) -> Output {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect(context);
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let stdout_reader = spawn_output_reader(
+        child.stdout.take().expect("capture command stdout"),
+        Arc::clone(&stdout),
+    );
+    let stderr_reader = spawn_output_reader(
+        child.stderr.take().expect("capture command stderr"),
+        Arc::clone(&stderr),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        if let Some(status) = child.try_wait().expect("poll command") {
+            stdout_reader
+                .join()
+                .expect("join command stdout")
+                .expect("read command stdout");
+            stderr_reader
+                .join()
+                .expect("join command stderr")
+                .expect("read command stderr");
+            return Output {
+                status,
+                stdout: stdout.lock().expect("lock command stdout").clone(),
+                stderr: stderr.lock().expect("lock command stderr").clone(),
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let status = child.wait().expect("wait timed-out command");
+            stdout_reader
+                .join()
+                .expect("join timed-out command stdout")
+                .expect("read timed-out command stdout");
+            stderr_reader
+                .join()
+                .expect("join timed-out command stderr")
+                .expect("read timed-out command stderr");
+            panic!(
+                "{context}: command timed out after {timeout:?} with {status:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&stdout.lock().expect("lock timed-out command stdout")),
+                String::from_utf8_lossy(&stderr.lock().expect("lock timed-out command stderr"))
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn unique_socket(name: &str) -> std::path::PathBuf {
@@ -850,14 +924,16 @@ impl TestChildProcess for CapturedDmuxChild {
 
 struct PtyDmuxChild {
     child: Child,
-    master: File,
+    master: Option<File>,
     stdout: Arc<Mutex<Vec<u8>>>,
     stdout_reader: Option<JoinHandle<std::io::Result<()>>>,
+    stdout_reader_stop: Arc<AtomicBool>,
 }
 
 impl PtyDmuxChild {
     fn resize(&self, cols: u16, rows: u16) {
-        set_pty_size(self.master.as_raw_fd(), cols, rows);
+        let master = self.master.as_ref().expect("pty master is open");
+        set_pty_size(master.as_raw_fd(), cols, rows);
         let result = unsafe { kill(self.child.id() as c_int, SIGWINCH) };
         assert_eq!(
             result,
@@ -868,13 +944,13 @@ impl PtyDmuxChild {
     }
 
     fn write_all(&mut self, input: &[u8]) {
-        self.master.write_all(input).expect("write pty input");
-        self.master.flush().expect("flush pty input");
+        let master = self.master.as_mut().expect("pty master is open");
+        master.write_all(input).expect("write pty input");
+        master.flush().expect("flush pty input");
     }
 
     fn assert_running(&mut self, context: &str) {
         if let Some(status) = self.child.try_wait().expect("poll pty dmux child") {
-            self.join_reader();
             panic!(
                 "{context}: child exited unexpectedly with {status:?}\nstdout:\n{}",
                 self.stdout_text()
@@ -891,7 +967,6 @@ impl PtyDmuxChild {
                 return;
             }
             if let Some(status) = self.child.try_wait().expect("poll pty dmux child") {
-                self.join_reader();
                 panic!(
                     "{context}: child exited before stdout contained {needles:?} with {status:?}\nstdout:\n{}",
                     self.stdout_text()
@@ -900,7 +975,6 @@ impl PtyDmuxChild {
             if std::time::Instant::now() >= deadline {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
-                self.join_reader();
                 panic!(
                     "{context}: stdout did not contain {needles:?} before timeout\nstdout:\n{}",
                     self.stdout_text()
@@ -908,6 +982,11 @@ impl PtyDmuxChild {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    fn close_master(&mut self) {
+        self.stdout_reader_stop.store(true, Ordering::SeqCst);
+        let _ = self.master.take();
     }
 
     fn join_reader(&mut self) {
@@ -922,6 +1001,35 @@ impl PtyDmuxChild {
     fn stdout_text(&self) -> String {
         String::from_utf8_lossy(&self.stdout.lock().expect("lock pty stdout")).to_string()
     }
+
+    fn clear_stdout(&mut self) {
+        self.stdout.lock().expect("lock pty stdout").clear();
+    }
+
+    fn wait_for_stdout_idle(&mut self, idle_for: Duration, context: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut last_len = self.stdout.lock().expect("lock pty stdout").len();
+        let mut idle_since = std::time::Instant::now();
+
+        loop {
+            self.assert_running(context);
+            let len = self.stdout.lock().expect("lock pty stdout").len();
+            if len != last_len {
+                last_len = len;
+                idle_since = std::time::Instant::now();
+            }
+            if idle_since.elapsed() >= idle_for {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "{context}: stdout did not become idle for {idle_for:?}\nstdout:\n{}",
+                    self.stdout_text()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl TestChildProcess for PtyDmuxChild {
@@ -935,6 +1043,7 @@ impl TestChildProcess for PtyDmuxChild {
 
     fn wait_with_output(mut self) -> std::io::Result<Output> {
         let status = self.child.wait()?;
+        self.close_master();
         self.join_reader();
         Ok(Output {
             status,
@@ -979,15 +1088,31 @@ fn spawn_pty_attached_dmux(
     rows: u16,
     readiness_needles: &[&str],
 ) -> PtyDmuxChild {
+    spawn_pty_attached_dmux_with_env(socket, args, cols, rows, readiness_needles, &[])
+}
+
+fn spawn_pty_attached_dmux_with_env(
+    socket: &std::path::Path,
+    args: &[&str],
+    cols: u16,
+    rows: u16,
+    readiness_needles: &[&str],
+    envs: &[(&str, &str)],
+) -> PtyDmuxChild {
     let (master, slave) = open_test_pty(cols, rows);
     let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stdout_reader_stop = Arc::new(AtomicBool::new(false));
     let stdout_reader = spawn_pty_output_reader(
         master.try_clone().expect("clone pty master"),
         Arc::clone(&stdout),
+        Arc::clone(&stdout_reader_stop),
     );
-    let child = Command::new(env!("CARGO_BIN_EXE_dmux"))
-        .env("DEVMUX_SOCKET", socket)
-        .args(args)
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dmux"));
+    command.env("DEVMUX_SOCKET", socket).args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let child = command
         .stdin(Stdio::from(
             slave.try_clone().expect("clone pty slave stdin"),
         ))
@@ -999,9 +1124,10 @@ fn spawn_pty_attached_dmux(
         .expect("spawn pty attached dmux");
     let mut child = PtyDmuxChild {
         child,
-        master,
+        master: Some(master),
         stdout,
         stdout_reader: Some(stdout_reader),
+        stdout_reader_stop,
     };
     child.wait_for_stdout_contains_all(readiness_needles, "pty attach readiness");
     child
@@ -1040,10 +1166,15 @@ where
 fn spawn_pty_output_reader(
     mut reader: File,
     output: Arc<Mutex<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
 ) -> JoinHandle<std::io::Result<()>> {
     std::thread::spawn(move || {
+        set_nonblocking(reader.as_raw_fd());
         let mut buffer = [0_u8; 1024];
         loop {
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             match reader.read(&mut buffer) {
                 Ok(0) => return Ok(()),
                 Ok(n) => output
@@ -1051,11 +1182,31 @@ fn spawn_pty_output_reader(
                     .expect("lock captured pty output")
                     .extend_from_slice(&buffer[..n]),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
                 Err(error) if error.raw_os_error() == Some(5) => return Ok(()),
                 Err(error) => return Err(error),
             }
         }
     })
+}
+
+fn set_nonblocking(fd: c_int) {
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    assert_ne!(
+        flags,
+        -1,
+        "get fd flags: {}",
+        std::io::Error::last_os_error()
+    );
+    let result = unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) };
+    assert_ne!(
+        result,
+        -1,
+        "set fd nonblocking: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 fn open_test_pty(cols: u16, rows: u16) -> (File, File) {
@@ -1289,6 +1440,149 @@ fn interactive_new_attaches_and_detaches_created_session() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("interactive-ready"), "{stdout:?}");
 
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn interactive_new_default_shell_splits_and_remains_usable_in_real_pty() {
+    let socket = unique_socket("interactive-new-pty-split");
+    let session = format!("interactive-new-pty-split-{}", std::process::id());
+
+    let mut child = spawn_pty_attached_dmux_with_env(
+        &socket,
+        &["new", "-s", &session],
+        80,
+        24,
+        &[&session, "C-b ? help"],
+        &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
+    );
+
+    child.write_all(b"printf base-ready\\n\r");
+    let base = poll_capture_eventually(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    child.write_all(b"\x02%");
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+    child.wait_for_stdout_contains_all(&["base-ready", "|"], "pty split redraw");
+
+    child.write_all(b"printf split-ready\\n\r");
+    let split = poll_capture_eventually(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    child.write_all(b"\x02hprintf base-after-split\\n\r");
+    let base = poll_capture_eventually(&socket, &session, "base-after-split");
+    assert!(base.contains("base-after-split"), "{base:?}");
+    let active = poll_active_pane(&socket, &session, 0);
+    assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
+
+    child.write_all(b"\x02d");
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn live_snapshot_attach_does_not_spam_idle_full_frame_redraws() {
+    let socket = unique_socket("live-snapshot-idle-redraw");
+    let session = format!("live-snapshot-idle-redraw-{}", std::process::id());
+
+    let mut child = spawn_pty_attached_dmux_with_env(
+        &socket,
+        &["new", "-s", &session],
+        80,
+        24,
+        &[&session, "C-b ? help"],
+        &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
+    );
+
+    child.write_all(b"\x02%");
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+    child.wait_for_stdout_idle(Duration::from_millis(250), "settle split redraw");
+    child.clear_stdout();
+
+    std::thread::sleep(Duration::from_millis(1200));
+    let idle_output = child.stdout_text();
+    assert!(
+        !idle_output.contains(&session),
+        "idle attach emitted a repeated full frame:\n{idle_output:?}"
+    );
+
+    child.write_all(b"\x02d");
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn live_snapshot_attach_uses_alternate_screen_and_restores_on_detach() {
+    let socket = unique_socket("live-snapshot-alt-screen");
+    let session = format!("live-snapshot-alt-screen-{}", std::process::id());
+
+    let mut child = spawn_pty_attached_dmux_with_env(
+        &socket,
+        &["new", "-s", &session],
+        80,
+        24,
+        &[&session, "C-b ? help"],
+        &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
+    );
+
+    child.clear_stdout();
+    child.write_all(b"\x02%");
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+    child.wait_for_stdout_contains_all(&["\x1b[?1049h", "|"], "enter snapshot screen");
+
+    child.write_all(b"\x02d");
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\x1b[?1049l"),
+        "snapshot attach did not restore alternate screen:\n{stdout:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn live_snapshot_frame_output_fits_attach_pty_rows() {
+    let socket = unique_socket("live-snapshot-frame-height");
+    let session = format!("live-snapshot-frame-height-{}", std::process::id());
+
+    let mut child = spawn_pty_attached_dmux_with_env(
+        &socket,
+        &["new", "-s", &session],
+        80,
+        24,
+        &[&session, "C-b ? help"],
+        &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
+    );
+
+    child.clear_stdout();
+    child.write_all(b"\x02%");
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+    child.wait_for_stdout_contains_all(&["|"], "snapshot frame");
+
+    let stdout = child.stdout_text();
+    let frame = stdout
+        .rsplit_once("\x1b[2J\x1b[H")
+        .map(|(_, frame)| frame)
+        .unwrap_or(stdout.as_str());
+    let rendered_rows = frame.matches("\r\n").count() + usize::from(!frame.ends_with("\r\n"));
+    assert!(
+        rendered_rows <= 24,
+        "snapshot frame rendered {rendered_rows} rows in a 24-row PTY:\n{frame:?}"
+    );
+
+    child.write_all(b"\x02d");
+    assert_success(&wait_for_child_exit(child));
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
@@ -2230,6 +2524,64 @@ fn attach_renders_split_pane_snapshot() {
     assert_success(&captured);
     let captured = String::from_utf8_lossy(&captured.stdout);
     assert!(!captured.contains(" | "), "{captured:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_renders_styled_split_pane_frame() {
+    let socket = unique_socket("attach-styled-pane-frame");
+    let session = format!("attach-styled-pane-frame-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf '\\033[31mbase-styled\\033[0m'; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-styled");
+    assert!(base.contains("base-styled"), "{base:?}");
+    assert!(!base.contains('\x1b'), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf '\\033[1;38;2;1;2;3msplit-styled\\033[0m'; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-styled");
+    assert!(split.contains("split-styled"), "{split:?}");
+    assert!(!split.contains('\x1b'), "{split:?}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_dmux"))
+        .env("DEVMUX_SOCKET", &socket)
+        .env("DEVMUX_ATTACH_SIZE", "40x4")
+        .args(["attach", "-t", &session])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run attach");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\x1b[31mbase-styled\x1b[0m"), "{stdout:?}");
+    assert!(
+        stdout.contains("\x1b[1;38;2;1;2;3msplit-styled\x1b[0m"),
+        "{stdout:?}"
+    );
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

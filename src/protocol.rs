@@ -36,6 +36,9 @@ pub enum Request {
     AttachLayoutSnapshot {
         session: String,
     },
+    AttachLayoutFrame {
+        session: String,
+    },
     AttachEvents {
         session: String,
     },
@@ -143,6 +146,10 @@ pub fn encode_attach_snapshot(session: &str) -> String {
 
 pub fn encode_attach_layout_snapshot(session: &str) -> String {
     format!("ATTACH_LAYOUT_SNAPSHOT\t{session}\n")
+}
+
+pub fn encode_attach_layout_frame(session: &str) -> String {
+    format!("ATTACH_LAYOUT_FRAME\t{session}\n")
 }
 
 #[allow(dead_code)]
@@ -332,6 +339,9 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
         }),
         ["ATTACH_LAYOUT_SNAPSHOT", session] => Ok(Request::AttachLayoutSnapshot {
+            session: (*session).to_string(),
+        }),
+        ["ATTACH_LAYOUT_FRAME", session] => Ok(Request::AttachLayoutFrame {
             session: (*session).to_string(),
         }),
         ["ATTACH_EVENTS", session] => Ok(Request::AttachEvents {
@@ -990,6 +1000,17 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::AttachLayoutSnapshot {
+                session: "dev".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_attach_layout_frame_request() {
+        let line = encode_attach_layout_frame("dev");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::AttachLayoutFrame {
                 session: "dev".to_string(),
             }
         );

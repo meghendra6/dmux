@@ -13,6 +13,8 @@ static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
 static MOUSE_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l";
+const EXIT_ALTERNATE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?1049l";
 const LIVE_SNAPSHOT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL: Duration = Duration::from_millis(1000);
 const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
@@ -256,6 +258,19 @@ fn read_attach_layout_snapshot(
     }
 }
 
+fn read_attach_layout_frame(
+    socket: &Path,
+    session: &str,
+) -> io::Result<AttachLayoutSnapshotResponse> {
+    match send_control_request(socket, &protocol::encode_attach_layout_frame(session)) {
+        Ok(body) => parse_attach_layout_snapshot_response(&body),
+        Err(error) if is_unknown_request_error(&error) => {
+            read_attach_layout_snapshot(socket, session)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn is_unknown_request_error(error: &io::Error) -> bool {
     error.to_string().starts_with("unknown request line:")
 }
@@ -362,8 +377,11 @@ fn write_live_snapshot_frame_with_message(
     message: Option<&str>,
 ) -> io::Result<LiveSnapshotFrame> {
     let status = read_attach_status_line(socket, session)?;
-    let snapshot = read_attach_layout_snapshot(socket, session)?;
+    let snapshot = read_attach_layout_frame(socket, session)?;
     let header_rows = usize::from(!status.is_empty()) + usize::from(message.is_some());
+    let snapshot_rows = detect_attach_size()
+        .map(|size| usize::from(size.rows).saturating_sub(header_rows))
+        .unwrap_or(usize::MAX);
 
     let mut stdout = io::stdout().lock();
     stdout.write_all(CLEAR_SCREEN)?;
@@ -373,13 +391,50 @@ fn write_live_snapshot_frame_with_message(
     if let Some(message) = message {
         stdout.write_all(format!("{message}\r\n").as_bytes())?;
     }
-    stdout.write_all(&snapshot.snapshot)?;
+    write_snapshot_rows(&mut stdout, &snapshot.snapshot, snapshot_rows)?;
     stdout.flush()?;
 
     Ok(LiveSnapshotFrame {
         regions: snapshot.regions,
         header_rows,
     })
+}
+
+fn write_snapshot_rows(
+    stdout: &mut impl Write,
+    snapshot: &[u8],
+    max_rows: usize,
+) -> io::Result<()> {
+    if max_rows == 0 {
+        return Ok(());
+    }
+
+    let mut rows = 0;
+    let mut start = 0;
+    while start < snapshot.len() && rows < max_rows {
+        let line_end = snapshot[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(snapshot.len(), |offset| start + offset);
+        let content_end = if line_end > start && snapshot[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+
+        if rows > 0 {
+            stdout.write_all(b"\r\n")?;
+        }
+        stdout.write_all(&snapshot[start..content_end])?;
+        rows += 1;
+
+        if line_end == snapshot.len() {
+            break;
+        }
+        start = line_end + 1;
+    }
+
+    Ok(())
 }
 
 pub fn detect_attach_size() -> Option<PtySize> {
@@ -1301,6 +1356,7 @@ fn run_live_snapshot_attach(
         Arc::clone(&redraw_hint_pending),
     );
     spawn_live_snapshot_lifetime_thread(stream.try_clone()?, sender);
+    let _screen_guard = AlternateScreenGuard::enter()?;
     let mut frame = write_live_snapshot_frame(socket, session)?;
     let mut mouse_mode = None;
     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
@@ -1452,8 +1508,11 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::Error(message)) => return Err(io::Error::other(message)),
             Ok(LiveSnapshotInputEvent::Detach) | Ok(LiveSnapshotInputEvent::Eof) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
-                if !redraw_paused {
+                let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                let message_expired = pane_number_message
+                    .as_ref()
+                    .is_some_and(|(_, until)| Instant::now() >= *until);
+                if !redraw_paused && (!event_stream_active || resized || message_expired) {
                     frame = write_live_snapshot_frame_with_pane_number_message(
                         socket,
                         session,
@@ -2464,7 +2523,26 @@ struct RawModeGuard {
     saved: Option<String>,
 }
 
+struct AlternateScreenGuard;
+
 struct MouseModeGuard;
+
+impl AlternateScreenGuard {
+    fn enter() -> io::Result<Self> {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(ENTER_ALTERNATE_SCREEN)?;
+        stdout.flush()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for AlternateScreenGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(EXIT_ALTERNATE_SCREEN);
+        let _ = stdout.flush();
+    }
+}
 
 impl MouseModeGuard {
     fn enable() -> io::Result<Self> {
