@@ -138,10 +138,14 @@ where
         "list-panes" => parse_list_panes(args),
         "select-pane" => parse_select_pane(args),
         "kill-pane" => parse_kill_pane(args),
-        "new-window" => parse_new_window(args),
-        "list-windows" => parse_list_windows(args),
-        "select-window" => parse_select_window(args),
-        "kill-window" => parse_kill_window(args),
+        "new-window" => parse_new_window(args, "new-window"),
+        "new-tab" => parse_new_window(args, "new-tab"),
+        "list-windows" => parse_list_windows(args, "list-windows"),
+        "list-tabs" => parse_list_windows(args, "list-tabs"),
+        "select-window" => parse_select_window(args, "select-window", "-w", &["-w"]),
+        "select-tab" => parse_select_window(args, "select-tab", "-i", &["-i", "--index"]),
+        "kill-window" => parse_kill_window(args, "kill-window", &["-w"]),
+        "kill-tab" => parse_kill_window(args, "kill-tab", &["-i", "--index"]),
         "zoom-pane" => parse_zoom_pane(args),
         "status-line" => parse_status_line(args),
         "display-message" => parse_display_message(args),
@@ -224,6 +228,10 @@ Commands:\n\
   split-window -t <name> -h|-v [-- command...]\n\
   list-panes -t <name> [-F <format>]\n\
   select-pane -t <name> -p <index>\n\
+  new-tab -t <name> [-- command...]      alias for new-window\n\
+  list-tabs -t <name>                    alias for list-windows\n\
+  select-tab -t <name> -i <index>        alias for select-window\n\
+  kill-tab -t <name> [-i <index>]        alias for kill-window\n\
   kill-session -t <name>\n\
   kill-server\n\
 \n\
@@ -761,7 +769,7 @@ fn parse_kill_pane(args: Vec<String>) -> Result<Command, String> {
     })
 }
 
-fn parse_new_window(args: Vec<String>) -> Result<Command, String> {
+fn parse_new_window(args: Vec<String>, command_name: &str) -> Result<Command, String> {
     let mut session = None;
     let mut command = Vec::new();
     let mut i = 0;
@@ -771,7 +779,7 @@ fn parse_new_window(args: Vec<String>) -> Result<Command, String> {
             "-t" => {
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| "new-window requires a session name after -t".to_string())?;
+                    .ok_or_else(|| format!("{command_name} requires a session name after -t"))?;
                 session = Some(value.clone());
                 i += 2;
             }
@@ -780,7 +788,7 @@ fn parse_new_window(args: Vec<String>) -> Result<Command, String> {
                 break;
             }
             value if value.starts_with('-') => {
-                return Err(format!("new-window does not support option {value:?}"));
+                return Err(format!("{command_name} does not support option {value:?}"));
             }
             _ => {
                 command.extend(args[i..].iter().cloned());
@@ -790,18 +798,23 @@ fn parse_new_window(args: Vec<String>) -> Result<Command, String> {
     }
 
     Ok(Command::NewWindow {
-        session: session.ok_or_else(|| "new-window requires -t <session>".to_string())?,
+        session: session.ok_or_else(|| format!("{command_name} requires -t <session>"))?,
         command,
     })
 }
 
-fn parse_list_windows(args: Vec<String>) -> Result<Command, String> {
-    let session = parse_target(args, "list-windows")?
-        .ok_or_else(|| "list-windows requires -t <session>".to_string())?;
+fn parse_list_windows(args: Vec<String>, command_name: &str) -> Result<Command, String> {
+    let session = parse_target(args, command_name)?
+        .ok_or_else(|| format!("{command_name} requires -t <session>"))?;
     Ok(Command::ListWindows { session })
 }
 
-fn parse_select_window(args: Vec<String>) -> Result<Command, String> {
+fn parse_select_window(
+    args: Vec<String>,
+    command_name: &str,
+    primary_index_flag: &str,
+    index_flags: &[&str],
+) -> Result<Command, String> {
     let mut session = None;
     let mut window = None;
     let mut i = 0;
@@ -811,31 +824,42 @@ fn parse_select_window(args: Vec<String>) -> Result<Command, String> {
             "-t" => {
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| "select-window requires a session name after -t".to_string())?;
+                    .ok_or_else(|| format!("{command_name} requires a session name after -t"))?;
                 session = Some(value.clone());
                 i += 2;
             }
-            "-w" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "select-window requires a window index after -w".to_string())?;
-                window =
-                    Some(value.parse::<usize>().map_err(|_| {
-                        "select-window -w must be a non-negative integer".to_string()
-                    })?);
+            value if index_flags.contains(&value) => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    format!(
+                        "{command_name} requires a tab/window index after {}",
+                        args[i]
+                    )
+                })?;
+                window = Some(value.parse::<usize>().map_err(|_| {
+                    format!("{command_name} {} must be a non-negative integer", args[i])
+                })?);
                 i += 2;
             }
-            value => return Err(format!("select-window does not support argument {value:?}")),
+            value => {
+                return Err(format!(
+                    "{command_name} does not support argument {value:?}"
+                ));
+            }
         }
     }
 
     Ok(Command::SelectWindow {
-        session: session.ok_or_else(|| "select-window requires -t <session>".to_string())?,
-        window: window.ok_or_else(|| "select-window requires -w <index>".to_string())?,
+        session: session.ok_or_else(|| format!("{command_name} requires -t <session>"))?,
+        window: window
+            .ok_or_else(|| format!("{command_name} requires {primary_index_flag} <index>"))?,
     })
 }
 
-fn parse_kill_window(args: Vec<String>) -> Result<Command, String> {
+fn parse_kill_window(
+    args: Vec<String>,
+    command_name: &str,
+    index_flags: &[&str],
+) -> Result<Command, String> {
     let mut session = None;
     let mut window = None;
     let mut i = 0;
@@ -845,26 +869,32 @@ fn parse_kill_window(args: Vec<String>) -> Result<Command, String> {
             "-t" => {
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| "kill-window requires a session name after -t".to_string())?;
+                    .ok_or_else(|| format!("{command_name} requires a session name after -t"))?;
                 session = Some(value.clone());
                 i += 2;
             }
-            "-w" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "kill-window requires a window index after -w".to_string())?;
-                window =
-                    Some(value.parse::<usize>().map_err(|_| {
-                        "kill-window -w must be a non-negative integer".to_string()
-                    })?);
+            value if index_flags.contains(&value) => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    format!(
+                        "{command_name} requires a tab/window index after {}",
+                        args[i]
+                    )
+                })?;
+                window = Some(value.parse::<usize>().map_err(|_| {
+                    format!("{command_name} {} must be a non-negative integer", args[i])
+                })?);
                 i += 2;
             }
-            value => return Err(format!("kill-window does not support argument {value:?}")),
+            value => {
+                return Err(format!(
+                    "{command_name} does not support argument {value:?}"
+                ));
+            }
         }
     }
 
     Ok(Command::KillWindow {
-        session: session.ok_or_else(|| "kill-window requires -t <session>".to_string())?,
+        session: session.ok_or_else(|| format!("{command_name} requires -t <session>"))?,
         window,
     })
 }
@@ -1482,8 +1512,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_new_tab_alias_target_and_command() {
+        let command = parse_args(["dmux", "new-tab", "-t", "dev", "--", "echo", "tab"]).unwrap();
+        assert_eq!(
+            command,
+            Command::NewWindow {
+                session: "dev".to_string(),
+                command: vec!["echo".to_string(), "tab".to_string()],
+            }
+        );
+    }
+
+    #[test]
     fn parses_list_windows_target() {
         let command = parse_args(["dmux", "list-windows", "-t", "dev"]).unwrap();
+        assert_eq!(
+            command,
+            Command::ListWindows {
+                session: "dev".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_list_tabs_alias_target() {
+        let command = parse_args(["dmux", "list-tabs", "-t", "dev"]).unwrap();
         assert_eq!(
             command,
             Command::ListWindows {
@@ -1505,8 +1558,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_select_tab_alias_target_and_index() {
+        let command = parse_args(["dmux", "select-tab", "-t", "dev", "-i", "1"]).unwrap();
+        assert_eq!(
+            command,
+            Command::SelectWindow {
+                session: "dev".to_string(),
+                window: 1,
+            }
+        );
+    }
+
+    #[test]
     fn parses_kill_window_target_and_index() {
         let command = parse_args(["dmux", "kill-window", "-t", "dev", "-w", "1"]).unwrap();
+        assert_eq!(
+            command,
+            Command::KillWindow {
+                session: "dev".to_string(),
+                window: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_kill_tab_alias_target_and_index() {
+        let command = parse_args(["dmux", "kill-tab", "-t", "dev", "-i", "1"]).unwrap();
         assert_eq!(
             command,
             Command::KillWindow {
