@@ -95,10 +95,18 @@ fn run() -> Result<(), String> {
             )?;
             Ok(())
         }
-        cli::Command::CapturePane { session, mode } => {
+        cli::Command::CapturePane {
+            session,
+            mode,
+            selection,
+        } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            let body = send_request(&socket, &protocol::encode_capture(&session, mode), true)?;
+            let body = send_request(
+                &socket,
+                &protocol::encode_capture_with_selection(&session, mode, selection),
+                true,
+            )?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
@@ -122,21 +130,23 @@ fn run() -> Result<(), String> {
             session,
             mode,
             search,
+            match_index,
         } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
             let body = send_request(
                 &socket,
-                &protocol::encode_copy_mode(&session, mode, search.as_deref()),
+                &protocol::encode_copy_mode(&session, mode, search.as_deref(), match_index),
                 true,
             )?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
-        cli::Command::ListBuffers => {
+        cli::Command::ListBuffers { format } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            let body = send_request(&socket, protocol::encode_list_buffers(), true)?;
+            let request = protocol::encode_list_buffers(format.as_deref());
+            let body = send_request(&socket, &request, true)?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }

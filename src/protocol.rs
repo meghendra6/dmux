@@ -48,8 +48,8 @@ pub enum CaptureMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BufferSelection {
     All,
-    LineRange { start: usize, end: usize },
-    Search(String),
+    LineRange { start: isize, end: isize },
+    Search { needle: String, match_index: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +98,7 @@ pub enum Request {
     Capture {
         session: String,
         mode: CaptureMode,
+        selection: BufferSelection,
     },
     SaveBuffer {
         session: String,
@@ -114,8 +115,11 @@ pub enum Request {
         session: String,
         mode: CaptureMode,
         search: Option<String>,
+        match_index: Option<usize>,
     },
-    ListBuffers,
+    ListBuffers {
+        format: Option<String>,
+    },
     PasteBuffer {
         session: String,
         buffer: Option<String>,
@@ -275,8 +279,32 @@ pub fn encode_detach_client(session: Option<&str>, client_id: Option<usize>) -> 
     )
 }
 
+#[allow(dead_code)]
 pub fn encode_capture(session: &str, mode: CaptureMode) -> String {
     format!("CAPTURE\t{session}\t{}\n", encode_capture_mode(mode))
+}
+
+pub fn encode_capture_with_selection(
+    session: &str,
+    mode: CaptureMode,
+    selection: BufferSelection,
+) -> String {
+    let mode = encode_capture_mode(mode);
+    match selection {
+        BufferSelection::All => format!("CAPTURE\t{session}\t{mode}\n"),
+        BufferSelection::LineRange { start, end } => {
+            format!("CAPTURE_LINES\t{session}\t{mode}\t{start}\t{end}\n")
+        }
+        BufferSelection::Search {
+            needle,
+            match_index,
+        } => {
+            format!(
+                "CAPTURE_SEARCH\t{session}\t{mode}\t{}\t{match_index}\n",
+                encode_hex(needle.as_bytes())
+            )
+        }
+    }
 }
 
 pub fn encode_save_buffer(
@@ -292,11 +320,18 @@ pub fn encode_save_buffer(
         BufferSelection::LineRange { start, end } => {
             format!("SAVE_BUFFER_LINES\t{session}\t{mode}\t{buffer}\t{start}\t{end}\n")
         }
-        BufferSelection::Search(needle) => {
-            format!(
-                "SAVE_BUFFER_SEARCH\t{session}\t{mode}\t{buffer}\t{}\n",
-                encode_hex(needle.as_bytes())
-            )
+        BufferSelection::Search {
+            needle,
+            match_index,
+        } => {
+            let needle = encode_hex(needle.as_bytes());
+            if match_index == 1 {
+                format!("SAVE_BUFFER_SEARCH\t{session}\t{mode}\t{buffer}\t{needle}\n")
+            } else {
+                format!(
+                    "SAVE_BUFFER_SEARCH\t{session}\t{mode}\t{buffer}\t{needle}\t{match_index}\n"
+                )
+            }
         }
     }
 }
@@ -310,16 +345,25 @@ pub fn encode_save_buffer_text(session: &str, buffer: Option<&str>, text: &str) 
     )
 }
 
-pub fn encode_list_buffers() -> &'static str {
-    "LIST_BUFFERS\n"
+pub fn encode_list_buffers(format: Option<&str>) -> String {
+    match format {
+        Some(format) => format!("LIST_BUFFERS_FORMAT\t{}\n", encode_hex(format.as_bytes())),
+        None => "LIST_BUFFERS\n".to_string(),
+    }
 }
 
-pub fn encode_copy_mode(session: &str, mode: CaptureMode, search: Option<&str>) -> String {
-    format!(
-        "COPY_MODE\t{session}\t{}\t{}\n",
-        encode_capture_mode(mode),
-        encode_optional_text(search)
-    )
+pub fn encode_copy_mode(
+    session: &str,
+    mode: CaptureMode,
+    search: Option<&str>,
+    match_index: Option<usize>,
+) -> String {
+    let mode = encode_capture_mode(mode);
+    let search = encode_optional_text(search);
+    match match_index {
+        Some(match_index) => format!("COPY_MODE\t{session}\t{mode}\t{search}\t{match_index}\n"),
+        None => format!("COPY_MODE\t{session}\t{mode}\t{search}\n"),
+    }
 }
 
 pub fn encode_paste_buffer(session: &str, buffer: Option<&str>) -> String {
@@ -564,10 +608,31 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["CAPTURE", session] => Ok(Request::Capture {
             session: (*session).to_string(),
             mode: CaptureMode::All,
+            selection: BufferSelection::All,
         }),
         ["CAPTURE", session, mode] => Ok(Request::Capture {
             session: (*session).to_string(),
             mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::All,
+        }),
+        ["CAPTURE_LINES", session, mode, start, end] => Ok(Request::Capture {
+            session: (*session).to_string(),
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::LineRange {
+                start: decode_line_offset(start, "CAPTURE_LINES has invalid start line")?,
+                end: decode_line_offset(end, "CAPTURE_LINES has invalid end line")?,
+            },
+        }),
+        ["CAPTURE_SEARCH", session, mode, needle, match_index] => Ok(Request::Capture {
+            session: (*session).to_string(),
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::Search {
+                needle: decode_utf8_hex(needle, "CAPTURE_SEARCH")?,
+                match_index: decode_positive_index(
+                    match_index,
+                    "CAPTURE_SEARCH has invalid match index",
+                )?,
+            },
         }),
         ["SAVE_BUFFER", session, mode, buffer] => Ok(Request::SaveBuffer {
             session: (*session).to_string(),
@@ -580,15 +645,37 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             buffer: decode_optional_text(buffer, "SAVE_BUFFER_LINES")?,
             mode: decode_capture_mode(mode)?,
             selection: BufferSelection::LineRange {
-                start: decode_positive_index(start, "SAVE_BUFFER_LINES has invalid start line")?,
-                end: decode_positive_index(end, "SAVE_BUFFER_LINES has invalid end line")?,
+                start: decode_line_offset(start, "SAVE_BUFFER_LINES has invalid start line")?,
+                end: decode_line_offset(end, "SAVE_BUFFER_LINES has invalid end line")?,
             },
         }),
         ["SAVE_BUFFER_SEARCH", session, mode, buffer, needle] => Ok(Request::SaveBuffer {
             session: (*session).to_string(),
             buffer: decode_optional_text(buffer, "SAVE_BUFFER_SEARCH")?,
             mode: decode_capture_mode(mode)?,
-            selection: BufferSelection::Search(decode_utf8_hex(needle, "SAVE_BUFFER_SEARCH")?),
+            selection: BufferSelection::Search {
+                needle: decode_utf8_hex(needle, "SAVE_BUFFER_SEARCH")?,
+                match_index: 1,
+            },
+        }),
+        [
+            "SAVE_BUFFER_SEARCH",
+            session,
+            mode,
+            buffer,
+            needle,
+            match_index,
+        ] => Ok(Request::SaveBuffer {
+            session: (*session).to_string(),
+            buffer: decode_optional_text(buffer, "SAVE_BUFFER_SEARCH")?,
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::Search {
+                needle: decode_utf8_hex(needle, "SAVE_BUFFER_SEARCH")?,
+                match_index: decode_positive_index(
+                    match_index,
+                    "SAVE_BUFFER_SEARCH has invalid match index",
+                )?,
+            },
         }),
         ["SAVE_BUFFER_TEXT", session, buffer, text] => Ok(Request::SaveBufferText {
             session: (*session).to_string(),
@@ -604,8 +691,26 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
             mode: decode_capture_mode(mode)?,
             search: decode_optional_text(search, "COPY_MODE")?,
+            match_index: None,
         }),
-        ["LIST_BUFFERS"] => Ok(Request::ListBuffers),
+        ["COPY_MODE", session, mode, search, match_index] => {
+            let search = decode_optional_text(search, "COPY_MODE")?;
+            let match_index =
+                decode_optional_positive_index(match_index, "COPY_MODE has invalid match index")?;
+            if search.is_none() && match_index.is_some() {
+                return Err("COPY_MODE match index requires search".to_string());
+            }
+            Ok(Request::CopyMode {
+                session: (*session).to_string(),
+                mode: decode_capture_mode(mode)?,
+                search,
+                match_index,
+            })
+        }
+        ["LIST_BUFFERS"] => Ok(Request::ListBuffers { format: None }),
+        ["LIST_BUFFERS_FORMAT", format] => Ok(Request::ListBuffers {
+            format: Some(decode_utf8_hex(format, "LIST_BUFFERS_FORMAT")?),
+        }),
         ["PASTE_BUFFER", session, buffer] => Ok(Request::PasteBuffer {
             session: (*session).to_string(),
             buffer: decode_optional_text(buffer, "PASTE_BUFFER")?,
@@ -924,11 +1029,30 @@ fn decode_optional_index(value: &str, invalid_message: &str) -> Result<Option<us
     }
 }
 
+fn decode_optional_positive_index(
+    value: &str,
+    invalid_message: &str,
+) -> Result<Option<usize>, String> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        decode_positive_index(value, invalid_message).map(Some)
+    }
+}
+
 fn decode_positive_index(value: &str, invalid_message: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
         .ok()
         .filter(|value| *value > 0)
+        .ok_or_else(|| invalid_message.to_string())
+}
+
+fn decode_line_offset(value: &str, invalid_message: &str) -> Result<isize, String> {
+    value
+        .parse::<isize>()
+        .ok()
+        .filter(|value| *value != 0)
         .ok_or_else(|| invalid_message.to_string())
 }
 
@@ -1089,6 +1213,7 @@ mod tests {
             Request::Capture {
                 session: "dev".to_string(),
                 mode: CaptureMode::Screen,
+                selection: BufferSelection::All,
             }
         );
     }
@@ -1101,6 +1226,7 @@ mod tests {
             Request::Capture {
                 session: "dev".to_string(),
                 mode: CaptureMode::History,
+                selection: BufferSelection::All,
             }
         );
     }
@@ -1112,6 +1238,24 @@ mod tests {
             Request::Capture {
                 session: "dev".to_string(),
                 mode: CaptureMode::All,
+                selection: BufferSelection::All,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_capture_line_range_request() {
+        let line = encode_capture_with_selection(
+            "dev",
+            CaptureMode::Screen,
+            BufferSelection::LineRange { start: -2, end: -1 },
+        );
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::Capture {
+                session: "dev".to_string(),
+                mode: CaptureMode::Screen,
+                selection: BufferSelection::LineRange { start: -2, end: -1 },
             }
         );
     }
@@ -1160,7 +1304,10 @@ mod tests {
             "dev",
             Some("match"),
             CaptureMode::All,
-            BufferSelection::Search("needle".to_string()),
+            BufferSelection::Search {
+                needle: "needle".to_string(),
+                match_index: 2,
+            },
         );
         assert_eq!(
             decode_request(&line).unwrap(),
@@ -1168,7 +1315,10 @@ mod tests {
                 session: "dev".to_string(),
                 buffer: Some("match".to_string()),
                 mode: CaptureMode::All,
-                selection: BufferSelection::Search("needle".to_string()),
+                selection: BufferSelection::Search {
+                    needle: "needle".to_string(),
+                    match_index: 2,
+                },
             }
         );
     }
@@ -1199,13 +1349,25 @@ mod tests {
 
     #[test]
     fn round_trips_copy_mode_request() {
-        let line = encode_copy_mode("dev", CaptureMode::History, Some("needle"));
+        let line = encode_copy_mode("dev", CaptureMode::History, Some("needle"), Some(2));
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::CopyMode {
                 session: "dev".to_string(),
                 mode: CaptureMode::History,
                 search: Some("needle".to_string()),
+                match_index: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_list_buffers_format_request() {
+        let line = encode_list_buffers(Some("#{buffer.name}"));
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::ListBuffers {
+                format: Some("#{buffer.name}".to_string()),
             }
         );
     }

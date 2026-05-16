@@ -2791,7 +2791,7 @@ fn run_copy_mode_with_reader<R: Read>(
 ) -> io::Result<()> {
     let body = send_control_request(
         socket,
-        &protocol::encode_copy_mode(session, protocol::CaptureMode::All, None),
+        &protocol::encode_copy_mode(session, protocol::CaptureMode::All, None, None),
     )?;
     let output = String::from_utf8_lossy(&body);
     let mut view = CopyModeView::from_numbered_output(&output)?;

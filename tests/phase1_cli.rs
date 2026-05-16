@@ -826,6 +826,284 @@ fn save_buffer_can_copy_line_range_and_search_match() {
 }
 
 #[test]
+fn capture_and_save_buffer_support_tail_ranges_and_search_match_indexes() {
+    let socket = unique_socket("copy-tail-range-search-index");
+    let source = format!("copy-tail-range-search-index-{}", std::process::id());
+    let sink = format!("copy-tail-range-search-index-sink-{}", std::process::id());
+    let file = unique_temp_file("copy-tail-range-search-index");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &source,
+            "--",
+            "sh",
+            "-c",
+            "printf first; printf '\\n'; printf needle-one; printf '\\n'; printf middle; printf '\\n'; printf needle-two; printf '\\n'; printf tail; printf '\\n'; sleep 30",
+        ],
+    ));
+    let captured = poll_capture(&socket, &source, "tail");
+    assert!(captured.contains("needle-two"), "{captured:?}");
+
+    let tail = dmux(
+        &socket,
+        &[
+            "capture-pane",
+            "-t",
+            &source,
+            "-p",
+            "--screen",
+            "--start-line",
+            "-2",
+            "--end-line",
+            "-1",
+        ],
+    );
+    assert_success(&tail);
+    assert_eq!(String::from_utf8_lossy(&tail.stdout), "needle-two\ntail\n");
+
+    let from_second_to_tail = dmux(
+        &socket,
+        &[
+            "capture-pane",
+            "-t",
+            &source,
+            "-p",
+            "--screen",
+            "--start-line",
+            "2",
+            "--end-line",
+            "-1",
+        ],
+    );
+    assert_success(&from_second_to_tail);
+    assert_eq!(
+        String::from_utf8_lossy(&from_second_to_tail.stdout),
+        "needle-one\nmiddle\nneedle-two\ntail\n"
+    );
+
+    let second_capture_match = dmux(
+        &socket,
+        &[
+            "capture-pane",
+            "-t",
+            &source,
+            "-p",
+            "--screen",
+            "--search",
+            "needle",
+            "--match",
+            "2",
+        ],
+    );
+    assert_success(&second_capture_match);
+    assert_eq!(
+        String::from_utf8_lossy(&second_capture_match.stdout),
+        "needle-two\n"
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "save-buffer",
+            "-t",
+            &source,
+            "-b",
+            "tail",
+            "--screen",
+            "--start-line",
+            "-2",
+            "--end-line",
+            "-1",
+        ],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "save-buffer",
+            "-t",
+            &source,
+            "-b",
+            "mixed-range",
+            "--screen",
+            "--start-line",
+            "2",
+            "--end-line",
+            "-1",
+        ],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "save-buffer",
+            "-t",
+            &source,
+            "-b",
+            "second-match",
+            "--screen",
+            "--search",
+            "needle",
+            "--match",
+            "2",
+        ],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &sink,
+            "--",
+            "sh",
+            "-c",
+            &format!("cat > {}; sleep 30", file.display()),
+        ],
+    ));
+    assert_success(&dmux(&socket, &["paste-buffer", "-t", &sink, "-b", "tail"]));
+    assert_success(&dmux(
+        &socket,
+        &["paste-buffer", "-t", &sink, "-b", "second-match"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["paste-buffer", "-t", &sink, "-b", "mixed-range"],
+    ));
+    assert!(poll_file_equals(
+        &file,
+        "needle-two\ntail\nneedle-two\nneedle-one\nmiddle\nneedle-two\ntail\n"
+    ));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &source]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &sink]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn list_buffers_format_exposes_latest_metadata_and_replacement_order() {
+    let socket = unique_socket("buffer-list-format");
+    let session = format!("buffer-list-format-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    for (name, text) in [
+        ("alpha", "one\n"),
+        ("beta", "two\n"),
+        ("alpha", "one replaced\n"),
+    ] {
+        let mut stream = UnixStream::connect(&socket).expect("connect socket");
+        stream
+            .write_all(
+                format!(
+                    "SAVE_BUFFER_TEXT\t{session}\t{}\t{}\n",
+                    encode_hex(name.as_bytes()),
+                    encode_hex(text.as_bytes())
+                )
+                .as_bytes(),
+            )
+            .expect("write save buffer text request");
+        assert_eq!(read_socket_line(&mut stream), "OK\n");
+        assert_eq!(read_socket_line(&mut stream), format!("{name}\n"));
+    }
+
+    let listed = dmux(
+        &socket,
+        &[
+            "list-buffers",
+            "--format",
+            "#{buffer.index}:#{buffer.name}:#{buffer.bytes}:#{buffer.lines}:#{buffer.latest}:#{buffer.preview}",
+        ],
+    );
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(listed, "0:beta:4:1:0:two\n1:alpha:13:1:1:one replaced\n");
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(
+            format!(
+                "SAVE_BUFFER_TEXT\t{session}\t{}\t{}\n",
+                encode_hex(b"#{buffer.latest}"),
+                encode_hex(b"#{buffer.bytes}\n")
+            )
+            .as_bytes(),
+        )
+        .expect("write token-like save buffer text request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "#{buffer.latest}\n");
+
+    let listed = dmux(
+        &socket,
+        &[
+            "list-buffers",
+            "--format",
+            "#{buffer.index}:#{buffer.name}:#{buffer.latest}:#{buffer.preview}",
+        ],
+    );
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(
+        listed,
+        "0:beta:0:two\n1:alpha:0:one replaced\n2:#{buffer.latest}:1:#{buffer.bytes}\n"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn paste_buffer_rejects_exited_panes_and_missing_buffers_explicitly() {
+    let socket = unique_socket("paste-safe");
+    let session = format!("paste-safe-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "printf done"],
+    ));
+    let _ = poll_capture(&socket, &session, "done");
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(
+            format!(
+                "SAVE_BUFFER_TEXT\t{session}\t{}\t{}\n",
+                encode_hex(b"saved"),
+                encode_hex(b"text")
+            )
+            .as_bytes(),
+        )
+        .expect("write save buffer text request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "saved\n");
+
+    let missing = dmux(&socket, &["paste-buffer", "-t", &session, "-b", "missing"]);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("missing buffer"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    let exited = dmux(&socket, &["paste-buffer", "-t", &session, "-b", "saved"]);
+    assert!(!exited.status.success());
+    assert!(
+        String::from_utf8_lossy(&exited.stderr).contains("pane is not running"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&exited.stderr)
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn save_buffer_command_uses_current_active_pane_after_split() {
     let socket = unique_socket("save-buffer-active-pane-after-split");
     let session = format!("save-buffer-active-pane-after-split-{}", std::process::id());
@@ -1079,6 +1357,23 @@ fn copy_mode_prints_numbered_lines_and_search_matches() {
     assert_success(&output);
     let output = String::from_utf8_lossy(&output.stdout);
     assert_eq!(output, "2\tneedle-one\n4\tneedle-two\n");
+
+    let output = dmux(
+        &socket,
+        &[
+            "copy-mode",
+            "-t",
+            &session,
+            "--screen",
+            "--search",
+            "needle",
+            "--match",
+            "2",
+        ],
+    );
+    assert_success(&output);
+    let output = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output, "4\tneedle-two\n");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
