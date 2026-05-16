@@ -3736,28 +3736,26 @@ fn write_render_output_rows(output: &mut Vec<u8>, snapshot: &[u8], max_rows: usi
 
     let mut rows = 0;
     let mut start = 0;
-    while start < snapshot.len() && rows < max_rows {
-        let line_end = snapshot[start..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(snapshot.len(), |offset| start + offset);
-        let content_end = if line_end > start && snapshot[line_end - 1] == b'\r' {
-            line_end - 1
-        } else {
-            line_end
-        };
-
+    while rows < max_rows {
         if rows > 0 {
             output.extend_from_slice(b"\r\n");
         }
         output.extend_from_slice(CLEAR_LINE);
-        output.extend_from_slice(&snapshot[start..content_end]);
-        rows += 1;
 
-        if line_end == snapshot.len() {
-            break;
+        if start < snapshot.len() {
+            let line_end = snapshot[start..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(snapshot.len(), |offset| start + offset);
+            let content_end = if line_end > start && snapshot[line_end - 1] == b'\r' {
+                line_end - 1
+            } else {
+                line_end
+            };
+            output.extend_from_slice(&snapshot[start..content_end]);
+            start = line_end.saturating_add(1);
         }
-        start = line_end + 1;
+        rows += 1;
     }
 }
 
@@ -5952,6 +5950,29 @@ left | right\r\n"
     }
 
     #[test]
+    fn format_attach_render_frame_clears_rows_below_short_snapshot() {
+        let snapshot = RenderedAttachSnapshot {
+            text: "short\r\n".to_string(),
+            regions: vec![PaneRegion {
+                pane: 0,
+                row_start: 0,
+                row_end: 1,
+                col_start: 0,
+                col_end: 10,
+            }],
+            cursor: None,
+        };
+
+        let body = String::from_utf8(format_attach_render_frame_body("", None, &snapshot, 3))
+            .expect("render frame utf8");
+
+        assert!(
+            body.contains("\x1b[H\x1b[2Kshort\r\n\x1b[2K\r\n\x1b[2K"),
+            "{body:?}"
+        );
+    }
+
+    #[test]
     fn format_attach_render_frame_places_cursor_after_output() {
         let snapshot = RenderedAttachSnapshot {
             text: "left │ right\r\n".to_string(),
@@ -5983,10 +6004,8 @@ left | right\r\n"
         ))
         .expect("render frame utf8");
 
-        assert!(
-            body.contains("\x1b[2Kleft │ right\x1b[?25h\x1b[2;10H"),
-            "{body:?}"
-        );
+        assert!(body.contains("\x1b[2Kleft │ right\r\n"), "{body:?}");
+        assert!(body.ends_with("\x1b[?25h\x1b[2;10H"), "{body:?}");
     }
 
     #[test]
@@ -6012,7 +6031,8 @@ left | right\r\n"
         ))
         .expect("render frame utf8");
 
-        assert!(body.contains("\x1b[2Khidden\x1b[?25l\x1b[2;7H"), "{body:?}");
+        assert!(body.contains("\x1b[2Khidden\r\n"), "{body:?}");
+        assert!(body.ends_with("\x1b[?25l\x1b[2;7H"), "{body:?}");
         assert!(!body.contains("\x1b[?25h\x1b[2;7H"), "{body:?}");
     }
 
