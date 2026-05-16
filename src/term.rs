@@ -6,6 +6,7 @@ pub struct TerminalState {
     screen: TerminalScreen,
     alternate_screen: Option<TerminalScreen>,
     use_alternate_screen: bool,
+    cursor_visible: bool,
     scrollback: Scrollback,
     parser: vte::Parser,
     style: CellStyle,
@@ -17,6 +18,7 @@ impl TerminalState {
             screen: TerminalScreen::new(width, height),
             alternate_screen: None,
             use_alternate_screen: false,
+            cursor_visible: true,
             scrollback: Scrollback::new(max_scrollback_lines),
             parser: vte::Parser::new(),
             style: CellStyle::default(),
@@ -62,6 +64,10 @@ impl TerminalState {
 
     pub fn cursor_position(&self) -> (usize, usize) {
         self.active_screen().cursor_position()
+    }
+
+    pub fn cursor_visible(&self) -> bool {
+        self.cursor_visible
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -126,6 +132,7 @@ impl TerminalState {
         self.screen = TerminalScreen::new(self.screen.width, self.screen.height);
         self.alternate_screen = None;
         self.use_alternate_screen = false;
+        self.cursor_visible = true;
         self.scrollback.clear();
         self.style = CellStyle::default();
     }
@@ -236,15 +243,11 @@ impl vte::Perform for TerminalState {
             'd' => self.active_screen_mut().move_to_row(first_param(params, 1)),
             's' => self.active_screen_mut().save_cursor(),
             'u' => self.active_screen_mut().restore_cursor(),
-            'h' if is_private_mode(intermediates, params, 1049)
-                || is_private_mode(intermediates, params, 1047) =>
-            {
-                self.enter_alternate_screen();
+            'h' if is_private_mode_sequence(intermediates) => {
+                self.apply_private_modes(params, true)
             }
-            'l' if is_private_mode(intermediates, params, 1049)
-                || is_private_mode(intermediates, params, 1047) =>
-            {
-                self.exit_alternate_screen();
+            'l' if is_private_mode_sequence(intermediates) => {
+                self.apply_private_modes(params, false);
             }
             _ => {}
         }
@@ -260,6 +263,20 @@ impl vte::Perform for TerminalState {
             b'8' => self.active_screen_mut().restore_cursor(),
             b'c' => self.reset_terminal(),
             _ => {}
+        }
+    }
+}
+
+impl TerminalState {
+    fn apply_private_modes(&mut self, params: &vte::Params, enabled: bool) {
+        for mode in flat_params(params) {
+            match (mode, enabled) {
+                (1049 | 1047, true) => self.enter_alternate_screen(),
+                (1049 | 1047, false) => self.exit_alternate_screen(),
+                (25, true) => self.cursor_visible = true,
+                (25, false) => self.cursor_visible = false,
+                _ => {}
+            }
         }
     }
 }
@@ -703,8 +720,8 @@ fn cursor_position(params: &vte::Params) -> (usize, usize) {
     (nth_param(params, 0, 1), nth_param(params, 1, 1))
 }
 
-fn is_private_mode(intermediates: &[u8], params: &vte::Params, mode: usize) -> bool {
-    intermediates.contains(&b'?') && first_param(params, 0) == mode
+fn is_private_mode_sequence(intermediates: &[u8]) -> bool {
+    intermediates.contains(&b'?')
 }
 
 fn parse_extended_color(params: &[usize]) -> Option<(Color, usize)> {
@@ -949,6 +966,35 @@ mod tests {
         let mut state = TerminalState::new(20, 3, 100);
         state.apply_bytes(b"ab\x1b[scd\x1b[uZ");
         assert_eq!(state.capture_screen_text(), "abZd\n");
+    }
+
+    #[test]
+    fn cursor_visibility_tracks_private_mode() {
+        let mut state = TerminalState::new(20, 3, 100);
+        assert!(state.cursor_visible());
+
+        state.apply_bytes(b"\x1b[?25l");
+        assert!(!state.cursor_visible());
+
+        state.apply_bytes(b"\x1b[?25h");
+        assert!(state.cursor_visible());
+    }
+
+    #[test]
+    fn batched_private_modes_update_cursor_visibility_and_alternate_screen() {
+        let mut state = TerminalState::new(20, 3, 100);
+        state.apply_bytes(b"primary");
+
+        state.apply_bytes(b"\x1b[?1000;25l");
+        assert!(!state.cursor_visible());
+
+        state.apply_bytes(b"\x1b[?25;1049halternate");
+        assert!(state.cursor_visible());
+        assert_eq!(state.capture_screen_text(), "alternate\n");
+
+        state.apply_bytes(b"\x1b[?1049;25l");
+        assert!(!state.cursor_visible());
+        assert_eq!(state.capture_screen_text(), "primary\n");
     }
 
     #[test]
