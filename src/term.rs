@@ -138,11 +138,18 @@ impl TerminalState {
         self.style = CellStyle::default();
     }
 
-    fn apply_sgr(&mut self, params: Vec<usize>) {
-        let params = if params.is_empty() { vec![0] } else { params };
+    fn apply_sgr(&mut self, params: &vte::Params) {
+        let params = sgr_params(params);
+        if params.is_empty() {
+            self.style = CellStyle::default();
+            return;
+        }
+
         let mut index = 0;
         while index < params.len() {
-            match params[index] {
+            let param = &params[index];
+            let code = param.first().copied().unwrap_or(0);
+            match code {
                 0 => self.style = CellStyle::default(),
                 1 => self.style.bold = true,
                 2 => self.style.dim = true,
@@ -156,15 +163,15 @@ impl TerminalState {
                 23 => self.style.italic = false,
                 24 => self.style.underline = false,
                 27 => self.style.inverse = false,
-                30..=37 => self.style.fg = Some(Color::Ansi(params[index] as u8 - 30)),
+                30..=37 => self.style.fg = Some(Color::Ansi(code as u8 - 30)),
                 39 => self.style.fg = None,
-                40..=47 => self.style.bg = Some(Color::Ansi(params[index] as u8 - 40)),
+                40..=47 => self.style.bg = Some(Color::Ansi(code as u8 - 40)),
                 49 => self.style.bg = None,
-                90..=97 => self.style.fg = Some(Color::Ansi(params[index] as u8 - 90 + 8)),
-                100..=107 => self.style.bg = Some(Color::Ansi(params[index] as u8 - 100 + 8)),
+                90..=97 => self.style.fg = Some(Color::Ansi(code as u8 - 90 + 8)),
+                100..=107 => self.style.bg = Some(Color::Ansi(code as u8 - 100 + 8)),
                 38 | 48 => {
-                    if let Some((color, consumed)) = parse_extended_color(&params[index + 1..]) {
-                        if params[index] == 38 {
+                    if let Some((color, consumed)) = parse_sgr_color(param, &params[index + 1..]) {
+                        if code == 38 {
                             self.style.fg = Some(color);
                         } else {
                             self.style.bg = Some(color);
@@ -206,20 +213,26 @@ impl vte::Perform for TerminalState {
         }
 
         match action {
-            'm' => self.apply_sgr(flat_params(params)),
-            'J' => match first_param(params, 0) {
-                0 => self.active_screen_mut().clear_display_from_cursor(),
-                1 => self.active_screen_mut().clear_display_to_cursor(),
-                2 => self.active_screen_mut().clear_display(),
-                3 => self.scrollback.clear(),
-                _ => {}
-            },
-            'K' => match first_param(params, 0) {
-                0 => self.active_screen_mut().clear_line_from_cursor(),
-                1 => self.active_screen_mut().clear_line_to_cursor(),
-                2 => self.active_screen_mut().clear_line(),
-                _ => {}
-            },
+            'm' => self.apply_sgr(params),
+            'J' => {
+                let style = self.style;
+                match first_param(params, 0) {
+                    0 => self.active_screen_mut().clear_display_from_cursor(style),
+                    1 => self.active_screen_mut().clear_display_to_cursor(style),
+                    2 => self.active_screen_mut().clear_display(style),
+                    3 => self.scrollback.clear(),
+                    _ => {}
+                }
+            }
+            'K' => {
+                let style = self.style;
+                match first_param(params, 0) {
+                    0 => self.active_screen_mut().clear_line_from_cursor(style),
+                    1 => self.active_screen_mut().clear_line_to_cursor(style),
+                    2 => self.active_screen_mut().clear_line(style),
+                    _ => {}
+                }
+            }
             'H' | 'f' => {
                 let (row, col) = cursor_position(params);
                 self.active_screen_mut().move_cursor(row, col);
@@ -274,6 +287,11 @@ impl vte::Perform for TerminalState {
                 let count = first_param(params, 1);
                 let style = self.style;
                 self.active_screen_mut().scroll_region_down(count, style);
+            }
+            'X' => {
+                let count = first_param(params, 1);
+                let style = self.style;
+                self.active_screen_mut().erase_chars(count, style);
             }
             's' => self.active_screen_mut().save_cursor(),
             'u' => self.active_screen_mut().restore_cursor(),
@@ -440,25 +458,25 @@ impl TerminalScreen {
         }
     }
 
-    fn clear_display(&mut self) {
-        self.rows = vec![vec![Cell::blank(); self.width]; self.height];
+    fn clear_display(&mut self, style: CellStyle) {
+        self.rows = vec![self.blank_row(style); self.height];
     }
 
-    fn clear_display_from_cursor(&mut self) {
+    fn clear_display_from_cursor(&mut self, style: CellStyle) {
         for col in self.cursor_col..self.width {
-            self.rows[self.cursor_row][col] = Cell::blank();
+            self.rows[self.cursor_row][col] = Cell::blank_with_style(style);
         }
         for row in (self.cursor_row + 1)..self.height {
-            self.rows[row] = vec![Cell::blank(); self.width];
+            self.rows[row] = self.blank_row(style);
         }
     }
 
-    fn clear_display_to_cursor(&mut self) {
+    fn clear_display_to_cursor(&mut self, style: CellStyle) {
         for row in 0..self.cursor_row {
-            self.rows[row] = vec![Cell::blank(); self.width];
+            self.rows[row] = self.blank_row(style);
         }
         for col in 0..=self.cursor_col.min(self.width - 1) {
-            self.rows[self.cursor_row][col] = Cell::blank();
+            self.rows[self.cursor_row][col] = Cell::blank_with_style(style);
         }
     }
 
@@ -501,20 +519,20 @@ impl TerminalScreen {
         }
     }
 
-    fn clear_line_from_cursor(&mut self) {
+    fn clear_line_from_cursor(&mut self, style: CellStyle) {
         for col in self.cursor_col..self.width {
-            self.rows[self.cursor_row][col] = Cell::blank();
+            self.rows[self.cursor_row][col] = Cell::blank_with_style(style);
         }
     }
 
-    fn clear_line_to_cursor(&mut self) {
+    fn clear_line_to_cursor(&mut self, style: CellStyle) {
         for col in 0..=self.cursor_col.min(self.width - 1) {
-            self.rows[self.cursor_row][col] = Cell::blank();
+            self.rows[self.cursor_row][col] = Cell::blank_with_style(style);
         }
     }
 
-    fn clear_line(&mut self) {
-        self.rows[self.cursor_row] = vec![Cell::blank(); self.width];
+    fn clear_line(&mut self, style: CellStyle) {
+        self.rows[self.cursor_row] = self.blank_row(style);
     }
 
     fn move_cursor(&mut self, row: usize, col: usize) {
@@ -640,6 +658,13 @@ impl TerminalScreen {
             self.rows.insert(self.cursor_row, self.blank_row(style));
         }
         self.cursor_col = 0;
+    }
+
+    fn erase_chars(&mut self, count: usize, style: CellStyle) {
+        let end = (self.cursor_col + count).min(self.width);
+        for col in self.cursor_col..end {
+            self.rows[self.cursor_row][col] = Cell::blank_with_style(style);
+        }
     }
 
     fn cursor_in_scroll_region(&self) -> bool {
@@ -848,6 +873,13 @@ fn flat_params(params: &vte::Params) -> Vec<usize> {
         .collect()
 }
 
+fn sgr_params(params: &vte::Params) -> Vec<Vec<usize>> {
+    params
+        .iter()
+        .map(|param| param.iter().copied().map(usize::from).collect())
+        .collect()
+}
+
 fn first_param(params: &vte::Params, default: usize) -> usize {
     params
         .iter()
@@ -878,18 +910,44 @@ fn is_private_mode_sequence(intermediates: &[u8]) -> bool {
     intermediates.contains(&b'?')
 }
 
-fn parse_extended_color(params: &[usize]) -> Option<(Color, usize)> {
-    match params {
-        [5, value, ..] if *value <= u8::MAX as usize => Some((Color::Indexed(*value as u8), 2)),
-        [2, red, green, blue, ..]
-            if *red <= u8::MAX as usize
-                && *green <= u8::MAX as usize
-                && *blue <= u8::MAX as usize =>
-        {
-            Some((Color::Rgb(*red as u8, *green as u8, *blue as u8), 4))
+fn parse_sgr_color(param: &[usize], following: &[Vec<usize>]) -> Option<(Color, usize)> {
+    if param.len() > 1 {
+        return parse_sgr_color_components(&param[1..]).map(|color| (color, 0));
+    }
+
+    let mode = following.first()?.first().copied()?;
+    match mode {
+        5 => {
+            let value = following.get(1)?.first().copied()?;
+            u8::try_from(value)
+                .ok()
+                .map(|value| (Color::Indexed(value), 2))
+        }
+        2 => {
+            let red = following.get(1)?.first().copied()?;
+            let green = following.get(2)?.first().copied()?;
+            let blue = following.get(3)?.first().copied()?;
+            parse_rgb(red, green, blue).map(|color| (color, 4))
         }
         _ => None,
     }
+}
+
+fn parse_sgr_color_components(components: &[usize]) -> Option<Color> {
+    match components {
+        [5, value, ..] => u8::try_from(*value).ok().map(Color::Indexed),
+        [2, _color_space, red, green, blue, ..] => parse_rgb(*red, *green, *blue),
+        [2, red, green, blue, ..] => parse_rgb(*red, *green, *blue),
+        _ => None,
+    }
+}
+
+fn parse_rgb(red: usize, green: usize, blue: usize) -> Option<Color> {
+    Some(Color::Rgb(
+        u8::try_from(red).ok()?,
+        u8::try_from(green).ok()?,
+        u8::try_from(blue).ok()?,
+    ))
 }
 
 #[allow(dead_code)]
@@ -1026,6 +1084,57 @@ mod tests {
         assert_eq!(
             state.render_screen_ansi_text(),
             "\x1b[1;38;2;1;2;3mhi\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn styled_render_preserves_colon_truecolor_sgr() {
+        let mut state = TerminalState::new(20, 3, 100);
+        state.apply_bytes(b"\x1b[38:2:1:2:3mfg\x1b[48:2::4:5:6mbg\x1b[0m");
+
+        assert_eq!(
+            state.render_screen_ansi_text(),
+            "\x1b[38;2;1;2;3mfg\x1b[0m\x1b[38;2;1;2;3;48;2;4;5;6mbg\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn erase_line_preserves_current_background_style() {
+        let mut state = TerminalState::new(4, 2, 100);
+        state.apply_bytes(b"\x1b[48;2;1;2;3m\x1b[K");
+
+        assert_eq!(
+            state.render_screen_ansi_lines(4, 1),
+            vec!["\x1b[48;2;1;2;3m    \x1b[0m"]
+        );
+    }
+
+    #[test]
+    fn erase_line_preserves_reverse_video_style() {
+        let mut state = TerminalState::new(4, 2, 100);
+        state.apply_bytes(b"\x1b[31;44;7m\x1b[K");
+
+        assert_eq!(
+            state.render_screen_ansi_lines(4, 1),
+            vec!["\x1b[7;31;44m    \x1b[0m"]
+        );
+    }
+
+    #[test]
+    fn erase_display_and_erase_chars_preserve_current_background_style() {
+        let mut state = TerminalState::new(4, 2, 100);
+        state.apply_bytes(b"\x1b[48;5;24m\x1b[2J");
+
+        assert_eq!(
+            state.render_screen_ansi_lines(4, 1),
+            vec!["\x1b[48;5;24m    \x1b[0m"]
+        );
+
+        let mut state = TerminalState::new(4, 2, 100);
+        state.apply_bytes(b"abcd\x1b[1;2H\x1b[48;5;25m\x1b[2X");
+        assert_eq!(
+            state.render_screen_ansi_lines(4, 1),
+            vec!["a\x1b[48;5;25m  \x1b[0md"]
         );
     }
 

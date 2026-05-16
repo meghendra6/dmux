@@ -405,6 +405,34 @@ fn capture_pane_modes_separate_history_from_screen() {
 }
 
 #[test]
+fn detached_session_sets_color_capable_terminal_environment() {
+    let socket = unique_socket("terminal-env");
+    let session = format!("terminal-env-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf 'TERM=%s COLORTERM=%s\\n' \"$TERM\" \"$COLORTERM\"; sleep 30",
+        ],
+    ));
+    let captured = poll_capture(&socket, &session, "TERM=screen-256color");
+    assert!(
+        captured.contains("TERM=screen-256color COLORTERM=truecolor"),
+        "{captured:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn buffers_save_capture_list_paste_and_delete() {
     let socket = unique_socket("buffers");
     let source = format!("buffer-source-{}", std::process::id());
@@ -5701,6 +5729,66 @@ fn attach_render_stream_refreshes_scroll_region_redraw_after_split() {
         !pushed.contains("view-a-01")
             && !pushed.contains("view-a-02")
             && !pushed.contains("view-a-03"),
+        "{pushed:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_render_stream_preserves_truecolor_background_after_line_erase() {
+    let socket = unique_socket("attach-render-truecolor-bg");
+    let session = format!("attach-render-truecolor-bg-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    let mut stream = attach_render_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT_META\n");
+    let initial = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
+    assert!(initial.contains("base-ready"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf '\\033[?1049h\\033[H\\033[2J\\033[38:2::1:2:3mfg-ready\\r\\n\\033[48:2::4:5:6m\\033[Kbg-ready'; sleep 30",
+        ],
+    ));
+
+    let pushed = read_attach_render_output_until_contains(&mut stream, "bg-ready");
+    assert!(pushed.contains("\x1b[38;2;1;2;3mfg-ready"), "{pushed:?}");
+    assert!(pushed.contains("48;2;4;5;6m"), "{pushed:?}");
+    assert!(pushed.contains("bg-ready"), "{pushed:?}");
+    let bg_style_start = pushed
+        .find("48;2;4;5;6m")
+        .unwrap_or_else(|| panic!("missing background style in {pushed:?}"));
+    let styled_tail = &pushed[bg_style_start..];
+    let bg_reset = styled_tail
+        .find("\x1b[0m")
+        .unwrap_or_else(|| panic!("missing reset after background style in {pushed:?}"));
+    assert!(
+        styled_tail[..bg_reset].contains(&format!("bg-ready{}", " ".repeat(16))),
         "{pushed:?}"
     );
 

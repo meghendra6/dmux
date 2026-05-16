@@ -24,6 +24,7 @@ const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
+const RESET_STYLE: &[u8] = b"\x1b[0m";
 const ATTACH_RENDER_RESPONSE: &str = "OK\tRENDER_OUTPUT_META\n";
 const STDIN_FILENO: c_int = 0;
 const F_GETFL: c_int = 3;
@@ -704,6 +705,7 @@ fn diff_live_render_output(
             .is_none_or(|previous| previous != current)
         {
             write_absolute_cursor_position(&mut output, row + 1, 1);
+            output.extend_from_slice(RESET_STYLE);
             output.extend_from_slice(current);
             changed_rows = true;
         }
@@ -3407,7 +3409,7 @@ mod tests {
         let output = diff_live_render_output(&render_frame(second), &mut state);
 
         assert!(!output.starts_with(CURSOR_HOME), "{output:?}");
-        assert!(output.starts_with(b"\x1b[2;1H"), "{output:?}");
+        assert!(output.starts_with(b"\x1b[2;1H\x1b[0m"), "{output:?}");
         assert!(
             output
                 .windows(CLEAR_LINE.len())
@@ -3420,6 +3422,21 @@ mod tests {
                 .any(|window| window == b"status")
         );
         assert!(output.ends_with(b"\x1b[2;4H"), "{output:?}");
+    }
+
+    #[test]
+    fn diff_live_render_output_resets_style_before_clearing_changed_rows() {
+        let mut state = LiveRenderOutputState::default();
+        let first = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2K\x1b[48;5;24mstyled\x1b[0m\x1b[2;4H";
+        let second = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Kplain\x1b[2;4H";
+        let _ = diff_live_render_output(&render_frame(first), &mut state);
+
+        let output = diff_live_render_output(&render_frame(second), &mut state);
+
+        assert!(
+            output.starts_with(b"\x1b[2;1H\x1b[0m\x1b[2Kplain"),
+            "{output:?}"
+        );
     }
 
     #[test]

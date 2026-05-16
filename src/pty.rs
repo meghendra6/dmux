@@ -178,6 +178,7 @@ pub fn resize(master: &File, size: PtySize) -> io::Result<()> {
 
 fn child_exec(spec: &SpawnSpec) -> ! {
     let _ = std::env::set_current_dir(&spec.cwd);
+    configure_child_terminal_environment();
 
     let args = spec
         .command
@@ -200,6 +201,16 @@ fn child_exec(spec: &SpawnSpec) -> ! {
     unsafe {
         execvp(args[0].as_ptr(), argv.as_ptr());
         _exit(127);
+    }
+}
+
+fn configure_child_terminal_environment() {
+    // The PTY child should see dmux's terminal capabilities, not the launching
+    // process's terminal. A weak inherited TERM such as "dumb" causes full-screen
+    // programs to choose degraded color output.
+    unsafe {
+        std::env::set_var("TERM", "screen-256color");
+        std::env::set_var("COLORTERM", "truecolor");
     }
 }
 
