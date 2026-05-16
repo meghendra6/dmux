@@ -5,6 +5,7 @@ mod protocol;
 mod pty;
 mod server;
 mod term;
+mod terminal_query;
 
 fn main() {
     if let Err(err) = run() {

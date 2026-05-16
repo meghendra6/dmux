@@ -1,6 +1,7 @@
 use crate::protocol::{self, BufferSelection, CaptureMode, Request, SplitDirection};
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::{TerminalChanges, TerminalState};
+use crate::terminal_query::PtyOutputFilter;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
@@ -1145,6 +1146,7 @@ struct Pane {
     size: Mutex<PtySize>,
     raw_history: Arc<Mutex<Vec<u8>>>,
     terminal: Arc<Mutex<TerminalState>>,
+    output_filter: Mutex<PtyOutputFilter>,
     clients: TrackedStreamClients,
     next_client_id: AtomicUsize,
     attach_events: AttachEventClients,
@@ -1368,6 +1370,7 @@ fn spawn_pane(
             spec.size.rows as usize,
             10_000,
         ))),
+        output_filter: Mutex::new(PtyOutputFilter::default()),
         clients: Arc::new(Mutex::new(Vec::new())),
         next_client_id: AtomicUsize::new(0),
         attach_events,
@@ -3238,18 +3241,39 @@ fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
                 Err(_) => break,
             };
             let bytes = &buf[..n];
-            append_history(&pane.raw_history, bytes);
-            let terminal_changes = pane.terminal.lock().unwrap().apply_bytes(bytes);
-            if let Some(session) = pane.session() {
-                session.notify_attach_redraw_for_pane_output(terminal_changes);
-            } else {
-                notify_attach_redraw(&pane.attach_events);
-            }
-            broadcast(&pane.clients, bytes);
+            handle_pane_output(&pane, bytes);
         }
+        flush_pane_output_filter(&pane);
         shutdown_tracked_clients(&pane.clients);
         remove_exited_pane_from_session(&pane);
     });
+}
+
+fn handle_pane_output(pane: &Arc<Pane>, bytes: &[u8]) {
+    let filtered = pane.output_filter.lock().unwrap().filter(bytes);
+    if !filtered.reply_bytes.is_empty() {
+        let _ = pane.writer.lock().unwrap().write_all(&filtered.reply_bytes);
+    }
+    publish_pane_output(pane, &filtered.display_bytes);
+}
+
+fn flush_pane_output_filter(pane: &Arc<Pane>) {
+    let pending = pane.output_filter.lock().unwrap().finish();
+    publish_pane_output(pane, &pending);
+}
+
+fn publish_pane_output(pane: &Arc<Pane>, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    append_history(&pane.raw_history, bytes);
+    let terminal_changes = pane.terminal.lock().unwrap().apply_bytes(bytes);
+    if let Some(session) = pane.session() {
+        session.notify_attach_redraw_for_pane_output(terminal_changes);
+    } else {
+        notify_attach_redraw(&pane.attach_events);
+    }
+    broadcast(&pane.clients, bytes);
 }
 
 fn remove_exited_pane_from_session(pane: &Arc<Pane>) {
@@ -3498,6 +3522,7 @@ mod tests {
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
+            output_filter: Mutex::new(PtyOutputFilter::default()),
             clients: Arc::new(Mutex::new(Vec::new())),
             next_client_id: AtomicUsize::new(0),
             attach_events: Arc::new(Mutex::new(Vec::new())),
@@ -3816,6 +3841,7 @@ mod tests {
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
+            output_filter: Mutex::new(PtyOutputFilter::default()),
             clients: Arc::new(Mutex::new(Vec::new())),
             next_client_id: AtomicUsize::new(0),
             attach_events: Arc::clone(&attach_events),
@@ -3858,6 +3884,7 @@ mod tests {
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
+            output_filter: Mutex::new(PtyOutputFilter::default()),
             clients: Arc::new(Mutex::new(Vec::new())),
             next_client_id: AtomicUsize::new(0),
             attach_events: Arc::clone(&attach_events),
