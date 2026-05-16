@@ -48,6 +48,12 @@ Implemented Phase 0/1 commands:
 - `dmux kill-session -t <name>`
 - `dmux kill-server`
 
+Commands that operate on panes accept structured targets as
+`<session>[:<window>[.<pane>]]`. Numeric window and pane values are indexes,
+`@<id>` selects a window ID, `%<id>` selects a pane ID, and `=<name>` selects a
+window name. Session names cannot contain `:` because it separates structured
+targets.
+
 `capture-pane -p` defaults to combined scrollback history plus the current
 screen. Use `--screen` for only the current screen, `--history` for only
 scrollback, or `--all` for the combined output explicitly.

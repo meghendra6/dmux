@@ -31,11 +31,35 @@ pub enum PaneSelectTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneTarget {
+    Active,
+    Index(usize),
+    Id(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowTarget {
     Active,
     Index(usize),
     Id(usize),
     Name(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub session: String,
+    pub window: WindowTarget,
+    pub pane: PaneTarget,
+}
+
+impl Target {
+    pub fn active(session: String) -> Self {
+        Self {
+            session,
+            window: WindowTarget::Active,
+            pane: PaneTarget::Active,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,12 +120,12 @@ pub enum Request {
     },
     List,
     Capture {
-        session: String,
+        target: Target,
         mode: CaptureMode,
         selection: BufferSelection,
     },
     SaveBuffer {
-        session: String,
+        target: Target,
         buffer: Option<String>,
         mode: CaptureMode,
         selection: BufferSelection,
@@ -121,7 +145,7 @@ pub enum Request {
         format: Option<String>,
     },
     PasteBuffer {
-        session: String,
+        target: Target,
         buffer: Option<String>,
     },
     DeleteBuffer {
@@ -133,34 +157,34 @@ pub enum Request {
         rows: u16,
     },
     ResizePane {
-        session: String,
+        target: Target,
         direction: PaneResizeDirection,
         amount: usize,
     },
     Send {
-        session: String,
+        target: Target,
         bytes: Vec<u8>,
     },
     Split {
-        session: String,
+        target: Target,
         direction: SplitDirection,
         command: Vec<String>,
     },
     ListPanes {
         session: String,
+        window: WindowTarget,
         format: Option<String>,
     },
     SelectPane {
         session: String,
+        window: WindowTarget,
         target: PaneSelectTarget,
     },
     KillPane {
-        session: String,
-        pane: Option<usize>,
+        target: Target,
     },
     RespawnPane {
-        session: String,
-        pane: Option<usize>,
+        target: Target,
         force: bool,
         command: Vec<String>,
     },
@@ -189,11 +213,10 @@ pub enum Request {
     },
     KillWindow {
         session: String,
-        window: Option<usize>,
+        target: WindowTarget,
     },
     ZoomPane {
-        session: String,
-        pane: Option<usize>,
+        target: Target,
     },
     StatusLine {
         session: String,
@@ -284,41 +307,67 @@ pub fn encode_capture(session: &str, mode: CaptureMode) -> String {
     format!("CAPTURE\t{session}\t{}\n", encode_capture_mode(mode))
 }
 
+#[allow(dead_code)]
 pub fn encode_capture_with_selection(
     session: &str,
     mode: CaptureMode,
     selection: BufferSelection,
 ) -> String {
+    encode_capture_target(&Target::active(session.to_string()), mode, selection)
+}
+
+pub fn encode_capture_target(
+    target: &Target,
+    mode: CaptureMode,
+    selection: BufferSelection,
+) -> String {
     let mode = encode_capture_mode(mode);
+    let target = encode_target(target);
     match selection {
-        BufferSelection::All => format!("CAPTURE\t{session}\t{mode}\n"),
+        BufferSelection::All => format!("CAPTURE_TARGET\t{target}\t{mode}\n"),
         BufferSelection::LineRange { start, end } => {
-            format!("CAPTURE_LINES\t{session}\t{mode}\t{start}\t{end}\n")
+            format!("CAPTURE_TARGET_LINES\t{target}\t{mode}\t{start}\t{end}\n")
         }
         BufferSelection::Search {
             needle,
             match_index,
         } => {
             format!(
-                "CAPTURE_SEARCH\t{session}\t{mode}\t{}\t{match_index}\n",
+                "CAPTURE_TARGET_SEARCH\t{target}\t{mode}\t{}\t{match_index}\n",
                 encode_hex(needle.as_bytes())
             )
         }
     }
 }
 
+#[allow(dead_code)]
 pub fn encode_save_buffer(
     session: &str,
     buffer: Option<&str>,
     mode: CaptureMode,
     selection: BufferSelection,
 ) -> String {
+    encode_save_buffer_target(
+        &Target::active(session.to_string()),
+        buffer,
+        mode,
+        selection,
+    )
+}
+
+pub fn encode_save_buffer_target(
+    target: &Target,
+    buffer: Option<&str>,
+    mode: CaptureMode,
+    selection: BufferSelection,
+) -> String {
     let mode = encode_capture_mode(mode);
     let buffer = encode_optional_text(buffer);
+    let target = encode_target(target);
     match selection {
-        BufferSelection::All => format!("SAVE_BUFFER\t{session}\t{mode}\t{buffer}\n"),
+        BufferSelection::All => format!("SAVE_BUFFER_TARGET\t{target}\t{mode}\t{buffer}\n"),
         BufferSelection::LineRange { start, end } => {
-            format!("SAVE_BUFFER_LINES\t{session}\t{mode}\t{buffer}\t{start}\t{end}\n")
+            format!("SAVE_BUFFER_TARGET_LINES\t{target}\t{mode}\t{buffer}\t{start}\t{end}\n")
         }
         BufferSelection::Search {
             needle,
@@ -326,10 +375,10 @@ pub fn encode_save_buffer(
         } => {
             let needle = encode_hex(needle.as_bytes());
             if match_index == 1 {
-                format!("SAVE_BUFFER_SEARCH\t{session}\t{mode}\t{buffer}\t{needle}\n")
+                format!("SAVE_BUFFER_TARGET_SEARCH\t{target}\t{mode}\t{buffer}\t{needle}\n")
             } else {
                 format!(
-                    "SAVE_BUFFER_SEARCH\t{session}\t{mode}\t{buffer}\t{needle}\t{match_index}\n"
+                    "SAVE_BUFFER_TARGET_SEARCH\t{target}\t{mode}\t{buffer}\t{needle}\t{match_index}\n"
                 )
             }
         }
@@ -366,9 +415,15 @@ pub fn encode_copy_mode(
     }
 }
 
+#[allow(dead_code)]
 pub fn encode_paste_buffer(session: &str, buffer: Option<&str>) -> String {
+    encode_paste_buffer_target(&Target::active(session.to_string()), buffer)
+}
+
+pub fn encode_paste_buffer_target(target: &Target, buffer: Option<&str>) -> String {
     format!(
-        "PASTE_BUFFER\t{session}\t{}\n",
+        "PASTE_BUFFER_TARGET\t{}\t{}\n",
+        encode_target(target),
         encode_optional_text(buffer)
     )
 }
@@ -382,14 +437,32 @@ pub fn encode_resize(session: &str, cols: u16, rows: u16) -> String {
 }
 
 pub fn encode_resize_pane(session: &str, direction: PaneResizeDirection, amount: usize) -> String {
+    encode_resize_pane_target(&Target::active(session.to_string()), direction, amount)
+}
+
+pub fn encode_resize_pane_target(
+    target: &Target,
+    direction: PaneResizeDirection,
+    amount: usize,
+) -> String {
     format!(
-        "RESIZE_PANE\t{session}\t{}\t{amount}\n",
+        "RESIZE_PANE_TARGET\t{}\t{}\t{amount}\n",
+        encode_target(target),
         encode_pane_resize_direction(direction)
     )
 }
 
+#[allow(dead_code)]
 pub fn encode_send(session: &str, bytes: &[u8]) -> String {
-    format!("SEND\t{session}\t{}\n", encode_hex(bytes))
+    encode_send_target(&Target::active(session.to_string()), bytes)
+}
+
+pub fn encode_send_target(target: &Target, bytes: &[u8]) -> String {
+    format!(
+        "SEND_TARGET\t{}\t{}\n",
+        encode_target(target),
+        encode_hex(bytes)
+    )
 }
 
 pub fn encode_split(session: &str, direction: SplitDirection, command: &[String]) -> String {
@@ -401,13 +474,36 @@ pub fn encode_split(session: &str, direction: SplitDirection, command: &[String]
     )
 }
 
+pub fn encode_split_target(
+    target: &Target,
+    direction: SplitDirection,
+    command: &[String],
+) -> String {
+    let joined = command.join(&ARG_SEPARATOR.to_string());
+    format!(
+        "SPLIT_TARGET\t{}\t{}\t{}\t{joined}\n",
+        encode_target(target),
+        encode_split_direction(direction),
+        command.len()
+    )
+}
+
 pub fn encode_list_panes(session: &str, format: Option<&str>) -> String {
+    encode_list_panes_target(session, WindowTarget::Active, format)
+}
+
+pub fn encode_list_panes_target(
+    session: &str,
+    window: WindowTarget,
+    format: Option<&str>,
+) -> String {
+    let window = encode_window_target(window);
     match format {
         Some(format) => format!(
-            "LIST_PANES_FORMAT\t{session}\t{}\n",
+            "LIST_PANES_TARGET_FORMAT\t{session}\t{window}\t{}\n",
             encode_hex(format.as_bytes())
         ),
-        None => format!("LIST_PANES\t{session}\n"),
+        None => format!("LIST_PANES_TARGET\t{session}\t{window}\n"),
     }
 }
 
@@ -428,23 +524,53 @@ pub fn encode_select_pane_target(session: &str, target: PaneSelectTarget) -> Str
     }
 }
 
-pub fn encode_kill_pane(session: &str, pane: Option<usize>) -> String {
-    match pane {
-        Some(pane) => format!("KILL_PANE\t{session}\t{pane}\n"),
-        None => format!("KILL_PANE\t{session}\tactive\n"),
+pub fn encode_select_pane_in_window(
+    session: &str,
+    window: WindowTarget,
+    target: PaneSelectTarget,
+) -> String {
+    let window = encode_window_target(window);
+    match target {
+        PaneSelectTarget::Index(pane) => {
+            format!("SELECT_PANE_TARGET\t{session}\t{window}\t{pane}\n")
+        }
+        PaneSelectTarget::Id(id) => format!("SELECT_PANE_TARGET_ID\t{session}\t{window}\t{id}\n"),
+        PaneSelectTarget::Direction(direction) => {
+            format!(
+                "SELECT_PANE_TARGET_DIRECTION\t{session}\t{window}\t{}\n",
+                encode_pane_direction(direction)
+            )
+        }
     }
 }
 
+pub fn encode_kill_pane(session: &str, pane: Option<usize>) -> String {
+    let mut target = Target::active(session.to_string());
+    target.pane = pane.map_or(PaneTarget::Active, PaneTarget::Index);
+    encode_kill_pane_target(&target)
+}
+
+pub fn encode_kill_pane_target(target: &Target) -> String {
+    format!("KILL_PANE_TARGET\t{}\n", encode_target(target))
+}
+
+#[allow(dead_code)]
 pub fn encode_respawn_pane(
     session: &str,
     pane: Option<usize>,
     force: bool,
     command: &[String],
 ) -> String {
+    let mut target = Target::active(session.to_string());
+    target.pane = pane.map_or(PaneTarget::Active, PaneTarget::Index);
+    encode_respawn_pane_target(&target, force, command)
+}
+
+pub fn encode_respawn_pane_target(target: &Target, force: bool, command: &[String]) -> String {
     let joined = command.join(&ARG_SEPARATOR.to_string());
     format!(
-        "RESPAWN_PANE\t{session}\t{}\t{}\t{}\t{joined}\n",
-        pane.map_or_else(|| "active".to_string(), |pane| pane.to_string()),
+        "RESPAWN_PANE_TARGET\t{}\t{}\t{}\t{joined}\n",
+        encode_target(target),
         usize::from(force),
         command.len()
     )
@@ -506,18 +632,29 @@ pub fn encode_previous_window(session: &str) -> String {
     format!("PREVIOUS_WINDOW\t{session}\n")
 }
 
+#[allow(dead_code)]
 pub fn encode_kill_window(session: &str, window: Option<usize>) -> String {
-    match window {
-        Some(window) => format!("KILL_WINDOW\t{session}\t{window}\n"),
-        None => format!("KILL_WINDOW\t{session}\tactive\n"),
-    }
+    encode_kill_window_target(
+        session,
+        window.map_or(WindowTarget::Active, WindowTarget::Index),
+    )
+}
+
+pub fn encode_kill_window_target(session: &str, target: WindowTarget) -> String {
+    format!(
+        "KILL_WINDOW_TARGET\t{session}\t{}\n",
+        encode_window_target(target)
+    )
 }
 
 pub fn encode_zoom_pane(session: &str, pane: Option<usize>) -> String {
-    match pane {
-        Some(pane) => format!("ZOOM_PANE\t{session}\t{pane}\n"),
-        None => format!("ZOOM_PANE\t{session}\tactive\n"),
-    }
+    let mut target = Target::active(session.to_string());
+    target.pane = pane.map_or(PaneTarget::Active, PaneTarget::Index);
+    encode_zoom_pane_target(&target)
+}
+
+pub fn encode_zoom_pane_target(target: &Target) -> String {
+    format!("ZOOM_PANE_TARGET\t{}\n", encode_target(target))
 }
 
 pub fn encode_status_line(session: &str, format: Option<&str>) -> String {
@@ -543,6 +680,85 @@ pub fn encode_kill(session: &str) -> String {
 
 pub fn encode_kill_server() -> &'static str {
     "KILL_SERVER\n"
+}
+
+pub fn encode_target(target: &Target) -> String {
+    format!(
+        "{}|{}|{}",
+        encode_hex(target.session.as_bytes()),
+        encode_window_target(target.window.clone()),
+        encode_pane_target(&target.pane)
+    )
+}
+
+fn encode_window_target(target: WindowTarget) -> String {
+    match target {
+        WindowTarget::Active => "active".to_string(),
+        WindowTarget::Index(index) => format!("index:{index}"),
+        WindowTarget::Id(id) => format!("id:{id}"),
+        WindowTarget::Name(name) => format!("name:{}", encode_hex(name.as_bytes())),
+    }
+}
+
+fn encode_pane_target(target: &PaneTarget) -> String {
+    match target {
+        PaneTarget::Active => "active".to_string(),
+        PaneTarget::Index(index) => format!("index:{index}"),
+        PaneTarget::Id(id) => format!("id:{id}"),
+    }
+}
+
+fn decode_target(value: &str, command: &str) -> Result<Target, String> {
+    let parts = value.split('|').collect::<Vec<_>>();
+    let [session, window, pane] = parts.as_slice() else {
+        return Err(format!("{command} has invalid target"));
+    };
+    Ok(Target {
+        session: decode_utf8_hex(session, command)?,
+        window: decode_structured_window_target(window, command)?,
+        pane: decode_structured_pane_target(pane, command)?,
+    })
+}
+
+fn decode_structured_window_target(value: &str, command: &str) -> Result<WindowTarget, String> {
+    if value == "active" {
+        return Ok(WindowTarget::Active);
+    }
+    let Some((kind, value)) = value.split_once(':') else {
+        return Err(format!("{command} has invalid window target"));
+    };
+    match kind {
+        "index" => value
+            .parse::<usize>()
+            .map(WindowTarget::Index)
+            .map_err(|_| format!("{command} has invalid window index")),
+        "id" => value
+            .parse::<usize>()
+            .map(WindowTarget::Id)
+            .map_err(|_| format!("{command} has invalid window id")),
+        "name" => decode_utf8_hex(value, command).map(WindowTarget::Name),
+        _ => Err(format!("{command} has invalid window target")),
+    }
+}
+
+fn decode_structured_pane_target(value: &str, command: &str) -> Result<PaneTarget, String> {
+    if value == "active" {
+        return Ok(PaneTarget::Active);
+    }
+    let Some((kind, value)) = value.split_once(':') else {
+        return Err(format!("{command} has invalid pane target"));
+    };
+    match kind {
+        "index" => value
+            .parse::<usize>()
+            .map(PaneTarget::Index)
+            .map_err(|_| format!("{command} has invalid pane index")),
+        "id" => value
+            .parse::<usize>()
+            .map(PaneTarget::Id)
+            .map_err(|_| format!("{command} has invalid pane id")),
+        _ => Err(format!("{command} has invalid pane target")),
+    }
 }
 
 pub fn decode_request(line: &str) -> Result<Request, String> {
@@ -606,17 +822,17 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
         }),
         ["CAPTURE", session] => Ok(Request::Capture {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
             mode: CaptureMode::All,
             selection: BufferSelection::All,
         }),
         ["CAPTURE", session, mode] => Ok(Request::Capture {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
             mode: decode_capture_mode(mode)?,
             selection: BufferSelection::All,
         }),
         ["CAPTURE_LINES", session, mode, start, end] => Ok(Request::Capture {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
             mode: decode_capture_mode(mode)?,
             selection: BufferSelection::LineRange {
                 start: decode_line_offset(start, "CAPTURE_LINES has invalid start line")?,
@@ -624,7 +840,7 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             },
         }),
         ["CAPTURE_SEARCH", session, mode, needle, match_index] => Ok(Request::Capture {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
             mode: decode_capture_mode(mode)?,
             selection: BufferSelection::Search {
                 needle: decode_utf8_hex(needle, "CAPTURE_SEARCH")?,
@@ -634,14 +850,38 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 )?,
             },
         }),
+        ["CAPTURE_TARGET", target, mode] => Ok(Request::Capture {
+            target: decode_target(target, "CAPTURE_TARGET")?,
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::All,
+        }),
+        ["CAPTURE_TARGET_LINES", target, mode, start, end] => Ok(Request::Capture {
+            target: decode_target(target, "CAPTURE_TARGET_LINES")?,
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::LineRange {
+                start: decode_line_offset(start, "CAPTURE_TARGET_LINES has invalid start line")?,
+                end: decode_line_offset(end, "CAPTURE_TARGET_LINES has invalid end line")?,
+            },
+        }),
+        ["CAPTURE_TARGET_SEARCH", target, mode, needle, match_index] => Ok(Request::Capture {
+            target: decode_target(target, "CAPTURE_TARGET_SEARCH")?,
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::Search {
+                needle: decode_utf8_hex(needle, "CAPTURE_TARGET_SEARCH")?,
+                match_index: decode_positive_index(
+                    match_index,
+                    "CAPTURE_TARGET_SEARCH has invalid match index",
+                )?,
+            },
+        }),
         ["SAVE_BUFFER", session, mode, buffer] => Ok(Request::SaveBuffer {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
             buffer: decode_optional_text(buffer, "SAVE_BUFFER")?,
             mode: decode_capture_mode(mode)?,
             selection: BufferSelection::All,
         }),
         ["SAVE_BUFFER_LINES", session, mode, buffer, start, end] => Ok(Request::SaveBuffer {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
             buffer: decode_optional_text(buffer, "SAVE_BUFFER_LINES")?,
             mode: decode_capture_mode(mode)?,
             selection: BufferSelection::LineRange {
@@ -650,7 +890,7 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             },
         }),
         ["SAVE_BUFFER_SEARCH", session, mode, buffer, needle] => Ok(Request::SaveBuffer {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
             buffer: decode_optional_text(buffer, "SAVE_BUFFER_SEARCH")?,
             mode: decode_capture_mode(mode)?,
             selection: BufferSelection::Search {
@@ -666,7 +906,7 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             needle,
             match_index,
         ] => Ok(Request::SaveBuffer {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
             buffer: decode_optional_text(buffer, "SAVE_BUFFER_SEARCH")?,
             mode: decode_capture_mode(mode)?,
             selection: BufferSelection::Search {
@@ -674,6 +914,52 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 match_index: decode_positive_index(
                     match_index,
                     "SAVE_BUFFER_SEARCH has invalid match index",
+                )?,
+            },
+        }),
+        ["SAVE_BUFFER_TARGET", target, mode, buffer] => Ok(Request::SaveBuffer {
+            target: decode_target(target, "SAVE_BUFFER_TARGET")?,
+            buffer: decode_optional_text(buffer, "SAVE_BUFFER_TARGET")?,
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::All,
+        }),
+        ["SAVE_BUFFER_TARGET_LINES", target, mode, buffer, start, end] => Ok(Request::SaveBuffer {
+            target: decode_target(target, "SAVE_BUFFER_TARGET_LINES")?,
+            buffer: decode_optional_text(buffer, "SAVE_BUFFER_TARGET_LINES")?,
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::LineRange {
+                start: decode_line_offset(
+                    start,
+                    "SAVE_BUFFER_TARGET_LINES has invalid start line",
+                )?,
+                end: decode_line_offset(end, "SAVE_BUFFER_TARGET_LINES has invalid end line")?,
+            },
+        }),
+        ["SAVE_BUFFER_TARGET_SEARCH", target, mode, buffer, needle] => Ok(Request::SaveBuffer {
+            target: decode_target(target, "SAVE_BUFFER_TARGET_SEARCH")?,
+            buffer: decode_optional_text(buffer, "SAVE_BUFFER_TARGET_SEARCH")?,
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::Search {
+                needle: decode_utf8_hex(needle, "SAVE_BUFFER_TARGET_SEARCH")?,
+                match_index: 1,
+            },
+        }),
+        [
+            "SAVE_BUFFER_TARGET_SEARCH",
+            target,
+            mode,
+            buffer,
+            needle,
+            match_index,
+        ] => Ok(Request::SaveBuffer {
+            target: decode_target(target, "SAVE_BUFFER_TARGET_SEARCH")?,
+            buffer: decode_optional_text(buffer, "SAVE_BUFFER_TARGET_SEARCH")?,
+            mode: decode_capture_mode(mode)?,
+            selection: BufferSelection::Search {
+                needle: decode_utf8_hex(needle, "SAVE_BUFFER_TARGET_SEARCH")?,
+                match_index: decode_positive_index(
+                    match_index,
+                    "SAVE_BUFFER_TARGET_SEARCH has invalid match index",
                 )?,
             },
         }),
@@ -712,8 +998,12 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             format: Some(decode_utf8_hex(format, "LIST_BUFFERS_FORMAT")?),
         }),
         ["PASTE_BUFFER", session, buffer] => Ok(Request::PasteBuffer {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
             buffer: decode_optional_text(buffer, "PASTE_BUFFER")?,
+        }),
+        ["PASTE_BUFFER_TARGET", target, buffer] => Ok(Request::PasteBuffer {
+            target: decode_target(target, "PASTE_BUFFER_TARGET")?,
+            buffer: decode_optional_text(buffer, "PASTE_BUFFER_TARGET")?,
         }),
         ["DELETE_BUFFER", buffer] => Ok(Request::DeleteBuffer {
             buffer: decode_utf8_hex(buffer, "DELETE_BUFFER")?,
@@ -728,7 +1018,16 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 .map_err(|_| "RESIZE has invalid rows".to_string())?,
         }),
         ["RESIZE_PANE", session, direction, amount] => Ok(Request::ResizePane {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
+            direction: decode_pane_resize_direction(direction)?,
+            amount: amount
+                .parse::<usize>()
+                .ok()
+                .filter(|amount| *amount > 0)
+                .ok_or_else(|| "RESIZE_PANE amount must be a positive integer".to_string())?,
+        }),
+        ["RESIZE_PANE_TARGET", target, direction, amount] => Ok(Request::ResizePane {
+            target: decode_target(target, "RESIZE_PANE_TARGET")?,
             direction: decode_pane_resize_direction(direction)?,
             amount: amount
                 .parse::<usize>()
@@ -737,7 +1036,11 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 .ok_or_else(|| "RESIZE_PANE amount must be a positive integer".to_string())?,
         }),
         ["SEND", session, hex] => Ok(Request::Send {
-            session: (*session).to_string(),
+            target: Target::active((*session).to_string()),
+            bytes: decode_hex(hex)?,
+        }),
+        ["SEND_TARGET", target, hex] => Ok(Request::Send {
+            target: decode_target(target, "SEND_TARGET")?,
             bytes: decode_hex(hex)?,
         }),
         ["SPLIT", session, direction, argc, joined] => {
@@ -753,21 +1056,52 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 return Err("SPLIT argc does not match command".to_string());
             }
             Ok(Request::Split {
-                session: (*session).to_string(),
+                target: Target::active((*session).to_string()),
+                direction: decode_split_direction(direction)?,
+                command,
+            })
+        }
+        ["SPLIT_TARGET", target, direction, argc, joined] => {
+            let argc = argc
+                .parse::<usize>()
+                .map_err(|_| "SPLIT_TARGET has invalid argc".to_string())?;
+            let command = if *joined == "" {
+                Vec::new()
+            } else {
+                joined.split(ARG_SEPARATOR).map(str::to_string).collect()
+            };
+            if command.len() != argc {
+                return Err("SPLIT_TARGET argc does not match command".to_string());
+            }
+            Ok(Request::Split {
+                target: decode_target(target, "SPLIT_TARGET")?,
                 direction: decode_split_direction(direction)?,
                 command,
             })
         }
         ["LIST_PANES", session] => Ok(Request::ListPanes {
             session: (*session).to_string(),
+            window: WindowTarget::Active,
             format: None,
         }),
         ["LIST_PANES_FORMAT", session, format] => Ok(Request::ListPanes {
             session: (*session).to_string(),
+            window: WindowTarget::Active,
             format: Some(decode_utf8_hex(format, "LIST_PANES_FORMAT")?),
+        }),
+        ["LIST_PANES_TARGET", session, window] => Ok(Request::ListPanes {
+            session: (*session).to_string(),
+            window: decode_structured_window_target(window, "LIST_PANES_TARGET")?,
+            format: None,
+        }),
+        ["LIST_PANES_TARGET_FORMAT", session, window, format] => Ok(Request::ListPanes {
+            session: (*session).to_string(),
+            window: decode_structured_window_target(window, "LIST_PANES_TARGET_FORMAT")?,
+            format: Some(decode_utf8_hex(format, "LIST_PANES_TARGET_FORMAT")?),
         }),
         ["SELECT_PANE", session, pane] => Ok(Request::SelectPane {
             session: (*session).to_string(),
+            window: WindowTarget::Active,
             target: PaneSelectTarget::Index(
                 pane.parse::<usize>()
                     .map_err(|_| "SELECT_PANE has invalid pane index".to_string())?,
@@ -775,6 +1109,7 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         }),
         ["SELECT_PANE_ID", session, id] => Ok(Request::SelectPane {
             session: (*session).to_string(),
+            window: WindowTarget::Active,
             target: PaneSelectTarget::Id(
                 id.parse::<usize>()
                     .map_err(|_| "SELECT_PANE_ID has invalid pane id".to_string())?,
@@ -782,14 +1117,45 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         }),
         ["SELECT_PANE_DIRECTION", session, direction] => Ok(Request::SelectPane {
             session: (*session).to_string(),
+            window: WindowTarget::Active,
             target: PaneSelectTarget::Direction(decode_pane_direction(
                 direction,
                 "SELECT_PANE_DIRECTION has invalid direction",
             )?),
         }),
-        ["KILL_PANE", session, pane] => Ok(Request::KillPane {
+        ["SELECT_PANE_TARGET", session, window, pane] => Ok(Request::SelectPane {
             session: (*session).to_string(),
-            pane: decode_optional_pane(pane)?,
+            window: decode_structured_window_target(window, "SELECT_PANE_TARGET")?,
+            target: PaneSelectTarget::Index(
+                pane.parse::<usize>()
+                    .map_err(|_| "SELECT_PANE_TARGET has invalid pane index".to_string())?,
+            ),
+        }),
+        ["SELECT_PANE_TARGET_ID", session, window, id] => Ok(Request::SelectPane {
+            session: (*session).to_string(),
+            window: decode_structured_window_target(window, "SELECT_PANE_TARGET_ID")?,
+            target: PaneSelectTarget::Id(
+                id.parse::<usize>()
+                    .map_err(|_| "SELECT_PANE_TARGET_ID has invalid pane id".to_string())?,
+            ),
+        }),
+        ["SELECT_PANE_TARGET_DIRECTION", session, window, direction] => Ok(Request::SelectPane {
+            session: (*session).to_string(),
+            window: decode_structured_window_target(window, "SELECT_PANE_TARGET_DIRECTION")?,
+            target: PaneSelectTarget::Direction(decode_pane_direction(
+                direction,
+                "SELECT_PANE_TARGET_DIRECTION has invalid direction",
+            )?),
+        }),
+        ["KILL_PANE", session, pane] => Ok(Request::KillPane {
+            target: Target {
+                session: (*session).to_string(),
+                window: WindowTarget::Active,
+                pane: decode_optional_pane(pane)?.map_or(PaneTarget::Active, PaneTarget::Index),
+            },
+        }),
+        ["KILL_PANE_TARGET", target] => Ok(Request::KillPane {
+            target: decode_target(target, "KILL_PANE_TARGET")?,
         }),
         ["RESPAWN_PANE", session, pane, force, argc, joined] => {
             let argc = argc
@@ -804,12 +1170,37 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 return Err("RESPAWN_PANE argc does not match command".to_string());
             }
             Ok(Request::RespawnPane {
-                session: (*session).to_string(),
-                pane: decode_optional_pane(pane)?,
+                target: Target {
+                    session: (*session).to_string(),
+                    window: WindowTarget::Active,
+                    pane: decode_optional_pane(pane)?.map_or(PaneTarget::Active, PaneTarget::Index),
+                },
                 force: match *force {
                     "0" => false,
                     "1" => true,
                     _ => return Err("RESPAWN_PANE has invalid force flag".to_string()),
+                },
+                command,
+            })
+        }
+        ["RESPAWN_PANE_TARGET", target, force, argc, joined] => {
+            let argc = argc
+                .parse::<usize>()
+                .map_err(|_| "RESPAWN_PANE_TARGET has invalid argc".to_string())?;
+            let command = if *joined == "" {
+                Vec::new()
+            } else {
+                joined.split(ARG_SEPARATOR).map(str::to_string).collect()
+            };
+            if command.len() != argc {
+                return Err("RESPAWN_PANE_TARGET argc does not match command".to_string());
+            }
+            Ok(Request::RespawnPane {
+                target: decode_target(target, "RESPAWN_PANE_TARGET")?,
+                force: match *force {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err("RESPAWN_PANE_TARGET has invalid force flag".to_string()),
                 },
                 command,
             })
@@ -888,11 +1279,23 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         }),
         ["KILL_WINDOW", session, window] => Ok(Request::KillWindow {
             session: (*session).to_string(),
-            window: decode_optional_window(window)?,
+            target: decode_optional_window(window)?
+                .map_or(WindowTarget::Active, WindowTarget::Index),
+        }),
+        ["KILL_WINDOW_TARGET", session, target] => Ok(Request::KillWindow {
+            session: (*session).to_string(),
+            target: decode_structured_window_target(target, "KILL_WINDOW_TARGET")?,
         }),
         ["ZOOM_PANE", session, pane] => Ok(Request::ZoomPane {
-            session: (*session).to_string(),
-            pane: decode_optional_zoom_pane(pane)?,
+            target: Target {
+                session: (*session).to_string(),
+                window: WindowTarget::Active,
+                pane: decode_optional_zoom_pane(pane)?
+                    .map_or(PaneTarget::Active, PaneTarget::Index),
+            },
+        }),
+        ["ZOOM_PANE_TARGET", target] => Ok(Request::ZoomPane {
+            target: decode_target(target, "ZOOM_PANE_TARGET")?,
         }),
         ["STATUS_LINE", session] => Ok(Request::StatusLine {
             session: (*session).to_string(),
@@ -1124,6 +1527,10 @@ fn hex_value(byte: u8) -> Result<u8, String> {
 mod tests {
     use super::*;
 
+    fn active_target(session: &str) -> Target {
+        Target::active(session.to_string())
+    }
+
     #[test]
     fn round_trips_new_request_with_spaced_args() {
         let command = vec!["sh".to_string(), "-c".to_string(), "echo ok".to_string()];
@@ -1192,7 +1599,7 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::ResizePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 direction: PaneResizeDirection::Left,
                 amount: 5,
             }
@@ -1211,7 +1618,7 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::Capture {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::Screen,
                 selection: BufferSelection::All,
             }
@@ -1224,7 +1631,7 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::Capture {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::History,
                 selection: BufferSelection::All,
             }
@@ -1236,7 +1643,7 @@ mod tests {
         assert_eq!(
             decode_request("CAPTURE\tdev\n").unwrap(),
             Request::Capture {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::All,
                 selection: BufferSelection::All,
             }
@@ -1253,7 +1660,7 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::Capture {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::Screen,
                 selection: BufferSelection::LineRange { start: -2, end: -1 },
             }
@@ -1271,7 +1678,7 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::SaveBuffer {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 buffer: Some("saved".to_string()),
                 mode: CaptureMode::Screen,
                 selection: BufferSelection::All,
@@ -1290,7 +1697,7 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::SaveBuffer {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 buffer: Some("picked".to_string()),
                 mode: CaptureMode::Screen,
                 selection: BufferSelection::LineRange { start: 2, end: 3 },
@@ -1312,7 +1719,7 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::SaveBuffer {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 buffer: Some("match".to_string()),
                 mode: CaptureMode::All,
                 selection: BufferSelection::Search {
@@ -1378,7 +1785,7 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::PasteBuffer {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 buffer: Some("saved".to_string()),
             }
         );
@@ -1390,8 +1797,26 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::Send {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 bytes: b"hello\r".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_structured_send_target() {
+        let target = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Id(7),
+            pane: PaneTarget::Id(42),
+        };
+        let line = encode_send_target(&target, b"hello");
+
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::Send {
+                target,
+                bytes: b"hello".to_vec(),
             }
         );
     }
@@ -1404,8 +1829,28 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::Split {
-                session: "dev".to_string(),
+                target: Target::active("dev".to_string()),
                 direction: SplitDirection::Horizontal,
+                command,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_targeted_split_request() {
+        let command = vec!["sh".to_string(), "-c".to_string(), "echo split".to_string()];
+        let target = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Index(1),
+            pane: PaneTarget::Id(42),
+        };
+        let line = encode_split_target(&target, SplitDirection::Vertical, &command);
+
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::Split {
+                target,
+                direction: SplitDirection::Vertical,
                 command,
             }
         );
@@ -1418,6 +1863,7 @@ mod tests {
             decode_request(&line).unwrap(),
             Request::SelectPane {
                 session: "dev".to_string(),
+                window: WindowTarget::Active,
                 target: PaneSelectTarget::Index(1),
             }
         );
@@ -1431,6 +1877,7 @@ mod tests {
             decode_request(&line).unwrap(),
             Request::SelectPane {
                 session: "dev".to_string(),
+                window: WindowTarget::Active,
                 target: PaneSelectTarget::Id(42),
             }
         );
@@ -1445,6 +1892,7 @@ mod tests {
             decode_request(&line).unwrap(),
             Request::SelectPane {
                 session: "dev".to_string(),
+                window: WindowTarget::Active,
                 target: PaneSelectTarget::Direction(PaneDirection::Left),
             }
         );
@@ -1456,8 +1904,11 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::KillPane {
-                session: "dev".to_string(),
-                pane: Some(1),
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Active,
+                    pane: PaneTarget::Index(1),
+                },
             }
         );
     }
@@ -1468,8 +1919,7 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::KillPane {
-                session: "dev".to_string(),
-                pane: None,
+                target: active_target("dev"),
             }
         );
     }
@@ -1485,8 +1935,11 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::RespawnPane {
-                session: "dev".to_string(),
-                pane: Some(1),
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Active,
+                    pane: PaneTarget::Index(1),
+                },
                 force: true,
                 command,
             }
@@ -1618,7 +2071,7 @@ mod tests {
             decode_request(&line).unwrap(),
             Request::KillWindow {
                 session: "dev".to_string(),
-                window: Some(1),
+                target: WindowTarget::Index(1),
             }
         );
     }
@@ -1630,7 +2083,7 @@ mod tests {
             decode_request(&line).unwrap(),
             Request::KillWindow {
                 session: "dev".to_string(),
-                window: None,
+                target: WindowTarget::Active,
             }
         );
     }
@@ -1641,8 +2094,7 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::ZoomPane {
-                session: "dev".to_string(),
-                pane: None,
+                target: active_target("dev"),
             }
         );
     }
@@ -1653,8 +2105,11 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::ZoomPane {
-                session: "dev".to_string(),
-                pane: Some(0),
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Active,
+                    pane: PaneTarget::Index(0),
+                },
             }
         );
     }
@@ -1666,6 +2121,7 @@ mod tests {
             decode_request(&line).unwrap(),
             Request::ListPanes {
                 session: "dev".to_string(),
+                window: WindowTarget::Active,
                 format: Some("#{pane.index}:#{pane.zoomed}".to_string()),
             }
         );

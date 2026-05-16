@@ -8430,6 +8430,133 @@ fn new_window_creates_second_active_window() {
 }
 
 #[test]
+fn structured_targets_address_non_active_window() {
+    let socket = unique_socket("structured-targets");
+    let session = format!("structured-targets-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; while IFS= read -r line; do printf base:$line; done",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new-window",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf second-ready; while IFS= read -r line; do printf second:$line; done",
+        ],
+    ));
+    let second = poll_capture(&socket, &session, "second-ready");
+    assert!(second.contains("second-ready"), "{second:?}");
+
+    let window0 = format!("{session}:0");
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &window0, "from-target", "Enter"],
+    ));
+    let targeted = poll_capture(&socket, &window0, "base:from-target");
+    assert!(targeted.contains("base:from-target"), "{targeted:?}");
+
+    let active = poll_capture(&socket, &session, "second-ready");
+    assert!(active.contains("second-ready"), "{active:?}");
+    assert!(!active.contains("base:from-target"), "{active:?}");
+
+    let failed_select = dmux(&socket, &["select-pane", "-t", &window0, "-p", "99"]);
+    assert!(!failed_select.status.success());
+    assert!(String::from_utf8_lossy(&failed_select.stderr).contains("missing pane"));
+    let active = poll_capture(&socket, &session, "second-ready");
+    assert!(active.contains("second-ready"), "{active:?}");
+    assert!(!active.contains("base:from-target"), "{active:?}");
+
+    let invalid_zoom = format!("{window0}.99");
+    let failed_zoom = dmux(&socket, &["zoom-pane", "-t", &invalid_zoom]);
+    assert!(!failed_zoom.status.success());
+    assert!(String::from_utf8_lossy(&failed_zoom.stderr).contains("missing pane"));
+    let active = poll_capture(&socket, &session, "second-ready");
+    assert!(active.contains("second-ready"), "{active:?}");
+    assert!(!active.contains("base:from-target"), "{active:?}");
+
+    let windows = dmux(
+        &socket,
+        &[
+            "list-windows",
+            "-t",
+            &session,
+            "-F",
+            "#{window.index}:#{window.id}:#{window.active}",
+        ],
+    );
+    assert_success(&windows);
+    let listed = String::from_utf8_lossy(&windows.stdout);
+    let base_id = listed
+        .lines()
+        .find_map(|line| line.strip_prefix("0:"))
+        .and_then(|rest| rest.split(':').next())
+        .expect("base window id")
+        .to_string();
+
+    let by_id = format!("{session}:@{base_id}");
+    let panes = dmux(
+        &socket,
+        &["list-panes", "-t", &by_id, "-F", "#{pane.index}"],
+    );
+    assert_success(&panes);
+    assert_eq!(String::from_utf8_lossy(&panes.stdout).trim(), "0");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &by_id,
+            "-v",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &by_id, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+    let panes = dmux(
+        &socket,
+        &["list-panes", "-t", &by_id, "-F", "#{pane.index}"],
+    );
+    assert_success(&panes);
+    assert_eq!(String::from_utf8_lossy(&panes.stdout).trim(), "0\n1");
+    let active = poll_capture(&socket, &session, "second-ready");
+    assert!(active.contains("second-ready"), "{active:?}");
+    assert!(!active.contains("split-ready"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-window", "-t", &by_id]));
+    let windows = dmux(
+        &socket,
+        &["list-windows", "-t", &session, "-F", "#{window.index}"],
+    );
+    assert_success(&windows);
+    assert_eq!(String::from_utf8_lossy(&windows.stdout).trim(), "0");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn tab_alias_commands_share_window_state() {
     let socket = unique_socket("tab-aliases");
     let session = format!("tab-aliases-{}", std::process::id());
@@ -8820,7 +8947,43 @@ fn window_changes_mark_raw_attach_layout_transitions() {
     assert_eq!(raw_layout_epoch(&socket, &session), 4);
 
     assert_success(&dmux(&socket, &["kill-window", "-t", &session, "-w", "1"]));
-    assert_eq!(raw_layout_epoch(&socket, &session), 5);
+    assert_eq!(raw_layout_epoch(&socket, &session), 4);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn zoomed_select_marks_raw_attach_layout_transitions() {
+    let socket = unique_socket("zoom-select-raw-epoch");
+    let session = format!("zoom-select-raw-epoch-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+    assert_eq!(raw_layout_epoch(&socket, &session), 0);
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "--",
+            "sh",
+            "-c",
+            "sleep 30",
+        ],
+    ));
+    assert_eq!(raw_layout_epoch(&socket, &session), 1);
+
+    assert_success(&dmux(&socket, &["zoom-pane", "-t", &session, "-p", "1"]));
+    assert_eq!(raw_layout_epoch(&socket, &session), 2);
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_eq!(raw_layout_epoch(&socket, &session), 3);
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -10242,9 +10405,17 @@ fn rename_session_rejects_invalid_and_duplicate_names() {
     assert!(!control.status.success());
     assert!(String::from_utf8_lossy(&control.stderr).contains("control characters"));
 
+    let colon = dmux(&socket, &["rename-session", "-t", &first, "bad:target"]);
+    assert!(!colon.status.success());
+    assert!(String::from_utf8_lossy(&colon.stderr).contains("cannot contain ':'"));
+
     let bad_new = dmux(&socket, &["new", "-d", "-s", "bad\u{1}name"]);
     assert!(!bad_new.status.success());
     assert!(String::from_utf8_lossy(&bad_new.stderr).contains("control characters"));
+
+    let bad_new_colon = dmux(&socket, &["new", "-d", "-s", "bad:target"]);
+    assert!(!bad_new_colon.status.success());
+    assert!(String::from_utf8_lossy(&bad_new_colon.stderr).contains("cannot contain ':'"));
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &first]));
     assert_success(&dmux(&socket, &["kill-session", "-t", &second]));
