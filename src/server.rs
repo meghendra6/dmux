@@ -1,3 +1,4 @@
+use crate::layout::LayoutNode;
 use crate::protocol::{self, BufferSelection, CaptureMode, Request, SplitDirection};
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::{TerminalChanges, TerminalState};
@@ -553,64 +554,6 @@ struct TabId(usize);
 impl TabId {
     fn as_usize(self) -> usize {
         self.0
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum LayoutNode {
-    Pane(usize),
-    Split {
-        direction: SplitDirection,
-        first: Box<LayoutNode>,
-        second: Box<LayoutNode>,
-    },
-}
-
-impl LayoutNode {
-    fn split_pane(&mut self, target: usize, direction: SplitDirection, new_index: usize) -> bool {
-        match self {
-            LayoutNode::Pane(index) if *index == target => {
-                *self = LayoutNode::Split {
-                    direction,
-                    first: Box::new(LayoutNode::Pane(target)),
-                    second: Box::new(LayoutNode::Pane(new_index)),
-                };
-                true
-            }
-            LayoutNode::Pane(_) => false,
-            LayoutNode::Split { first, second, .. } => {
-                first.split_pane(target, direction, new_index)
-                    || second.split_pane(target, direction, new_index)
-            }
-        }
-    }
-
-    fn remove_pane(&mut self, removed: usize) -> bool {
-        match self {
-            LayoutNode::Pane(index) if *index == removed => false,
-            LayoutNode::Pane(index) => {
-                if *index > removed {
-                    *index -= 1;
-                }
-                true
-            }
-            LayoutNode::Split { first, second, .. } => {
-                let keep_first = first.remove_pane(removed);
-                let keep_second = second.remove_pane(removed);
-                match (keep_first, keep_second) {
-                    (true, true) => true,
-                    (true, false) => {
-                        *self = (**first).clone();
-                        true
-                    }
-                    (false, true) => {
-                        *self = (**second).clone();
-                        true
-                    }
-                    (false, false) => false,
-                }
-            }
-        }
     }
 }
 
