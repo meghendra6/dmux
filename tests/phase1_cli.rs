@@ -3781,6 +3781,100 @@ fn raw_attach_external_split_waits_for_copy_mode_to_finish() {
 }
 
 #[test]
+fn raw_copy_mode_saves_view_text_after_external_active_pane_change() {
+    let socket = unique_socket("raw-copy-mode-stable-source");
+    let session = format!("raw-copy-mode-stable-source-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-copy-source; printf '\\n'; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-copy-source");
+    assert!(base.contains("base-copy-source"), "{base:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["base-copy-source"]);
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02[").expect("write copy-mode entry");
+        stdin.flush().expect("flush copy-mode entry");
+    }
+    child.wait_for_stdout_contains_all(&["-- copy mode --"], "raw copy-mode before split");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-copy-source; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-copy-source");
+    assert!(split.contains("split-copy-source"), "{split:?}");
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"y").expect("write copy key");
+        stdin.flush().expect("flush copy key");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut listed = String::new();
+    while std::time::Instant::now() < deadline {
+        let output = dmux(&socket, &["list-buffers"]);
+        assert_success(&output);
+        listed = String::from_utf8_lossy(&output.stdout).to_string();
+        if listed
+            .lines()
+            .any(|line| line.ends_with("\tbase-copy-source"))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.ends_with("\tbase-copy-source")),
+        "{listed:?}"
+    );
+    assert!(
+        !listed
+            .lines()
+            .any(|line| line.ends_with("\tsplit-copy-source")),
+        "{listed:?}"
+    );
+
+    child.wait_for_stdout_contains_all(
+        &["split-copy-source"],
+        "external split transition after copy-mode save",
+    );
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_prefix_l_uses_regions_from_external_split_render_frame() {
     let socket = unique_socket("attach-prefix-external-split-focus");
     let session = format!("attach-prefix-external-split-focus-{}", std::process::id());
