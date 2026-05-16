@@ -5637,6 +5637,63 @@ fn attach_render_stream_pushes_split_frame_after_structural_change() {
 }
 
 #[test]
+fn attach_render_stream_refreshes_scroll_region_redraw_after_split() {
+    let socket = unique_socket("attach-render-scroll-region");
+    let session = format!("attach-render-scroll-region-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    let mut stream = attach_render_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT_META\n");
+    let initial = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
+    assert!(initial.contains("base-ready"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf '\\033[?1049h\\033[H\\033[2Jheader\\r\\nview-a-01\\r\\nview-a-02\\r\\nview-a-03\\r\\nfooter'; sleep 0.1; printf '\\033[2;4r\\033[2;1H\\033[3M\\033[2;1Hview-b-01\\r\\nview-b-02\\r\\nview-b-03\\033[6;1Hscroll-region-ready'; sleep 30",
+        ],
+    ));
+    let captured = poll_capture(&socket, &session, "scroll-region-ready");
+    assert!(captured.contains("view-b-03"), "{captured:?}");
+
+    let pushed = read_attach_render_frame_body_until_contains(&mut stream, "scroll-region-ready");
+    assert!(pushed.contains("view-b-01"), "{pushed:?}");
+    assert!(pushed.contains("view-b-02"), "{pushed:?}");
+    assert!(pushed.contains("view-b-03"), "{pushed:?}");
+    assert!(
+        !pushed.contains("view-a-01")
+            && !pushed.contains("view-a-02")
+            && !pushed.contains("view-a-03"),
+        "{pushed:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_render_stream_coalesces_bursty_pane_output() {
     let socket = unique_socket("attach-render-coalesce");
     let session = format!("attach-render-coalesce-{}", std::process::id());

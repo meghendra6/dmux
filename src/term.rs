@@ -78,10 +78,11 @@ impl TerminalState {
     }
 
     fn line_feed(&mut self) {
+        let style = self.style;
         if self.use_alternate_screen {
-            self.active_screen_mut().line_feed_without_scrollback();
+            self.active_screen_mut().line_feed_without_scrollback(style);
         } else {
-            self.screen.line_feed(&mut self.scrollback);
+            self.screen.line_feed(style, Some(&mut self.scrollback));
         }
     }
 
@@ -241,6 +242,47 @@ impl vte::Perform for TerminalState {
             }
             'G' => self.active_screen_mut().move_to_col(first_param(params, 1)),
             'd' => self.active_screen_mut().move_to_row(first_param(params, 1)),
+            'r' => {
+                let top = nth_param(params, 0, 1);
+                let bottom = nth_param(params, 1, self.active_screen().height);
+                self.active_screen_mut().set_scroll_region(top, bottom);
+            }
+            'M' => {
+                let count = first_param(params, 1);
+                let style = self.style;
+                if self.use_alternate_screen {
+                    self.active_screen_mut()
+                        .delete_lines_in_scroll_region(count, style, None);
+                } else {
+                    self.screen.delete_lines_in_scroll_region(
+                        count,
+                        style,
+                        Some(&mut self.scrollback),
+                    );
+                }
+            }
+            'L' => {
+                let count = first_param(params, 1);
+                let style = self.style;
+                self.active_screen_mut()
+                    .insert_lines_in_scroll_region(count, style);
+            }
+            'S' if !is_private_mode_sequence(intermediates) => {
+                let count = first_param(params, 1);
+                let style = self.style;
+                if self.use_alternate_screen {
+                    self.active_screen_mut()
+                        .scroll_region_up(count, style, None);
+                } else {
+                    self.screen
+                        .scroll_region_up(count, style, Some(&mut self.scrollback));
+                }
+            }
+            'T' => {
+                let count = first_param(params, 1);
+                let style = self.style;
+                self.active_screen_mut().scroll_region_down(count, style);
+            }
             's' => self.active_screen_mut().save_cursor(),
             'u' => self.active_screen_mut().restore_cursor(),
             'h' if is_private_mode_sequence(intermediates) => {
@@ -261,6 +303,15 @@ impl vte::Perform for TerminalState {
         match byte {
             b'7' => self.active_screen_mut().save_cursor(),
             b'8' => self.active_screen_mut().restore_cursor(),
+            b'D' => self.line_feed(),
+            b'E' => {
+                self.active_screen_mut().carriage_return();
+                self.line_feed();
+            }
+            b'M' => {
+                let style = self.style;
+                self.active_screen_mut().reverse_index(style);
+            }
             b'c' => self.reset_terminal(),
             _ => {}
         }
@@ -275,6 +326,8 @@ impl TerminalState {
                 (1049 | 1047, false) => self.exit_alternate_screen(),
                 (25, true) => self.cursor_visible = true,
                 (25, false) => self.cursor_visible = false,
+                (6, true) => self.active_screen_mut().set_origin_mode(true),
+                (6, false) => self.active_screen_mut().set_origin_mode(false),
                 _ => {}
             }
         }
@@ -298,6 +351,9 @@ struct TerminalScreen {
     cursor_row: usize,
     cursor_col: usize,
     saved_cursor: Option<(usize, usize)>,
+    scroll_top: usize,
+    scroll_bottom: usize,
+    origin_mode: bool,
 }
 
 impl TerminalScreen {
@@ -311,6 +367,9 @@ impl TerminalScreen {
             cursor_row: 0,
             cursor_col: 0,
             saved_cursor: None,
+            scroll_top: 0,
+            scroll_bottom: height - 1,
+            origin_mode: false,
         }
     }
 
@@ -318,11 +377,11 @@ impl TerminalScreen {
         let width = char_cell_width(ch).min(self.width);
         if self.cursor_col + width > self.width {
             self.cursor_col = 0;
-            self.line_feed(scrollback);
+            self.line_feed(style, Some(scrollback));
         }
         if self.cursor_col >= self.width {
             self.cursor_col = 0;
-            self.line_feed(scrollback);
+            self.line_feed(style, Some(scrollback));
         }
 
         self.write_char_cells(ch, style, width);
@@ -332,11 +391,11 @@ impl TerminalScreen {
         let width = char_cell_width(ch).min(self.width);
         if self.cursor_col + width > self.width {
             self.cursor_col = 0;
-            self.line_feed_without_scrollback();
+            self.line_feed_without_scrollback(style);
         }
         if self.cursor_col >= self.width {
             self.cursor_col = 0;
-            self.line_feed_without_scrollback();
+            self.line_feed_without_scrollback(style);
         }
 
         self.write_char_cells(ch, style, width);
@@ -362,23 +421,23 @@ impl TerminalScreen {
         self.cursor_col = 0;
     }
 
-    fn line_feed(&mut self, scrollback: &mut Scrollback) {
-        if self.cursor_row + 1 >= self.height {
-            let top = self.row_to_string(0);
-            scrollback.push(top);
-            self.rows.remove(0);
-            self.rows.push(vec![Cell::blank(); self.width]);
+    fn line_feed(&mut self, style: CellStyle, scrollback: Option<&mut Scrollback>) {
+        if self.cursor_row == self.scroll_bottom && self.cursor_in_scroll_region() {
+            self.scroll_region_up(1, style, scrollback);
         } else {
-            self.cursor_row += 1;
+            self.cursor_row = (self.cursor_row + 1).min(self.height - 1);
         }
     }
 
-    fn line_feed_without_scrollback(&mut self) {
-        if self.cursor_row + 1 >= self.height {
-            self.rows.remove(0);
-            self.rows.push(vec![Cell::blank(); self.width]);
+    fn line_feed_without_scrollback(&mut self, style: CellStyle) {
+        self.line_feed(style, None);
+    }
+
+    fn reverse_index(&mut self, style: CellStyle) {
+        if self.cursor_row == self.scroll_top && self.cursor_in_scroll_region() {
+            self.scroll_region_down(1, style);
         } else {
-            self.cursor_row += 1;
+            self.cursor_row = self.cursor_row.saturating_sub(1);
         }
     }
 
@@ -434,6 +493,7 @@ impl TerminalScreen {
         self.width = width;
         self.height = height;
         self.rows = rows;
+        self.reset_scroll_region();
         self.cursor_row = self
             .cursor_row
             .saturating_sub(source_row_start)
@@ -466,12 +526,12 @@ impl TerminalScreen {
     }
 
     fn move_cursor(&mut self, row: usize, col: usize) {
-        self.cursor_row = row.saturating_sub(1).min(self.height - 1);
+        self.cursor_row = self.resolve_cursor_row(row);
         self.cursor_col = col.saturating_sub(1).min(self.width - 1);
     }
 
     fn move_to_row(&mut self, row: usize) {
-        self.cursor_row = row.saturating_sub(1).min(self.height - 1);
+        self.cursor_row = self.resolve_cursor_row(row);
     }
 
     fn move_to_col(&mut self, col: usize) {
@@ -479,11 +539,19 @@ impl TerminalScreen {
     }
 
     fn move_up(&mut self, count: usize) {
-        self.cursor_row = self.cursor_row.saturating_sub(count);
+        if self.cursor_in_scroll_region() {
+            self.cursor_row = self.cursor_row.saturating_sub(count).max(self.scroll_top);
+        } else {
+            self.cursor_row = self.cursor_row.saturating_sub(count);
+        }
     }
 
     fn move_down(&mut self, count: usize) {
-        self.cursor_row = (self.cursor_row + count).min(self.height - 1);
+        if self.cursor_in_scroll_region() {
+            self.cursor_row = (self.cursor_row + count).min(self.scroll_bottom);
+        } else {
+            self.cursor_row = (self.cursor_row + count).min(self.height - 1);
+        }
     }
 
     fn move_right(&mut self, count: usize) {
@@ -507,6 +575,104 @@ impl TerminalScreen {
 
     fn cursor_position(&self) -> (usize, usize) {
         (self.cursor_row, self.cursor_col)
+    }
+
+    fn set_scroll_region(&mut self, top: usize, bottom: usize) {
+        let top = top.saturating_sub(1).min(self.height - 1);
+        let bottom = bottom.saturating_sub(1).min(self.height - 1);
+        if top >= bottom {
+            return;
+        }
+        self.scroll_top = top;
+        self.scroll_bottom = bottom;
+        self.cursor_col = 0;
+        self.cursor_row = if self.origin_mode { self.scroll_top } else { 0 };
+    }
+
+    fn reset_scroll_region(&mut self) {
+        self.scroll_top = 0;
+        self.scroll_bottom = self.height - 1;
+    }
+
+    fn set_origin_mode(&mut self, enabled: bool) {
+        self.origin_mode = enabled;
+        self.cursor_col = 0;
+        self.cursor_row = if enabled { self.scroll_top } else { 0 };
+    }
+
+    fn scroll_region_up(
+        &mut self,
+        count: usize,
+        style: CellStyle,
+        mut scrollback: Option<&mut Scrollback>,
+    ) {
+        let count = count.min(self.scroll_bottom - self.scroll_top + 1);
+        for _ in 0..count {
+            if self.scroll_top == 0 {
+                if let Some(scrollback) = scrollback.as_deref_mut() {
+                    scrollback.push(self.row_to_string(0));
+                }
+            }
+            self.rows.remove(self.scroll_top);
+            self.rows.insert(self.scroll_bottom, self.blank_row(style));
+        }
+    }
+
+    fn scroll_region_down(&mut self, count: usize, style: CellStyle) {
+        let count = count.min(self.scroll_bottom - self.scroll_top + 1);
+        for _ in 0..count {
+            self.rows.remove(self.scroll_bottom);
+            self.rows.insert(self.scroll_top, self.blank_row(style));
+        }
+    }
+
+    fn delete_lines_in_scroll_region(
+        &mut self,
+        count: usize,
+        style: CellStyle,
+        mut scrollback: Option<&mut Scrollback>,
+    ) {
+        if !self.cursor_in_scroll_region() {
+            return;
+        }
+        let count = count.min(self.scroll_bottom - self.cursor_row + 1);
+        for _ in 0..count {
+            if self.cursor_row == 0 && self.scroll_top == 0 {
+                if let Some(scrollback) = scrollback.as_deref_mut() {
+                    scrollback.push(self.row_to_string(0));
+                }
+            }
+            self.rows.remove(self.cursor_row);
+            self.rows.insert(self.scroll_bottom, self.blank_row(style));
+        }
+    }
+
+    fn insert_lines_in_scroll_region(&mut self, count: usize, style: CellStyle) {
+        if !self.cursor_in_scroll_region() {
+            return;
+        }
+        let count = count.min(self.scroll_bottom - self.cursor_row + 1);
+        for _ in 0..count {
+            self.rows.remove(self.scroll_bottom);
+            self.rows.insert(self.cursor_row, self.blank_row(style));
+        }
+    }
+
+    fn cursor_in_scroll_region(&self) -> bool {
+        self.cursor_row >= self.scroll_top && self.cursor_row <= self.scroll_bottom
+    }
+
+    fn resolve_cursor_row(&self, row: usize) -> usize {
+        let row = row.saturating_sub(1);
+        if self.origin_mode {
+            (self.scroll_top + row).min(self.scroll_bottom)
+        } else {
+            row.min(self.height - 1)
+        }
+    }
+
+    fn blank_row(&self, style: CellStyle) -> Vec<Cell> {
+        vec![Cell::blank_with_style(style); self.width]
     }
 
     fn non_empty_lines(&self) -> Vec<String> {
@@ -632,9 +798,13 @@ struct Cell {
 
 impl Cell {
     fn blank() -> Self {
+        Self::blank_with_style(CellStyle::default())
+    }
+
+    fn blank_with_style(style: CellStyle) -> Self {
         Self {
             ch: ' ',
-            style: CellStyle::default(),
+            style,
             wide_continuation: false,
         }
     }
@@ -1045,6 +1215,99 @@ mod tests {
     }
 
     #[test]
+    fn line_feed_scrolls_only_the_active_scroll_region() {
+        let mut state = TerminalState::new(12, 5, 100);
+        state.apply_bytes(b"header\r\nbody-1\r\nbody-2\r\nbody-3\r\nfooter");
+
+        state.apply_bytes(b"\x1b[2;4r\x1b[4;1H\nnew");
+
+        assert_screen_rows(&state, &["header", "body-2", "body-3", "new", "footer"]);
+        assert_eq!(state.capture_history_text(), "");
+    }
+
+    #[test]
+    fn reverse_index_scrolls_only_the_active_scroll_region() {
+        let mut state = TerminalState::new(12, 5, 100);
+        state.apply_bytes(b"header\r\nbody-1\r\nbody-2\r\nbody-3\r\nfooter");
+
+        state.apply_bytes(b"\x1b[2;4r\x1b[2;1H\x1bMnew");
+
+        assert_screen_rows(&state, &["header", "new", "body-1", "body-2", "footer"]);
+        assert_eq!(state.capture_history_text(), "");
+    }
+
+    #[test]
+    fn delete_line_shifts_rows_inside_scroll_region_only() {
+        let mut state = TerminalState::new(12, 5, 100);
+        state.apply_bytes(b"header\r\nbody-1\r\nbody-2\r\nbody-3\r\nfooter");
+
+        state.apply_bytes(b"\x1b[2;4r\x1b[2;1H\x1b[M\x1b[4;1Hnew");
+
+        assert_screen_rows(&state, &["header", "body-2", "body-3", "new", "footer"]);
+        assert_eq!(state.capture_history_text(), "");
+    }
+
+    #[test]
+    fn insert_line_shifts_rows_inside_scroll_region_only() {
+        let mut state = TerminalState::new(12, 5, 100);
+        state.apply_bytes(b"header\r\nbody-1\r\nbody-2\r\nbody-3\r\nfooter");
+
+        state.apply_bytes(b"\x1b[2;4r\x1b[2;1H\x1b[Lnew");
+
+        assert_screen_rows(&state, &["header", "new", "body-1", "body-2", "footer"]);
+        assert_eq!(state.capture_history_text(), "");
+    }
+
+    #[test]
+    fn scroll_up_and_down_operate_inside_scroll_region_only() {
+        let mut state = TerminalState::new(12, 5, 100);
+        state.apply_bytes(b"header\r\nbody-1\r\nbody-2\r\nbody-3\r\nfooter");
+        state.apply_bytes(b"\x1b[2;4r\x1b[S\x1b[4;1Hnew");
+        assert_screen_rows(&state, &["header", "body-2", "body-3", "new", "footer"]);
+
+        let mut state = TerminalState::new(12, 5, 100);
+        state.apply_bytes(b"header\r\nbody-1\r\nbody-2\r\nbody-3\r\nfooter");
+        state.apply_bytes(b"\x1b[2;4r\x1b[T\x1b[2;1Hnew");
+        assert_screen_rows(&state, &["header", "new", "body-1", "body-2", "footer"]);
+    }
+
+    #[test]
+    fn cursor_vertical_moves_clamp_inside_scroll_region() {
+        let mut state = TerminalState::new(12, 5, 100);
+        state.apply_bytes(b"\x1b[2;4r\x1b[2;1H\x1b[A");
+        assert_eq!(state.cursor_position(), (1, 0));
+
+        state.apply_bytes(b"\x1b[4;1H\x1b[B");
+        assert_eq!(state.cursor_position(), (3, 0));
+    }
+
+    #[test]
+    fn origin_mode_addresses_rows_relative_to_scroll_region() {
+        let mut state = TerminalState::new(12, 5, 100);
+
+        state.apply_bytes(b"\x1b[2;4r\x1b[?6h\x1b[1;1Hinside");
+        assert_screen_rows(&state, &["", "inside", "", "", ""]);
+
+        state.apply_bytes(b"\x1b[?6l\x1b[1;1Hhome");
+        assert_screen_rows(&state, &["home", "inside", "", "", ""]);
+    }
+
+    #[test]
+    fn alternate_screen_scroll_region_does_not_pollute_scrollback() {
+        let mut state = TerminalState::new(12, 5, 100);
+        state.apply_bytes(b"primary");
+
+        state.apply_bytes(b"\x1b[?1049halt-1\r\nalt-2\r\nalt-3");
+        state.apply_bytes(b"\x1b[1;3r\x1b[3;1H\nnew");
+
+        assert_screen_rows(&state, &["alt-2", "alt-3", "new", "", ""]);
+        assert_eq!(state.capture_history_text(), "");
+
+        state.apply_bytes(b"\x1b[?1049l");
+        assert_eq!(state.capture_screen_text(), "primary\n");
+    }
+
+    #[test]
     fn resize_changes_wrap_width_for_future_output() {
         let mut state = TerminalState::new(5, 3, 100);
         state.apply_bytes(b"abcde");
@@ -1063,5 +1326,15 @@ mod tests {
         state.resize(10, 2);
 
         assert_eq!(state.capture_screen_text(), "three\nfour\n");
+    }
+
+    fn assert_screen_rows(state: &TerminalState, expected: &[&str]) {
+        for (row, expected) in expected.iter().enumerate() {
+            assert_eq!(
+                state.active_screen().row_to_string(row),
+                *expected,
+                "row {row}"
+            );
+        }
     }
 }
