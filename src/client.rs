@@ -84,6 +84,25 @@ struct AttachRenderFrame {
     header_rows: usize,
 }
 
+#[derive(Debug, Default)]
+struct LiveRenderOutputState {
+    rows: Option<Vec<Vec<u8>>>,
+    cursor: Vec<u8>,
+    geometry: Option<LiveRenderOutputGeometry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedLiveRenderOutput {
+    rows: Vec<Vec<u8>>,
+    cursor: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveRenderOutputGeometry {
+    header_rows: usize,
+    regions: Vec<AttachPaneRegion>,
+}
+
 pub fn attach<F>(
     socket: &Path,
     session: &str,
@@ -632,10 +651,137 @@ fn write_snapshot_rows(
     Ok(())
 }
 
-fn write_live_render_output(render_output: &[u8]) -> io::Result<()> {
+fn write_live_render_output(
+    frame: &AttachRenderFrame,
+    state: &mut LiveRenderOutputState,
+) -> io::Result<()> {
+    let output = diff_live_render_output(frame, state);
     let mut stdout = io::stdout().lock();
-    stdout.write_all(render_output)?;
+    stdout.write_all(&output)?;
     stdout.flush()
+}
+
+fn reset_live_render_output_state(state: &mut LiveRenderOutputState) {
+    state.rows = None;
+    state.cursor.clear();
+    state.geometry = None;
+}
+
+fn diff_live_render_output(
+    frame: &AttachRenderFrame,
+    state: &mut LiveRenderOutputState,
+) -> Vec<u8> {
+    let Some(parsed) = parse_live_render_output(&frame.output) else {
+        reset_live_render_output_state(state);
+        return frame.output.clone();
+    };
+    let geometry = LiveRenderOutputGeometry {
+        header_rows: frame.header_rows,
+        regions: frame.regions.clone(),
+    };
+
+    let Some(previous_rows) = state.rows.as_ref() else {
+        store_live_render_output_state(state, geometry, parsed);
+        return frame.output.clone();
+    };
+    if previous_rows.len() != parsed.rows.len()
+        || state
+            .geometry
+            .as_ref()
+            .is_none_or(|stored| stored != &geometry)
+    {
+        store_live_render_output_state(state, geometry, parsed);
+        return frame.output.clone();
+    }
+
+    let mut output = Vec::new();
+    let mut changed_rows = false;
+    for (row, current) in parsed.rows.iter().enumerate() {
+        if previous_rows
+            .get(row)
+            .is_none_or(|previous| previous != current)
+        {
+            write_absolute_cursor_position(&mut output, row + 1, 1);
+            output.extend_from_slice(current);
+            changed_rows = true;
+        }
+    }
+    if changed_rows || state.cursor != parsed.cursor {
+        output.extend_from_slice(&parsed.cursor);
+    }
+    store_live_render_output_state(state, geometry, parsed);
+    output
+}
+
+fn store_live_render_output_state(
+    state: &mut LiveRenderOutputState,
+    geometry: LiveRenderOutputGeometry,
+    parsed: ParsedLiveRenderOutput,
+) {
+    state.rows = Some(parsed.rows);
+    state.cursor = parsed.cursor;
+    state.geometry = Some(geometry);
+}
+
+fn parse_live_render_output(render_output: &[u8]) -> Option<ParsedLiveRenderOutput> {
+    let body = render_output.strip_prefix(CURSOR_HOME)?;
+    let (rows, cursor) = split_trailing_cursor_position(body);
+    Some(ParsedLiveRenderOutput {
+        rows: split_render_output_rows(rows),
+        cursor: cursor.to_vec(),
+    })
+}
+
+fn split_trailing_cursor_position(output: &[u8]) -> (&[u8], &[u8]) {
+    for start in (0..output.len())
+        .rev()
+        .filter(|index| output[*index] == b'\x1b')
+    {
+        if is_cursor_position_escape(&output[start..]) {
+            return (&output[..start], &output[start..]);
+        }
+    }
+    (output, &[])
+}
+
+fn is_cursor_position_escape(bytes: &[u8]) -> bool {
+    let Some(bytes) = bytes.strip_prefix(b"\x1b[") else {
+        return false;
+    };
+    let Some((row, tail)) = split_digits(bytes) else {
+        return false;
+    };
+    if row.is_empty() {
+        return false;
+    }
+    let Some(tail) = tail.strip_prefix(b";") else {
+        return false;
+    };
+    let Some((col, tail)) = split_digits(tail) else {
+        return false;
+    };
+    !col.is_empty() && tail == b"H"
+}
+
+fn split_digits(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let len = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    Some((&bytes[..len], &bytes[len..]))
+}
+
+fn split_render_output_rows(rows: &[u8]) -> Vec<Vec<u8>> {
+    rows.split(|byte| *byte == b'\n')
+        .map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            line.to_vec()
+        })
+        .collect()
+}
+
+fn write_absolute_cursor_position(output: &mut Vec<u8>, row: usize, col: usize) {
+    output.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
 }
 
 fn write_snapshot_rows_for_repaint(
@@ -1684,6 +1830,7 @@ fn run_live_snapshot_attach(
     let mut fallback_event_stream_started = false;
     let mut pane_number_message = None;
     let mut pending_input_repaint_deadline = None;
+    let mut render_output_state = LiveRenderOutputState::default();
 
     loop {
         let message_expiry = pane_number_message.as_ref().map(|(_, until)| *until);
@@ -1709,6 +1856,7 @@ fn run_live_snapshot_attach(
                         &mut pane_number_message,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
                     last_redraw = Instant::now();
                     pending_input_repaint_deadline = None;
                 } else if event_stream_active && !bytes.is_empty() {
@@ -1733,6 +1881,7 @@ fn run_live_snapshot_attach(
                         &mut pane_number_message,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
                 }
                 last_redraw = Instant::now();
             }
@@ -1743,6 +1892,7 @@ fn run_live_snapshot_attach(
                 if !redraw_paused {
                     frame = write_live_snapshot_frame(socket, session)?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
                 }
                 last_redraw = Instant::now();
             }
@@ -1757,6 +1907,7 @@ fn run_live_snapshot_attach(
                     &mut pane_number_message,
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::ShowHelp) => {
@@ -1771,6 +1922,7 @@ fn run_live_snapshot_attach(
                     &mut pane_number_message,
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::SelectPane(index)) => {
@@ -1780,6 +1932,7 @@ fn run_live_snapshot_attach(
                 if !redraw_paused {
                     frame = write_live_snapshot_frame(socket, session)?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
                 }
                 last_redraw = Instant::now();
             }
@@ -1788,6 +1941,7 @@ fn run_live_snapshot_attach(
                 if resized && !redraw_paused {
                     frame = write_live_snapshot_frame(socket, session)?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
                     last_redraw = Instant::now();
                 }
                 if let Some(pane) =
@@ -1798,6 +1952,7 @@ fn run_live_snapshot_attach(
                     if !redraw_paused {
                         frame = write_live_snapshot_frame(socket, session)?;
                         sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                        reset_live_render_output_state(&mut render_output_state);
                     }
                     last_redraw = Instant::now();
                 }
@@ -1811,6 +1966,7 @@ fn run_live_snapshot_attach(
                 redraw_paused = false;
                 frame = write_live_snapshot_frame(socket, session)?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::RedrawHint) => {
@@ -1823,22 +1979,21 @@ fn run_live_snapshot_attach(
                         &mut pane_number_message,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
                     last_redraw = Instant::now();
                     pending_input_repaint_deadline = None;
                 }
             }
             Ok(LiveSnapshotInputEvent::RenderFrame(render_frame)) => {
-                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                if resized {
+                    reset_live_render_output_state(&mut render_output_state);
+                }
                 handle_render_frame_received(&mut event_stream_active);
                 if !redraw_paused {
-                    let AttachRenderFrame {
-                        output,
-                        regions,
-                        header_rows,
-                    } = render_frame;
                     frame = LiveSnapshotFrame {
-                        regions,
-                        header_rows,
+                        regions: render_frame.regions.clone(),
+                        header_rows: render_frame.header_rows,
                     };
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     if pane_number_message
@@ -1851,9 +2006,10 @@ fn run_live_snapshot_attach(
                             &mut pane_number_message,
                         )?;
                         sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                        reset_live_render_output_state(&mut render_output_state);
                     } else {
                         pane_number_message = None;
-                        write_live_render_output(&output)?;
+                        write_live_render_output(&render_frame, &mut render_output_state)?;
                     }
                     last_redraw = Instant::now();
                     pending_input_repaint_deadline = None;
@@ -1909,6 +2065,7 @@ fn run_live_snapshot_attach(
                         &mut pane_number_message,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
                     last_redraw = Instant::now();
                     pending_input_repaint_deadline = None;
                 }
@@ -3182,6 +3339,125 @@ mod tests {
                 col_end: 6,
             }]
         );
+    }
+
+    #[test]
+    fn rejects_attach_render_frame_with_extra_output_bytes() {
+        let body = b"HEADER_ROWS\t0\nREGIONS\t0\nOUTPUT\t3\nabcd";
+
+        let err = parse_attach_render_frame_body(body).unwrap_err();
+
+        assert!(err.to_string().contains("extra render output"));
+    }
+
+    #[test]
+    fn rejects_attach_render_frame_with_truncated_output_bytes() {
+        let body = b"HEADER_ROWS\t0\nREGIONS\t0\nOUTPUT\t4\nabc";
+
+        let err = parse_attach_render_frame_body(body).unwrap_err();
+
+        assert!(err.to_string().contains("truncated render output"));
+    }
+
+    fn render_frame(output: &[u8]) -> AttachRenderFrame {
+        AttachRenderFrame {
+            output: output.to_vec(),
+            regions: vec![AttachPaneRegion {
+                pane: 0,
+                row_start: 0,
+                row_end: 2,
+                col_start: 0,
+                col_end: 10,
+            }],
+            header_rows: 1,
+        }
+    }
+
+    #[test]
+    fn diff_live_render_output_writes_full_first_frame() {
+        let mut state = LiveRenderOutputState::default();
+        let frame = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Kold\x1b[2;4H";
+
+        let output = diff_live_render_output(&render_frame(frame), &mut state);
+
+        assert_eq!(output, frame);
+    }
+
+    #[test]
+    fn diff_live_render_output_writes_only_changed_rows_and_cursor() {
+        let mut state = LiveRenderOutputState::default();
+        let first = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Kold-long\x1b[2;4H";
+        let second = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Knew\x1b[2;4H";
+        let _ = diff_live_render_output(&render_frame(first), &mut state);
+
+        let output = diff_live_render_output(&render_frame(second), &mut state);
+
+        assert!(!output.starts_with(CURSOR_HOME), "{output:?}");
+        assert!(output.starts_with(b"\x1b[2;1H"), "{output:?}");
+        assert!(
+            output
+                .windows(CLEAR_LINE.len())
+                .any(|window| window == CLEAR_LINE)
+        );
+        assert!(output.windows(b"new".len()).any(|window| window == b"new"));
+        assert!(
+            !output
+                .windows(b"status".len())
+                .any(|window| window == b"status")
+        );
+        assert!(output.ends_with(b"\x1b[2;4H"), "{output:?}");
+    }
+
+    #[test]
+    fn diff_live_render_output_writes_full_frame_after_reset() {
+        let mut state = LiveRenderOutputState::default();
+        let first = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Kold";
+        let second = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Knew";
+        let _ = diff_live_render_output(&render_frame(first), &mut state);
+
+        reset_live_render_output_state(&mut state);
+        let output = diff_live_render_output(&render_frame(second), &mut state);
+
+        assert_eq!(output, second);
+    }
+
+    #[test]
+    fn diff_live_render_output_writes_nothing_for_identical_frame() {
+        let mut state = LiveRenderOutputState::default();
+        let frame = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Ksame\x1b[2;5H";
+        let _ = diff_live_render_output(&render_frame(frame), &mut state);
+
+        let output = diff_live_render_output(&render_frame(frame), &mut state);
+
+        assert!(output.is_empty(), "{output:?}");
+    }
+
+    #[test]
+    fn diff_live_render_output_writes_only_cursor_when_rows_match() {
+        let mut state = LiveRenderOutputState::default();
+        let first = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Ksame\x1b[2;5H";
+        let second = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Ksame\x1b[2;6H";
+        let _ = diff_live_render_output(&render_frame(first), &mut state);
+
+        let output = diff_live_render_output(&render_frame(second), &mut state);
+
+        assert_eq!(output, b"\x1b[2;6H");
+    }
+
+    #[test]
+    fn diff_live_render_output_writes_full_frame_after_geometry_change() {
+        let mut state = LiveRenderOutputState::default();
+        let first = render_frame(b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Kold");
+        let second = AttachRenderFrame {
+            output: b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Knew".to_vec(),
+            regions: Vec::new(),
+            header_rows: 1,
+        };
+        let _ = diff_live_render_output(&first, &mut state);
+
+        let output = diff_live_render_output(&second, &mut state);
+
+        assert_eq!(output, second.output);
     }
 
     #[test]
