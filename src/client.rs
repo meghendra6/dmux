@@ -21,6 +21,7 @@ const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
+const ATTACH_RENDER_RESPONSE: &str = "OK\tRENDER_OUTPUT_META\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachMode {
@@ -50,13 +51,14 @@ struct AttachLayoutSnapshotResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AttachRenderFrame {
-    status: String,
-    layout: AttachLayoutSnapshotResponse,
+struct LiveSnapshotFrame {
+    regions: Vec<AttachPaneRegion>,
+    header_rows: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveSnapshotFrame {
+struct AttachRenderFrame {
+    output: Vec<u8>,
     regions: Vec<AttachPaneRegion>,
     header_rows: usize,
 }
@@ -295,33 +297,54 @@ fn read_attach_render_frame(stream: &mut UnixStream) -> io::Result<AttachRenderF
     parse_attach_render_frame_body(&body)
 }
 
-fn is_unknown_request_error(error: &io::Error) -> bool {
-    error.to_string().starts_with("unknown request line:")
-}
-
 fn parse_attach_render_frame_body(body: &[u8]) -> io::Result<AttachRenderFrame> {
     let mut cursor = 0;
-    let header = read_body_line(body, &mut cursor)?;
-    let Some(len) = header.strip_prefix("STATUS\t") else {
-        return Err(io::Error::other("missing status header"));
+    let header_rows = read_body_line(body, &mut cursor)?;
+    let Some(header_rows) = header_rows.strip_prefix("HEADER_ROWS\t") else {
+        return Err(io::Error::other("missing render header rows"));
+    };
+    let header_rows = header_rows
+        .parse::<usize>()
+        .map_err(|_| io::Error::other("invalid render header rows"))?;
+
+    let regions = read_body_line(body, &mut cursor)?;
+    let Some(count) = regions.strip_prefix("REGIONS\t") else {
+        return Err(io::Error::other("missing render regions header"));
+    };
+    let count = count
+        .parse::<usize>()
+        .map_err(|_| io::Error::other("invalid render region count"))?;
+
+    let mut regions = Vec::new();
+    for _ in 0..count {
+        let line = read_body_line(body, &mut cursor)?;
+        regions.push(parse_attach_pane_region(line)?);
+    }
+
+    let output = read_body_line(body, &mut cursor)?;
+    let Some(len) = output.strip_prefix("OUTPUT\t") else {
+        return Err(io::Error::other("missing render output header"));
     };
     let len = len
         .parse::<usize>()
-        .map_err(|_| io::Error::other("invalid status length"))?;
-    if body.len().saturating_sub(cursor) < len + 1 {
-        return Err(io::Error::other("truncated status body"));
+        .map_err(|_| io::Error::other("invalid render output length"))?;
+    let remaining = body.len().saturating_sub(cursor);
+    if remaining < len {
+        return Err(io::Error::other("truncated render output body"));
     }
-    let status = std::str::from_utf8(&body[cursor..cursor + len])
-        .map_err(|_| io::Error::other("non-utf8 status body"))?
-        .to_string();
-    cursor += len;
-    if body.get(cursor) != Some(&b'\n') {
-        return Err(io::Error::other("missing status terminator"));
+    if remaining > len {
+        return Err(io::Error::other("extra render output body bytes"));
     }
-    cursor += 1;
 
-    let layout = parse_attach_layout_snapshot_response(&body[cursor..])?;
-    Ok(AttachRenderFrame { status, layout })
+    Ok(AttachRenderFrame {
+        output: body[cursor..cursor + len].to_vec(),
+        regions,
+        header_rows,
+    })
+}
+
+fn is_unknown_request_error(error: &io::Error) -> bool {
+    error.to_string().starts_with("unknown request line:")
 }
 
 fn parse_attach_layout_snapshot_response(body: &[u8]) -> io::Result<AttachLayoutSnapshotResponse> {
@@ -446,13 +469,6 @@ fn write_live_snapshot_frame_with_message_and_clear(
     write_live_frame_to_stdout(&status, message, &snapshot, clear)
 }
 
-fn write_live_render_frame_with_message(
-    render_frame: &AttachRenderFrame,
-    message: Option<&str>,
-) -> io::Result<LiveSnapshotFrame> {
-    write_live_frame_to_stdout(&render_frame.status, message, &render_frame.layout, false)
-}
-
 fn write_live_frame_to_stdout(
     status: &str,
     message: Option<&str>,
@@ -532,6 +548,12 @@ fn write_snapshot_rows(
     }
 
     Ok(())
+}
+
+fn write_live_render_output(render_output: &[u8]) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(render_output)?;
+    stdout.flush()
 }
 
 fn write_snapshot_rows_for_repaint(
@@ -1437,7 +1459,7 @@ fn spawn_live_snapshot_render_thread(
                 return;
             }
         };
-        if response != "OK\n" {
+        if response != ATTACH_RENDER_RESPONSE {
             let _ = sender.send(LiveSnapshotInputEvent::RenderStreamUnavailable);
             return;
         }
@@ -1696,11 +1718,30 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::RenderFrame(render_frame)) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 if !redraw_paused {
-                    frame = write_live_render_frame_with_pane_number_message(
-                        &render_frame,
-                        &mut pane_number_message,
-                    )?;
+                    let AttachRenderFrame {
+                        output,
+                        regions,
+                        header_rows,
+                    } = render_frame;
+                    frame = LiveSnapshotFrame {
+                        regions,
+                        header_rows,
+                    };
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    if pane_number_message
+                        .as_ref()
+                        .is_some_and(|(_, until)| Instant::now() < *until)
+                    {
+                        frame = write_live_snapshot_frame_with_pane_number_message(
+                            socket,
+                            session,
+                            &mut pane_number_message,
+                        )?;
+                        sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    } else {
+                        pane_number_message = None;
+                        write_live_render_output(&output)?;
+                    }
                     last_redraw = Instant::now();
                 }
             }
@@ -1804,23 +1845,6 @@ fn write_live_snapshot_frame_with_pane_number_message(
         .as_ref()
         .map(|(message, _)| message.as_str());
     write_live_snapshot_frame_with_message(socket, session, message)
-}
-
-fn write_live_render_frame_with_pane_number_message(
-    render_frame: &AttachRenderFrame,
-    pane_number_message: &mut Option<(String, Instant)>,
-) -> io::Result<LiveSnapshotFrame> {
-    if pane_number_message
-        .as_ref()
-        .is_some_and(|(_, until)| Instant::now() >= *until)
-    {
-        *pane_number_message = None;
-    }
-
-    let message = pane_number_message
-        .as_ref()
-        .map(|(message, _)| message.as_str());
-    write_live_render_frame_with_message(render_frame, message)
 }
 
 fn pane_entries(socket: &Path, session: &str) -> io::Result<Vec<PaneListEntry>> {
@@ -2987,6 +3011,31 @@ mod tests {
         assert_eq!(parsed.snapshot, b"abc\r\nxy");
         assert_eq!(
             parsed.regions,
+            vec![AttachPaneRegion {
+                pane: 2,
+                row_start: 3,
+                row_end: 4,
+                col_start: 5,
+                col_end: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn reads_attach_render_frame_with_metadata_and_output_bytes() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let body = b"HEADER_ROWS\t1\nREGIONS\t1\nREGION\t2\t3\t4\t5\t6\nOUTPUT\t6\n\x1b[Habc";
+        server
+            .write_all(format!("FRAME\t{}\n", body.len()).as_bytes())
+            .unwrap();
+        server.write_all(body).unwrap();
+
+        let frame = read_attach_render_frame(&mut client).unwrap();
+
+        assert_eq!(frame.output, b"\x1b[Habc");
+        assert_eq!(frame.header_rows, 1);
+        assert_eq!(
+            frame.regions,
             vec![AttachPaneRegion {
                 pane: 2,
                 row_start: 3,

@@ -17,7 +17,10 @@ const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 +
 const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
 const ATTACH_RENDER_STATUS_FORMAT: &str =
     "#{session.name} #{window.list} pane #{pane.index} | #{status.help}";
+const ATTACH_RENDER_RESPONSE: &[u8] = b"OK\tRENDER_OUTPUT_META\n";
 const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(50);
+const CURSOR_HOME: &[u8] = b"\x1b[H";
+const CLEAR_LINE: &[u8] = b"\x1b[2K";
 
 type TrackedStreamClients = Arc<Mutex<Vec<TrackedStream>>>;
 type AttachEventClients = TrackedStreamClients;
@@ -1152,6 +1155,7 @@ fn handle_new(
         cwd,
         PtySize { cols: 80, rows: 24 },
         Arc::clone(&attach_events),
+        None,
     )?;
     let session = Arc::new(Session::new(name.clone(), Arc::clone(&pane), attach_events));
     pane.set_session(&session);
@@ -1165,6 +1169,7 @@ fn spawn_pane(
     cwd: PathBuf,
     size: PtySize,
     attach_events: AttachEventClients,
+    initial_session: Option<Weak<Session>>,
 ) -> io::Result<Arc<Pane>> {
     let mut spec = SpawnSpec::new(session_name, command, cwd);
     spec.size = size;
@@ -1183,7 +1188,7 @@ fn spawn_pane(
         clients: Arc::new(Mutex::new(Vec::new())),
         next_client_id: AtomicUsize::new(0),
         attach_events,
-        session: Mutex::new(None),
+        session: Mutex::new(initial_session),
     });
 
     start_output_pump(reader, Arc::clone(&pane));
@@ -1479,6 +1484,7 @@ fn handle_split(
         cwd,
         size,
         session.attach_event_clients(),
+        Some(Arc::downgrade(&session)),
     )?;
     pane.set_session(&session);
     session.add_pane(direction, pane);
@@ -1728,6 +1734,7 @@ fn handle_new_window(
         cwd,
         size,
         session.attach_event_clients(),
+        Some(Arc::downgrade(&session)),
     )?;
     pane.set_session(&session);
     session.add_window(pane);
@@ -2014,7 +2021,7 @@ fn handle_attach_render(
         return Ok(());
     };
 
-    write_ok(stream)?;
+    stream.write_all(ATTACH_RENDER_RESPONSE)?;
     let Some(_registration) = session.register_attach_render_stream(stream)? else {
         return Ok(());
     };
@@ -2138,22 +2145,98 @@ fn format_attach_layout_snapshot_body(snapshot: &RenderedAttachSnapshot) -> Vec<
 fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
     let context = session.status_context(&session.name)?;
     let status = format_status_line(ATTACH_RENDER_STATUS_FORMAT, &context);
+    let header_rows = usize::from(!status.is_empty());
+    let snapshot_rows = session
+        .active_window_size()
+        .map(|size| usize::from(size.rows).saturating_sub(header_rows))
+        .unwrap_or(usize::MAX);
     let snapshot = attach_pane_frame_with_regions(session)?;
-    Some(format_attach_render_frame_body(&status, &snapshot))
+    Some(format_attach_render_frame_body(
+        &status,
+        &snapshot,
+        snapshot_rows,
+    ))
 }
 
-fn format_attach_render_frame_body(status: &str, snapshot: &RenderedAttachSnapshot) -> Vec<u8> {
-    let layout = format_attach_layout_snapshot_body(snapshot);
-    let mut body = String::new();
-    body.push_str("STATUS\t");
-    body.push_str(&status.len().to_string());
-    body.push('\n');
+fn format_attach_render_frame_body(
+    status: &str,
+    snapshot: &RenderedAttachSnapshot,
+    snapshot_rows: usize,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    output.extend_from_slice(CURSOR_HOME);
+    if !status.is_empty() {
+        write_render_output_line(&mut output, status.as_bytes(), true);
+    }
+    write_render_output_rows(&mut output, snapshot.text.as_bytes(), snapshot_rows);
 
-    let mut bytes = body.into_bytes();
-    bytes.extend_from_slice(status.as_bytes());
-    bytes.push(b'\n');
-    bytes.extend_from_slice(&layout);
+    let mut header = String::new();
+    header.push_str("HEADER_ROWS\t");
+    header.push_str(&usize::from(!status.is_empty()).to_string());
+    header.push('\n');
+    header.push_str("REGIONS\t");
+    header.push_str(&snapshot.regions.len().to_string());
+    header.push('\n');
+    for region in &snapshot.regions {
+        header.push_str("REGION\t");
+        header.push_str(&region.pane.to_string());
+        header.push('\t');
+        header.push_str(&region.row_start.to_string());
+        header.push('\t');
+        header.push_str(&region.row_end.to_string());
+        header.push('\t');
+        header.push_str(&region.col_start.to_string());
+        header.push('\t');
+        header.push_str(&region.col_end.to_string());
+        header.push('\n');
+    }
+    header.push_str("OUTPUT\t");
+    header.push_str(&output.len().to_string());
+    header.push('\n');
+
+    let mut bytes = header.into_bytes();
+    bytes.extend_from_slice(&output);
     bytes
+}
+
+fn write_render_output_line(output: &mut Vec<u8>, line: &[u8], clear_line: bool) {
+    if clear_line {
+        output.extend_from_slice(CLEAR_LINE);
+    }
+    output.extend_from_slice(line);
+    output.extend_from_slice(b"\r\n");
+}
+
+fn write_render_output_rows(output: &mut Vec<u8>, snapshot: &[u8], max_rows: usize) {
+    if max_rows == 0 {
+        return;
+    }
+
+    let mut rows = 0;
+    let mut start = 0;
+    while start < snapshot.len() && rows < max_rows {
+        let line_end = snapshot[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(snapshot.len(), |offset| start + offset);
+        let content_end = if line_end > start && snapshot[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+
+        if rows > 0 {
+            output.extend_from_slice(b"\r\n");
+        }
+        output.extend_from_slice(CLEAR_LINE);
+        output.extend_from_slice(&snapshot[start..content_end]);
+        rows += 1;
+
+        if line_end == snapshot.len() {
+            break;
+        }
+        start = line_end + 1;
+    }
 }
 
 fn write_attach_render_frame(stream: &mut UnixStream, body: &[u8]) -> bool {
@@ -3723,6 +3806,42 @@ REGION\t1\t0\t1\t7\t12\n\
 SNAPSHOT\t14\n\
 left | right\r\n"
         );
+    }
+
+    #[test]
+    fn format_attach_render_frame_includes_regions_and_output_bytes() {
+        let snapshot = RenderedAttachSnapshot {
+            text: "left | right\r\n".to_string(),
+            regions: vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 4,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 7,
+                    col_end: 12,
+                },
+            ],
+        };
+
+        let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 10))
+            .expect("render frame utf8");
+
+        assert!(body.starts_with("HEADER_ROWS\t1\nREGIONS\t2\n"), "{body:?}");
+        assert!(
+            body.contains("REGION\t0\t0\t1\t0\t4\nREGION\t1\t0\t1\t7\t12\n"),
+            "{body:?}"
+        );
+        assert!(body.contains("\nOUTPUT\t"), "{body:?}");
+        assert!(body.contains("\x1b[H\x1b[2Kstatus\r\n"), "{body:?}");
+        assert!(body.contains("\x1b[2Kleft | right"), "{body:?}");
+        assert!(!body.contains("SNAPSHOT\t"), "{body:?}");
     }
 
     #[test]
