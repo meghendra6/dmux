@@ -8,6 +8,14 @@ pub enum SplitDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneResizeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureMode {
     Screen,
     History,
@@ -81,6 +89,11 @@ pub enum Request {
         session: String,
         cols: u16,
         rows: u16,
+    },
+    ResizePane {
+        session: String,
+        direction: PaneResizeDirection,
+        amount: usize,
     },
     Send {
         session: String,
@@ -235,6 +248,13 @@ pub fn encode_delete_buffer(buffer: &str) -> String {
 
 pub fn encode_resize(session: &str, cols: u16, rows: u16) -> String {
     format!("RESIZE\t{session}\t{cols}\t{rows}\n")
+}
+
+pub fn encode_resize_pane(session: &str, direction: PaneResizeDirection, amount: usize) -> String {
+    format!(
+        "RESIZE_PANE\t{session}\t{}\t{amount}\n",
+        encode_pane_resize_direction(direction)
+    )
 }
 
 pub fn encode_send(session: &str, bytes: &[u8]) -> String {
@@ -428,6 +448,15 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 .parse::<u16>()
                 .map_err(|_| "RESIZE has invalid rows".to_string())?,
         }),
+        ["RESIZE_PANE", session, direction, amount] => Ok(Request::ResizePane {
+            session: (*session).to_string(),
+            direction: decode_pane_resize_direction(direction)?,
+            amount: amount
+                .parse::<usize>()
+                .ok()
+                .filter(|amount| *amount > 0)
+                .ok_or_else(|| "RESIZE_PANE amount must be a positive integer".to_string())?,
+        }),
         ["SEND", session, hex] => Ok(Request::Send {
             session: (*session).to_string(),
             bytes: decode_hex(hex)?,
@@ -529,6 +558,15 @@ fn encode_split_direction(direction: SplitDirection) -> &'static str {
     }
 }
 
+fn encode_pane_resize_direction(direction: PaneResizeDirection) -> &'static str {
+    match direction {
+        PaneResizeDirection::Left => "L",
+        PaneResizeDirection::Right => "R",
+        PaneResizeDirection::Up => "U",
+        PaneResizeDirection::Down => "D",
+    }
+}
+
 fn encode_capture_mode(mode: CaptureMode) -> &'static str {
     match mode {
         CaptureMode::Screen => "screen",
@@ -551,6 +589,16 @@ fn decode_split_direction(value: &str) -> Result<SplitDirection, String> {
         "h" => Ok(SplitDirection::Horizontal),
         "v" => Ok(SplitDirection::Vertical),
         _ => Err("SPLIT has invalid direction".to_string()),
+    }
+}
+
+fn decode_pane_resize_direction(value: &str) -> Result<PaneResizeDirection, String> {
+    match value {
+        "L" => Ok(PaneResizeDirection::Left),
+        "R" => Ok(PaneResizeDirection::Right),
+        "U" => Ok(PaneResizeDirection::Up),
+        "D" => Ok(PaneResizeDirection::Down),
+        _ => Err("RESIZE_PANE has invalid direction".to_string()),
     }
 }
 
@@ -678,6 +726,25 @@ mod tests {
                 rows: 40,
             }
         );
+    }
+
+    #[test]
+    fn round_trips_directional_resize_pane_request() {
+        let line = encode_resize_pane("dev", PaneResizeDirection::Left, 5);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::ResizePane {
+                session: "dev".to_string(),
+                direction: PaneResizeDirection::Left,
+                amount: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_zero_directional_resize_pane_amount() {
+        let err = decode_request("RESIZE_PANE\tdev\tL\t0\n").unwrap_err();
+        assert!(err.contains("positive"), "{err}");
     }
 
     #[test]

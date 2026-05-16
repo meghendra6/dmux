@@ -1,6 +1,8 @@
 use crate::ids::{PaneId, TabId};
-use crate::layout::{LayoutNode, PaneRegion, layout_regions_for_size, split_extent};
-use crate::protocol::{self, BufferSelection, CaptureMode, Request, SplitDirection};
+use crate::layout::{LayoutNode, PaneRegion, layout_regions_for_size, split_extent_weighted};
+use crate::protocol::{
+    self, BufferSelection, CaptureMode, PaneResizeDirection, Request, SplitDirection,
+};
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::{TerminalChanges, TerminalState};
 use crate::terminal_query::PtyOutputFilter;
@@ -309,6 +311,17 @@ impl Session {
     fn resize_current_visible_panes(&self) -> io::Result<bool> {
         let pane_resizes = self.windows.lock().unwrap().visible_pane_resizes();
         resize_panes(pane_resizes)
+    }
+
+    fn resize_active_pane(
+        &self,
+        direction: PaneResizeDirection,
+        amount: usize,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        self.windows
+            .lock()
+            .unwrap()
+            .resize_active_pane(direction, amount)
     }
 
     fn active_window_size(&self) -> Option<PtySize> {
@@ -707,6 +720,16 @@ impl Window {
         self.visible_pane_resizes()
     }
 
+    fn resize_active_pane(
+        &mut self,
+        direction: PaneResizeDirection,
+        amount: usize,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        self.layout
+            .resize_pane(self.panes.active_index(), direction, amount, self.size)?;
+        Ok(self.visible_pane_resizes())
+    }
+
     fn visible_pane_resizes(&self) -> Vec<(Arc<Pane>, PtySize)> {
         let layout = self
             .zoomed
@@ -900,6 +923,16 @@ impl WindowSet {
     fn resize_visible_panes(&mut self, size: PtySize) -> Vec<(Arc<Pane>, PtySize)> {
         self.active_window_mut()
             .map_or_else(Vec::new, |window| window.resize_visible_panes(size))
+    }
+
+    fn resize_active_pane(
+        &mut self,
+        direction: PaneResizeDirection,
+        amount: usize,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        self.active_window_mut()
+            .ok_or_else(|| "missing window".to_string())?
+            .resize_active_pane(direction, amount)
     }
 
     fn visible_pane_resizes(&self) -> Vec<(Arc<Pane>, PtySize)> {
@@ -1198,6 +1231,11 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             cols,
             rows,
         } => handle_resize(&state, &mut stream, &session, cols, rows),
+        Request::ResizePane {
+            session,
+            direction,
+            amount,
+        } => handle_resize_pane(&state, &mut stream, &session, direction, amount),
         Request::Send { session, bytes } => handle_send(&state, &mut stream, &session, &bytes),
         Request::Split {
             session,
@@ -1582,6 +1620,39 @@ fn handle_resize(
         return Ok(());
     };
     if !session.resize_visible_panes(size)? {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    }
+
+    session.notify_attach_redraw_immediate();
+    write_ok(stream)
+}
+
+fn handle_resize_pane(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    direction: PaneResizeDirection,
+    amount: usize,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    let pane_resizes = match session.resize_active_pane(direction, amount) {
+        Ok(pane_resizes) => pane_resizes,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    if !resize_panes(pane_resizes)? {
         write_err(stream, "missing pane")?;
         return Ok(());
     }
@@ -2646,6 +2717,7 @@ fn render_layout(
             direction,
             first,
             second,
+            ..
         } => {
             let first = render_layout(first, screens)?;
             let second = render_layout(second, screens)?;
@@ -2682,11 +2754,13 @@ fn render_styled_sized_layout(
         }
         LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight,
+            second_weight,
             first,
             second,
         } => {
             let ((first_start, first_end), (second_start, second_end)) =
-                split_extent(col_start, col_end, 3);
+                split_extent_weighted(col_start, col_end, 3, *first_weight, *second_weight);
             let left = render_styled_sized_layout(
                 first,
                 terminals,
@@ -2707,11 +2781,13 @@ fn render_styled_sized_layout(
         }
         LayoutNode::Split {
             direction: SplitDirection::Vertical,
+            first_weight,
+            second_weight,
             first,
             second,
         } => {
             let ((first_start, first_end), (second_start, second_end)) =
-                split_extent(row_start, row_end, 1);
+                split_extent_weighted(row_start, row_end, 1, *first_weight, *second_weight);
             let top = render_styled_sized_layout(
                 first,
                 terminals,
@@ -2837,11 +2913,13 @@ fn render_sized_layout(
         }
         LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight,
+            second_weight,
             first,
             second,
         } => {
             let ((first_start, first_end), (second_start, second_end)) =
-                split_extent(col_start, col_end, 3);
+                split_extent_weighted(col_start, col_end, 3, *first_weight, *second_weight);
             let left =
                 render_sized_layout(first, screens, row_start, row_end, first_start, first_end)?;
             let right = render_sized_layout(
@@ -2856,11 +2934,13 @@ fn render_sized_layout(
         }
         LayoutNode::Split {
             direction: SplitDirection::Vertical,
+            first_weight,
+            second_weight,
             first,
             second,
         } => {
             let ((first_start, first_end), (second_start, second_end)) =
-                split_extent(row_start, row_end, 1);
+                split_extent_weighted(row_start, row_end, 1, *first_weight, *second_weight);
             let top =
                 render_sized_layout(first, screens, first_start, first_end, col_start, col_end)?;
             let bottom = render_sized_layout(
@@ -3835,6 +3915,8 @@ mod tests {
             layout,
             LayoutNode::Split {
                 direction: SplitDirection::Horizontal,
+                first_weight: 1,
+                second_weight: 1,
                 first: Box::new(LayoutNode::Pane(0)),
                 second: Box::new(LayoutNode::Pane(1)),
             }
@@ -3845,9 +3927,13 @@ mod tests {
     fn layout_node_removes_pane_and_shifts_remaining_indexes() {
         let mut layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Split {
                 direction: SplitDirection::Vertical,
+                first_weight: 1,
+                second_weight: 1,
                 first: Box::new(LayoutNode::Pane(1)),
                 second: Box::new(LayoutNode::Pane(2)),
             }),
@@ -3859,6 +3945,8 @@ mod tests {
             layout,
             LayoutNode::Split {
                 direction: SplitDirection::Horizontal,
+                first_weight: 1,
+                second_weight: 1,
                 first: Box::new(LayoutNode::Pane(0)),
                 second: Box::new(LayoutNode::Pane(1)),
             }
@@ -3869,6 +3957,8 @@ mod tests {
     fn render_attach_layout_joins_horizontal_panes() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -3892,6 +3982,8 @@ mod tests {
     fn render_attach_layout_maps_horizontal_pane_regions() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -3933,6 +4025,8 @@ mod tests {
     fn render_attach_layout_for_size_uses_allocated_regions_and_padding() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -3983,6 +4077,8 @@ mod tests {
     fn render_attach_layout_for_size_omits_horizontal_separator_when_space_is_too_narrow() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4026,6 +4122,8 @@ mod tests {
     fn render_attach_layout_for_size_omits_vertical_separator_when_space_is_too_short() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Vertical,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4094,6 +4192,8 @@ mod tests {
     fn sized_layout_regions_do_not_overlap_when_horizontal_space_is_one_column() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4123,6 +4223,8 @@ mod tests {
     fn sized_layout_regions_do_not_overlap_when_vertical_space_is_one_row() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Vertical,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4152,6 +4254,8 @@ mod tests {
     fn sized_layout_regions_split_horizontal_panes_around_separator() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4181,6 +4285,8 @@ mod tests {
     fn sized_layout_regions_split_vertical_panes_around_separator() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Vertical,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4397,6 +4503,8 @@ left | right\r\n"
     fn render_attach_layout_stacks_vertical_panes() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Vertical,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4420,6 +4528,8 @@ left | right\r\n"
     fn render_attach_layout_maps_vertical_pane_regions() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Vertical,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4473,9 +4583,13 @@ left | right\r\n"
     fn render_attach_layout_offsets_nested_pane_regions() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Split {
                 direction: SplitDirection::Vertical,
+                first_weight: 1,
+                second_weight: 1,
                 first: Box::new(LayoutNode::Pane(1)),
                 second: Box::new(LayoutNode::Pane(2)),
             }),
@@ -4529,8 +4643,12 @@ left | right\r\n"
     fn render_attach_layout_expands_only_bottom_nested_region_rows() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Split {
                 direction: SplitDirection::Vertical,
+                first_weight: 1,
+                second_weight: 1,
                 first: Box::new(LayoutNode::Pane(0)),
                 second: Box::new(LayoutNode::Pane(1)),
             }),
@@ -4585,6 +4703,8 @@ left | right\r\n"
     fn render_attach_layout_expands_right_region_rows_for_left_padding() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4650,6 +4770,8 @@ left | right\r\n"
     fn render_attach_frame_for_size_preserves_styled_pane_output() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4700,6 +4822,8 @@ left | right\r\n"
     fn render_attach_frame_for_size_clips_styled_content_to_region_width() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4747,6 +4871,8 @@ left | right\r\n"
     fn render_attach_frame_for_size_clips_wide_utf8_to_region_width() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4775,6 +4901,8 @@ left | right\r\n"
     fn render_attach_frame_for_size_maps_active_pane_cursor() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Horizontal,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
@@ -4815,6 +4943,8 @@ left | right\r\n"
     fn render_attach_frame_for_size_uses_visible_width_for_vertical_separator() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Vertical,
+            first_weight: 1,
+            second_weight: 1,
             first: Box::new(LayoutNode::Pane(0)),
             second: Box::new(LayoutNode::Pane(1)),
         };
