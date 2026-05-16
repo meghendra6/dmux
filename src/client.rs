@@ -21,6 +21,7 @@ const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const LIVE_SNAPSHOT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL: Duration = Duration::from_millis(1000);
 const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
+const ATTACH_RESIZE_AMOUNT: usize = 5;
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
@@ -948,6 +949,10 @@ enum PaneCommand {
     FocusDown,
     FocusUp,
     FocusRight,
+    ResizeLeft,
+    ResizeDown,
+    ResizeUp,
+    ResizeRight,
     Close,
     ToggleZoom,
 }
@@ -1104,6 +1109,34 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusRight));
+                    continue;
+                }
+                b'H' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeLeft));
+                    continue;
+                }
+                b'J' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeDown));
+                    continue;
+                }
+                b'K' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeUp));
+                    continue;
+                }
+                b'L' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeRight));
                     continue;
                 }
                 b'x' => {
@@ -1336,6 +1369,52 @@ fn translate_live_snapshot_input_with_mouse(
                     }
                     actions.push(LiveSnapshotInputAction::PaneCommand(
                         PaneCommand::FocusRight,
+                    ));
+                    offset += 1;
+                    continue;
+                }
+                b'H' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(
+                        PaneCommand::ResizeLeft,
+                    ));
+                    offset += 1;
+                    continue;
+                }
+                b'J' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(
+                        PaneCommand::ResizeDown,
+                    ));
+                    offset += 1;
+                    continue;
+                }
+                b'K' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::ResizeUp));
+                    offset += 1;
+                    continue;
+                }
+                b'L' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(
+                        PaneCommand::ResizeRight,
                     ));
                     offset += 1;
                     continue;
@@ -2196,6 +2275,30 @@ fn apply_live_pane_command(
         | PaneCommand::FocusDown
         | PaneCommand::FocusUp
         | PaneCommand::FocusRight => select_directional_pane(socket, session, command, frame),
+        PaneCommand::ResizeLeft => resize_pane(
+            socket,
+            session,
+            protocol::PaneResizeDirection::Left,
+            ATTACH_RESIZE_AMOUNT,
+        ),
+        PaneCommand::ResizeDown => resize_pane(
+            socket,
+            session,
+            protocol::PaneResizeDirection::Down,
+            ATTACH_RESIZE_AMOUNT,
+        ),
+        PaneCommand::ResizeUp => resize_pane(
+            socket,
+            session,
+            protocol::PaneResizeDirection::Up,
+            ATTACH_RESIZE_AMOUNT,
+        ),
+        PaneCommand::ResizeRight => resize_pane(
+            socket,
+            session,
+            protocol::PaneResizeDirection::Right,
+            ATTACH_RESIZE_AMOUNT,
+        ),
         PaneCommand::Close => {
             let _ = send_control_request(socket, &protocol::encode_kill_pane(session, None))?;
             Ok(())
@@ -2209,6 +2312,19 @@ fn apply_live_pane_command(
 
 fn split_pane(socket: &Path, session: &str, direction: protocol::SplitDirection) -> io::Result<()> {
     let _ = send_control_request(socket, &protocol::encode_split(session, direction, &[]))?;
+    Ok(())
+}
+
+fn resize_pane(
+    socket: &Path,
+    session: &str,
+    direction: protocol::PaneResizeDirection,
+    amount: usize,
+) -> io::Result<()> {
+    let _ = send_control_request(
+        socket,
+        &protocol::encode_resize_pane(session, direction, amount),
+    )?;
     Ok(())
 }
 
@@ -2360,6 +2476,10 @@ fn raw_pending_input(
                     PaneCommand::FocusDown => b'j',
                     PaneCommand::FocusUp => b'k',
                     PaneCommand::FocusRight => b'l',
+                    PaneCommand::ResizeLeft => b'H',
+                    PaneCommand::ResizeDown => b'J',
+                    PaneCommand::ResizeUp => b'K',
+                    PaneCommand::ResizeRight => b'L',
                     PaneCommand::Close => b'x',
                     PaneCommand::ToggleZoom => b'z',
                 });
@@ -2476,6 +2596,37 @@ where
                     if let Err(error) =
                         send_control_request(socket, &protocol::encode_zoom_pane(session, None))
                     {
+                        write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                input_state.saw_prefix,
+                                RawPendingFocus::Preserve,
+                            ),
+                        });
+                    }
+                }
+                AttachInputAction::PaneCommand(PaneCommand::ResizeLeft)
+                | AttachInputAction::PaneCommand(PaneCommand::ResizeDown)
+                | AttachInputAction::PaneCommand(PaneCommand::ResizeUp)
+                | AttachInputAction::PaneCommand(PaneCommand::ResizeRight) => {
+                    let (direction, amount) = match action {
+                        AttachInputAction::PaneCommand(PaneCommand::ResizeLeft) => {
+                            (protocol::PaneResizeDirection::Left, ATTACH_RESIZE_AMOUNT)
+                        }
+                        AttachInputAction::PaneCommand(PaneCommand::ResizeDown) => {
+                            (protocol::PaneResizeDirection::Down, ATTACH_RESIZE_AMOUNT)
+                        }
+                        AttachInputAction::PaneCommand(PaneCommand::ResizeUp) => {
+                            (protocol::PaneResizeDirection::Up, ATTACH_RESIZE_AMOUNT)
+                        }
+                        AttachInputAction::PaneCommand(PaneCommand::ResizeRight) => {
+                            (protocol::PaneResizeDirection::Right, ATTACH_RESIZE_AMOUNT)
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) = resize_pane(socket, session, direction, amount) {
                         write_attach_transient_message(&error.to_string())?;
                     } else {
                         return Ok(RawAttachExit::Reconnect {

@@ -1,8 +1,20 @@
-use crate::protocol::{BufferSelection, CaptureMode, SplitDirection};
+use crate::protocol::{BufferSelection, CaptureMode, PaneResizeDirection, SplitDirection};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelpTopic {
     Attach,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneResize {
+    Absolute {
+        cols: u16,
+        rows: u16,
+    },
+    Directional {
+        direction: PaneResizeDirection,
+        amount: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,8 +54,7 @@ pub enum Command {
     },
     ResizePane {
         session: String,
-        cols: u16,
-        rows: u16,
+        resize: PaneResize,
     },
     SendKeys {
         session: String,
@@ -253,6 +264,7 @@ Attach keys:\n\
   C-b [       copy-mode for the active pane\n\
   C-b o       cycle panes in multi-pane attach\n\
   C-b h/j/k/l focus left/down/up/right\n\
+  C-b H/J/K/L resize active pane left/down/up/right by 5 cells\n\
   C-b q       show pane numbers; press a digit to select\n\
   C-b x       close the active pane\n\
   C-b z       toggle zoom for the active pane\n\
@@ -262,11 +274,12 @@ Attach keys:\n\
 Pane commands:\n\
   dmux split-window -t <name> -h [-- command...]  split left/right\n\
   dmux split-window -t <name> -v [-- command...]  split top/bottom\n\
+  dmux resize-pane -t <name> -L|-R|-U|-D [amount]\n\
   dmux select-pane -t <name> -p <index>\n"
 }
 
 pub fn attach_help_summary() -> &'static str {
-    "C-b d detach | C-b ? help | C-b % split right | C-b \" split down | C-b h/j/k/l focus | C-b x close | C-b z zoom | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | select: dmux select-pane -t <name> -p <index>"
+    "C-b d detach | C-b ? help | C-b % split right | C-b \" split down | C-b h/j/k/l focus | C-b H/J/K/L resize by 5 | C-b x close | C-b z zoom | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | resize: dmux resize-pane -t <name> -L|-R|-U|-D [amount] | select: dmux select-pane -t <name> -p <index>"
 }
 
 fn parse_capture(args: Vec<String>) -> Result<Command, String> {
@@ -547,6 +560,7 @@ fn parse_resize_pane(args: Vec<String>) -> Result<Command, String> {
     let mut session = None;
     let mut cols = None;
     let mut rows = None;
+    let mut directional = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -580,15 +594,51 @@ fn parse_resize_pane(args: Vec<String>) -> Result<Command, String> {
                 );
                 i += 2;
             }
+            "-L" | "-R" | "-U" | "-D" => {
+                if directional.is_some() {
+                    return Err("resize-pane accepts only one direction".to_string());
+                }
+                let direction = match args[i].as_str() {
+                    "-L" => PaneResizeDirection::Left,
+                    "-R" => PaneResizeDirection::Right,
+                    "-U" => PaneResizeDirection::Up,
+                    "-D" => PaneResizeDirection::Down,
+                    _ => unreachable!(),
+                };
+                let amount = if args.get(i + 1).is_some_and(|value| !value.starts_with('-')) {
+                    let value = &args[i + 1];
+                    i += 2;
+                    value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            "resize-pane amount must be a positive integer".to_string()
+                        })?
+                } else {
+                    i += 1;
+                    1
+                };
+                directional = Some(PaneResize::Directional { direction, amount });
+            }
             value => return Err(format!("resize-pane does not support argument {value:?}")),
         }
     }
 
-    Ok(Command::ResizePane {
-        session: session.ok_or_else(|| "resize-pane requires -t <session>".to_string())?,
-        cols: cols.ok_or_else(|| "resize-pane requires -x <cols>".to_string())?,
-        rows: rows.ok_or_else(|| "resize-pane requires -y <rows>".to_string())?,
-    })
+    let session = session.ok_or_else(|| "resize-pane requires -t <session>".to_string())?;
+    if directional.is_some() && (cols.is_some() || rows.is_some()) {
+        return Err("resize-pane accepts either -x/-y or one of -L/-R/-U/-D".to_string());
+    }
+    let resize = if let Some(resize) = directional {
+        resize
+    } else {
+        PaneResize::Absolute {
+            cols: cols.ok_or_else(|| "resize-pane requires -x <cols>".to_string())?,
+            rows: rows.ok_or_else(|| "resize-pane requires -y <rows>".to_string())?,
+        }
+    };
+
+    Ok(Command::ResizePane { session, resize })
 }
 
 fn parse_send_keys(args: Vec<String>) -> Result<Command, String> {
@@ -1374,10 +1424,65 @@ mod tests {
             command,
             Command::ResizePane {
                 session: "dev".to_string(),
-                cols: 100,
-                rows: 40,
+                resize: PaneResize::Absolute {
+                    cols: 100,
+                    rows: 40
+                },
             }
         );
+    }
+
+    #[test]
+    fn parses_resize_pane_direction_default_amount() {
+        let command = parse_args(["dmux", "resize-pane", "-t", "dev", "-L"]).unwrap();
+        assert_eq!(
+            command,
+            Command::ResizePane {
+                session: "dev".to_string(),
+                resize: PaneResize::Directional {
+                    direction: PaneResizeDirection::Left,
+                    amount: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_resize_pane_direction_amount() {
+        let command = parse_args(["dmux", "resize-pane", "-t", "dev", "-D", "5"]).unwrap();
+        assert_eq!(
+            command,
+            Command::ResizePane {
+                session: "dev".to_string(),
+                resize: PaneResize::Directional {
+                    direction: PaneResizeDirection::Down,
+                    amount: 5,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_resize_pane_zero_direction_amount() {
+        let err = parse_args(["dmux", "resize-pane", "-t", "dev", "-R", "0"]).unwrap_err();
+        assert!(err.contains("positive integer"), "{err}");
+    }
+
+    #[test]
+    fn rejects_resize_pane_mixed_absolute_and_directional() {
+        let err = parse_args([
+            "dmux",
+            "resize-pane",
+            "-t",
+            "dev",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "-L",
+        ])
+        .unwrap_err();
+        assert!(err.contains("either"), "{err}");
     }
 
     #[test]

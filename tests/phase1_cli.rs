@@ -219,6 +219,44 @@ fn read_socket_line(stream: &mut UnixStream) -> String {
     String::from_utf8(bytes).expect("utf8 socket response")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestPaneRegion {
+    pane: usize,
+    row_start: usize,
+    row_end: usize,
+    col_start: usize,
+    col_end: usize,
+}
+
+fn attach_layout_regions(socket: &std::path::Path, session: &str) -> Vec<TestPaneRegion> {
+    let mut stream = UnixStream::connect(socket).expect("connect socket");
+    stream
+        .write_all(format!("ATTACH_LAYOUT_SNAPSHOT\t{session}\n").as_bytes())
+        .expect("write layout snapshot request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    let mut body = String::new();
+    stream.read_to_string(&mut body).expect("read layout body");
+    parse_layout_regions(&body)
+}
+
+fn parse_layout_regions(body: &str) -> Vec<TestPaneRegion> {
+    body.lines()
+        .filter_map(|line| {
+            let parts = line.split('\t').collect::<Vec<_>>();
+            match parts.as_slice() {
+                ["REGION", pane, row_start, row_end, col_start, col_end] => Some(TestPaneRegion {
+                    pane: pane.parse().expect("region pane"),
+                    row_start: row_start.parse().expect("region row start"),
+                    row_end: row_end.parse().expect("region row end"),
+                    col_start: col_start.parse().expect("region col start"),
+                    col_end: col_end.parse().expect("region col end"),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 fn try_read_socket_line(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::new();
     let mut byte = [0_u8; 1];
@@ -2690,6 +2728,168 @@ fn split_window_resizes_child_ptys_to_vertical_layout_regions() {
     ));
     let base = poll_capture(&socket, &session, "base-after-kill:25 80");
     assert!(base.contains("base-after-kill:25 80"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn resize_pane_left_changes_horizontal_split_region_and_survives_absolute_resize() {
+    let socket = unique_socket("resize-left-weighted");
+    let session = format!("resize-left-weighted-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    assert!(poll_capture(&socket, &session, "base-ready").contains("base-ready"));
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    assert!(poll_capture(&socket, &session, "split-ready").contains("split-ready"));
+
+    let before = attach_layout_regions(&socket, &session);
+    assert_eq!(before[0].col_end - before[0].col_start, 40);
+    assert_eq!(before[1].col_end - before[1].col_start, 40);
+
+    assert_success(&dmux(&socket, &["resize-pane", "-t", &session, "-L", "5"]));
+    let after = attach_layout_regions(&socket, &session);
+    assert_eq!(after[0].col_end - after[0].col_start, 35);
+    assert_eq!(after[1].col_end - after[1].col_start, 45);
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "163", "-y", "24"],
+    ));
+    let resized = attach_layout_regions(&socket, &session);
+    assert_eq!(resized[0].col_end - resized[0].col_start, 70);
+    assert_eq!(resized[1].col_end - resized[1].col_start, 90);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn resize_pane_up_changes_vertical_split_region() {
+    let socket = unique_socket("resize-up-weighted");
+    let session = format!("resize-up-weighted-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    assert!(poll_capture(&socket, &session, "base-ready").contains("base-ready"));
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "80", "-y", "25"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    assert!(poll_capture(&socket, &session, "split-ready").contains("split-ready"));
+
+    let before = attach_layout_regions(&socket, &session);
+    assert_eq!(before[0].row_end - before[0].row_start, 12);
+    assert_eq!(before[1].row_end - before[1].row_start, 12);
+
+    assert_success(&dmux(&socket, &["resize-pane", "-t", &session, "-U", "5"]));
+    let after = attach_layout_regions(&socket, &session);
+    assert_eq!(after[0].row_end - after[0].row_start, 7);
+    assert_eq!(after[1].row_end - after[1].row_start, 17);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn resize_pane_without_adjacent_boundary_errors_and_preserves_layout() {
+    let socket = unique_socket("resize-missing-adjacent");
+    let session = format!("resize-missing-adjacent-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    assert!(poll_capture(&socket, &session, "base-ready").contains("base-ready"));
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    assert!(poll_capture(&socket, &session, "split-ready").contains("split-ready"));
+
+    let before = attach_layout_regions(&socket, &session);
+    let output = dmux(&socket, &["resize-pane", "-t", &session, "-R", "5"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("missing adjacent pane"),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(attach_layout_regions(&socket, &session), before);
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

@@ -122,18 +122,18 @@ fn run() -> Result<(), String> {
             send_request(&socket, &protocol::encode_delete_buffer(&buffer), true)?;
             Ok(())
         }
-        cli::Command::ResizePane {
-            session,
-            cols,
-            rows,
-        } => {
+        cli::Command::ResizePane { session, resize } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            send_request(
-                &socket,
-                &protocol::encode_resize(&session, cols, rows),
-                true,
-            )?;
+            let request = match resize {
+                cli::PaneResize::Absolute { cols, rows } => {
+                    protocol::encode_resize(&session, cols, rows)
+                }
+                cli::PaneResize::Directional { direction, amount } => {
+                    protocol::encode_resize_pane(&session, direction, amount)
+                }
+            };
+            send_request(&socket, &request, true)?;
             Ok(())
         }
         cli::Command::SendKeys { session, keys } => {
