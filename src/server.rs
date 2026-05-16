@@ -4274,6 +4274,34 @@ left | right\r\n"
     }
 
     #[test]
+    fn render_attach_frame_for_size_clips_wide_utf8_to_region_width() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let mut left = TerminalState::new(20, 1, 100);
+        left.apply_bytes("한글".as_bytes());
+        let mut right = TerminalState::new(20, 1, 100);
+        right.apply_bytes(b"right");
+        let panes = vec![
+            PaneRenderSnapshot {
+                index: 0,
+                terminal: &left,
+            },
+            PaneRenderSnapshot {
+                index: 1,
+                terminal: &right,
+            },
+        ];
+
+        let rendered =
+            render_attach_frame_for_size(&layout, &panes, PtySize { cols: 10, rows: 1 }).unwrap();
+
+        assert_eq!(rendered.text, "한  | righ\r\n");
+    }
+
+    #[test]
     fn render_attach_frame_for_size_uses_visible_width_for_vertical_separator() {
         let layout = LayoutNode::Split {
             direction: SplitDirection::Vertical,

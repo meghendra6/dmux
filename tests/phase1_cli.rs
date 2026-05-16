@@ -1809,6 +1809,68 @@ fn live_snapshot_attach_does_not_repaint_stale_frame_before_forwarded_input_echo
 }
 
 #[test]
+fn live_snapshot_attach_renders_utf8_output_after_split() {
+    let socket = unique_socket("live-snapshot-utf8-after-split");
+    let session = format!("live-snapshot-utf8-after-split-{}", std::process::id());
+
+    let mut child = spawn_pty_attached_dmux_with_env(
+        &socket,
+        &["new", "-s", &session],
+        80,
+        24,
+        &[&session, "C-b ? help"],
+        &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
+    );
+
+    child.write_all(b"\x02%");
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+    child.clear_stdout();
+
+    child.write_all("printf '한글 ✓\\n'\r".as_bytes());
+    let captured = poll_capture_eventually(&socket, &session, "한글 ✓");
+    assert!(captured.contains("한글 ✓"), "{captured:?}");
+    child.wait_for_stdout_contains_all(&["한글 ✓"], "utf8 output render after split");
+
+    child.write_all(b"\x02d");
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn live_snapshot_attach_applies_cursor_restore_output_after_split() {
+    let socket = unique_socket("live-snapshot-cursor-restore");
+    let session = format!("live-snapshot-cursor-restore-{}", std::process::id());
+
+    let mut child = spawn_pty_attached_dmux_with_env(
+        &socket,
+        &["new", "-s", &session],
+        80,
+        24,
+        &[&session, "C-b ? help"],
+        &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
+    );
+
+    child.write_all(b"\x02%");
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+    child.clear_stdout();
+
+    child.write_all(b"printf 'ab\\0337cd\\0338Z\\n'\r");
+    let captured = poll_capture_eventually(&socket, &session, "abZd");
+    assert!(captured.contains("abZd"), "{captured:?}");
+    child.wait_for_stdout_contains_all(&["abZd"], "cursor restore output render after split");
+
+    child.write_all(b"\x02d");
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn live_snapshot_attach_uses_alternate_screen_and_restores_on_detach() {
     let socket = unique_socket("live-snapshot-alt-screen");
     let session = format!("live-snapshot-alt-screen-{}", std::process::id());
@@ -2388,6 +2450,54 @@ fn split_window_resizes_child_ptys_to_vertical_layout_regions() {
     ));
     let base = poll_capture(&socket, &session, "base-after-kill:25 80");
     assert!(base.contains("base-after-kill:25 80"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn vertical_split_attach_preserves_recent_output_near_cursor() {
+    let socket = unique_socket("vertical-split-preserve-recent");
+    let session = format!("vertical-split-preserve-recent-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20; do echo recent-$i; done; sleep 30",
+        ],
+    ));
+    let before = poll_capture(&socket, &session, "recent-20");
+    assert!(before.contains("recent-20"), "{before:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["recent-20", "split-ready"]);
+    child
+        .stdin_mut("attach stdin")
+        .write_all(b"\x02d")
+        .expect("write detach");
+    assert_success(&wait_for_child_exit(child));
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

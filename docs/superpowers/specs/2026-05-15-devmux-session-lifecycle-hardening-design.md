@@ -2,8 +2,8 @@
 
 ## Goal
 
-Bring `dmux` to a basic terminal multiplexer skeleton: a user can start it with
-no arguments, get one interactive terminal, split panes from inside attach,
+Bring `dmux` to a core terminal multiplexer architecture: a user can start it
+with no arguments, get one interactive terminal, split panes from inside attach,
 move focus, close/zoom panes, detach, reattach, and shut down cleanly.
 
 The target is not feature parity with mature multiplexers. The target is that
@@ -24,7 +24,7 @@ CLI commands for ordinary pane operations.
 
 ### Attach-Time Pane Basics
 
-Use the existing `C-b` prefix model and add the minimum pane operations a user
+Use the existing `C-b` prefix model and add the core pane operations a user
 expects inside attach:
 
 - `C-b d`: detach.

@@ -1,11 +1,13 @@
 use std::collections::VecDeque;
 
+use unicode_width::UnicodeWidthChar;
+
 pub struct TerminalState {
     screen: TerminalScreen,
     alternate_screen: Option<TerminalScreen>,
     use_alternate_screen: bool,
     scrollback: Scrollback,
-    parser: ParserState,
+    parser: vte::Parser,
     style: CellStyle,
 }
 
@@ -16,15 +18,17 @@ impl TerminalState {
             alternate_screen: None,
             use_alternate_screen: false,
             scrollback: Scrollback::new(max_scrollback_lines),
-            parser: ParserState::Ground,
+            parser: vte::Parser::new(),
             style: CellStyle::default(),
         }
     }
 
     pub fn apply_bytes(&mut self, bytes: &[u8]) {
+        let mut parser = std::mem::take(&mut self.parser);
         for byte in bytes {
-            self.apply_byte(*byte);
+            parser.advance(self, *byte);
         }
+        self.parser = parser;
     }
 
     pub fn capture_text(&self) -> String {
@@ -63,47 +67,6 @@ impl TerminalState {
         }
     }
 
-    fn apply_byte(&mut self, byte: u8) {
-        match &mut self.parser {
-            ParserState::Ground => match byte {
-                b'\x1b' => self.parser = ParserState::Escape,
-                b'\r' => self.active_screen_mut().carriage_return(),
-                b'\n' => self.line_feed(),
-                b'\t' => self.tab(),
-                b'\x08' => self.active_screen_mut().backspace(),
-                0x20..=0x7e => self.put_char(byte as char),
-                _ => {}
-            },
-            ParserState::Escape => match byte {
-                b'[' => self.parser = ParserState::Csi(Vec::new()),
-                b']' => self.parser = ParserState::Osc { saw_escape: false },
-                _ => self.parser = ParserState::Ground,
-            },
-            ParserState::Csi(buffer) => {
-                if (0x40..=0x7e).contains(&byte) {
-                    let params = String::from_utf8_lossy(buffer).to_string();
-                    self.apply_csi(&params, byte);
-                    self.parser = ParserState::Ground;
-                } else {
-                    buffer.push(byte);
-                }
-            }
-            ParserState::Osc { saw_escape } => {
-                if *saw_escape {
-                    if byte == b'\\' {
-                        self.parser = ParserState::Ground;
-                    } else {
-                        *saw_escape = byte == b'\x1b';
-                    }
-                } else if byte == b'\x07' {
-                    self.parser = ParserState::Ground;
-                } else if byte == b'\x1b' {
-                    *saw_escape = true;
-                }
-            }
-        }
-    }
-
     fn line_feed(&mut self) {
         if self.use_alternate_screen {
             self.active_screen_mut().line_feed_without_scrollback();
@@ -116,25 +79,6 @@ impl TerminalState {
         let next_tab = ((self.active_screen().cursor_col / 8) + 1) * 8;
         while self.active_screen().cursor_col < next_tab {
             self.put_char(' ');
-        }
-    }
-
-    fn apply_csi(&mut self, params: &str, final_byte: u8) {
-        match final_byte {
-            b'm' => self.apply_sgr(params),
-            b'J' if params == "2" || params.is_empty() => self.active_screen_mut().clear(),
-            b'K' => self.active_screen_mut().clear_line_from_cursor(),
-            b'H' | b'f' => {
-                let (row, col) = parse_cursor_position(params);
-                self.active_screen_mut().move_cursor(row, col);
-            }
-            b'A' => self.active_screen_mut().move_up(parse_count(params)),
-            b'B' => self.active_screen_mut().move_down(parse_count(params)),
-            b'C' => self.active_screen_mut().move_right(parse_count(params)),
-            b'D' => self.active_screen_mut().move_left(parse_count(params)),
-            b'h' if params == "?1049" => self.enter_alternate_screen(),
-            b'l' if params == "?1049" => self.exit_alternate_screen(),
-            _ => {}
         }
     }
 
@@ -174,8 +118,16 @@ impl TerminalState {
         self.use_alternate_screen = false;
     }
 
-    fn apply_sgr(&mut self, params: &str) {
-        let params = parse_sgr_params(params);
+    fn reset_terminal(&mut self) {
+        self.screen = TerminalScreen::new(self.screen.width, self.screen.height);
+        self.alternate_screen = None;
+        self.use_alternate_screen = false;
+        self.scrollback.clear();
+        self.style = CellStyle::default();
+    }
+
+    fn apply_sgr(&mut self, params: Vec<usize>) {
+        let params = if params.is_empty() { vec![0] } else { params };
         let mut index = 0;
         while index < params.len() {
             match params[index] {
@@ -215,6 +167,99 @@ impl TerminalState {
     }
 }
 
+impl vte::Perform for TerminalState {
+    fn print(&mut self, c: char) {
+        self.put_char(c);
+    }
+
+    fn execute(&mut self, byte: u8) {
+        match byte {
+            b'\r' => self.active_screen_mut().carriage_return(),
+            b'\n' | 0x0b | 0x0c => self.line_feed(),
+            b'\t' => self.tab(),
+            b'\x08' => self.active_screen_mut().backspace(),
+            _ => {}
+        }
+    }
+
+    fn csi_dispatch(
+        &mut self,
+        params: &vte::Params,
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        if ignore {
+            return;
+        }
+
+        match action {
+            'm' => self.apply_sgr(flat_params(params)),
+            'J' => match first_param(params, 0) {
+                0 => self.active_screen_mut().clear_display_from_cursor(),
+                1 => self.active_screen_mut().clear_display_to_cursor(),
+                2 => self.active_screen_mut().clear_display(),
+                3 => self.scrollback.clear(),
+                _ => {}
+            },
+            'K' => match first_param(params, 0) {
+                0 => self.active_screen_mut().clear_line_from_cursor(),
+                1 => self.active_screen_mut().clear_line_to_cursor(),
+                2 => self.active_screen_mut().clear_line(),
+                _ => {}
+            },
+            'H' | 'f' => {
+                let (row, col) = cursor_position(params);
+                self.active_screen_mut().move_cursor(row, col);
+            }
+            'A' => self.active_screen_mut().move_up(first_param(params, 1)),
+            'B' => self.active_screen_mut().move_down(first_param(params, 1)),
+            'C' => self.active_screen_mut().move_right(first_param(params, 1)),
+            'D' => self.active_screen_mut().move_left(first_param(params, 1)),
+            'E' => {
+                let count = first_param(params, 1);
+                let screen = self.active_screen_mut();
+                screen.move_down(count);
+                screen.carriage_return();
+            }
+            'F' => {
+                let count = first_param(params, 1);
+                let screen = self.active_screen_mut();
+                screen.move_up(count);
+                screen.carriage_return();
+            }
+            'G' => self.active_screen_mut().move_to_col(first_param(params, 1)),
+            'd' => self.active_screen_mut().move_to_row(first_param(params, 1)),
+            's' => self.active_screen_mut().save_cursor(),
+            'u' => self.active_screen_mut().restore_cursor(),
+            'h' if is_private_mode(intermediates, params, 1049)
+                || is_private_mode(intermediates, params, 1047) =>
+            {
+                self.enter_alternate_screen();
+            }
+            'l' if is_private_mode(intermediates, params, 1049)
+                || is_private_mode(intermediates, params, 1047) =>
+            {
+                self.exit_alternate_screen();
+            }
+            _ => {}
+        }
+    }
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], ignore: bool, byte: u8) {
+        if ignore {
+            return;
+        }
+
+        match byte {
+            b'7' => self.active_screen_mut().save_cursor(),
+            b'8' => self.active_screen_mut().restore_cursor(),
+            b'c' => self.reset_terminal(),
+            _ => {}
+        }
+    }
+}
+
 fn join_capture_lines(lines: Vec<String>) -> String {
     if lines.is_empty() {
         String::new()
@@ -231,6 +276,7 @@ struct TerminalScreen {
     rows: Vec<Vec<Cell>>,
     cursor_row: usize,
     cursor_col: usize,
+    saved_cursor: Option<(usize, usize)>,
 }
 
 impl TerminalScreen {
@@ -243,27 +289,52 @@ impl TerminalScreen {
             rows: vec![vec![Cell::blank(); width]; height],
             cursor_row: 0,
             cursor_col: 0,
+            saved_cursor: None,
         }
     }
 
     fn put_char(&mut self, ch: char, style: CellStyle, scrollback: &mut Scrollback) {
+        let width = char_cell_width(ch).min(self.width);
+        if self.cursor_col + width > self.width {
+            self.cursor_col = 0;
+            self.line_feed(scrollback);
+        }
         if self.cursor_col >= self.width {
             self.cursor_col = 0;
             self.line_feed(scrollback);
         }
 
-        self.rows[self.cursor_row][self.cursor_col] = Cell { ch, style };
-        self.cursor_col += 1;
+        self.write_char_cells(ch, style, width);
     }
 
     fn put_char_without_scrollback(&mut self, ch: char, style: CellStyle) {
+        let width = char_cell_width(ch).min(self.width);
+        if self.cursor_col + width > self.width {
+            self.cursor_col = 0;
+            self.line_feed_without_scrollback();
+        }
         if self.cursor_col >= self.width {
             self.cursor_col = 0;
             self.line_feed_without_scrollback();
         }
 
-        self.rows[self.cursor_row][self.cursor_col] = Cell { ch, style };
-        self.cursor_col += 1;
+        self.write_char_cells(ch, style, width);
+    }
+
+    fn write_char_cells(&mut self, ch: char, style: CellStyle, width: usize) {
+        self.rows[self.cursor_row][self.cursor_col] = Cell {
+            ch,
+            style,
+            wide_continuation: false,
+        };
+        for offset in 1..width {
+            self.rows[self.cursor_row][self.cursor_col + offset] = Cell {
+                ch: ' ',
+                style,
+                wide_continuation: true,
+            };
+        }
+        self.cursor_col += width;
     }
 
     fn carriage_return(&mut self) {
@@ -292,35 +363,68 @@ impl TerminalScreen {
 
     fn backspace(&mut self) {
         self.cursor_col = self.cursor_col.saturating_sub(1);
+        while self.cursor_col > 0 && self.rows[self.cursor_row][self.cursor_col].wide_continuation {
+            self.cursor_col -= 1;
+        }
     }
 
-    fn clear(&mut self) {
+    fn clear_display(&mut self) {
         self.rows = vec![vec![Cell::blank(); self.width]; self.height];
-        self.cursor_row = 0;
-        self.cursor_col = 0;
+    }
+
+    fn clear_display_from_cursor(&mut self) {
+        for col in self.cursor_col..self.width {
+            self.rows[self.cursor_row][col] = Cell::blank();
+        }
+        for row in (self.cursor_row + 1)..self.height {
+            self.rows[row] = vec![Cell::blank(); self.width];
+        }
+    }
+
+    fn clear_display_to_cursor(&mut self) {
+        for row in 0..self.cursor_row {
+            self.rows[row] = vec![Cell::blank(); self.width];
+        }
+        for col in 0..=self.cursor_col.min(self.width - 1) {
+            self.rows[self.cursor_row][col] = Cell::blank();
+        }
     }
 
     fn resize(&mut self, width: usize, height: usize) {
         let width = width.max(1);
         let height = height.max(1);
         let old_cursor_col = self.cursor_col;
+        let old_height = self.height;
+        let old_width = self.width;
+        let copy_rows = old_height.min(height);
+        let copy_cols = old_width.min(width);
+        let source_row_start = if height < old_height && self.cursor_row >= height {
+            (self.cursor_row + 1 - height).min(old_height - copy_rows)
+        } else {
+            0
+        };
         let mut rows = vec![vec![Cell::blank(); width]; height];
-        let copy_rows = self.height.min(height);
-        let copy_cols = self.width.min(width);
 
         for (row_index, row) in rows.iter_mut().enumerate().take(copy_rows) {
-            row[..copy_cols].copy_from_slice(&self.rows[row_index][..copy_cols]);
+            let source_row = source_row_start + row_index;
+            row[..copy_cols].copy_from_slice(&self.rows[source_row][..copy_cols]);
         }
 
         self.width = width;
         self.height = height;
         self.rows = rows;
-        self.cursor_row = self.cursor_row.min(self.height - 1);
+        self.cursor_row = self
+            .cursor_row
+            .saturating_sub(source_row_start)
+            .min(self.height - 1);
         if old_cursor_col >= self.width {
             self.cursor_col = 0;
             self.cursor_row = (self.cursor_row + 1).min(self.height - 1);
         } else {
             self.cursor_col = self.cursor_col.min(self.width - 1);
+        }
+        if let Some((row, col)) = self.saved_cursor {
+            self.saved_cursor = Some((row.saturating_sub(source_row_start), col));
         }
     }
 
@@ -330,8 +434,26 @@ impl TerminalScreen {
         }
     }
 
+    fn clear_line_to_cursor(&mut self) {
+        for col in 0..=self.cursor_col.min(self.width - 1) {
+            self.rows[self.cursor_row][col] = Cell::blank();
+        }
+    }
+
+    fn clear_line(&mut self) {
+        self.rows[self.cursor_row] = vec![Cell::blank(); self.width];
+    }
+
     fn move_cursor(&mut self, row: usize, col: usize) {
         self.cursor_row = row.saturating_sub(1).min(self.height - 1);
+        self.cursor_col = col.saturating_sub(1).min(self.width - 1);
+    }
+
+    fn move_to_row(&mut self, row: usize) {
+        self.cursor_row = row.saturating_sub(1).min(self.height - 1);
+    }
+
+    fn move_to_col(&mut self, col: usize) {
         self.cursor_col = col.saturating_sub(1).min(self.width - 1);
     }
 
@@ -351,11 +473,29 @@ impl TerminalScreen {
         self.cursor_col = self.cursor_col.saturating_sub(count);
     }
 
+    fn save_cursor(&mut self) {
+        self.saved_cursor = Some((self.cursor_row, self.cursor_col));
+    }
+
+    fn restore_cursor(&mut self) {
+        if let Some((row, col)) = self.saved_cursor {
+            self.cursor_row = row.min(self.height - 1);
+            self.cursor_col = col.min(self.width - 1);
+        }
+    }
+
     fn non_empty_lines(&self) -> Vec<String> {
         let mut lines = self
             .rows
             .iter()
-            .map(|row| trim_trailing_spaces(row.iter().map(|cell| cell.ch).collect::<String>()))
+            .map(|row| {
+                trim_trailing_spaces(
+                    row.iter()
+                        .filter(|cell| !cell.wide_continuation)
+                        .map(|cell| cell.ch)
+                        .collect::<String>(),
+                )
+            })
             .collect::<Vec<_>>();
 
         while lines.last().is_some_and(|line| line.is_empty()) {
@@ -369,6 +509,7 @@ impl TerminalScreen {
         trim_trailing_spaces(
             self.rows[row]
                 .iter()
+                .filter(|cell| !cell.wide_continuation)
                 .map(|cell| cell.ch)
                 .collect::<String>(),
         )
@@ -386,6 +527,9 @@ impl TerminalScreen {
             let row = &self.rows[row_index];
             let last_col = last_non_blank_cell(row).unwrap_or(0);
             for cell in row.iter().take(last_col + 1) {
+                if cell.wide_continuation {
+                    continue;
+                }
                 if cell.style != current_style {
                     output.push_str(&style_transition_from(current_style, cell.style));
                     current_style = cell.style;
@@ -413,10 +557,17 @@ impl TerminalScreen {
         let mut current_style = CellStyle::default();
         let mut styled_text_emitted = false;
         let row = self.rows.get(row_index);
-        let cells = row.into_iter().flat_map(|row| row.iter()).take(width);
+        let cells = row.into_iter().flat_map(|row| row.iter());
         let mut visible_width = 0;
 
         for cell in cells {
+            if cell.wide_continuation {
+                continue;
+            }
+            let cell_width = char_cell_width(cell.ch);
+            if visible_width + cell_width > width {
+                break;
+            }
             if cell.style != current_style {
                 output.push_str(&style_transition_from(current_style, cell.style));
                 current_style = cell.style;
@@ -425,7 +576,7 @@ impl TerminalScreen {
                 styled_text_emitted = true;
             }
             output.push(cell.ch);
-            visible_width += 1;
+            visible_width += cell_width;
         }
 
         if current_style != CellStyle::default() && styled_text_emitted {
@@ -440,9 +591,10 @@ impl TerminalScreen {
 
     #[allow(dead_code)]
     fn last_non_empty_row(&self) -> Option<usize> {
-        self.rows
-            .iter()
-            .rposition(|row| row.iter().any(|cell| cell.ch != ' '))
+        self.rows.iter().rposition(|row| {
+            row.iter()
+                .any(|cell| !cell.wide_continuation && cell.ch != ' ')
+        })
     }
 }
 
@@ -450,6 +602,7 @@ impl TerminalScreen {
 struct Cell {
     ch: char,
     style: CellStyle,
+    wide_continuation: bool,
 }
 
 impl Cell {
@@ -457,6 +610,7 @@ impl Cell {
         Self {
             ch: ' ',
             style: CellStyle::default(),
+            wide_continuation: false,
         }
     }
 }
@@ -501,54 +655,48 @@ impl Scrollback {
             self.lines.pop_front();
         }
     }
-}
 
-enum ParserState {
-    Ground,
-    Escape,
-    Csi(Vec<u8>),
-    Osc { saw_escape: bool },
-}
-
-fn parse_count(params: &str) -> usize {
-    params
-        .split(';')
-        .next()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
-}
-
-fn parse_cursor_position(params: &str) -> (usize, usize) {
-    let mut parts = params.split(';');
-    let row = parts
-        .next()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1);
-    let col = parts
-        .next()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1);
-    (row, col)
-}
-
-fn parse_sgr_params(params: &str) -> Vec<usize> {
-    if params.is_empty() {
-        return vec![0];
+    fn clear(&mut self) {
+        self.lines.clear();
     }
+}
 
+fn flat_params(params: &vte::Params) -> Vec<usize> {
     params
-        .split(';')
-        .map(|part| {
-            if part.is_empty() {
-                0
-            } else {
-                part.parse::<usize>().unwrap_or(0)
-            }
-        })
+        .iter()
+        .flat_map(|param| param.iter().copied())
+        .map(usize::from)
         .collect()
+}
+
+fn first_param(params: &vte::Params, default: usize) -> usize {
+    params
+        .iter()
+        .next()
+        .and_then(|param| param.first())
+        .copied()
+        .map(usize::from)
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn nth_param(params: &vte::Params, index: usize, default: usize) -> usize {
+    params
+        .iter()
+        .nth(index)
+        .and_then(|param| param.first())
+        .copied()
+        .map(usize::from)
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn cursor_position(params: &vte::Params) -> (usize, usize) {
+    (nth_param(params, 0, 1), nth_param(params, 1, 1))
+}
+
+fn is_private_mode(intermediates: &[u8], params: &vte::Params, mode: usize) -> bool {
+    intermediates.contains(&b'?') && first_param(params, 0) == mode
 }
 
 fn parse_extended_color(params: &[usize]) -> Option<(Color, usize)> {
@@ -567,7 +715,8 @@ fn parse_extended_color(params: &[usize]) -> Option<(Color, usize)> {
 
 #[allow(dead_code)]
 fn last_non_blank_cell(row: &[Cell]) -> Option<usize> {
-    row.iter().rposition(|cell| cell.ch != ' ')
+    row.iter()
+        .rposition(|cell| !cell.wide_continuation && cell.ch != ' ')
 }
 
 #[allow(dead_code)]
@@ -652,6 +801,10 @@ fn trim_trailing_spaces(mut value: String) -> String {
         value.pop();
     }
     value
+}
+
+fn char_cell_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
 }
 
 #[cfg(test)]
@@ -739,11 +892,73 @@ mod tests {
 
         assert_eq!(state.capture_screen_text(), "Zbc\n");
 
-        state.apply_bytes(b"\x1b[2Jab\x08Z");
+        state.apply_bytes(b"\x1b[H\x1b[2Jab\x08Z");
         assert_eq!(state.capture_screen_text(), "aZ\n");
 
         state.apply_bytes(b"\x1b[?1049l");
         assert_eq!(state.capture_screen_text(), "primary\n");
+    }
+
+    #[test]
+    fn erase_display_does_not_move_cursor() {
+        let mut state = TerminalState::new(10, 3, 100);
+        state.apply_bytes(b"abc");
+        state.apply_bytes(b"\x1b[2JZ");
+
+        assert_eq!(state.capture_screen_text(), "   Z\n");
+    }
+
+    #[test]
+    fn erase_line_modes_match_terminal_semantics() {
+        let mut state = TerminalState::new(10, 3, 100);
+        state.apply_bytes(b"abcdef");
+        state.apply_bytes(b"\x1b[1D\x1b[1KZ");
+        assert_eq!(state.capture_screen_text(), "     Z\n");
+
+        let mut state = TerminalState::new(10, 3, 100);
+        state.apply_bytes(b"abcdef");
+        state.apply_bytes(b"\x1b[2D\x1b[2KZ");
+        assert_eq!(state.capture_screen_text(), "    Z\n");
+    }
+
+    #[test]
+    fn erase_to_cursor_handles_post_last_column_cursor() {
+        let mut state = TerminalState::new(3, 2, 100);
+        state.apply_bytes(b"abc\x1b[1K");
+        assert_eq!(state.capture_screen_text(), "");
+
+        let mut state = TerminalState::new(3, 2, 100);
+        state.apply_bytes(b"abc\x1b[1J");
+        assert_eq!(state.capture_screen_text(), "");
+    }
+
+    #[test]
+    fn save_and_restore_cursor_with_escape_and_csi_sequences() {
+        let mut state = TerminalState::new(20, 3, 100);
+        state.apply_bytes(b"ab\x1b7cd\x1b8Z");
+        assert_eq!(state.capture_screen_text(), "abZd\n");
+
+        let mut state = TerminalState::new(20, 3, 100);
+        state.apply_bytes(b"ab\x1b[scd\x1b[uZ");
+        assert_eq!(state.capture_screen_text(), "abZd\n");
+    }
+
+    #[test]
+    fn utf8_sequences_print_complete_codepoints() {
+        let mut state = TerminalState::new(20, 3, 100);
+        state.apply_bytes("한글 ✓".as_bytes());
+
+        assert_eq!(state.capture_screen_text(), "한글 ✓\n");
+    }
+
+    #[test]
+    fn styled_render_lines_count_wide_characters_by_cell_width() {
+        let mut state = TerminalState::new(10, 2, 100);
+        state.apply_bytes("한글".as_bytes());
+
+        assert_eq!(state.render_screen_ansi_lines(4, 1), vec!["한글"]);
+        assert_eq!(state.render_screen_ansi_lines(3, 1), vec!["한 "]);
+        assert_eq!(state.render_screen_ansi_lines(5, 1), vec!["한글 "]);
     }
 
     #[test]
@@ -785,5 +1000,14 @@ mod tests {
         let captured = state.capture_text();
         assert!(captured.contains("abc"), "{captured:?}");
         assert!(captured.contains("XYZ"), "{captured:?}");
+    }
+
+    #[test]
+    fn resize_shrink_preserves_rows_near_cursor() {
+        let mut state = TerminalState::new(10, 4, 100);
+        state.apply_bytes(b"one\r\ntwo\r\nthree\r\nfour");
+        state.resize(10, 2);
+
+        assert_eq!(state.capture_screen_text(), "three\nfour\n");
     }
 }
