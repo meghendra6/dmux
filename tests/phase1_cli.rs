@@ -1697,7 +1697,7 @@ fn live_snapshot_frame_output_fits_attach_pty_rows() {
 
     let stdout = child.stdout_text();
     let frame = stdout
-        .rsplit_once("\x1b[2J\x1b[H")
+        .rsplit_once("\x1b[H")
         .map(|(_, frame)| frame)
         .unwrap_or(stdout.as_str());
     let rendered_rows = frame.matches("\r\n").count() + usize::from(!frame.ends_with("\r\n"));
@@ -3420,6 +3420,353 @@ fn attach_prefix_h_l_focuses_horizontal_panes_for_live_input() {
     assert!(split.contains("split-focus:split-right"), "{split:?}");
     let active = poll_active_pane(&socket, &session, 1);
     assert!(active.lines().any(|line| line == "1\t1"), "{active:?}");
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn raw_attach_reconnects_when_external_split_creates_first_layout() {
+    let socket = unique_socket("raw-attach-external-first-split");
+    let session = format!("raw-attach-external-first-split-{}", std::process::id());
+    let base_file = unique_temp_file("raw-attach-external-first-split-base");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    let mut child = spawn_pty_attached_dmux(
+        &socket,
+        &["attach", "-t", &session],
+        80,
+        24,
+        &["base-ready"],
+    );
+    std::thread::sleep(Duration::from_millis(150));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf external-ready; read line; echo external:$line; sleep 30",
+        ],
+    ));
+    child.wait_for_stdout_contains_all(&["external-ready"], "external first split transition");
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    let active = poll_active_pane(&socket, &session, 0);
+    assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
+
+    child.write_all(b"\x02lok\r");
+    let split = poll_capture(&socket, &session, "external:ok");
+    assert!(split.contains("external:ok"), "{split:?}");
+    let active = poll_active_pane(&socket, &session, 1);
+    assert!(active.lines().any(|line| line == "1\t1"), "{active:?}");
+
+    child.write_all(b"\x02d");
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_raw_state_epoch_marks_first_layout_transition() {
+    let socket = unique_socket("attach-raw-state-epoch");
+    let session = format!("attach-raw-state-epoch-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf epoch-base; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "epoch-base");
+    assert!(base.contains("epoch-base"), "{base:?}");
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(format!("ATTACH_RAW_STATE\t{session}\n").as_bytes())
+        .expect("write raw state request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "RAW_LAYOUT_EPOCH\t0\n");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf epoch-split; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "epoch-split");
+    assert!(split.contains("epoch-split"), "{split:?}");
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(format!("ATTACH_RAW_STATE\t{session}\n").as_bytes())
+        .expect("write raw state request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "RAW_LAYOUT_EPOCH\t1\n");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf epoch-third; sleep 30",
+        ],
+    ));
+    let third = poll_capture(&socket, &session, "epoch-third");
+    assert!(third.contains("epoch-third"), "{third:?}");
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    stream
+        .write_all(format!("ATTACH_RAW_STATE\t{session}\n").as_bytes())
+        .expect("write raw state request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "RAW_LAYOUT_EPOCH\t1\n");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn external_first_split_reconnects_multiple_raw_attach_clients() {
+    let socket = unique_socket("raw-attach-external-first-split-multiple");
+    let session = format!(
+        "raw-attach-external-first-split-multiple-{}",
+        std::process::id()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf multi-base; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "multi-base");
+    assert!(base.contains("multi-base"), "{base:?}");
+
+    let mut first = spawn_attached_to_session(&socket, &session, &["multi-base"]);
+    let mut second = spawn_attached_to_session(&socket, &session, &["multi-base"]);
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf multi-split; sleep 30",
+        ],
+    ));
+    first.wait_for_stdout_contains_all(&["multi-split"], "first raw attach transition");
+    second.wait_for_stdout_contains_all(&["multi-split"], "second raw attach transition");
+
+    {
+        let stdin = first.stdin_mut("first attach stdin");
+        stdin.write_all(b"\x02d").expect("write first detach");
+        stdin.flush().expect("flush first detach");
+    }
+    {
+        let stdin = second.stdin_mut("second attach stdin");
+        stdin.write_all(b"\x02d").expect("write second detach");
+        stdin.flush().expect("flush second detach");
+    }
+    assert_success(&wait_for_child_exit(first));
+    assert_success(&wait_for_child_exit(second));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn raw_attach_copy_mode_waits_for_later_input() {
+    let socket = unique_socket("raw-attach-copy-mode-later-input");
+    let session = format!("raw-attach-copy-mode-later-input-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf raw-copy-later; printf '\\n'; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "raw-copy-later");
+    assert!(base.contains("raw-copy-later"), "{base:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["raw-copy-later"]);
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02[").expect("write copy-mode entry");
+        stdin.flush().expect("flush copy-mode entry");
+    }
+
+    child.wait_for_stdout_contains_all(&["-- copy mode --"], "raw attach copy-mode entry");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"y").expect("write delayed copy key");
+        stdin.flush().expect("flush delayed copy key");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut listed = String::new();
+    while std::time::Instant::now() < deadline {
+        let output = dmux(&socket, &["list-buffers"]);
+        assert_success(&output);
+        listed = String::from_utf8_lossy(&output.stdout).to_string();
+        if listed
+            .lines()
+            .any(|line| line.ends_with("\t15\traw-copy-later"))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.ends_with("\t15\traw-copy-later")),
+        "{listed:?}"
+    );
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn raw_attach_external_split_waits_for_copy_mode_to_finish() {
+    let socket = unique_socket("raw-attach-external-split-copy-mode");
+    let session = format!("raw-attach-external-split-copy-mode-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf copy-split-base; printf '\\n'; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "copy-split-base");
+    assert!(base.contains("copy-split-base"), "{base:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["copy-split-base"]);
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02[").expect("write copy-mode entry");
+        stdin.flush().expect("flush copy-mode entry");
+    }
+    child.wait_for_stdout_contains_all(&["-- copy mode --"], "raw copy-mode before split");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf copy-split-ready; read line; echo copy-split:$line; sleep 30",
+        ],
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"q").expect("write copy-mode exit key");
+        stdin.flush().expect("flush copy-mode exit key");
+    }
+
+    child.wait_for_stdout_contains_all(
+        &["copy-split-ready"],
+        "external split transition after copy-mode",
+    );
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"\x02lok\n")
+            .expect("write focus and split input");
+        stdin.flush().expect("flush split input");
+    }
+    let split = poll_capture(&socket, &session, "copy-split:ok");
+    assert!(split.contains("copy-split:ok"), "{split:?}");
 
     {
         let stdin = child.stdin_mut("attach stdin");

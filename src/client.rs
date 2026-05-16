@@ -2,6 +2,7 @@ use crate::cli;
 use crate::protocol;
 use crate::pty::PtySize;
 use std::io::{self, Read, Write};
+use std::os::raw::c_int;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -22,10 +23,30 @@ const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
 const ATTACH_RENDER_RESPONSE: &str = "OK\tRENDER_OUTPUT_META\n";
+const STDIN_FILENO: c_int = 0;
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NONBLOCK: c_int = 0o4000;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const O_NONBLOCK: c_int = 0x0004;
+
+unsafe extern "C" {
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachMode {
-    Live,
+    Live { raw_layout_epoch: u64 },
     Snapshot,
 }
 
@@ -79,21 +100,22 @@ where
     if let Some(message) = response.strip_prefix("ERR ") {
         return Err(io::Error::other(message.trim_end().to_string()));
     }
-    let attach_mode = parse_attach_ok(&response)?;
-
-    if attach_mode == AttachMode::Snapshot {
-        let _guard = RawModeGuard::enable();
-        install_winch_handler();
-        let mut last_size = initial_size;
-        return run_live_snapshot_attach(
-            socket,
-            session,
-            &mut stream,
-            Vec::new(),
-            &mut last_size,
-            &mut on_resize,
-        );
-    }
+    let mut raw_layout_epoch = match parse_attach_ok(&response)? {
+        AttachMode::Snapshot => {
+            let _guard = RawModeGuard::enable();
+            install_winch_handler();
+            let mut last_size = initial_size;
+            return run_live_snapshot_attach(
+                socket,
+                session,
+                &mut stream,
+                Vec::new(),
+                &mut last_size,
+                &mut on_resize,
+            );
+        }
+        AttachMode::Live { raw_layout_epoch } => raw_layout_epoch,
+    };
 
     let _guard = RawModeGuard::enable();
     install_winch_handler();
@@ -110,6 +132,7 @@ where
             &mut stream,
             socket,
             session,
+            raw_layout_epoch,
             std::mem::take(&mut pending_input),
             || {
                 if take_winch_pending() {
@@ -152,9 +175,12 @@ where
                     &mut on_resize,
                 );
             }
-            AttachMode::Live => {
+            AttachMode::Live {
+                raw_layout_epoch: next_raw_layout_epoch,
+            } => {
                 // Continue the raw loop on the fresh stream; pending bytes must still
                 // pass through the raw prefix translator.
+                raw_layout_epoch = next_raw_layout_epoch;
                 pending_input = pending_after_transition;
             }
         }
@@ -198,6 +224,7 @@ fn run_raw_attach_session<F, C>(
     stream: &mut UnixStream,
     socket: &Path,
     session: &str,
+    raw_layout_epoch: u64,
     initial_input: Vec<u8>,
     mut tick: F,
     enter_copy_mode: C,
@@ -207,15 +234,21 @@ where
     C: FnMut(&[u8]) -> io::Result<()> + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel();
+    let stop_input = Arc::new(AtomicBool::new(false));
+    let copy_mode_active = Arc::new(AtomicBool::new(false));
     let mut input_stream = stream.try_clone()?;
     let input_socket = socket.to_path_buf();
     let input_session = session.to_string();
+    let input_stop = Arc::clone(&stop_input);
+    let input_copy_mode_active = Arc::clone(&copy_mode_active);
     std::thread::spawn(move || {
         let result = forward_stdin_until_detach(
             &mut input_stream,
             &input_socket,
             &input_session,
             initial_input,
+            input_stop,
+            input_copy_mode_active,
             || Ok(()),
             enter_copy_mode,
         );
@@ -231,12 +264,49 @@ where
         }
         if !copy_attach_output_once(stream)? {
             let _ = stream.set_read_timeout(None);
-            return match receiver.recv_timeout(Duration::from_millis(50)) {
-                Ok(result) => result,
-                Err(_) => Ok(RawAttachExit::Detach),
+            if let Ok(result) = receiver.recv_timeout(Duration::from_millis(50)) {
+                return result;
+            }
+            let should_reconnect = raw_attach_should_reconnect(socket, session, raw_layout_epoch);
+            stop_input.store(true, Ordering::SeqCst);
+            let stopped_input = if should_reconnect && copy_mode_active.load(Ordering::SeqCst) {
+                receiver.recv().ok()
+            } else {
+                receiver.recv_timeout(Duration::from_millis(250)).ok()
+            };
+            return if should_reconnect {
+                match stopped_input {
+                    Some(Ok(RawAttachExit::Reconnect { pending_input })) => {
+                        Ok(RawAttachExit::Reconnect { pending_input })
+                    }
+                    _ => Ok(RawAttachExit::Reconnect {
+                        pending_input: Vec::new(),
+                    }),
+                }
+            } else {
+                Ok(RawAttachExit::Detach)
             };
         }
     }
+}
+
+fn raw_attach_should_reconnect(socket: &Path, session: &str, raw_layout_epoch: u64) -> bool {
+    read_raw_attach_layout_epoch(socket, session)
+        .is_ok_and(|current_epoch| current_epoch > raw_layout_epoch)
+}
+
+fn read_raw_attach_layout_epoch(socket: &Path, session: &str) -> io::Result<u64> {
+    let body = send_control_request(socket, &protocol::encode_attach_raw_state(session))?;
+    let body = String::from_utf8_lossy(&body);
+    let Some(line) = body.lines().next() else {
+        return Err(io::Error::other("missing raw attach state"));
+    };
+    let Some(epoch) = line.strip_prefix("RAW_LAYOUT_EPOCH\t") else {
+        return Err(io::Error::other("invalid raw attach state"));
+    };
+    epoch
+        .parse::<u64>()
+        .map_err(|_| io::Error::other("invalid raw attach layout epoch"))
 }
 
 fn read_attach_status_line(socket: &Path, session: &str) -> io::Result<String> {
@@ -427,11 +497,23 @@ fn write_attach_status_line(socket: &Path, session: &str) -> io::Result<()> {
 
 fn parse_attach_ok(response: &str) -> io::Result<AttachMode> {
     if response == "OK\n" {
-        return Ok(AttachMode::Live);
+        return Ok(AttachMode::Live {
+            raw_layout_epoch: 0,
+        });
     }
 
     if response == "OK\tSNAPSHOT\n" {
         return Ok(AttachMode::Snapshot);
+    }
+
+    if let Some(epoch) = response
+        .strip_prefix("OK\tLIVE\t")
+        .and_then(|value| value.strip_suffix('\n'))
+    {
+        let raw_layout_epoch = epoch
+            .parse::<u64>()
+            .map_err(|_| io::Error::other("invalid raw attach layout epoch"))?;
+        return Ok(AttachMode::Live { raw_layout_epoch });
     }
 
     Err(io::Error::other(format!(
@@ -2092,6 +2174,8 @@ fn forward_stdin_until_detach<F, C>(
     socket: &Path,
     session: &str,
     initial_input: Vec<u8>,
+    stop_requested: Arc<AtomicBool>,
+    copy_mode_active: Arc<AtomicBool>,
     mut tick: F,
     mut enter_copy_mode: C,
 ) -> io::Result<RawAttachExit>
@@ -2105,13 +2189,32 @@ where
 
     loop {
         tick()?;
+        if initial_input.is_none() && stop_requested.load(Ordering::SeqCst) {
+            return Ok(RawAttachExit::Reconnect {
+                pending_input: raw_pending_input(
+                    &[],
+                    input_state.saw_prefix,
+                    RawPendingFocus::Preserve,
+                ),
+            });
+        }
         let actions = if let Some(input) = initial_input.take() {
             translate_attach_input_with_state(&input, &mut input_state)
         } else {
-            let n = io::stdin().lock().read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
+            let read_result = {
+                let _nonblocking_stdin = NonBlockingFdGuard::enable(STDIN_FILENO)?;
+                io::stdin().read(&mut buf)
+            };
+            let n = match read_result {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             translate_attach_input_with_state(&buf[..n], &mut input_state)
         };
 
@@ -2204,7 +2307,10 @@ where
                     }
                 }
                 AttachInputAction::EnterCopyMode { initial_input } => {
-                    enter_copy_mode(&initial_input)?;
+                    copy_mode_active.store(true, Ordering::SeqCst);
+                    let result = enter_copy_mode(&initial_input);
+                    copy_mode_active.store(false, Ordering::SeqCst);
+                    result?;
                 }
                 AttachInputAction::ShowHelp => {
                     write_attach_help_message()?;
@@ -2795,6 +2901,12 @@ struct RawModeGuard {
     saved: Option<String>,
 }
 
+struct NonBlockingFdGuard {
+    fd: c_int,
+    saved_flags: c_int,
+    active: bool,
+}
+
 struct AlternateScreenGuard;
 
 struct MouseModeGuard;
@@ -2866,6 +2978,39 @@ impl RawModeGuard {
         }
 
         Self { saved }
+    }
+}
+
+impl NonBlockingFdGuard {
+    fn enable(fd: c_int) -> io::Result<Self> {
+        let saved_flags = unsafe { fcntl(fd, F_GETFL) };
+        if saved_flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if saved_flags & O_NONBLOCK != 0 {
+            return Ok(Self {
+                fd,
+                saved_flags,
+                active: false,
+            });
+        }
+        let result = unsafe { fcntl(fd, F_SETFL, saved_flags | O_NONBLOCK) };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            fd,
+            saved_flags,
+            active: true,
+        })
+    }
+}
+
+impl Drop for NonBlockingFdGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = unsafe { fcntl(self.fd, F_SETFL, self.saved_flags) };
+        }
     }
 }
 
@@ -2998,6 +3143,16 @@ mod tests {
         assert_eq!(
             parse_attach_ok("OK\tSNAPSHOT\n").unwrap(),
             AttachMode::Snapshot
+        );
+    }
+
+    #[test]
+    fn parses_live_attach_ok_with_raw_layout_epoch() {
+        assert_eq!(
+            parse_attach_ok("OK\tLIVE\t42\n").unwrap(),
+            AttachMode::Live {
+                raw_layout_epoch: 42
+            }
         );
     }
 
