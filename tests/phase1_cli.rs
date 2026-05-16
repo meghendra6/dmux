@@ -319,6 +319,31 @@ fn count_attach_render_frames_until_contains(
     panic!("render stream frame did not contain {needle:?}; last:\n{last:?}");
 }
 
+fn count_attach_render_output_frames_until_contains(
+    stream: &mut UnixStream,
+    needle: &str,
+) -> (usize, String, String) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut count = 0;
+    let mut last_body = String::new();
+    let mut last_output = String::new();
+
+    while std::time::Instant::now() < deadline {
+        count += 1;
+        let body = read_attach_render_frame_body(stream);
+        last_body = String::from_utf8_lossy(&body).to_string();
+        last_output =
+            String::from_utf8_lossy(&attach_render_output_from_frame_body(&body)).to_string();
+        if last_output.contains(needle) {
+            return (count, last_body, last_output);
+        }
+    }
+
+    panic!(
+        "render stream output did not contain {needle:?}; last body:\n{last_body:?}\nlast output:\n{last_output:?}"
+    );
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -5791,6 +5816,87 @@ fn attach_render_stream_preserves_truecolor_background_after_line_erase() {
         styled_tail[..bg_reset].contains(&format!("bg-ready{}", " ".repeat(16))),
         "{pushed:?}"
     );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_render_stream_pushes_primary_output_promptly_after_alternate_screen_exit() {
+    let socket = unique_socket("attach-render-alt-exit-primary");
+    let session = format!("attach-render-alt-exit-primary-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    let mut stream = attach_render_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT_META\n");
+    let initial = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
+    assert!(initial.contains("base-ready"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf '\\033[?1049h\\033[?25l\\033[H\\033[2Jalt-title\\r\\nalt-body'; read line; printf '\\033[?1049l\\033[?25h'; read line; printf 'after-alt-exit-ready'; sleep 30",
+        ],
+    ));
+
+    let alt = read_attach_render_output_until_contains(&mut stream, "alt-body");
+    assert!(alt.contains("\x1b[?25l"), "{alt:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "exit-alt", "Enter"],
+    ));
+    let exit = read_attach_render_output_until_contains(&mut stream, "\x1b[?25h");
+    assert!(!exit.contains("after-alt-exit-ready"), "{exit:?}");
+
+    let started = std::time::Instant::now();
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "draw-primary", "Enter"],
+    ));
+    let (frames, frame_body, pushed) =
+        count_attach_render_output_frames_until_contains(&mut stream, "after-alt-exit-ready");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "primary output after alternate-screen exit was delayed: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        frames <= 3,
+        "primary output after alternate-screen exit took too many frames: {frames}\n{frame_body:?}"
+    );
+    assert!(pushed.contains("after-alt-exit-ready"), "{pushed:?}");
+    assert!(!pushed.contains("alt-title"), "{pushed:?}");
+    assert!(!pushed.contains("alt-body"), "{pushed:?}");
+    assert!(!frame_body.contains("STATUS\t"), "{frame_body:?}");
+    assert!(!frame_body.contains("\nSNAPSHOT\t"), "{frame_body:?}");
+
+    let captured = poll_capture(&socket, &session, "after-alt-exit-ready");
+    assert!(captured.contains("after-alt-exit-ready"), "{captured:?}");
+    assert!(!captured.contains("alt-title"), "{captured:?}");
+    assert!(!captured.contains("alt-body"), "{captured:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
