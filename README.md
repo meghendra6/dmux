@@ -19,12 +19,18 @@ Implemented Phase 0/1 commands:
 - `dmux resize-pane -t <name> -L|-R|-U|-D [amount]`
 - `dmux send-keys -t <name> <keys...>`
 - `dmux new-window -t <name> [-- command...]`
-- `dmux list-windows -t <name>`
-- `dmux select-window -t <name> -w <index>`
+- `dmux list-windows -t <name> [-F <format>]`
+- `dmux select-window -t <name> -w <index>|--window-id <id>|-n <name>`
+- `dmux rename-window -t <name> [-w <index>|--window-id <id>|-n <old-name>] <new-name>`
+- `dmux next-window -t <name>`
+- `dmux previous-window -t <name>`
 - `dmux kill-window -t <name> [-w <index>]`
 - `dmux new-tab -t <name> [-- command...]`
-- `dmux list-tabs -t <name>`
-- `dmux select-tab -t <name> -i <index>`
+- `dmux list-tabs -t <name> [-F <format>]`
+- `dmux select-tab -t <name> -i <index>|--tab-id <id>|-n <name>`
+- `dmux rename-tab -t <name> [-i <index>|--tab-id <id>|-n <old-name>] <new-name>`
+- `dmux next-tab -t <name>`
+- `dmux previous-tab -t <name>`
 - `dmux kill-tab -t <name> [-i <index>]`
 - `dmux split-window -t <name> -h|-v [-- command...]`
 - `dmux split -t <name> -h|-v [-- command...]`
@@ -60,11 +66,13 @@ currently basic line-level selection. In unzoomed multi-pane attach, copy-mode
 copies lines from the rendered composed layout, including pane separators and
 visible content from multiple panes, while input is routed to the server active
 pane. Unzoomed multi-pane attach handles `C-b d` to detach, `C-b ?` to show
-attach help, `C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` to
-focus by direction, `C-b H/J/K/L` to resize the active pane left/down/up/right by
+attach help, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
+`C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` to focus by
+direction, `C-b H/J/K/L` to resize the active pane left/down/up/right by
 5 cells, `C-b o` to cycle the server active pane, `C-b q` followed by a single
 digit to select a pane by number, `C-b x` to close the active pane, `C-b z` to
-toggle zoom, and mouse click to select a pane. `C-b %` and `C-b "` also work
+toggle zoom, and mouse click to select a pane. `C-b c`, `C-b n`, `C-b p`,
+`C-b %`, and `C-b "` also work
 from a fresh single-pane attach and transition automatically into the multi-pane
 layout view. Pane splitting is also available with
 `dmux split-window -t <name> -h|-v [-- command...]`; active pane focus is
@@ -94,15 +102,18 @@ Implemented Phase 2 groundwork:
 - attach-time PTY resize to the current terminal size when available
 - attached clients request PTY resize on terminal `SIGWINCH`
 - minimal window tracking with active window selection
-- Zellij-style tab command aliases over the window model
+- tab command aliases over the window model
 - window removal while keeping the session alive
+- named windows/tabs with stable IDs, index/ID/name selection, rename, and cycling
+- window/tab list formats: `#{window.index}`, `#{window.id}`, `#{window.name}`,
+  `#{window.active}`, `#{window.panes}` and matching `#{tab.*}` fields
 - split-pane sessions with a server-side active pane
 - active pane selection by pane index, stable ID, or layout direction
 - pane removal while keeping the session alive
 - pane zoom state while keeping all panes alive
 - server-side statusline format expansion
 - stable pane IDs exposed as `#{pane.id}` in pane/status formats
-- stable tab/window IDs exposed as `#{tab.id}` and `#{window.id}` in status formats
+- stable tab/window IDs plus active name/index/count exposed in status formats
 - in-memory buffers backed by pane capture and paste into active panes
 - command-driven line range and search selection for buffer saves
 - command-driven line-numbered copy-mode inspection with search filtering
@@ -128,7 +139,7 @@ Current limits:
 - copy-mode selection is line-based only
 - buffer contents are in-memory only
 - full terminal protocol support is incomplete
-- no named layout or named-window support yet
+- no named layout support yet
 - Unix/macOS POSIX PTY support only
 
 Supported `send-keys` tokens are literal text plus `Enter`, `Space`, `Tab`,

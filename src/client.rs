@@ -943,6 +943,9 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneCommand {
+    NewWindow,
+    NextWindow,
+    PreviousWindow,
     SplitRight,
     SplitDown,
     FocusLeft,
@@ -1074,6 +1077,27 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::SplitRight));
+                    continue;
+                }
+                b'c' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::NewWindow));
+                    continue;
+                }
+                b'n' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::NextWindow));
+                    continue;
+                }
+                b'p' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    actions.push(AttachInputAction::PaneCommand(PaneCommand::PreviousWindow));
                     continue;
                 }
                 b'"' => {
@@ -1317,6 +1341,40 @@ fn translate_live_snapshot_input_with_mouse(
                     }
                     actions.push(LiveSnapshotInputAction::PaneCommand(
                         PaneCommand::SplitRight,
+                    ));
+                    offset += 1;
+                    continue;
+                }
+                b'c' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::NewWindow));
+                    offset += 1;
+                    continue;
+                }
+                b'n' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(
+                        PaneCommand::NextWindow,
+                    ));
+                    offset += 1;
+                    continue;
+                }
+                b'p' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    actions.push(LiveSnapshotInputAction::PaneCommand(
+                        PaneCommand::PreviousWindow,
                     ));
                     offset += 1;
                     continue;
@@ -2267,6 +2325,18 @@ fn apply_live_pane_command(
     _frame: &LiveSnapshotFrame,
 ) -> io::Result<()> {
     match command {
+        PaneCommand::NewWindow => {
+            let _ = send_control_request(socket, &protocol::encode_new_window(session, &[]))?;
+            Ok(())
+        }
+        PaneCommand::NextWindow => {
+            let _ = send_control_request(socket, &protocol::encode_next_window(session))?;
+            Ok(())
+        }
+        PaneCommand::PreviousWindow => {
+            let _ = send_control_request(socket, &protocol::encode_previous_window(session))?;
+            Ok(())
+        }
         PaneCommand::SplitRight => {
             split_pane(socket, session, protocol::SplitDirection::Horizontal)
         }
@@ -2418,6 +2488,9 @@ fn raw_pending_input(
             AttachInputAction::PaneCommand(command) => {
                 pending.push(0x02);
                 pending.push(match command {
+                    PaneCommand::NewWindow => b'c',
+                    PaneCommand::NextWindow => b'n',
+                    PaneCommand::PreviousWindow => b'p',
                     PaneCommand::SplitRight => b'%',
                     PaneCommand::SplitDown => b'"',
                     PaneCommand::FocusLeft => b'h',
@@ -2505,6 +2578,51 @@ where
         for (index, action) in actions.iter().enumerate() {
             match action {
                 AttachInputAction::Forward(output) => stream.write_all(&output)?,
+                AttachInputAction::PaneCommand(PaneCommand::NewWindow) => {
+                    if let Err(error) =
+                        send_control_request(socket, &protocol::encode_new_window(session, &[]))
+                    {
+                        write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                input_state.saw_prefix,
+                                RawPendingFocus::Preserve,
+                            ),
+                        });
+                    }
+                }
+                AttachInputAction::PaneCommand(PaneCommand::NextWindow) => {
+                    if let Err(error) =
+                        send_control_request(socket, &protocol::encode_next_window(session))
+                    {
+                        write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                input_state.saw_prefix,
+                                RawPendingFocus::Preserve,
+                            ),
+                        });
+                    }
+                }
+                AttachInputAction::PaneCommand(PaneCommand::PreviousWindow) => {
+                    if let Err(error) =
+                        send_control_request(socket, &protocol::encode_previous_window(session))
+                    {
+                        write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                input_state.saw_prefix,
+                                RawPendingFocus::Preserve,
+                            ),
+                        });
+                    }
+                }
                 AttachInputAction::PaneCommand(PaneCommand::SplitRight) => {
                     split_pane(socket, session, protocol::SplitDirection::Horizontal)?;
                     return Ok(RawAttachExit::Reconnect {
@@ -4189,6 +4307,9 @@ mod tests {
     #[test]
     fn attach_input_translates_pane_commands() {
         let cases = [
+            (b'c', PaneCommand::NewWindow),
+            (b'n', PaneCommand::NextWindow),
+            (b'p', PaneCommand::PreviousWindow),
             (b'%', PaneCommand::SplitRight),
             (b'"', PaneCommand::SplitDown),
             (b'h', PaneCommand::FocusLeft),
