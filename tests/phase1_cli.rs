@@ -2892,6 +2892,68 @@ fn kill_pane_resizes_remaining_child_pty_to_full_layout_region() {
 }
 
 #[test]
+fn exited_split_pane_is_removed_and_remaining_pane_resizes() {
+    let socket = unique_socket("split-pane-exit-removal");
+    let session = format!("split-pane-exit-removal-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; while read line; do printf 'base-%s:%s\\n' \"$line\" \"$(stty size)\"; done",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; exit 0",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "close", "Enter"],
+    ));
+
+    let panes = poll_pane_count(&socket, &session, 1);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
+    let active = poll_active_pane(&socket, &session, 0);
+    assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "after-exit", "Enter"],
+    ));
+    let base = poll_capture(&socket, &session, "base-after-exit:24 83");
+    assert!(base.contains("base-after-exit:24 83"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn zoom_pane_resizes_child_pty_between_full_and_split_layout_regions() {
     let socket = unique_socket("zoom-resize-pty");
     let session = format!("zoom-resize-pty-{}", std::process::id());
