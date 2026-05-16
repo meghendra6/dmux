@@ -1034,7 +1034,7 @@ fn translate_attach_input_with_state(
         if state.saw_prefix {
             state.saw_prefix = false;
             match *byte {
-                b'd' => {
+                b'd' | b'D' => {
                     if !output.is_empty() {
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
@@ -1282,7 +1282,7 @@ fn translate_live_snapshot_input_with_mouse(
         if state.saw_prefix {
             state.saw_prefix = false;
             match byte {
-                b'd' => {
+                b'd' | b'D' => {
                     if !output.is_empty() {
                         actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
                             &mut output,
@@ -4148,6 +4148,16 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_input_detaches_on_prefix_uppercase_d() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"\x02D", &mut state);
+
+        assert_eq!(actions, vec![LiveSnapshotInputAction::Detach]);
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
     fn live_snapshot_input_forwards_literal_prefix_with_regular_key() {
         let mut state = LiveSnapshotInputState::default();
 
@@ -4775,6 +4785,13 @@ mod tests {
     #[test]
     fn attach_input_detaches_on_prefix_d_without_forwarding_bytes() {
         let actions = translate_attach_input(b"\x02d", &mut false);
+
+        assert_eq!(actions, vec![AttachInputAction::Detach]);
+    }
+
+    #[test]
+    fn attach_input_detaches_on_prefix_uppercase_d() {
+        let actions = translate_attach_input(b"\x02D", &mut false);
 
         assert_eq!(actions, vec![AttachInputAction::Detach]);
     }

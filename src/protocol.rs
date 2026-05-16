@@ -58,6 +58,21 @@ pub enum Request {
         session: String,
         command: Vec<String>,
     },
+    ListSessions {
+        format: Option<String>,
+    },
+    RenameSession {
+        old_name: String,
+        new_name: String,
+    },
+    ListClients {
+        session: Option<String>,
+        format: Option<String>,
+    },
+    DetachClient {
+        session: Option<String>,
+        client_id: Option<usize>,
+    },
     Attach {
         session: String,
     },
@@ -221,6 +236,37 @@ pub fn encode_attach_render(session: &str) -> String {
 
 pub fn encode_list() -> &'static str {
     "LIST\n"
+}
+
+pub fn encode_list_sessions(format: Option<&str>) -> String {
+    match format {
+        Some(format) => format!("LIST_SESSIONS_FORMAT\t{}\n", encode_hex(format.as_bytes())),
+        None => "LIST\n".to_string(),
+    }
+}
+
+pub fn encode_rename_session(old_name: &str, new_name: &str) -> String {
+    format!(
+        "RENAME_SESSION\t{}\t{}\n",
+        encode_hex(old_name.as_bytes()),
+        encode_hex(new_name.as_bytes())
+    )
+}
+
+pub fn encode_list_clients(session: Option<&str>, format: Option<&str>) -> String {
+    format!(
+        "LIST_CLIENTS\t{}\t{}\n",
+        encode_optional_text(session),
+        encode_optional_text(format)
+    )
+}
+
+pub fn encode_detach_client(session: Option<&str>, client_id: Option<usize>) -> String {
+    format!(
+        "DETACH_CLIENT\t{}\t{}\n",
+        encode_optional_text(session),
+        client_id.map(|id| id.to_string()).unwrap_or_default()
+    )
 }
 
 pub fn encode_capture(session: &str, mode: CaptureMode) -> String {
@@ -463,6 +509,22 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
         }),
         ["LIST"] => Ok(Request::List),
+        ["LIST_SESSIONS"] => Ok(Request::ListSessions { format: None }),
+        ["LIST_SESSIONS_FORMAT", format] => Ok(Request::ListSessions {
+            format: Some(decode_utf8_hex(format, "LIST_SESSIONS_FORMAT")?),
+        }),
+        ["RENAME_SESSION", old_name, new_name] => Ok(Request::RenameSession {
+            old_name: decode_utf8_hex(old_name, "RENAME_SESSION")?,
+            new_name: decode_utf8_hex(new_name, "RENAME_SESSION")?,
+        }),
+        ["LIST_CLIENTS", session, format] => Ok(Request::ListClients {
+            session: decode_optional_text(session, "LIST_CLIENTS")?,
+            format: decode_optional_text(format, "LIST_CLIENTS")?,
+        }),
+        ["DETACH_CLIENT", session, client_id] => Ok(Request::DetachClient {
+            session: decode_optional_text(session, "DETACH_CLIENT")?,
+            client_id: decode_optional_client_id(client_id)?,
+        }),
         ["ATTACH_SNAPSHOT", session] => Ok(Request::AttachSnapshot {
             session: (*session).to_string(),
         }),
@@ -785,6 +847,17 @@ fn decode_optional_window(value: &str) -> Result<Option<usize>, String> {
     decode_optional_index(value, "KILL_WINDOW has invalid window index")
 }
 
+fn decode_optional_client_id(value: &str) -> Result<Option<usize>, String> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        value
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| "DETACH_CLIENT has invalid client id".to_string())
+    }
+}
+
 fn decode_window_target(value: &str, invalid_message: &str) -> Result<WindowTarget, String> {
     if value == "active" {
         Ok(WindowTarget::Active)
@@ -893,6 +966,41 @@ mod tests {
             Request::New {
                 session: "dev".to_string(),
                 command
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_session_lifecycle_requests() {
+        assert_eq!(
+            decode_request("LIST_SESSIONS\n").unwrap(),
+            Request::ListSessions { format: None }
+        );
+        assert_eq!(
+            decode_request(&encode_list_sessions(Some("#{session.name}"))).unwrap(),
+            Request::ListSessions {
+                format: Some("#{session.name}".to_string()),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_rename_session("old", "new")).unwrap(),
+            Request::RenameSession {
+                old_name: "old".to_string(),
+                new_name: "new".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_list_clients(Some("dev"), Some("#{client.id}"))).unwrap(),
+            Request::ListClients {
+                session: Some("dev".to_string()),
+                format: Some("#{client.id}".to_string()),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_detach_client(Some("dev"), Some(7))).unwrap(),
+            Request::DetachClient {
+                session: Some("dev".to_string()),
+                client_id: Some(7),
             }
         );
     }

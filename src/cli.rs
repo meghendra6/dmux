@@ -31,7 +31,21 @@ pub enum Command {
     Attach {
         session: String,
     },
-    ListSessions,
+    ListSessions {
+        format: Option<String>,
+    },
+    RenameSession {
+        old_name: String,
+        new_name: String,
+    },
+    ListClients {
+        session: Option<String>,
+        format: Option<String>,
+    },
+    DetachClient {
+        session: Option<String>,
+        client_id: Option<usize>,
+    },
     CapturePane {
         session: String,
         mode: CaptureMode,
@@ -151,7 +165,11 @@ where
         "help" => parse_help(args),
         "new" | "new-session" => parse_new(args),
         "attach" | "attach-session" => parse_attach(args),
-        "ls" | "list-sessions" => Ok(Command::ListSessions),
+        "ls" => parse_list_sessions(args, "ls"),
+        "list-sessions" => parse_list_sessions(args, "list-sessions"),
+        "rename-session" => parse_rename_session(args),
+        "list-clients" => parse_list_clients(args),
+        "detach-client" => parse_detach_client(args),
         "capture-pane" => parse_capture(args),
         "save-buffer" => parse_save_buffer(args),
         "copy-mode" => parse_copy_mode(args),
@@ -312,7 +330,121 @@ Pane commands:\n\
 }
 
 pub fn attach_help_summary() -> &'static str {
-    "C-b d detach | C-b ? help | C-b c new window | C-b n/p next/previous window | C-b % split right | C-b \" split down | C-b h/j/k/l focus | C-b H/J/K/L resize by 5 | C-b x close | C-b z zoom | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | resize: dmux resize-pane -t <name> -L|-R|-U|-D [amount] | select: dmux select-pane -t <name> -p <index>"
+    "C-b d detach / C-b D detach | C-b ? help | C-b c new window | C-b n/p next/previous window | C-b % split right | C-b \" split down | C-b h/j/k/l focus | C-b H/J/K/L resize by 5 | C-b x close | C-b z zoom | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | resize: dmux resize-pane -t <name> -L|-R|-U|-D [amount] | select: dmux select-pane -t <name> -p <index>"
+}
+
+fn parse_list_sessions(args: Vec<String>, command_name: &str) -> Result<Command, String> {
+    let mut format = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-F" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command_name} requires a format after -F"))?;
+                format = Some(value.clone());
+                i += 2;
+            }
+            value => {
+                return Err(format!(
+                    "{command_name} does not support argument {value:?}"
+                ));
+            }
+        }
+    }
+    Ok(Command::ListSessions { format })
+}
+
+fn parse_rename_session(args: Vec<String>) -> Result<Command, String> {
+    let mut old_name = None;
+    let mut new_name = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "rename-session requires a session name after -t".to_string())?;
+                old_name = Some(value.clone());
+                i += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("rename-session does not support option {value:?}"));
+            }
+            value => {
+                if new_name.replace(value.to_string()).is_some() {
+                    return Err("rename-session accepts exactly one new name".to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+    let new_name = new_name.ok_or_else(|| "rename-session requires <new-name>".to_string())?;
+    if new_name.is_empty() {
+        return Err("rename-session new name cannot be empty".to_string());
+    }
+    Ok(Command::RenameSession {
+        old_name: old_name.ok_or_else(|| "rename-session requires -t <session>".to_string())?,
+        new_name,
+    })
+}
+
+fn parse_list_clients(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut format = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "list-clients requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-F" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "list-clients requires a format after -F".to_string())?;
+                format = Some(value.clone());
+                i += 2;
+            }
+            value => return Err(format!("list-clients does not support argument {value:?}")),
+        }
+    }
+    Ok(Command::ListClients { session, format })
+}
+
+fn parse_detach_client(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut client_id = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "detach-client requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-c" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "detach-client requires a client id after -c".to_string())?;
+                client_id =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        "detach-client -c must be a non-negative integer".to_string()
+                    })?);
+                i += 2;
+            }
+            value => return Err(format!("detach-client does not support argument {value:?}")),
+        }
+    }
+    if session.is_none() && client_id.is_none() {
+        return Err("detach-client requires -t <session> or -c <client-id>".to_string());
+    }
+    Ok(Command::DetachClient { session, client_id })
 }
 
 fn parse_capture(args: Vec<String>) -> Result<Command, String> {
@@ -1354,6 +1486,43 @@ mod tests {
     #[test]
     fn parses_no_subcommand_as_open_default() {
         assert_eq!(parse_args(["dmux"]).unwrap(), Command::OpenDefault);
+    }
+
+    #[test]
+    fn parses_session_lifecycle_commands() {
+        assert_eq!(
+            parse_args(["dmux", "list-sessions", "-F", "#{session.name}"]).unwrap(),
+            Command::ListSessions {
+                format: Some("#{session.name}".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "rename-session", "-t", "old", "new"]).unwrap(),
+            Command::RenameSession {
+                old_name: "old".to_string(),
+                new_name: "new".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "list-clients", "-t", "dev", "-F", "#{client.id}"]).unwrap(),
+            Command::ListClients {
+                session: Some("dev".to_string()),
+                format: Some("#{client.id}".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "detach-client", "-t", "dev", "-c", "3"]).unwrap(),
+            Command::DetachClient {
+                session: Some("dev".to_string()),
+                client_id: Some(3),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_detach_client_without_target() {
+        let err = parse_args(["dmux", "detach-client"]).unwrap_err();
+        assert!(err.contains("requires -t"), "{err}");
     }
 
     #[test]

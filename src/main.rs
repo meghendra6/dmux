@@ -56,11 +56,43 @@ fn run() -> Result<(), String> {
                 attach_session(&socket, &session)
             }
         }
-        cli::Command::ListSessions => {
+        cli::Command::ListSessions { format } => {
             let socket = paths::socket_path();
             require_running_server(&socket)?;
-            let body = send_request(&socket, protocol::encode_list(), false)?;
+            let request = protocol::encode_list_sessions(format.as_deref());
+            let body = send_request(&socket, &request, false)?;
             print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
+        cli::Command::RenameSession { old_name, new_name } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_rename_session(&old_name, &new_name),
+                false,
+            )?;
+            Ok(())
+        }
+        cli::Command::ListClients { session, format } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            let body = send_request(
+                &socket,
+                &protocol::encode_list_clients(session.as_deref(), format.as_deref()),
+                false,
+            )?;
+            print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
+        cli::Command::DetachClient { session, client_id } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_detach_client(session.as_deref(), client_id),
+                false,
+            )?;
             Ok(())
         }
         cli::Command::CapturePane { session, mode } => {

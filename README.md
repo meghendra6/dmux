@@ -8,7 +8,11 @@ Implemented Phase 0/1 commands:
 - `dmux new -s <name> [-- command...]`
 - `dmux`
 - `dmux attach [-t <name>]`
-- `dmux ls`
+- `dmux ls [-F <format>]`
+- `dmux list-sessions [-F <format>]`
+- `dmux rename-session -t <old-name> <new-name>`
+- `dmux list-clients [-t <name>] [-F <format>]`
+- `dmux detach-client [-t <name>] [-c <client-id>]`
 - `dmux capture-pane -t <name> -p [--screen|--history|--all]`
 - `dmux copy-mode -t <name> [--screen|--history|--all] [--search <text>]`
 - `dmux save-buffer -t <name> [-b <buffer>] [--screen|--history|--all] [--start-line <n> --end-line <n>|--search <text>]`
@@ -65,7 +69,7 @@ one rendered line; mouse drag saves an inclusive line range. Mouse selection is
 currently basic line-level selection. In unzoomed multi-pane attach, copy-mode
 copies lines from the rendered composed layout, including pane separators and
 visible content from multiple panes, while input is routed to the server active
-pane. Unzoomed multi-pane attach handles `C-b d` to detach, `C-b ?` to show
+pane. Unzoomed multi-pane attach handles `C-b d` to detach (`C-b D` also detaches), `C-b ?` to show
 attach help, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
 `C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` to focus by
 direction, `C-b H/J/K/L` to resize the active pane left/down/up/right by
@@ -100,6 +104,9 @@ Implemented Phase 2 groundwork:
 - explicit PTY resize requests with screen-state resize
 - detached session input through `send-keys`
 - attach-time PTY resize to the current terminal size when available
+- session formats: `#{session.name}`, `#{session.windows}`, `#{session.window_count}`, `#{session.attached}`, `#{session.attached_count}`, `#{session.created_at}`, and `#{client.count}`
+- client formats: `#{client.id}`, `#{client.session}`, `#{client.type}`, `#{client.attached}`, `#{client.width}`, and `#{client.height}`
+- session rename plus attach client listing and command-driven detach
 - attached clients request PTY resize on terminal `SIGWINCH`
 - minimal window tracking with active window selection
 - tab command aliases over the window model
