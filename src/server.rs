@@ -6,8 +6,9 @@ use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 const MAX_HISTORY_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
@@ -16,6 +17,7 @@ const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 +
 const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
 const ATTACH_RENDER_STATUS_FORMAT: &str =
     "#{session.name} #{window.list} pane #{pane.index} | #{status.help}";
+const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(50);
 
 type TrackedStreamClients = Arc<Mutex<Vec<TrackedStream>>>;
 type AttachEventClients = TrackedStreamClients;
@@ -235,6 +237,7 @@ struct Session {
     attach_events: AttachEventClients,
     attach_streams: AttachLifetimeStreams,
     attach_render_clients: AttachRenderClients,
+    attach_render_pending: AtomicBool,
     next_attach_event_id: AtomicUsize,
     next_attach_stream_id: AtomicUsize,
     next_attach_render_id: AtomicUsize,
@@ -248,6 +251,7 @@ impl Session {
             attach_events,
             attach_streams: Arc::new(Mutex::new(Vec::new())),
             attach_render_clients: Arc::new(Mutex::new(Vec::new())),
+            attach_render_pending: AtomicBool::new(false),
             next_attach_event_id: AtomicUsize::new(0),
             next_attach_stream_id: AtomicUsize::new(0),
             next_attach_render_id: AtomicUsize::new(0),
@@ -332,9 +336,34 @@ impl Session {
         Arc::clone(&self.attach_events)
     }
 
-    fn notify_attach_redraw(&self) {
+    fn notify_attach_redraw(self: &Arc<Self>) {
         notify_attach_redraw(&self.attach_events);
-        notify_attach_render(&self.attach_render_clients, self.attach_render_frame());
+        self.schedule_attach_render();
+    }
+
+    fn schedule_attach_render(self: &Arc<Self>) {
+        if self.attach_render_clients.lock().unwrap().is_empty() {
+            return;
+        }
+        if self
+            .attach_render_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let session = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            std::thread::sleep(ATTACH_RENDER_DEBOUNCE_INTERVAL);
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            session.attach_render_pending.store(false, Ordering::SeqCst);
+            notify_attach_render(&session.attach_render_clients, || {
+                session.attach_render_frame()
+            });
+        });
     }
 
     fn register_attach_stream(&self, stream: &UnixStream) -> io::Result<StreamRegistration> {
@@ -2896,7 +2925,14 @@ fn notify_attach_redraw(clients: &AttachEventClients) {
     *clients = live;
 }
 
-fn notify_attach_render(clients: &AttachRenderClients, frame: Option<Vec<u8>>) {
+fn notify_attach_render(
+    clients: &AttachRenderClients,
+    render_frame: impl FnOnce() -> Option<Vec<u8>>,
+) {
+    if clients.lock().unwrap().is_empty() {
+        return;
+    }
+    let frame = render_frame();
     let Some(frame) = frame else {
         return;
     };
@@ -2906,6 +2942,8 @@ fn notify_attach_render(clients: &AttachRenderClients, frame: Option<Vec<u8>>) {
     for mut client in clients.drain(..) {
         if write_attach_render_frame(&mut client.stream, &frame) {
             live.push(client);
+        } else {
+            let _ = client.stream.shutdown(std::net::Shutdown::Both);
         }
     }
 
@@ -2966,8 +3004,9 @@ fn register_attach_render_client(
     };
 
     let mut client = stream.try_clone()?;
-    client.set_nonblocking(true)?;
+    client.set_write_timeout(Some(std::time::Duration::from_millis(100)))?;
     if !write_attach_render_frame(&mut client, &frame) {
+        let _ = client.shutdown(std::net::Shutdown::Both);
         return Ok(None);
     }
 
@@ -3077,6 +3116,60 @@ mod tests {
         live_client.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"REDRAW\n");
         assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn notify_attach_render_does_not_build_frame_without_clients() {
+        let clients = Arc::new(Mutex::new(Vec::new()));
+        let called = std::sync::atomic::AtomicBool::new(false);
+
+        notify_attach_render(&clients, || {
+            called.store(true, Ordering::SeqCst);
+            Some(Vec::new())
+        });
+
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn notify_attach_render_shuts_down_failed_clients() {
+        let clients = Arc::new(Mutex::new(Vec::new()));
+        let (handler, mut client) = UnixStream::pair().unwrap();
+        let tracked = handler.try_clone().unwrap();
+        tracked.set_nonblocking(true).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        clients.lock().unwrap().push(tracked_stream(0, tracked));
+
+        notify_attach_render(&clients, || Some(vec![b'x'; 8 * 1024 * 1024]));
+
+        assert!(clients.lock().unwrap().is_empty());
+        let mut saw_eof = false;
+        let mut buf = [0_u8; 8192];
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) => {
+                    saw_eof = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("unexpected client read error: {error:?}"),
+            }
+        }
+        assert!(
+            saw_eof,
+            "failed render stream stayed open after write failure"
+        );
+        drop(handler);
     }
 
     #[test]
