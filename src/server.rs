@@ -1,6 +1,6 @@
 use crate::protocol::{self, BufferSelection, CaptureMode, Request, SplitDirection};
 use crate::pty::{self, PtySize, SpawnSpec};
-use crate::term::TerminalState;
+use crate::term::{TerminalChanges, TerminalState};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
@@ -349,9 +349,13 @@ impl Session {
         Arc::clone(&self.attach_events)
     }
 
-    fn notify_attach_redraw(self: &Arc<Self>) {
+    fn notify_attach_redraw_for_pane_output(self: &Arc<Self>, terminal_changes: TerminalChanges) {
         notify_attach_redraw(&self.attach_events);
-        self.schedule_attach_render();
+        if terminal_changes.requires_immediate_render() {
+            self.schedule_attach_render_immediate();
+        } else {
+            self.schedule_attach_render();
+        }
     }
 
     fn notify_attach_redraw_immediate(self: &Arc<Self>) {
@@ -3134,9 +3138,9 @@ fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
             };
             let bytes = &buf[..n];
             append_history(&pane.raw_history, bytes);
-            pane.terminal.lock().unwrap().apply_bytes(bytes);
+            let terminal_changes = pane.terminal.lock().unwrap().apply_bytes(bytes);
             if let Some(session) = pane.session() {
-                session.notify_attach_redraw();
+                session.notify_attach_redraw_for_pane_output(terminal_changes);
             } else {
                 notify_attach_redraw(&pane.attach_events);
             }
@@ -3488,6 +3492,102 @@ mod tests {
 
         session.notify_attach_redraw_immediate();
 
+        let body = String::from_utf8(read_attach_render_frame_body(&mut client))
+            .expect("render frame utf8");
+        assert!(body.contains("OUTPUT\t"), "{body:?}");
+        let _ = std::fs::remove_file(writer_path);
+    }
+
+    #[test]
+    fn pane_output_alternate_screen_change_bypasses_render_debounce() {
+        let (pane, writer_path) = test_pane();
+        let session = Arc::new(Session::new(
+            "test".to_string(),
+            Arc::clone(&pane),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let _registration = session
+            .register_attach_render_stream(&server)
+            .unwrap()
+            .unwrap();
+        let _initial = read_attach_render_frame_body(&mut client);
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        session.notify_attach_redraw_for_pane_output(TerminalChanges {
+            alternate_screen: true,
+            ..TerminalChanges::default()
+        });
+
+        assert!(
+            !session.attach_render_pending.load(Ordering::SeqCst),
+            "alternate-screen transitions should use the immediate scheduler, not the debounced scheduler"
+        );
+        let body = String::from_utf8(read_attach_render_frame_body(&mut client))
+            .expect("render frame utf8");
+        assert!(body.contains("OUTPUT\t"), "{body:?}");
+        let _ = std::fs::remove_file(writer_path);
+    }
+
+    #[test]
+    fn pane_output_after_alternate_screen_exit_bypasses_render_debounce() {
+        let (pane, writer_path) = test_pane();
+        let session = Arc::new(Session::new(
+            "test".to_string(),
+            Arc::clone(&pane),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let _registration = session
+            .register_attach_render_stream(&server)
+            .unwrap()
+            .unwrap();
+        let _initial = read_attach_render_frame_body(&mut client);
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        session.notify_attach_redraw_for_pane_output(TerminalChanges {
+            post_alternate_screen_exit: true,
+            ..TerminalChanges::default()
+        });
+
+        assert!(
+            !session.attach_render_pending.load(Ordering::SeqCst),
+            "primary output immediately after alternate-screen exit should use the immediate scheduler"
+        );
+        let body = String::from_utf8(read_attach_render_frame_body(&mut client))
+            .expect("render frame utf8");
+        assert!(body.contains("OUTPUT\t"), "{body:?}");
+        let _ = std::fs::remove_file(writer_path);
+    }
+
+    #[test]
+    fn ordinary_pane_output_keeps_render_debounce() {
+        let (pane, writer_path) = test_pane();
+        let session = Arc::new(Session::new(
+            "test".to_string(),
+            Arc::clone(&pane),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let _registration = session
+            .register_attach_render_stream(&server)
+            .unwrap()
+            .unwrap();
+        let _initial = read_attach_render_frame_body(&mut client);
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        session.notify_attach_redraw_for_pane_output(TerminalChanges::default());
+
+        assert!(
+            session.attach_render_pending.load(Ordering::SeqCst),
+            "ordinary pane output should keep the burst-coalescing debounce"
+        );
         let body = String::from_utf8(read_attach_render_frame_body(&mut client))
             .expect("render frame utf8");
         assert!(body.contains("OUTPUT\t"), "{body:?}");
