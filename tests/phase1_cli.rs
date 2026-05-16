@@ -7197,6 +7197,91 @@ fn kill_pane_by_index_keeps_reindexed_active_pane() {
 }
 
 #[test]
+fn pane_ids_remain_stable_after_index_reassignment() {
+    let socket = unique_socket("stable-pane-ids");
+    let session = format!("stable-pane-ids-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.index}:#{pane.id}:#{pane.active}",
+        ],
+    );
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0:0:0", "1:1:1"]);
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "0"]));
+
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.index}:#{pane.id}:#{pane.active}",
+        ],
+    );
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0:1:1"]);
+
+    let message = dmux(
+        &socket,
+        &[
+            "display-message",
+            "-t",
+            &session,
+            "-p",
+            "#{pane.index}:#{pane.id}",
+        ],
+    );
+    assert_success(&message);
+    let message = String::from_utf8_lossy(&message.stdout);
+    assert_eq!(message.trim_end(), "0:1");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn kill_pane_terminates_removed_pane_process() {
     let socket = unique_socket("kill-pane-terminates");
     let session = format!("kill-pane-terminates-{}", std::process::id());

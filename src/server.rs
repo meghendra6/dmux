@@ -240,6 +240,7 @@ fn join_selected_lines(lines: &[&str]) -> String {
 struct Session {
     name: String,
     windows: Mutex<WindowSet>,
+    next_pane_id: AtomicUsize,
     attach_events: AttachEventClients,
     attach_streams: AttachLifetimeStreams,
     attach_render_clients: AttachRenderClients,
@@ -256,9 +257,11 @@ struct Session {
 
 impl Session {
     fn new(name: String, pane: Arc<Pane>, attach_events: AttachEventClients) -> Self {
+        let next_pane_id = pane.id.as_usize() + 1;
         Self {
             name,
             windows: Mutex::new(WindowSet::new(Window::new(pane))),
+            next_pane_id: AtomicUsize::new(next_pane_id),
             attach_events,
             attach_streams: Arc::new(Mutex::new(Vec::new())),
             attach_render_clients: Arc::new(Mutex::new(Vec::new())),
@@ -272,6 +275,10 @@ impl Session {
             next_attach_stream_id: AtomicUsize::new(0),
             next_attach_render_id: AtomicUsize::new(0),
         }
+    }
+
+    fn next_pane_id(&self) -> PaneId {
+        PaneId(self.next_pane_id.fetch_add(1, Ordering::SeqCst))
     }
 
     fn active_pane(&self) -> Option<Arc<Pane>> {
@@ -521,6 +528,15 @@ struct Window {
     zoomed: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct PaneId(usize);
+
+impl PaneId {
+    fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LayoutNode {
     Pane(usize),
@@ -677,11 +693,14 @@ impl Window {
     fn pane_descriptions(&self) -> Vec<PaneDescription> {
         let window_zoomed = self.zoomed.is_some();
         (0..self.panes.len())
-            .map(|index| PaneDescription {
-                index,
-                active: index == self.panes.active_index(),
-                zoomed: self.zoomed == Some(index),
-                window_zoomed,
+            .filter_map(|index| {
+                self.panes.get(index).map(|pane| PaneDescription {
+                    id: pane.id,
+                    index,
+                    active: index == self.panes.active_index(),
+                    zoomed: self.zoomed == Some(index),
+                    window_zoomed,
+                })
             })
             .collect()
     }
@@ -764,6 +783,12 @@ impl Window {
 
     fn active_pane_index(&self) -> usize {
         self.panes.active_index()
+    }
+
+    fn active_pane_id(&self) -> Option<PaneId> {
+        self.panes
+            .get(self.panes.active_index())
+            .map(|pane| pane.id)
     }
 
     fn active_pane_zoomed(&self) -> bool {
@@ -947,6 +972,7 @@ impl WindowSet {
             window_index: self.active,
             window_count: self.windows.len(),
             pane_index: window.active_pane_index(),
+            pane_id: window.active_pane_id()?,
             pane_zoomed: window.active_pane_zoomed(),
             window_zoomed: window.is_zoomed(),
         })
@@ -984,6 +1010,7 @@ impl WindowSet {
 }
 
 struct PaneDescription {
+    id: PaneId,
     index: usize,
     active: bool,
     zoomed: bool,
@@ -1058,6 +1085,7 @@ struct StatusContext {
     window_index: usize,
     window_count: usize,
     pane_index: usize,
+    pane_id: PaneId,
     pane_zoomed: bool,
     window_zoomed: bool,
 }
@@ -1141,6 +1169,7 @@ impl<T: Clone> PaneSet<T> {
 }
 
 struct Pane {
+    id: PaneId,
     child_pid: i32,
     writer: Arc<Mutex<File>>,
     size: Mutex<PtySize>,
@@ -1335,6 +1364,7 @@ fn handle_new(
     let cwd = std::env::current_dir()?;
     let attach_events = Arc::new(Mutex::new(Vec::new()));
     let pane = spawn_pane(
+        PaneId(0),
         name.clone(),
         command,
         cwd,
@@ -1349,6 +1379,7 @@ fn handle_new(
 }
 
 fn spawn_pane(
+    id: PaneId,
     session_name: String,
     command: Vec<String>,
     cwd: PathBuf,
@@ -1361,6 +1392,7 @@ fn spawn_pane(
     let process = pty::spawn(&spec)?;
     let reader = process.master.try_clone()?;
     let pane = Arc::new(Pane {
+        id,
         child_pid: process.child_pid,
         writer: Arc::new(Mutex::new(process.master)),
         size: Mutex::new(spec.size),
@@ -1666,6 +1698,7 @@ fn handle_split(
     let close_raw_attach_streams = session.attach_panes().len() == 1;
     let cwd = std::env::current_dir()?;
     let pane = spawn_pane(
+        session.next_pane_id(),
         name.to_string(),
         command,
         cwd,
@@ -1716,6 +1749,7 @@ fn handle_list_panes(
 
 fn format_pane_line(format: &str, pane: &PaneDescription) -> String {
     format
+        .replace("#{pane.id}", &pane.id.as_usize().to_string())
         .replace("#{pane.index}", &pane.index.to_string())
         .replace("#{pane.active}", if pane.active { "1" } else { "0" })
         .replace("#{pane.zoomed}", if pane.zoomed { "1" } else { "0" })
@@ -1797,12 +1831,14 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
     let window_index = context.window_index.to_string();
     let window_list = format_window_list(context);
     let pane_index = context.pane_index.to_string();
+    let pane_id = context.pane_id.as_usize().to_string();
     let pane_zoomed = if context.pane_zoomed { "1" } else { "0" };
     let window_zoomed = if context.window_zoomed { "1" } else { "0" };
     let replacements = [
         ("#{session.name}", context.session_name.as_str()),
         ("#{window.index}", window_index.as_str()),
         ("#{window.list}", window_list.as_str()),
+        ("#{pane.id}", pane_id.as_str()),
         ("#{pane.index}", pane_index.as_str()),
         ("#{pane.zoomed}", pane_zoomed),
         ("#{window.zoomed_flag}", window_zoomed),
@@ -1926,6 +1962,7 @@ fn handle_new_window(
 
     let cwd = std::env::current_dir()?;
     let pane = spawn_pane(
+        session.next_pane_id(),
         name.to_string(),
         command,
         cwd,
@@ -3517,6 +3554,7 @@ mod tests {
         ));
         let writer = File::create(&writer_path).unwrap();
         let pane = Arc::new(Pane {
+            id: PaneId(0),
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
@@ -3836,6 +3874,7 @@ mod tests {
         ));
         let writer = File::create(&writer_path).unwrap();
         let pane = Arc::new(Pane {
+            id: PaneId(0),
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
@@ -3879,6 +3918,7 @@ mod tests {
             std::env::temp_dir().join(format!("dmux-attach-lifetime-{}", std::process::id()));
         let writer = File::create(&writer_path).unwrap();
         let pane = Arc::new(Pane {
+            id: PaneId(0),
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
