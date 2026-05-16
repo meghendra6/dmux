@@ -4577,7 +4577,7 @@ fn attach_layout_snapshot_response_includes_regions_without_changing_plain_snaps
 }
 
 #[test]
-fn attach_render_stream_sends_initial_frame_with_status_and_regions() {
+fn attach_render_stream_sends_initial_terminal_output_frame() {
     let socket = unique_socket("attach-render-initial");
     let session = format!("attach-render-initial-{}", std::process::id());
 
@@ -4614,13 +4614,15 @@ fn attach_render_stream_sends_initial_frame_with_status_and_regions() {
     assert!(split.contains("split-ready"), "{split:?}");
 
     let mut stream = attach_render_stream(&socket, &session);
-    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT\n");
     let body = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
 
-    assert!(body.starts_with("STATUS\t"), "{body:?}");
+    assert!(body.starts_with("\x1b[H"), "{body:?}");
+    assert!(body.contains("\x1b[2K"), "{body:?}");
+    assert!(!body.contains("STATUS\t"), "{body:?}");
+    assert!(!body.contains("\nREGIONS\t"), "{body:?}");
+    assert!(!body.contains("\nSNAPSHOT\t"), "{body:?}");
     assert!(body.contains(&session), "{body:?}");
-    assert!(body.contains("\nREGIONS\t2\n"), "{body:?}");
-    assert!(body.contains("\nSNAPSHOT\t"), "{body:?}");
     assert!(body.contains("base-ready"), "{body:?}");
     assert!(body.contains("split-ready"), "{body:?}");
 
@@ -4666,9 +4668,11 @@ fn attach_render_stream_pushes_frame_after_pane_output() {
     assert!(split.contains("split-ready"), "{split:?}");
 
     let mut stream = attach_render_stream(&socket, &session);
-    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT\n");
     let initial = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
     assert!(initial.contains("split-ready"), "{initial:?}");
+    assert!(!initial.contains("STATUS\t"), "{initial:?}");
+    assert!(!initial.contains("\nSNAPSHOT\t"), "{initial:?}");
 
     assert_success(&dmux(
         &socket,
@@ -4678,6 +4682,8 @@ fn attach_render_stream_pushes_frame_after_pane_output() {
     assert!(late.contains("late:hello"), "{late:?}");
     let pushed = read_attach_render_frame_body_until_contains(&mut stream, "late:hello");
     assert!(pushed.contains("late:hello"), "{pushed:?}");
+    assert!(!pushed.contains("STATUS\t"), "{pushed:?}");
+    assert!(!pushed.contains("\nSNAPSHOT\t"), "{pushed:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -4721,9 +4727,11 @@ fn attach_render_stream_coalesces_bursty_pane_output() {
     assert!(split.contains("split-ready"), "{split:?}");
 
     let mut stream = attach_render_stream(&socket, &session);
-    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT\n");
     let initial = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
     assert!(initial.contains("split-ready"), "{initial:?}");
+    assert!(!initial.contains("STATUS\t"), "{initial:?}");
+    assert!(!initial.contains("\nSNAPSHOT\t"), "{initial:?}");
 
     assert_success(&dmux(
         &socket,
@@ -4733,6 +4741,8 @@ fn attach_render_stream_coalesces_bursty_pane_output() {
     assert!(done.contains("burst-done"), "{done:?}");
     let (frames, pushed) = count_attach_render_frames_until_contains(&mut stream, "burst-done");
     assert!(pushed.contains("burst-done"), "{pushed:?}");
+    assert!(!pushed.contains("STATUS\t"), "{pushed:?}");
+    assert!(!pushed.contains("\nSNAPSHOT\t"), "{pushed:?}");
     assert!(
         frames <= 4,
         "bursty output emitted too many render frames before the final frame: {frames}\n{pushed:?}"

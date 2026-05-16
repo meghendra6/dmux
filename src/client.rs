@@ -50,12 +50,6 @@ struct AttachLayoutSnapshotResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AttachRenderFrame {
-    status: String,
-    layout: AttachLayoutSnapshotResponse,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveSnapshotFrame {
     regions: Vec<AttachPaneRegion>,
     header_rows: usize,
@@ -279,7 +273,7 @@ fn read_attach_layout_frame(
     }
 }
 
-fn read_attach_render_frame(stream: &mut UnixStream) -> io::Result<AttachRenderFrame> {
+fn read_attach_render_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     let header = read_line(stream)?;
     let Some(len) = header
         .strip_prefix("FRAME\t")
@@ -292,36 +286,11 @@ fn read_attach_render_frame(stream: &mut UnixStream) -> io::Result<AttachRenderF
         .map_err(|_| io::Error::other("invalid attach render frame length"))?;
     let mut body = vec![0_u8; len];
     stream.read_exact(&mut body)?;
-    parse_attach_render_frame_body(&body)
+    Ok(body)
 }
 
 fn is_unknown_request_error(error: &io::Error) -> bool {
     error.to_string().starts_with("unknown request line:")
-}
-
-fn parse_attach_render_frame_body(body: &[u8]) -> io::Result<AttachRenderFrame> {
-    let mut cursor = 0;
-    let header = read_body_line(body, &mut cursor)?;
-    let Some(len) = header.strip_prefix("STATUS\t") else {
-        return Err(io::Error::other("missing status header"));
-    };
-    let len = len
-        .parse::<usize>()
-        .map_err(|_| io::Error::other("invalid status length"))?;
-    if body.len().saturating_sub(cursor) < len + 1 {
-        return Err(io::Error::other("truncated status body"));
-    }
-    let status = std::str::from_utf8(&body[cursor..cursor + len])
-        .map_err(|_| io::Error::other("non-utf8 status body"))?
-        .to_string();
-    cursor += len;
-    if body.get(cursor) != Some(&b'\n') {
-        return Err(io::Error::other("missing status terminator"));
-    }
-    cursor += 1;
-
-    let layout = parse_attach_layout_snapshot_response(&body[cursor..])?;
-    Ok(AttachRenderFrame { status, layout })
 }
 
 fn parse_attach_layout_snapshot_response(body: &[u8]) -> io::Result<AttachLayoutSnapshotResponse> {
@@ -446,13 +415,6 @@ fn write_live_snapshot_frame_with_message_and_clear(
     write_live_frame_to_stdout(&status, message, &snapshot, clear)
 }
 
-fn write_live_render_frame_with_message(
-    render_frame: &AttachRenderFrame,
-    message: Option<&str>,
-) -> io::Result<LiveSnapshotFrame> {
-    write_live_frame_to_stdout(&render_frame.status, message, &render_frame.layout, false)
-}
-
 fn write_live_frame_to_stdout(
     status: &str,
     message: Option<&str>,
@@ -532,6 +494,12 @@ fn write_snapshot_rows(
     }
 
     Ok(())
+}
+
+fn write_live_render_output(render_output: &[u8]) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(render_output)?;
+    stdout.flush()
 }
 
 fn write_snapshot_rows_for_repaint(
@@ -1207,7 +1175,7 @@ enum LiveSnapshotInputEvent {
     PauseRedraw(mpsc::Sender<()>),
     RedrawNow,
     RedrawHint,
-    RenderFrame(AttachRenderFrame),
+    RenderFrame(Vec<u8>),
     RenderStreamReady,
     RenderStreamUnavailable,
     RenderStreamClosed,
@@ -1437,7 +1405,7 @@ fn spawn_live_snapshot_render_thread(
                 return;
             }
         };
-        if response != "OK\n" {
+        if response != "OK\tRENDER_OUTPUT\n" {
             let _ = sender.send(LiveSnapshotInputEvent::RenderStreamUnavailable);
             return;
         }
@@ -1693,14 +1661,23 @@ fn run_live_snapshot_attach(
                     last_redraw = Instant::now();
                 }
             }
-            Ok(LiveSnapshotInputEvent::RenderFrame(render_frame)) => {
+            Ok(LiveSnapshotInputEvent::RenderFrame(render_output)) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 if !redraw_paused {
-                    frame = write_live_render_frame_with_pane_number_message(
-                        &render_frame,
-                        &mut pane_number_message,
-                    )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    if pane_number_message
+                        .as_ref()
+                        .is_some_and(|(_, until)| Instant::now() < *until)
+                    {
+                        frame = write_live_snapshot_frame_with_pane_number_message(
+                            socket,
+                            session,
+                            &mut pane_number_message,
+                        )?;
+                        sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    } else {
+                        pane_number_message = None;
+                        write_live_render_output(&render_output)?;
+                    }
                     last_redraw = Instant::now();
                 }
             }
@@ -1804,23 +1781,6 @@ fn write_live_snapshot_frame_with_pane_number_message(
         .as_ref()
         .map(|(message, _)| message.as_str());
     write_live_snapshot_frame_with_message(socket, session, message)
-}
-
-fn write_live_render_frame_with_pane_number_message(
-    render_frame: &AttachRenderFrame,
-    pane_number_message: &mut Option<(String, Instant)>,
-) -> io::Result<LiveSnapshotFrame> {
-    if pane_number_message
-        .as_ref()
-        .is_some_and(|(_, until)| Instant::now() >= *until)
-    {
-        *pane_number_message = None;
-    }
-
-    let message = pane_number_message
-        .as_ref()
-        .map(|(message, _)| message.as_str());
-    write_live_render_frame_with_message(render_frame, message)
 }
 
 fn pane_entries(socket: &Path, session: &str) -> io::Result<Vec<PaneListEntry>> {
@@ -2995,6 +2955,16 @@ mod tests {
                 col_end: 6,
             }]
         );
+    }
+
+    #[test]
+    fn reads_attach_render_frame_as_raw_output_bytes() {
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        server.write_all(b"FRAME\t6\n\x1b[Habc").unwrap();
+
+        let frame = read_attach_render_frame(&mut client).unwrap();
+
+        assert_eq!(frame, b"\x1b[Habc");
     }
 
     #[test]

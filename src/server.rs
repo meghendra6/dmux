@@ -18,6 +18,8 @@ const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
 const ATTACH_RENDER_STATUS_FORMAT: &str =
     "#{session.name} #{window.list} pane #{pane.index} | #{status.help}";
 const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(50);
+const CURSOR_HOME: &[u8] = b"\x1b[H";
+const CLEAR_LINE: &[u8] = b"\x1b[2K";
 
 type TrackedStreamClients = Arc<Mutex<Vec<TrackedStream>>>;
 type AttachEventClients = TrackedStreamClients;
@@ -2014,7 +2016,7 @@ fn handle_attach_render(
         return Ok(());
     };
 
-    write_ok(stream)?;
+    stream.write_all(b"OK\tRENDER_OUTPUT\n")?;
     let Some(_registration) = session.register_attach_render_stream(stream)? else {
         return Ok(());
     };
@@ -2138,22 +2140,71 @@ fn format_attach_layout_snapshot_body(snapshot: &RenderedAttachSnapshot) -> Vec<
 fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
     let context = session.status_context(&session.name)?;
     let status = format_status_line(ATTACH_RENDER_STATUS_FORMAT, &context);
+    let header_rows = usize::from(!status.is_empty());
+    let snapshot_rows = session
+        .active_window_size()
+        .map(|size| usize::from(size.rows).saturating_sub(header_rows))
+        .unwrap_or(usize::MAX);
     let snapshot = attach_pane_frame_with_regions(session)?;
-    Some(format_attach_render_frame_body(&status, &snapshot))
+    Some(format_attach_render_frame_body(
+        &status,
+        &snapshot,
+        snapshot_rows,
+    ))
 }
 
-fn format_attach_render_frame_body(status: &str, snapshot: &RenderedAttachSnapshot) -> Vec<u8> {
-    let layout = format_attach_layout_snapshot_body(snapshot);
-    let mut body = String::new();
-    body.push_str("STATUS\t");
-    body.push_str(&status.len().to_string());
-    body.push('\n');
-
-    let mut bytes = body.into_bytes();
-    bytes.extend_from_slice(status.as_bytes());
-    bytes.push(b'\n');
-    bytes.extend_from_slice(&layout);
+fn format_attach_render_frame_body(
+    status: &str,
+    snapshot: &RenderedAttachSnapshot,
+    snapshot_rows: usize,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(CURSOR_HOME);
+    if !status.is_empty() {
+        write_render_output_line(&mut bytes, status.as_bytes(), true);
+    }
+    write_render_output_rows(&mut bytes, snapshot.text.as_bytes(), snapshot_rows);
     bytes
+}
+
+fn write_render_output_line(output: &mut Vec<u8>, line: &[u8], clear_line: bool) {
+    if clear_line {
+        output.extend_from_slice(CLEAR_LINE);
+    }
+    output.extend_from_slice(line);
+    output.extend_from_slice(b"\r\n");
+}
+
+fn write_render_output_rows(output: &mut Vec<u8>, snapshot: &[u8], max_rows: usize) {
+    if max_rows == 0 {
+        return;
+    }
+
+    let mut rows = 0;
+    let mut start = 0;
+    while start < snapshot.len() && rows < max_rows {
+        let line_end = snapshot[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(snapshot.len(), |offset| start + offset);
+        let content_end = if line_end > start && snapshot[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+
+        if rows > 0 {
+            output.extend_from_slice(b"\r\n");
+        }
+        output.extend_from_slice(CLEAR_LINE);
+        output.extend_from_slice(&snapshot[start..content_end]);
+        rows += 1;
+
+        if line_end == snapshot.len() {
+            break;
+        }
+        start = line_end + 1;
+    }
 }
 
 fn write_attach_render_frame(stream: &mut UnixStream, body: &[u8]) -> bool {
