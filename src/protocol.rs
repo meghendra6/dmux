@@ -30,6 +30,14 @@ pub enum PaneSelectTarget {
     Direction(PaneDirection),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowTarget {
+    Active,
+    Index(usize),
+    Id(usize),
+    Name(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureMode {
     Screen,
@@ -137,10 +145,22 @@ pub enum Request {
     },
     ListWindows {
         session: String,
+        format: Option<String>,
     },
     SelectWindow {
         session: String,
-        window: usize,
+        target: WindowTarget,
+    },
+    RenameWindow {
+        session: String,
+        target: WindowTarget,
+        name: String,
+    },
+    NextWindow {
+        session: String,
+    },
+    PreviousWindow {
+        session: String,
     },
     KillWindow {
         session: String,
@@ -324,12 +344,55 @@ pub fn encode_new_window(session: &str, command: &[String]) -> String {
     format!("NEW_WINDOW\t{session}\t{}\t{joined}\n", command.len())
 }
 
-pub fn encode_list_windows(session: &str) -> String {
-    format!("LIST_WINDOWS\t{session}\n")
+pub fn encode_list_windows(session: &str, format: Option<&str>) -> String {
+    match format {
+        Some(format) => format!(
+            "LIST_WINDOWS_FORMAT\t{session}\t{}\n",
+            encode_hex(format.as_bytes())
+        ),
+        None => format!("LIST_WINDOWS\t{session}\n"),
+    }
 }
 
 pub fn encode_select_window(session: &str, window: usize) -> String {
     format!("SELECT_WINDOW\t{session}\t{window}\n")
+}
+
+pub fn encode_select_window_target(session: &str, target: WindowTarget) -> String {
+    match target {
+        WindowTarget::Active => format!("SELECT_WINDOW_ACTIVE\t{session}\n"),
+        WindowTarget::Index(index) => encode_select_window(session, index),
+        WindowTarget::Id(id) => format!("SELECT_WINDOW_ID\t{session}\t{id}\n"),
+        WindowTarget::Name(name) => {
+            format!(
+                "SELECT_WINDOW_NAME\t{session}\t{}\n",
+                encode_hex(name.as_bytes())
+            )
+        }
+    }
+}
+
+pub fn encode_rename_window(session: &str, target: WindowTarget, name: &str) -> String {
+    let encoded_name = encode_hex(name.as_bytes());
+    match target {
+        WindowTarget::Active => format!("RENAME_WINDOW\t{session}\tactive\t{encoded_name}\n"),
+        WindowTarget::Index(index) => {
+            format!("RENAME_WINDOW\t{session}\t{index}\t{encoded_name}\n")
+        }
+        WindowTarget::Id(id) => format!("RENAME_WINDOW_ID\t{session}\t{id}\t{encoded_name}\n"),
+        WindowTarget::Name(old_name) => format!(
+            "RENAME_WINDOW_NAME\t{session}\t{}\t{encoded_name}\n",
+            encode_hex(old_name.as_bytes())
+        ),
+    }
+}
+
+pub fn encode_next_window(session: &str) -> String {
+    format!("NEXT_WINDOW\t{session}\n")
+}
+
+pub fn encode_previous_window(session: &str) -> String {
+    format!("PREVIOUS_WINDOW\t{session}\n")
 }
 
 pub fn encode_kill_window(session: &str, window: Option<usize>) -> String {
@@ -559,12 +622,58 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         }
         ["LIST_WINDOWS", session] => Ok(Request::ListWindows {
             session: (*session).to_string(),
+            format: None,
+        }),
+        ["LIST_WINDOWS_FORMAT", session, format] => Ok(Request::ListWindows {
+            session: (*session).to_string(),
+            format: Some(decode_utf8_hex(format, "LIST_WINDOWS_FORMAT")?),
         }),
         ["SELECT_WINDOW", session, window] => Ok(Request::SelectWindow {
             session: (*session).to_string(),
-            window: window
-                .parse::<usize>()
-                .map_err(|_| "SELECT_WINDOW has invalid window index".to_string())?,
+            target: WindowTarget::Index(
+                window
+                    .parse::<usize>()
+                    .map_err(|_| "SELECT_WINDOW has invalid window index".to_string())?,
+            ),
+        }),
+        ["SELECT_WINDOW_ID", session, id] => Ok(Request::SelectWindow {
+            session: (*session).to_string(),
+            target: WindowTarget::Id(
+                id.parse::<usize>()
+                    .map_err(|_| "SELECT_WINDOW_ID has invalid window id".to_string())?,
+            ),
+        }),
+        ["SELECT_WINDOW_NAME", session, name] => Ok(Request::SelectWindow {
+            session: (*session).to_string(),
+            target: WindowTarget::Name(decode_utf8_hex(name, "SELECT_WINDOW_NAME")?),
+        }),
+        ["SELECT_WINDOW_ACTIVE", session] => Ok(Request::SelectWindow {
+            session: (*session).to_string(),
+            target: WindowTarget::Active,
+        }),
+        ["RENAME_WINDOW", session, target, name] => Ok(Request::RenameWindow {
+            session: (*session).to_string(),
+            target: decode_window_target(target, "RENAME_WINDOW has invalid window index")?,
+            name: decode_utf8_hex(name, "RENAME_WINDOW")?,
+        }),
+        ["RENAME_WINDOW_ID", session, id, name] => Ok(Request::RenameWindow {
+            session: (*session).to_string(),
+            target: WindowTarget::Id(
+                id.parse::<usize>()
+                    .map_err(|_| "RENAME_WINDOW_ID has invalid window id".to_string())?,
+            ),
+            name: decode_utf8_hex(name, "RENAME_WINDOW_ID")?,
+        }),
+        ["RENAME_WINDOW_NAME", session, old_name, name] => Ok(Request::RenameWindow {
+            session: (*session).to_string(),
+            target: WindowTarget::Name(decode_utf8_hex(old_name, "RENAME_WINDOW_NAME")?),
+            name: decode_utf8_hex(name, "RENAME_WINDOW_NAME")?,
+        }),
+        ["NEXT_WINDOW", session] => Ok(Request::NextWindow {
+            session: (*session).to_string(),
+        }),
+        ["PREVIOUS_WINDOW", session] => Ok(Request::PreviousWindow {
+            session: (*session).to_string(),
         }),
         ["KILL_WINDOW", session, window] => Ok(Request::KillWindow {
             session: (*session).to_string(),
@@ -674,6 +783,17 @@ fn decode_optional_zoom_pane(value: &str) -> Result<Option<usize>, String> {
 
 fn decode_optional_window(value: &str) -> Result<Option<usize>, String> {
     decode_optional_index(value, "KILL_WINDOW has invalid window index")
+}
+
+fn decode_window_target(value: &str, invalid_message: &str) -> Result<WindowTarget, String> {
+    if value == "active" {
+        Ok(WindowTarget::Active)
+    } else {
+        value
+            .parse::<usize>()
+            .map(WindowTarget::Index)
+            .map_err(|_| invalid_message.to_string())
+    }
 }
 
 fn decode_optional_index(value: &str, invalid_message: &str) -> Result<Option<usize>, String> {
@@ -1064,7 +1184,96 @@ mod tests {
             decode_request(&line).unwrap(),
             Request::SelectWindow {
                 session: "dev".to_string(),
-                window: 1,
+                target: WindowTarget::Index(1),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_select_window_by_id_and_name_requests() {
+        assert_eq!(
+            decode_request(&encode_select_window_target("dev", WindowTarget::Id(42))).unwrap(),
+            Request::SelectWindow {
+                session: "dev".to_string(),
+                target: WindowTarget::Id(42),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_select_window_target(
+                "dev",
+                WindowTarget::Name("editor".to_string())
+            ))
+            .unwrap(),
+            Request::SelectWindow {
+                session: "dev".to_string(),
+                target: WindowTarget::Name("editor".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_rename_and_cycle_window_requests() {
+        assert_eq!(
+            decode_request(&encode_rename_window("dev", WindowTarget::Active, "editor")).unwrap(),
+            Request::RenameWindow {
+                session: "dev".to_string(),
+                target: WindowTarget::Active,
+                name: "editor".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_next_window("dev")).unwrap(),
+            Request::NextWindow {
+                session: "dev".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_previous_window("dev")).unwrap(),
+            Request::PreviousWindow {
+                session: "dev".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_list_windows_format_and_rename_targets() {
+        assert_eq!(
+            decode_request(&encode_list_windows("dev", None)).unwrap(),
+            Request::ListWindows {
+                session: "dev".to_string(),
+                format: None,
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_list_windows(
+                "dev",
+                Some("#{window.id}:#{window.name}")
+            ))
+            .unwrap(),
+            Request::ListWindows {
+                session: "dev".to_string(),
+                format: Some("#{window.id}:#{window.name}".to_string()),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_rename_window("dev", WindowTarget::Id(7), "logs")).unwrap(),
+            Request::RenameWindow {
+                session: "dev".to_string(),
+                target: WindowTarget::Id(7),
+                name: "logs".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_rename_window(
+                "dev",
+                WindowTarget::Name("old".to_string()),
+                "new"
+            ))
+            .unwrap(),
+            Request::RenameWindow {
+                session: "dev".to_string(),
+                target: WindowTarget::Name("old".to_string()),
+                name: "new".to_string(),
             }
         );
     }

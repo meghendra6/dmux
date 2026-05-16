@@ -9,6 +9,8 @@ mod server;
 mod term;
 mod terminal_query;
 
+const DEFAULT_LIST_WINDOWS_FORMAT: &str = "#{window.index}\tid=#{window.id}\tname=#{window.name}\tactive=#{window.active}\tpanes=#{window.panes}";
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -194,21 +196,52 @@ fn run() -> Result<(), String> {
             )?;
             Ok(())
         }
-        cli::Command::ListWindows { session } => {
+        cli::Command::ListWindows { session, format } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            let body = send_request(&socket, &protocol::encode_list_windows(&session), true)?;
+            let format = format.as_deref().unwrap_or(DEFAULT_LIST_WINDOWS_FORMAT);
+            let body = send_request(
+                &socket,
+                &protocol::encode_list_windows(&session, Some(format)),
+                true,
+            )?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
-        cli::Command::SelectWindow { session, window } => {
+        cli::Command::SelectWindow { session, target } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
             send_request(
                 &socket,
-                &protocol::encode_select_window(&session, window),
+                &protocol::encode_select_window_target(&session, target),
                 true,
             )?;
+            Ok(())
+        }
+        cli::Command::RenameWindow {
+            session,
+            target,
+            name,
+        } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_rename_window(&session, target, &name),
+                true,
+            )?;
+            Ok(())
+        }
+        cli::Command::NextWindow { session } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(&socket, &protocol::encode_next_window(&session), true)?;
+            Ok(())
+        }
+        cli::Command::PreviousWindow { session } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(&socket, &protocol::encode_previous_window(&session), true)?;
             Ok(())
         }
         cli::Command::KillWindow { session, window } => {

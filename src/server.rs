@@ -2,7 +2,7 @@ use crate::ids::{PaneId, TabId};
 use crate::layout::{LayoutNode, PaneRegion, layout_regions_for_size, split_extent_weighted};
 use crate::protocol::{
     self, BufferSelection, CaptureMode, PaneDirection, PaneResizeDirection, PaneSelectTarget,
-    Request, SplitDirection,
+    Request, SplitDirection, WindowTarget,
 };
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::{TerminalChanges, TerminalState};
@@ -245,6 +245,7 @@ fn join_selected_lines(lines: &[&str]) -> String {
 struct Session {
     name: String,
     windows: Mutex<WindowSet>,
+    current_size: Mutex<PtySize>,
     next_pane_id: AtomicUsize,
     next_tab_id: AtomicUsize,
     attach_events: AttachEventClients,
@@ -264,9 +265,15 @@ struct Session {
 impl Session {
     fn new(name: String, pane: Arc<Pane>, attach_events: AttachEventClients) -> Self {
         let next_pane_id = pane.id.as_usize() + 1;
+        let current_size = *pane.size.lock().unwrap();
         Self {
             name,
-            windows: Mutex::new(WindowSet::new(Window::new(TabId::new(0), pane))),
+            windows: Mutex::new(WindowSet::new(Window::new(
+                TabId::new(0),
+                "0".to_string(),
+                pane,
+            ))),
+            current_size: Mutex::new(current_size),
             next_pane_id: AtomicUsize::new(next_pane_id),
             next_tab_id: AtomicUsize::new(1),
             attach_events,
@@ -305,12 +312,14 @@ impl Session {
     }
 
     fn resize_visible_panes(&self, size: PtySize) -> io::Result<bool> {
+        *self.current_size.lock().unwrap() = size;
         let pane_resizes = self.windows.lock().unwrap().resize_visible_panes(size);
         resize_panes(pane_resizes)
     }
 
     fn resize_current_visible_panes(&self) -> io::Result<bool> {
-        let pane_resizes = self.windows.lock().unwrap().visible_pane_resizes();
+        let size = *self.current_size.lock().unwrap();
+        let pane_resizes = self.windows.lock().unwrap().resize_visible_panes(size);
         resize_panes(pane_resizes)
     }
 
@@ -326,7 +335,8 @@ impl Session {
     }
 
     fn active_window_size(&self) -> Option<PtySize> {
-        self.windows.lock().unwrap().active_window_size()
+        self.windows.lock().unwrap().active_window()?;
+        Some(*self.current_size.lock().unwrap())
     }
 
     fn select_pane(&self, target: PaneSelectTarget) -> Result<(), String> {
@@ -338,11 +348,12 @@ impl Session {
     }
 
     fn remove_exited_pane(self: &Arc<Self>, pane: &Arc<Pane>) {
+        let size = *self.current_size.lock().unwrap();
         let (removal, pane_resizes) = {
             let mut windows = self.windows.lock().unwrap();
             let removal = windows.remove_exited_pane(pane);
             let pane_resizes = if removal.needs_layout_redraw() {
-                windows.visible_pane_resizes()
+                windows.resize_visible_panes(size)
             } else {
                 Vec::new()
             };
@@ -368,18 +379,31 @@ impl Session {
     }
 
     fn add_window(&self, pane: Arc<Pane>) {
+        let id = self.next_tab_id();
         self.windows
             .lock()
             .unwrap()
-            .add(Window::new(self.next_tab_id(), pane));
+            .add(Window::new(id, id.as_usize().to_string(), pane));
     }
 
-    fn select_window(&self, index: usize) -> bool {
-        self.windows.lock().unwrap().select(index)
+    fn select_window(&self, target: WindowTarget) -> Result<(), String> {
+        self.windows.lock().unwrap().select(target)
     }
 
-    fn window_count(&self) -> usize {
-        self.windows.lock().unwrap().len()
+    fn rename_window(&self, target: WindowTarget, name: String) -> Result<(), String> {
+        self.windows.lock().unwrap().rename_window(target, name)
+    }
+
+    fn select_next_window(&self) -> Result<(), String> {
+        self.windows.lock().unwrap().select_next()
+    }
+
+    fn select_previous_window(&self) -> Result<(), String> {
+        self.windows.lock().unwrap().select_previous()
+    }
+
+    fn window_descriptions(&self) -> Vec<WindowDescription> {
+        self.windows.lock().unwrap().window_descriptions()
     }
 
     fn kill_window(&self, target: Option<usize>) -> Result<(), String> {
@@ -532,6 +556,11 @@ impl Session {
         self.raw_attach_layout_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
+    fn reconnect_raw_attach_streams(&self) {
+        self.mark_raw_attach_layout_transition();
+        self.close_raw_attach_streams();
+    }
+
     fn close_raw_attach_streams(&self) {
         shutdown_tracked_clients(&self.attach_streams);
         for pane in self.panes() {
@@ -548,6 +577,7 @@ impl Session {
 
 struct Window {
     id: TabId,
+    name: String,
     panes: PaneSet<Arc<Pane>>,
     layout: LayoutNode,
     size: PtySize,
@@ -555,10 +585,11 @@ struct Window {
 }
 
 impl Window {
-    fn new(id: TabId, pane: Arc<Pane>) -> Self {
+    fn new(id: TabId, name: String, pane: Arc<Pane>) -> Self {
         let size = *pane.size.lock().unwrap();
         Self {
             id,
+            name,
             panes: PaneSet::new(pane),
             layout: LayoutNode::Pane(0),
             size,
@@ -855,17 +886,91 @@ impl WindowSet {
         }
     }
 
-    fn add(&mut self, window: Window) {
+    fn add(&mut self, mut window: Window) {
+        if self
+            .windows
+            .iter()
+            .any(|existing| existing.name == window.name)
+        {
+            window.name = self.next_default_window_name(window.id.as_usize());
+        }
         self.windows.push(window);
         self.active = self.windows.len() - 1;
     }
 
-    fn select(&mut self, index: usize) -> bool {
-        if index >= self.windows.len() {
-            return false;
+    fn next_default_window_name(&self, start: usize) -> String {
+        let mut candidate = start;
+        loop {
+            let name = candidate.to_string();
+            if !self.windows.iter().any(|window| window.name == name) {
+                return name;
+            }
+            candidate += 1;
         }
+    }
+
+    fn select(&mut self, target: WindowTarget) -> Result<(), String> {
+        let index = self.resolve_target(target)?;
         self.active = index;
-        true
+        Ok(())
+    }
+
+    fn select_next(&mut self) -> Result<(), String> {
+        if self.windows.is_empty() {
+            return Err("missing window".to_string());
+        }
+        self.active = (self.active + 1) % self.windows.len();
+        Ok(())
+    }
+
+    fn select_previous(&mut self) -> Result<(), String> {
+        if self.windows.is_empty() {
+            return Err("missing window".to_string());
+        }
+        self.active = if self.active == 0 {
+            self.windows.len() - 1
+        } else {
+            self.active - 1
+        };
+        Ok(())
+    }
+
+    fn rename_window(&mut self, target: WindowTarget, name: String) -> Result<(), String> {
+        if name.trim().is_empty() {
+            return Err("window name cannot be empty".to_string());
+        }
+        if name.chars().any(char::is_control) {
+            return Err("window name cannot contain control characters".to_string());
+        }
+        let index = self.resolve_target(target)?;
+        if self
+            .windows
+            .iter()
+            .enumerate()
+            .any(|(candidate, window)| candidate != index && window.name == name)
+        {
+            return Err("window name already exists".to_string());
+        }
+        self.windows[index].name = name;
+        Ok(())
+    }
+
+    fn resolve_target(&self, target: WindowTarget) -> Result<usize, String> {
+        match target {
+            WindowTarget::Active => Ok(self.active),
+            WindowTarget::Index(index) if index < self.windows.len() => Ok(index),
+            WindowTarget::Index(_) => Err("missing window".to_string()),
+            WindowTarget::Id(id) => self
+                .windows
+                .iter()
+                .position(|window| window.id == TabId::new(id))
+                .ok_or_else(|| "missing window".to_string()),
+            WindowTarget::Name(name) => self
+                .windows
+                .iter()
+                .position(|window| window.name == name)
+                .ok_or_else(|| "missing window".to_string()),
+        }
     }
 
     fn active_window(&self) -> Option<&Window> {
@@ -940,6 +1045,20 @@ impl WindowSet {
             .map_or_else(Vec::new, Window::pane_descriptions)
     }
 
+    fn window_descriptions(&self) -> Vec<WindowDescription> {
+        self.windows
+            .iter()
+            .enumerate()
+            .map(|(index, window)| WindowDescription {
+                index,
+                id: window.id,
+                name: window.name.clone(),
+                active: index == self.active,
+                panes: window.panes.len(),
+            })
+            .collect()
+    }
+
     fn attach_panes(&self) -> Vec<IndexedPane> {
         self.active_window()
             .map_or_else(Vec::new, Window::attach_panes)
@@ -965,31 +1084,19 @@ impl WindowSet {
             .resize_active_pane(direction, amount)
     }
 
-    fn visible_pane_resizes(&self) -> Vec<(Arc<Pane>, PtySize)> {
-        self.active_window()
-            .map_or_else(Vec::new, Window::visible_pane_resizes)
-    }
-
-    fn active_window_size(&self) -> Option<PtySize> {
-        self.active_window().map(|window| window.size)
-    }
-
     fn status_context(&self, session_name: &str) -> Option<StatusContext> {
         let window = self.active_window()?;
         Some(StatusContext {
             session_name: session_name.to_string(),
             window_index: self.active,
             window_id: window.id,
+            window_name: window.name.clone(),
             window_count: self.windows.len(),
             pane_index: window.active_pane_index(),
             pane_id: window.active_pane_id()?,
             pane_zoomed: window.active_pane_zoomed(),
             window_zoomed: window.is_zoomed(),
         })
-    }
-
-    fn len(&self) -> usize {
-        self.windows.len()
     }
 
     fn kill_window(&mut self, target: Option<usize>) -> Result<(), String> {
@@ -1172,11 +1279,20 @@ struct StatusContext {
     session_name: String,
     window_index: usize,
     window_id: TabId,
+    window_name: String,
     window_count: usize,
     pane_index: usize,
     pane_id: PaneId,
     pane_zoomed: bool,
     window_zoomed: bool,
+}
+
+struct WindowDescription {
+    index: usize,
+    id: TabId,
+    name: String,
+    active: bool,
+    panes: usize,
 }
 
 struct PaneSet<T> {
@@ -1371,9 +1487,22 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::NewWindow { session, command } => {
             handle_new_window(&state, &mut stream, &session, command)
         }
-        Request::ListWindows { session } => handle_list_windows(&state, &mut stream, &session),
-        Request::SelectWindow { session, window } => {
-            handle_select_window(&state, &mut stream, &session, window)
+        Request::ListWindows { session, format } => {
+            handle_list_windows(&state, &mut stream, &session, format.as_deref())
+        }
+        Request::SelectWindow { session, target } => {
+            handle_select_window(&state, &mut stream, &session, target)
+        }
+        Request::RenameWindow {
+            session,
+            target,
+            name,
+        } => handle_rename_window(&state, &mut stream, &session, target, name),
+        Request::NextWindow { session } => {
+            handle_cycle_window(&state, &mut stream, &session, WindowCycle::Next)
+        }
+        Request::PreviousWindow { session } => {
+            handle_cycle_window(&state, &mut stream, &session, WindowCycle::Previous)
         }
         Request::KillWindow { session, window } => {
             handle_kill_window(&state, &mut stream, &session, window)
@@ -1842,8 +1971,7 @@ fn handle_split(
     session.notify_attach_redraw_immediate();
     let result = write_ok(stream);
     if close_raw_attach_streams {
-        session.mark_raw_attach_layout_transition();
-        session.close_raw_attach_streams();
+        session.reconnect_raw_attach_streams();
     }
     result
 }
@@ -1957,6 +2085,7 @@ fn status_context(state: &Arc<ServerState>, name: &str) -> Option<StatusContext>
 fn format_status_line(format: &str, context: &StatusContext) -> String {
     let window_index = context.window_index.to_string();
     let window_id = context.window_id.as_usize().to_string();
+    let window_count = context.window_count.to_string();
     let window_list = format_window_list(context);
     let pane_index = context.pane_index.to_string();
     let pane_id = context.pane_id.as_usize().to_string();
@@ -1966,9 +2095,15 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{session.name}", context.session_name.as_str()),
         ("#{window.id}", window_id.as_str()),
         ("#{window.index}", window_index.as_str()),
+        ("#{window.name}", context.window_name.as_str()),
+        ("#{window.active}", "1"),
+        ("#{window.count}", window_count.as_str()),
         ("#{window.list}", window_list.as_str()),
         ("#{tab.index}", window_index.as_str()),
         ("#{tab.id}", window_id.as_str()),
+        ("#{tab.name}", context.window_name.as_str()),
+        ("#{tab.active}", "1"),
+        ("#{tab.count}", window_count.as_str()),
         ("#{tab.list}", window_list.as_str()),
         ("#{pane.id}", pane_id.as_str()),
         ("#{pane.index}", pane_index.as_str()),
@@ -1976,6 +2111,10 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{window.zoomed_flag}", window_zoomed),
         ("#{status.help}", "C-b ? help"),
     ];
+    apply_replacements(format, &replacements)
+}
+
+fn apply_replacements(format: &str, replacements: &[(&str, &str)]) -> String {
     let mut output = String::with_capacity(format.len());
     let mut remaining = format;
 
@@ -2105,13 +2244,16 @@ fn handle_new_window(
     pane.set_session(&session);
     session.add_window(pane);
     session.notify_attach_redraw_immediate();
-    write_ok(stream)
+    let result = write_ok(stream);
+    session.reconnect_raw_attach_streams();
+    result
 }
 
 fn handle_list_windows(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     name: &str,
+    format: Option<&str>,
 ) -> io::Result<()> {
     let session = {
         let sessions = state.sessions.lock().unwrap();
@@ -2124,17 +2266,40 @@ fn handle_list_windows(
     };
 
     write_ok(stream)?;
-    for index in 0..session.window_count() {
-        writeln!(stream, "{index}")?;
+    for window in session.window_descriptions() {
+        match format {
+            Some(format) => writeln!(stream, "{}", format_window_line(format, &window))?,
+            None => writeln!(stream, "{}", window.index)?,
+        }
     }
     Ok(())
+}
+
+fn format_window_line(format: &str, window: &WindowDescription) -> String {
+    let index = window.index.to_string();
+    let id = window.id.as_usize().to_string();
+    let active = if window.active { "1" } else { "0" };
+    let panes = window.panes.to_string();
+    let replacements = [
+        ("#{window.index}", index.as_str()),
+        ("#{window.id}", id.as_str()),
+        ("#{window.name}", window.name.as_str()),
+        ("#{window.active}", active),
+        ("#{window.panes}", panes.as_str()),
+        ("#{tab.index}", index.as_str()),
+        ("#{tab.id}", id.as_str()),
+        ("#{tab.name}", window.name.as_str()),
+        ("#{tab.active}", active),
+        ("#{tab.panes}", panes.as_str()),
+    ];
+    apply_replacements(format, &replacements)
 }
 
 fn handle_select_window(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     name: &str,
-    index: usize,
+    target: WindowTarget,
 ) -> io::Result<()> {
     let session = {
         let sessions = state.sessions.lock().unwrap();
@@ -2146,13 +2311,86 @@ fn handle_select_window(
         return Ok(());
     };
 
-    if !session.select_window(index) {
-        write_err(stream, "missing window")?;
+    if let Err(message) = session.select_window(target) {
+        write_err(stream, &message)?;
+        return Ok(());
+    }
+    if !session.resize_current_visible_panes()? {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    }
+
+    session.notify_attach_redraw_immediate();
+    let result = write_ok(stream);
+    session.reconnect_raw_attach_streams();
+    result
+}
+
+fn handle_rename_window(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    target: WindowTarget,
+    new_name: String,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    if let Err(message) = session.rename_window(target, new_name) {
+        write_err(stream, &message)?;
         return Ok(());
     }
 
     session.notify_attach_redraw_immediate();
     write_ok(stream)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowCycle {
+    Next,
+    Previous,
+}
+
+fn handle_cycle_window(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    cycle: WindowCycle,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    let result = match cycle {
+        WindowCycle::Next => session.select_next_window(),
+        WindowCycle::Previous => session.select_previous_window(),
+    };
+    if let Err(message) = result {
+        write_err(stream, &message)?;
+        return Ok(());
+    }
+    if !session.resize_current_visible_panes()? {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    }
+
+    session.notify_attach_redraw_immediate();
+    let result = write_ok(stream);
+    session.reconnect_raw_attach_streams();
+    result
 }
 
 fn handle_kill_window(
@@ -2175,9 +2413,15 @@ fn handle_kill_window(
         write_err(stream, &message)?;
         return Ok(());
     }
+    if !session.resize_current_visible_panes()? {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    }
 
     session.notify_attach_redraw_immediate();
-    write_ok(stream)
+    let result = write_ok(stream);
+    session.reconnect_raw_attach_streams();
+    result
 }
 
 fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) -> io::Result<()> {
@@ -4127,7 +4371,7 @@ mod tests {
     fn window_directional_select_without_adjacent_preserves_active_pane() {
         let (pane0, path0) = test_pane_with_id(0);
         let (pane1, path1) = test_pane_with_id(1);
-        let mut window = Window::new(TabId::new(0), pane0);
+        let mut window = Window::new(TabId::new(0), "0".to_string(), pane0);
         window.add_pane(SplitDirection::Horizontal, pane1);
         window.select_pane(PaneSelectTarget::Index(0)).unwrap();
 
@@ -4146,7 +4390,7 @@ mod tests {
         let (pane0, path0) = test_pane_with_id(10);
         let (pane1, path1) = test_pane_with_id(11);
         let (pane2, path2) = test_pane_with_id(12);
-        let mut window = Window::new(TabId::new(0), pane0);
+        let mut window = Window::new(TabId::new(0), "0".to_string(), pane0);
         window.add_pane(SplitDirection::Horizontal, pane1);
         window.add_pane(SplitDirection::Vertical, pane2);
         window.remove_pane_at(1);
@@ -4157,6 +4401,65 @@ mod tests {
         let _ = std::fs::remove_file(path0);
         let _ = std::fs::remove_file(path1);
         let _ = std::fs::remove_file(path2);
+    }
+
+    #[test]
+    fn window_set_selects_by_id_and_name_and_cycles_with_wraparound() {
+        let (pane0, path0) = test_pane_with_id(0);
+        let (pane1, path1) = test_pane_with_id(1);
+        let (pane2, path2) = test_pane_with_id(2);
+        let mut windows = WindowSet::new(Window::new(TabId::new(10), "base".to_string(), pane0));
+        windows.add(Window::new(TabId::new(11), "editor".to_string(), pane1));
+        windows.add(Window::new(TabId::new(12), "logs".to_string(), pane2));
+
+        windows
+            .select(WindowTarget::Name("base".to_string()))
+            .unwrap();
+        assert_eq!(windows.status_context("dev").unwrap().window_index, 0);
+        windows.select_previous().unwrap();
+        assert_eq!(windows.status_context("dev").unwrap().window_index, 2);
+        windows.select_next().unwrap();
+        assert_eq!(windows.status_context("dev").unwrap().window_index, 0);
+        windows.select(WindowTarget::Id(11)).unwrap();
+        assert_eq!(windows.status_context("dev").unwrap().window_name, "editor");
+
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+        let _ = std::fs::remove_file(path2);
+    }
+
+    #[test]
+    fn window_set_rename_rejects_duplicates_and_empty_names() {
+        let (pane0, path0) = test_pane_with_id(0);
+        let (pane1, path1) = test_pane_with_id(1);
+        let mut windows = WindowSet::new(Window::new(TabId::new(0), "base".to_string(), pane0));
+        windows.add(Window::new(TabId::new(1), "editor".to_string(), pane1));
+
+        assert_eq!(
+            windows
+                .rename_window(WindowTarget::Active, "base".to_string())
+                .unwrap_err(),
+            "window name already exists"
+        );
+        assert_eq!(
+            windows
+                .rename_window(WindowTarget::Active, "".to_string())
+                .unwrap_err(),
+            "window name cannot be empty"
+        );
+        assert_eq!(
+            windows
+                .rename_window(WindowTarget::Active, "bad\nname".to_string())
+                .unwrap_err(),
+            "window name cannot contain control characters"
+        );
+        windows
+            .rename_window(WindowTarget::Name("editor".to_string()), "logs".to_string())
+            .unwrap();
+        assert_eq!(windows.status_context("dev").unwrap().window_name, "logs");
+
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
     }
 
     #[test]

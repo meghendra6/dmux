@@ -1,6 +1,6 @@
 use crate::protocol::{
     BufferSelection, CaptureMode, PaneDirection, PaneResizeDirection, PaneSelectTarget,
-    SplitDirection,
+    SplitDirection, WindowTarget,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,10 +86,22 @@ pub enum Command {
     },
     ListWindows {
         session: String,
+        format: Option<String>,
     },
     SelectWindow {
         session: String,
-        window: usize,
+        target: WindowTarget,
+    },
+    RenameWindow {
+        session: String,
+        target: WindowTarget,
+        name: String,
+    },
+    NextWindow {
+        session: String,
+    },
+    PreviousWindow {
+        session: String,
     },
     KillWindow {
         session: String,
@@ -156,8 +168,16 @@ where
         "new-tab" => parse_new_window(args, "new-tab"),
         "list-windows" => parse_list_windows(args, "list-windows"),
         "list-tabs" => parse_list_windows(args, "list-tabs"),
-        "select-window" => parse_select_window(args, "select-window", "-w", &["-w"]),
-        "select-tab" => parse_select_window(args, "select-tab", "-i", &["-i", "--index"]),
+        "select-window" => parse_select_window(args, "select-window", "-w", &["-w"], "--window-id"),
+        "select-tab" => {
+            parse_select_window(args, "select-tab", "-i", &["-i", "--index"], "--tab-id")
+        }
+        "rename-window" => parse_rename_window(args, "rename-window", &["-w"], "--window-id"),
+        "rename-tab" => parse_rename_window(args, "rename-tab", &["-i", "--index"], "--tab-id"),
+        "next-window" => parse_cycle_window(args, "next-window", true),
+        "next-tab" => parse_cycle_window(args, "next-tab", true),
+        "previous-window" => parse_cycle_window(args, "previous-window", false),
+        "previous-tab" => parse_cycle_window(args, "previous-tab", false),
         "kill-window" => parse_kill_window(args, "kill-window", &["-w"]),
         "kill-tab" => parse_kill_window(args, "kill-tab", &["-i", "--index"]),
         "zoom-pane" => parse_zoom_pane(args),
@@ -242,9 +262,17 @@ Commands:\n\
   split-window -t <name> -h|-v [-- command...]\n\
   list-panes -t <name> [-F <format>]\n\
   select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D\n\
+  new-window -t <name> [-- command...]\n\
+  list-windows -t <name> [-F <format>]\n\
+  select-window -t <name> -w <index>|--window-id <id>|-n <name>\n\
+  rename-window -t <name> [-w <index>|--window-id <id>|-n <old-name>] <new-name>\n\
+  next-window -t <name>                  cycle to next window\n\
+  previous-window -t <name>              cycle to previous window\n\
   new-tab -t <name> [-- command...]      alias for new-window\n\
-  list-tabs -t <name>                    alias for list-windows\n\
-  select-tab -t <name> -i <index>        alias for select-window\n\
+  list-tabs -t <name> [-F <format>]      alias for list-windows\n\
+  select-tab -t <name> -i <index>|--tab-id <id>|-n <name>\n\
+  rename-tab -t <name> [-i <index>|--tab-id <id>|-n <old-name>] <new-name>\n\
+  next-tab/previous-tab -t <name>        aliases for window cycling\n\
   kill-tab -t <name> [-i <index>]        alias for kill-window\n\
   kill-session -t <name>\n\
   kill-server\n\
@@ -261,6 +289,8 @@ If -t is omitted, attach targets default.\n\
 \n\
 Attach keys:\n\
   C-b d       detach\n\
+  C-b c       create a new window\n\
+  C-b n/p     next/previous window\n\
   C-b %       split right\n\
   C-b \"       split down\n\
   C-b ?       show this help\n\
@@ -282,7 +312,7 @@ Pane commands:\n\
 }
 
 pub fn attach_help_summary() -> &'static str {
-    "C-b d detach | C-b ? help | C-b % split right | C-b \" split down | C-b h/j/k/l focus | C-b H/J/K/L resize by 5 | C-b x close | C-b z zoom | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | resize: dmux resize-pane -t <name> -L|-R|-U|-D [amount] | select: dmux select-pane -t <name> -p <index>"
+    "C-b d detach | C-b ? help | C-b c new window | C-b n/p next/previous window | C-b % split right | C-b \" split down | C-b h/j/k/l focus | C-b H/J/K/L resize by 5 | C-b x close | C-b z zoom | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | resize: dmux resize-pane -t <name> -L|-R|-U|-D [amount] | select: dmux select-pane -t <name> -p <index>"
 }
 
 fn parse_capture(args: Vec<String>) -> Result<Command, String> {
@@ -895,9 +925,38 @@ fn parse_new_window(args: Vec<String>, command_name: &str) -> Result<Command, St
 }
 
 fn parse_list_windows(args: Vec<String>, command_name: &str) -> Result<Command, String> {
-    let session = parse_target(args, command_name)?
-        .ok_or_else(|| format!("{command_name} requires -t <session>"))?;
-    Ok(Command::ListWindows { session })
+    let mut session = None;
+    let mut format = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command_name} requires a session name after -t"))?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-F" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command_name} requires a format after -F"))?;
+                format = Some(value.clone());
+                i += 2;
+            }
+            value => {
+                return Err(format!(
+                    "{command_name} does not support argument {value:?}"
+                ));
+            }
+        }
+    }
+
+    Ok(Command::ListWindows {
+        session: session.ok_or_else(|| format!("{command_name} requires -t <session>"))?,
+        format,
+    })
 }
 
 fn parse_select_window(
@@ -905,9 +964,10 @@ fn parse_select_window(
     command_name: &str,
     primary_index_flag: &str,
     index_flags: &[&str],
+    id_flag: &str,
 ) -> Result<Command, String> {
     let mut session = None;
-    let mut window = None;
+    let mut target = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -926,9 +986,33 @@ fn parse_select_window(
                         args[i]
                     )
                 })?;
-                window = Some(value.parse::<usize>().map_err(|_| {
-                    format!("{command_name} {} must be a non-negative integer", args[i])
-                })?);
+                set_window_target(
+                    &mut target,
+                    WindowTarget::Index(value.parse::<usize>().map_err(|_| {
+                        format!("{command_name} {} must be a non-negative integer", args[i])
+                    })?),
+                    command_name,
+                )?;
+                i += 2;
+            }
+            value if value == id_flag => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    format!("{command_name} requires a window id after {id_flag}")
+                })?;
+                set_window_target(
+                    &mut target,
+                    WindowTarget::Id(value.parse::<usize>().map_err(|_| {
+                        format!("{command_name} {id_flag} must be a non-negative integer")
+                    })?),
+                    command_name,
+                )?;
+                i += 2;
+            }
+            "-n" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command_name} requires a window name after -n"))?;
+                set_window_target(&mut target, WindowTarget::Name(value.clone()), command_name)?;
                 i += 2;
             }
             value => {
@@ -941,9 +1025,118 @@ fn parse_select_window(
 
     Ok(Command::SelectWindow {
         session: session.ok_or_else(|| format!("{command_name} requires -t <session>"))?,
-        window: window
-            .ok_or_else(|| format!("{command_name} requires {primary_index_flag} <index>"))?,
+        target: target.ok_or_else(|| {
+            format!(
+                "{command_name} requires {primary_index_flag} <index>, {id_flag} <id>, or -n <name>"
+            )
+        })?,
     })
+}
+
+fn parse_rename_window(
+    args: Vec<String>,
+    command_name: &str,
+    index_flags: &[&str],
+    id_flag: &str,
+) -> Result<Command, String> {
+    let mut session = None;
+    let mut target = None;
+    let mut new_name = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command_name} requires a session name after -t"))?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            value if index_flags.contains(&value) => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    format!(
+                        "{command_name} requires a tab/window index after {}",
+                        args[i]
+                    )
+                })?;
+                set_window_target(
+                    &mut target,
+                    WindowTarget::Index(value.parse::<usize>().map_err(|_| {
+                        format!("{command_name} {} must be a non-negative integer", args[i])
+                    })?),
+                    command_name,
+                )?;
+                i += 2;
+            }
+            value if value == id_flag => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    format!("{command_name} requires a window id after {id_flag}")
+                })?;
+                set_window_target(
+                    &mut target,
+                    WindowTarget::Id(value.parse::<usize>().map_err(|_| {
+                        format!("{command_name} {id_flag} must be a non-negative integer")
+                    })?),
+                    command_name,
+                )?;
+                i += 2;
+            }
+            "-n" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command_name} requires a window name after -n"))?;
+                set_window_target(&mut target, WindowTarget::Name(value.clone()), command_name)?;
+                i += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("{command_name} does not support option {value:?}"));
+            }
+            value => {
+                if new_name.replace(value.to_string()).is_some() {
+                    return Err(format!("{command_name} accepts exactly one new name"));
+                }
+                i += 1;
+            }
+        }
+    }
+
+    let name = new_name.ok_or_else(|| format!("{command_name} requires <new-name>"))?;
+    if name.is_empty() {
+        return Err(format!("{command_name} new name cannot be empty"));
+    }
+
+    Ok(Command::RenameWindow {
+        session: session.ok_or_else(|| format!("{command_name} requires -t <session>"))?,
+        target: target.unwrap_or(WindowTarget::Active),
+        name,
+    })
+}
+
+fn parse_cycle_window(
+    args: Vec<String>,
+    command_name: &str,
+    next: bool,
+) -> Result<Command, String> {
+    let session = parse_target(args, command_name)?
+        .ok_or_else(|| format!("{command_name} requires -t <session>"))?;
+    if next {
+        Ok(Command::NextWindow { session })
+    } else {
+        Ok(Command::PreviousWindow { session })
+    }
+}
+
+fn set_window_target(
+    target: &mut Option<WindowTarget>,
+    value: WindowTarget,
+    command_name: &str,
+) -> Result<(), String> {
+    if target.replace(value).is_some() {
+        Err(format!("{command_name} accepts exactly one window target"))
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_kill_window(
@@ -1724,7 +1917,8 @@ mod tests {
         assert_eq!(
             command,
             Command::ListWindows {
-                session: "dev".to_string()
+                session: "dev".to_string(),
+                format: None,
             }
         );
     }
@@ -1735,7 +1929,8 @@ mod tests {
         assert_eq!(
             command,
             Command::ListWindows {
-                session: "dev".to_string()
+                session: "dev".to_string(),
+                format: None,
             }
         );
     }
@@ -1747,7 +1942,7 @@ mod tests {
             command,
             Command::SelectWindow {
                 session: "dev".to_string(),
-                window: 1,
+                target: WindowTarget::Index(1),
             }
         );
     }
@@ -1759,8 +1954,97 @@ mod tests {
             command,
             Command::SelectWindow {
                 session: "dev".to_string(),
-                window: 1,
+                target: WindowTarget::Index(1),
             }
+        );
+    }
+
+    #[test]
+    fn parses_select_window_by_id_and_name() {
+        assert_eq!(
+            parse_args(["dmux", "select-window", "-t", "dev", "--window-id", "42"]).unwrap(),
+            Command::SelectWindow {
+                session: "dev".to_string(),
+                target: WindowTarget::Id(42),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "select-tab", "-t", "dev", "-n", "editor"]).unwrap(),
+            Command::SelectWindow {
+                session: "dev".to_string(),
+                target: WindowTarget::Name("editor".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_window_targets() {
+        let err = parse_args([
+            "dmux",
+            "select-window",
+            "-t",
+            "dev",
+            "-w",
+            "1",
+            "-n",
+            "editor",
+        ])
+        .unwrap_err();
+        assert_eq!(err, "select-window accepts exactly one window target");
+    }
+
+    #[test]
+    fn parses_rename_and_cycle_window_commands() {
+        assert_eq!(
+            parse_args(["dmux", "rename-window", "-t", "dev", "editor"]).unwrap(),
+            Command::RenameWindow {
+                session: "dev".to_string(),
+                target: WindowTarget::Active,
+                name: "editor".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "rename-tab", "-t", "dev", "--tab-id", "7", "logs"]).unwrap(),
+            Command::RenameWindow {
+                session: "dev".to_string(),
+                target: WindowTarget::Id(7),
+                name: "logs".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "next-window", "-t", "dev"]).unwrap(),
+            Command::NextWindow {
+                session: "dev".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "previous-tab", "-t", "dev"]).unwrap(),
+            Command::PreviousWindow {
+                session: "dev".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_empty_rename_and_conflicting_rename_targets() {
+        assert_eq!(
+            parse_args(["dmux", "rename-window", "-t", "dev", ""]).unwrap_err(),
+            "rename-window new name cannot be empty"
+        );
+        assert_eq!(
+            parse_args([
+                "dmux",
+                "rename-tab",
+                "-t",
+                "dev",
+                "-i",
+                "0",
+                "--tab-id",
+                "1",
+                "name"
+            ])
+            .unwrap_err(),
+            "rename-tab accepts exactly one window target"
         );
     }
 

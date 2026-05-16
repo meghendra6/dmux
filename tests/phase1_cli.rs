@@ -239,6 +239,18 @@ fn attach_layout_regions(socket: &std::path::Path, session: &str) -> Vec<TestPan
     parse_layout_regions(&body)
 }
 
+fn raw_layout_epoch(socket: &std::path::Path, session: &str) -> u64 {
+    let mut stream = UnixStream::connect(socket).expect("connect socket");
+    stream
+        .write_all(format!("ATTACH_RAW_STATE\t{session}\n").as_bytes())
+        .expect("write raw state request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    read_socket_line(&mut stream)
+        .strip_prefix("RAW_LAYOUT_EPOCH\t")
+        .and_then(|line| line.trim_end().parse::<u64>().ok())
+        .expect("raw layout epoch")
+}
+
 fn parse_layout_regions(body: &str) -> Vec<TestPaneRegion> {
     body.lines()
         .filter_map(|line| {
@@ -7873,7 +7885,10 @@ fn new_window_creates_second_active_window() {
         ],
     ));
 
-    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    let windows = dmux(
+        &socket,
+        &["list-windows", "-t", &session, "-F", "#{window.index}"],
+    );
     assert_success(&windows);
     let windows = String::from_utf8_lossy(&windows.stdout);
     assert_eq!(windows.lines().collect::<Vec<_>>(), vec!["0", "1"]);
@@ -7930,7 +7945,10 @@ fn tab_alias_commands_share_window_state() {
     let second = poll_capture(&socket, &session, "second-tab");
     assert!(second.contains("second-tab"), "{second:?}");
 
-    let tabs = dmux(&socket, &["list-tabs", "-t", &session]);
+    let tabs = dmux(
+        &socket,
+        &["list-tabs", "-t", &session, "-F", "#{tab.index}"],
+    );
     assert_success(&tabs);
     let tabs = String::from_utf8_lossy(&tabs.stdout);
     assert_eq!(tabs.lines().collect::<Vec<_>>(), vec!["0", "1"]);
@@ -7955,7 +7973,10 @@ fn tab_alias_commands_share_window_state() {
     assert!(!selected.contains("second-tab"), "{selected:?}");
 
     assert_success(&dmux(&socket, &["kill-tab", "-t", &session, "-i", "1"]));
-    let tabs = dmux(&socket, &["list-tabs", "-t", &session]);
+    let tabs = dmux(
+        &socket,
+        &["list-tabs", "-t", &session, "-F", "#{tab.index}"],
+    );
     assert_success(&tabs);
     let tabs = String::from_utf8_lossy(&tabs.stdout);
     assert_eq!(tabs.lines().collect::<Vec<_>>(), vec!["0"]);
@@ -8033,6 +8054,326 @@ fn tab_ids_remain_stable_after_index_reassignment() {
     let active = poll_capture(&socket, &session, "second-tab-id");
     assert!(active.contains("second-tab-id"), "{active:?}");
     assert!(!active.contains("base-tab-id"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn window_metadata_rename_select_cycle_and_status_formats_work() {
+    let socket = unique_socket("window-metadata");
+    let session = format!("window-metadata-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-window; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-window");
+    assert!(base.contains("base-window"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new-window",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf editor-window; sleep 30",
+        ],
+    ));
+    let editor = poll_capture(&socket, &session, "editor-window");
+    assert!(editor.contains("editor-window"), "{editor:?}");
+
+    assert_success(&dmux(&socket, &["rename-window", "-t", &session, "editor"]));
+    assert_success(&dmux(
+        &socket,
+        &["select-window", "-t", &session, "-w", "0"],
+    ));
+    assert_success(&dmux(&socket, &["rename-window", "-t", &session, "base"]));
+
+    let duplicate = dmux(&socket, &["rename-window", "-t", &session, "editor"]);
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr).contains("window name already exists"),
+        "{:?}",
+        String::from_utf8_lossy(&duplicate.stderr)
+    );
+
+    let windows = dmux(
+        &socket,
+        &[
+            "list-windows",
+            "-t",
+            &session,
+            "-F",
+            "#{window.index}:#{window.id}:#{window.name}:#{window.active}:#{window.panes}",
+        ],
+    );
+    assert_success(&windows);
+    let windows = String::from_utf8_lossy(&windows.stdout);
+    assert_eq!(
+        windows.lines().collect::<Vec<_>>(),
+        vec!["0:0:base:1:1", "1:1:editor:0:1"]
+    );
+    let default_windows = dmux(&socket, &["list-windows", "-t", &session]);
+    assert_success(&default_windows);
+    let default_windows = String::from_utf8_lossy(&default_windows.stdout);
+    assert_contains_ordered_line(&default_windows, "0", "name=base", "active=1");
+    assert_contains_ordered_line(&default_windows, "1", "name=editor", "active=0");
+    let mut raw_list = UnixStream::connect(&socket).expect("connect socket");
+    raw_list
+        .write_all(format!("LIST_WINDOWS\t{session}\n").as_bytes())
+        .expect("write raw list-windows request");
+    assert_eq!(read_socket_line(&mut raw_list), "OK\n");
+    let mut raw_windows = String::new();
+    raw_list
+        .read_to_string(&mut raw_windows)
+        .expect("read raw list-windows body");
+    assert_eq!(raw_windows.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+
+    assert_success(&dmux(
+        &socket,
+        &["select-window", "-t", &session, "-n", "editor"],
+    ));
+    let selected = poll_capture(&socket, &session, "editor-window");
+    assert!(selected.contains("editor-window"), "{selected:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["select-window", "-t", &session, "--window-id", "0"],
+    ));
+    let selected = poll_capture(&socket, &session, "base-window");
+    assert!(selected.contains("base-window"), "{selected:?}");
+
+    assert_success(&dmux(&socket, &["next-window", "-t", &session]));
+    let selected = poll_capture(&socket, &session, "editor-window");
+    assert!(selected.contains("editor-window"), "{selected:?}");
+    assert_success(&dmux(&socket, &["next-window", "-t", &session]));
+    let selected = poll_capture(&socket, &session, "base-window");
+    assert!(selected.contains("base-window"), "{selected:?}");
+    assert_success(&dmux(&socket, &["previous-window", "-t", &session]));
+    let selected = poll_capture(&socket, &session, "editor-window");
+    assert!(selected.contains("editor-window"), "{selected:?}");
+
+    let status = dmux(
+        &socket,
+        &[
+            "status-line",
+            "-t",
+            &session,
+            "-F",
+            "#{window.index}:#{window.id}:#{window.name}:#{window.count}:#{tab.name}:#{tab.count}",
+        ],
+    );
+    assert_success(&status);
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout).trim_end(),
+        "1:1:editor:2:editor:2"
+    );
+
+    let empty = dmux(&socket, &["rename-window", "-t", &session, ""]);
+    assert!(!empty.status.success());
+    assert!(
+        String::from_utf8_lossy(&empty.stderr).contains("new name cannot be empty")
+            || String::from_utf8_lossy(&empty.stderr).contains("window name cannot be empty"),
+        "{:?}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    let control = dmux(&socket, &["rename-window", "-t", &session, "bad\nname"]);
+    assert!(!control.status.success());
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("control characters"),
+        "{:?}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    assert_success(&dmux(&socket, &["kill-window", "-t", &session]));
+    let windows = dmux(
+        &socket,
+        &[
+            "list-windows",
+            "-t",
+            &session,
+            "-F",
+            "#{window.index}:#{window.id}:#{window.name}:#{window.active}",
+        ],
+    );
+    assert_success(&windows);
+    assert_eq!(
+        String::from_utf8_lossy(&windows.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["0:0:base:1"]
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn window_switch_and_kill_sync_visible_window_size() {
+    let socket = unique_socket("window-size-sync");
+    let session = format!("window-size-sync-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "100", "-y", "40"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["new-window", "-t", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &["select-window", "-t", &session, "-w", "0"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["select-window", "-t", &session, "-w", "1"],
+    ));
+    let selected = attach_layout_regions(&socket, &session);
+    assert_eq!(selected.len(), 1, "{selected:?}");
+    assert_eq!(selected[0].row_end, 24);
+    assert_eq!(selected[0].col_end, 83);
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "100", "-y", "40"],
+    ));
+    assert_success(&dmux(&socket, &["kill-window", "-t", &session]));
+    let remaining = attach_layout_regions(&socket, &session);
+    assert_eq!(remaining.len(), 1, "{remaining:?}");
+    assert_eq!(remaining[0].row_end, 40);
+    assert_eq!(remaining[0].col_end, 100);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn window_changes_mark_raw_attach_layout_transitions() {
+    let socket = unique_socket("window-raw-epoch");
+    let session = format!("window-raw-epoch-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+    assert_eq!(raw_layout_epoch(&socket, &session), 0);
+
+    assert_success(&dmux(
+        &socket,
+        &["new-window", "-t", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+    assert_eq!(raw_layout_epoch(&socket, &session), 1);
+
+    assert_success(&dmux(
+        &socket,
+        &["select-window", "-t", &session, "-w", "0"],
+    ));
+    assert_eq!(raw_layout_epoch(&socket, &session), 2);
+
+    assert_success(&dmux(&socket, &["next-window", "-t", &session]));
+    assert_eq!(raw_layout_epoch(&socket, &session), 3);
+
+    assert_success(&dmux(&socket, &["previous-window", "-t", &session]));
+    assert_eq!(raw_layout_epoch(&socket, &session), 4);
+
+    assert_success(&dmux(&socket, &["kill-window", "-t", &session, "-w", "1"]));
+    assert_eq!(raw_layout_epoch(&socket, &session), 5);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn tab_aliases_support_metadata_rename_select_and_cycle() {
+    let socket = unique_socket("tab-metadata");
+    let session = format!("tab-metadata-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-tab; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-tab");
+    assert!(base.contains("base-tab"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new-tab",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf logs-tab; sleep 30",
+        ],
+    ));
+    let logs = poll_capture(&socket, &session, "logs-tab");
+    assert!(logs.contains("logs-tab"), "{logs:?}");
+
+    assert_success(&dmux(&socket, &["rename-tab", "-t", &session, "logs"]));
+    assert_success(&dmux(&socket, &["select-tab", "-t", &session, "-i", "0"]));
+    assert_success(&dmux(&socket, &["rename-tab", "-t", &session, "base"]));
+
+    let tabs = dmux(
+        &socket,
+        &[
+            "list-tabs",
+            "-t",
+            &session,
+            "-F",
+            "#{tab.index}:#{tab.id}:#{tab.name}:#{tab.active}:#{tab.panes}",
+        ],
+    );
+    assert_success(&tabs);
+    assert_eq!(
+        String::from_utf8_lossy(&tabs.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["0:0:base:1:1", "1:1:logs:0:1"]
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["select-tab", "-t", &session, "-n", "logs"],
+    ));
+    assert_success(&dmux(&socket, &["previous-tab", "-t", &session]));
+    let selected = poll_capture(&socket, &session, "base-tab");
+    assert!(selected.contains("base-tab"), "{selected:?}");
+    assert_success(&dmux(&socket, &["next-tab", "-t", &session]));
+    let selected = poll_capture(&socket, &session, "logs-tab");
+    assert!(selected.contains("logs-tab"), "{selected:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -8141,7 +8482,10 @@ fn kill_window_removes_active_window_and_keeps_session() {
 
     assert_success(&dmux(&socket, &["kill-window", "-t", &session]));
 
-    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    let windows = dmux(
+        &socket,
+        &["list-windows", "-t", &session, "-F", "#{window.index}"],
+    );
     assert_success(&windows);
     let windows = String::from_utf8_lossy(&windows.stdout);
     assert_eq!(windows.lines().collect::<Vec<_>>(), vec!["0"]);
@@ -8192,7 +8536,10 @@ fn kill_window_by_index_keeps_reindexed_active_window() {
 
     assert_success(&dmux(&socket, &["kill-window", "-t", &session, "-w", "0"]));
 
-    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    let windows = dmux(
+        &socket,
+        &["list-windows", "-t", &session, "-F", "#{window.index}"],
+    );
     assert_success(&windows);
     let windows = String::from_utf8_lossy(&windows.stdout);
     assert_eq!(windows.lines().collect::<Vec<_>>(), vec!["0"]);
@@ -8301,7 +8648,10 @@ fn kill_window_terminates_all_removed_window_panes() {
         "split process {split_pid} should be gone"
     );
 
-    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    let windows = dmux(
+        &socket,
+        &["list-windows", "-t", &session, "-F", "#{window.index}"],
+    );
     assert_success(&windows);
     let windows = String::from_utf8_lossy(&windows.stdout);
     assert_eq!(windows.lines().collect::<Vec<_>>(), vec!["0"]);
@@ -8343,7 +8693,10 @@ fn kill_window_rejects_last_window_and_keeps_session_usable() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot kill last window"), "{stderr:?}");
 
-    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    let windows = dmux(
+        &socket,
+        &["list-windows", "-t", &session, "-F", "#{window.index}"],
+    );
     assert_success(&windows);
     let windows = String::from_utf8_lossy(&windows.stdout);
     assert_eq!(windows.lines().collect::<Vec<_>>(), vec!["0"]);
