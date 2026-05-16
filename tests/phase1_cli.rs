@@ -469,6 +469,22 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
+fn save_buffer_text(socket: &std::path::Path, session: &str, name: &str, text: &str) {
+    let mut stream = UnixStream::connect(socket).expect("connect socket");
+    stream
+        .write_all(
+            format!(
+                "SAVE_BUFFER_TEXT\t{session}\t{}\t{}\n",
+                encode_hex(name.as_bytes()),
+                encode_hex(text.as_bytes())
+            )
+            .as_bytes(),
+        )
+        .expect("write save buffer text request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert_eq!(read_socket_line(&mut stream), format!("{name}\n"));
+}
+
 #[test]
 fn detached_session_keeps_process_output_available_for_capture() {
     let socket = unique_socket("capture");
@@ -9634,6 +9650,58 @@ fn display_message_preserves_token_like_session_names() {
 }
 
 #[test]
+fn status_line_and_display_message_expose_buffer_fields_safely() {
+    let socket = unique_socket("status-message-buffer");
+    let session = format!("status-message-buffer-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+    save_buffer_text(&socket, &session, "#{buffer.latest}", "#{pane.index}\n");
+
+    let output = dmux(
+        &socket,
+        &[
+            "status-line",
+            "-t",
+            &session,
+            "-F",
+            "#{buffer.count}:#{buffer.name}:#{buffer.bytes}:#{buffer.lines}:#{buffer.latest}:#{buffer.preview}:#{missing.token}",
+        ],
+    );
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim_end(),
+        "1:#{buffer.latest}:14:1:1:#{pane.index}:#{missing.token}"
+    );
+
+    let message = dmux(
+        &socket,
+        &["display-message", "-t", &session, "-p", "#{buffer.preview}"],
+    );
+    assert_success(&message);
+    assert_eq!(
+        String::from_utf8_lossy(&message.stdout).trim_end(),
+        "#{pane.index}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn status_line_uses_default_format() {
     let socket = unique_socket("status-line-default");
     let session = format!("status-line-default-{}", std::process::id());
@@ -10075,6 +10143,81 @@ fn status_line_reports_attached_count_for_current_session() {
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     let output = assert_child_exits_within(child, "attach after kill-session");
     assert_success(&output);
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_render_status_updates_for_client_count_and_messages() {
+    let socket = unique_socket("attach-render-status-message");
+    let session = format!("attach-render-status-message-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut render = attach_render_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut render), "OK\tRENDER_OUTPUT_META\n");
+    let initial = read_attach_render_frame_body_until_contains(&mut render, "clients 0");
+    assert!(initial.contains("base-ready") || initial.contains("split-ready"));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["clients 1"]);
+    let _updated = read_attach_render_frame_body_until_contains(&mut render, "clients 1");
+    save_buffer_text(&socket, &session, "render-buffer", "#{pane.index}\n");
+    let _buffer_update = read_attach_render_frame_body_until_contains(&mut render, "buffers 1");
+
+    let message = dmux(
+        &socket,
+        &[
+            "display-message",
+            "-t",
+            &session,
+            "-p",
+            "buffer=#{buffer.name}|#{missing.token}",
+        ],
+    );
+    assert_success(&message);
+    let frame = read_attach_render_frame_body_until_contains(&mut render, "buffer=");
+    assert!(
+        frame.contains("buffer=render-buffer|#{missing.token}"),
+        "{frame:?}"
+    );
+
+    child
+        .stdin_mut("detach attached status child")
+        .write_all(b"\x02d")
+        .expect("write detach input");
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let _detached = read_attach_render_frame_body_until_contains(&mut render, "clients 0");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
 
