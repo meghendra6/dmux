@@ -1659,6 +1659,42 @@ fn interactive_new_default_shell_splits_and_remains_usable_in_real_pty() {
 }
 
 #[test]
+fn interactive_split_preserves_unsubmitted_input_in_original_pane() {
+    let socket = unique_socket("interactive-split-preserves-pending-input");
+    let session = format!(
+        "interactive-split-preserves-pending-input-{}",
+        std::process::id()
+    );
+
+    let mut child = spawn_pty_attached_dmux_with_env(
+        &socket,
+        &["new", "-s", &session],
+        80,
+        24,
+        &[&session, "C-b ? help"],
+        &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
+    );
+
+    child.write_all(b"echo base-preserved");
+    child.wait_for_stdout_contains_all(&["echo base-preserved"], "pending input echo");
+    child.write_all(b"\x02%");
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+
+    child.write_all(b"\x02h\r");
+    let base = poll_capture_eventually(&socket, &session, "base-preserved");
+    assert!(base.contains("base-preserved"), "{base:?}");
+    let active = poll_active_pane(&socket, &session, 0);
+    assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
+
+    child.write_all(b"\x02d");
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn live_snapshot_attach_does_not_spam_idle_full_frame_redraws() {
     let socket = unique_socket("live-snapshot-idle-redraw");
     let session = format!("live-snapshot-idle-redraw-{}", std::process::id());
@@ -1728,6 +1764,47 @@ fn live_snapshot_attach_repaints_pane_output_without_repeating_full_clear() {
     assert!(
         !pushed_redraw_output.contains("\x1b[2J"),
         "pushed redraw repeated a full-screen clear:\n{pushed_redraw_output:?}"
+    );
+}
+
+#[test]
+fn live_snapshot_attach_does_not_repaint_stale_frame_before_forwarded_input_echo() {
+    let socket = unique_socket("live-snapshot-no-stale-input-redraw");
+    let session = format!("live-snapshot-no-stale-input-redraw-{}", std::process::id());
+
+    let mut child = spawn_pty_attached_dmux_with_env(
+        &socket,
+        &["new", "-s", &session],
+        80,
+        24,
+        &[&session, "C-b ? help"],
+        &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
+    );
+
+    child.write_all(b"\x02%");
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+    child.wait_for_stdout_contains_all(&["|"], "pty split redraw");
+    child.wait_for_stdout_idle(Duration::from_millis(250), "settle split redraw");
+    child.clear_stdout();
+
+    std::thread::sleep(Duration::from_millis(150));
+    child.write_all(b"echo stable-input\r");
+    let captured = poll_capture_eventually(&socket, &session, "stable-input");
+    assert!(captured.contains("stable-input"), "{captured:?}");
+    child.wait_for_stdout_contains_all(&["stable-input"], "forwarded input render");
+    child.wait_for_stdout_idle(Duration::from_millis(250), "settle forwarded input render");
+    let output = child.stdout_text();
+
+    child.write_all(b"\x02d");
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+
+    let repaint_count = output.matches("\x1b[H").count();
+    assert!(
+        repaint_count <= 1,
+        "forwarded input caused an extra stale repaint before PTY output:\n{output:?}"
     );
 }
 

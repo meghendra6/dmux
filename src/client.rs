@@ -1676,7 +1676,9 @@ fn run_live_snapshot_attach(
                 let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 forward_live_snapshot_input(socket, session, &bytes)?;
                 if !redraw_paused
-                    && (resized || last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL)
+                    && (resized
+                        || (!event_stream_active
+                            && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL))
                 {
                     frame = write_live_snapshot_frame_with_pane_number_message(
                         socket,
