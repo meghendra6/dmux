@@ -396,13 +396,17 @@ impl Session {
         format_attach_render_stream_frame(self)
     }
 
-    fn close_attach_streams(&self) {
+    fn close_raw_attach_streams(&self) {
         shutdown_tracked_clients(&self.attach_streams);
-        shutdown_tracked_clients(&self.attach_events);
-        shutdown_tracked_clients(&self.attach_render_clients);
         for pane in self.panes() {
             shutdown_tracked_clients(&pane.clients);
         }
+    }
+
+    fn close_attach_streams(&self) {
+        self.close_raw_attach_streams();
+        shutdown_tracked_clients(&self.attach_events);
+        shutdown_tracked_clients(&self.attach_render_clients);
     }
 }
 
@@ -1477,6 +1481,7 @@ fn handle_split(
         write_err(stream, "missing pane")?;
         return Ok(());
     };
+    let close_raw_attach_streams = session.attach_panes().len() == 1;
     let cwd = std::env::current_dir()?;
     let pane = spawn_pane(
         name.to_string(),
@@ -1493,7 +1498,11 @@ fn handle_split(
         return Ok(());
     }
     session.notify_attach_redraw();
-    write_ok(stream)
+    let result = write_ok(stream);
+    if close_raw_attach_streams {
+        session.close_raw_attach_streams();
+    }
+    result
 }
 
 fn handle_list_panes(

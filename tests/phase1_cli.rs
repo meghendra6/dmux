@@ -1697,7 +1697,7 @@ fn live_snapshot_frame_output_fits_attach_pty_rows() {
 
     let stdout = child.stdout_text();
     let frame = stdout
-        .rsplit_once("\x1b[2J\x1b[H")
+        .rsplit_once("\x1b[H")
         .map(|(_, frame)| frame)
         .unwrap_or(stdout.as_str());
     let rendered_rows = frame.matches("\r\n").count() + usize::from(!frame.ends_with("\r\n"));
@@ -3426,6 +3426,69 @@ fn attach_prefix_h_l_focuses_horizontal_panes_for_live_input() {
         stdin.write_all(b"\x02d").expect("write detach input");
         stdin.flush().expect("flush detach input");
     }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn raw_attach_reconnects_when_external_split_creates_first_layout() {
+    let socket = unique_socket("raw-attach-external-first-split");
+    let session = format!("raw-attach-external-first-split-{}", std::process::id());
+    let base_file = unique_temp_file("raw-attach-external-first-split-base");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    let mut child = spawn_pty_attached_dmux(
+        &socket,
+        &["attach", "-t", &session],
+        80,
+        24,
+        &["base-ready"],
+    );
+    std::thread::sleep(Duration::from_millis(150));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf external-ready; read line; echo external:$line; sleep 30",
+        ],
+    ));
+    child.wait_for_stdout_contains_all(&["external-ready"], "external first split transition");
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    let active = poll_active_pane(&socket, &session, 0);
+    assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
+
+    child.write_all(b"\x02lok\r");
+    let split = poll_capture(&socket, &session, "external:ok");
+    assert!(split.contains("external:ok"), "{split:?}");
+    let active = poll_active_pane(&socket, &session, 1);
+    assert!(active.lines().any(|line| line == "1\t1"), "{active:?}");
+
+    child.write_all(b"\x02d");
     let output = wait_for_child_exit(child);
     assert_success(&output);
 

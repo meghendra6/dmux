@@ -2,6 +2,7 @@ use crate::cli;
 use crate::protocol;
 use crate::pty::PtySize;
 use std::io::{self, Read, Write};
+use std::os::raw::c_int;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -22,6 +23,26 @@ const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
 const ATTACH_RENDER_RESPONSE: &str = "OK\tRENDER_OUTPUT_META\n";
+const STDIN_FILENO: c_int = 0;
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NONBLOCK: c_int = 0o4000;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+const O_NONBLOCK: c_int = 0x0004;
+
+unsafe extern "C" {
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachMode {
@@ -207,15 +228,18 @@ where
     C: FnMut(&[u8]) -> io::Result<()> + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel();
+    let stop_input = Arc::new(AtomicBool::new(false));
     let mut input_stream = stream.try_clone()?;
     let input_socket = socket.to_path_buf();
     let input_session = session.to_string();
+    let input_stop = Arc::clone(&stop_input);
     std::thread::spawn(move || {
         let result = forward_stdin_until_detach(
             &mut input_stream,
             &input_socket,
             &input_session,
             initial_input,
+            input_stop,
             || Ok(()),
             enter_copy_mode,
         );
@@ -231,12 +255,30 @@ where
         }
         if !copy_attach_output_once(stream)? {
             let _ = stream.set_read_timeout(None);
-            return match receiver.recv_timeout(Duration::from_millis(50)) {
-                Ok(result) => result,
-                Err(_) => Ok(RawAttachExit::Detach),
+            if let Ok(result) = receiver.recv_timeout(Duration::from_millis(50)) {
+                return result;
+            }
+            let should_reconnect = raw_attach_should_reconnect(socket, session);
+            stop_input.store(true, Ordering::SeqCst);
+            let stopped_input = receiver.recv_timeout(Duration::from_millis(250));
+            return if should_reconnect {
+                match stopped_input {
+                    Ok(Ok(RawAttachExit::Reconnect { pending_input })) => {
+                        Ok(RawAttachExit::Reconnect { pending_input })
+                    }
+                    _ => Ok(RawAttachExit::Reconnect {
+                        pending_input: Vec::new(),
+                    }),
+                }
+            } else {
+                Ok(RawAttachExit::Detach)
             };
         }
     }
+}
+
+fn raw_attach_should_reconnect(socket: &Path, session: &str) -> bool {
+    pane_entries(socket, session).is_ok_and(|entries| entries.len() > 1)
 }
 
 fn read_attach_status_line(socket: &Path, session: &str) -> io::Result<String> {
@@ -2092,6 +2134,7 @@ fn forward_stdin_until_detach<F, C>(
     socket: &Path,
     session: &str,
     initial_input: Vec<u8>,
+    stop_requested: Arc<AtomicBool>,
     mut tick: F,
     mut enter_copy_mode: C,
 ) -> io::Result<RawAttachExit>
@@ -2102,16 +2145,32 @@ where
     let mut buf = [0_u8; 1024];
     let mut input_state = RawAttachInputState::default();
     let mut initial_input = Some(initial_input);
+    let _nonblocking_stdin = NonBlockingFdGuard::enable(STDIN_FILENO)?;
 
     loop {
         tick()?;
+        if initial_input.is_none() && stop_requested.load(Ordering::SeqCst) {
+            return Ok(RawAttachExit::Reconnect {
+                pending_input: raw_pending_input(
+                    &[],
+                    input_state.saw_prefix,
+                    RawPendingFocus::Preserve,
+                ),
+            });
+        }
         let actions = if let Some(input) = initial_input.take() {
             translate_attach_input_with_state(&input, &mut input_state)
         } else {
-            let n = io::stdin().lock().read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
+            let n = match io::stdin().read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             translate_attach_input_with_state(&buf[..n], &mut input_state)
         };
 
@@ -2795,6 +2854,12 @@ struct RawModeGuard {
     saved: Option<String>,
 }
 
+struct NonBlockingFdGuard {
+    fd: c_int,
+    saved_flags: c_int,
+    active: bool,
+}
+
 struct AlternateScreenGuard;
 
 struct MouseModeGuard;
@@ -2866,6 +2931,39 @@ impl RawModeGuard {
         }
 
         Self { saved }
+    }
+}
+
+impl NonBlockingFdGuard {
+    fn enable(fd: c_int) -> io::Result<Self> {
+        let saved_flags = unsafe { fcntl(fd, F_GETFL) };
+        if saved_flags == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if saved_flags & O_NONBLOCK != 0 {
+            return Ok(Self {
+                fd,
+                saved_flags,
+                active: false,
+            });
+        }
+        let result = unsafe { fcntl(fd, F_SETFL, saved_flags | O_NONBLOCK) };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            fd,
+            saved_flags,
+            active: true,
+        })
+    }
+}
+
+impl Drop for NonBlockingFdGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = unsafe { fcntl(self.fd, F_SETFL, self.saved_flags) };
+        }
     }
 }
 
