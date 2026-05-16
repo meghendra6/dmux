@@ -6,18 +6,23 @@ use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 const MAX_HISTORY_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFERS: usize = 50;
 const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 + 4096;
 const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
+const ATTACH_RENDER_STATUS_FORMAT: &str =
+    "#{session.name} #{window.list} pane #{pane.index} | #{status.help}";
+const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(50);
 
 type TrackedStreamClients = Arc<Mutex<Vec<TrackedStream>>>;
 type AttachEventClients = TrackedStreamClients;
 type AttachLifetimeStreams = TrackedStreamClients;
+type AttachRenderClients = TrackedStreamClients;
 
 struct TrackedStream {
     id: usize,
@@ -227,21 +232,29 @@ fn join_selected_lines(lines: &[&str]) -> String {
 }
 
 struct Session {
+    name: String,
     windows: Mutex<WindowSet>,
     attach_events: AttachEventClients,
     attach_streams: AttachLifetimeStreams,
+    attach_render_clients: AttachRenderClients,
+    attach_render_pending: AtomicBool,
     next_attach_event_id: AtomicUsize,
     next_attach_stream_id: AtomicUsize,
+    next_attach_render_id: AtomicUsize,
 }
 
 impl Session {
-    fn new(pane: Arc<Pane>, attach_events: AttachEventClients) -> Self {
+    fn new(name: String, pane: Arc<Pane>, attach_events: AttachEventClients) -> Self {
         Self {
+            name,
             windows: Mutex::new(WindowSet::new(Window::new(pane))),
             attach_events,
             attach_streams: Arc::new(Mutex::new(Vec::new())),
+            attach_render_clients: Arc::new(Mutex::new(Vec::new())),
+            attach_render_pending: AtomicBool::new(false),
             next_attach_event_id: AtomicUsize::new(0),
             next_attach_stream_id: AtomicUsize::new(0),
+            next_attach_render_id: AtomicUsize::new(0),
         }
     }
 
@@ -323,8 +336,34 @@ impl Session {
         Arc::clone(&self.attach_events)
     }
 
-    fn notify_attach_redraw(&self) {
+    fn notify_attach_redraw(self: &Arc<Self>) {
         notify_attach_redraw(&self.attach_events);
+        self.schedule_attach_render();
+    }
+
+    fn schedule_attach_render(self: &Arc<Self>) {
+        if self.attach_render_clients.lock().unwrap().is_empty() {
+            return;
+        }
+        if self
+            .attach_render_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let session = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            std::thread::sleep(ATTACH_RENDER_DEBOUNCE_INTERVAL);
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            session.attach_render_pending.store(false, Ordering::SeqCst);
+            notify_attach_render(&session.attach_render_clients, || {
+                session.attach_render_frame()
+            });
+        });
     }
 
     fn register_attach_stream(&self, stream: &UnixStream) -> io::Result<StreamRegistration> {
@@ -338,9 +377,26 @@ impl Session {
         register_attach_event_client(&self.attach_events, &self.next_attach_event_id, stream)
     }
 
+    fn register_attach_render_stream(
+        &self,
+        stream: &UnixStream,
+    ) -> io::Result<Option<StreamRegistration>> {
+        register_attach_render_client(
+            &self.attach_render_clients,
+            &self.next_attach_render_id,
+            stream,
+            self.attach_render_frame(),
+        )
+    }
+
+    fn attach_render_frame(&self) -> Option<Vec<u8>> {
+        format_attach_render_stream_frame(self)
+    }
+
     fn close_attach_streams(&self) {
         shutdown_tracked_clients(&self.attach_streams);
         shutdown_tracked_clients(&self.attach_events);
+        shutdown_tracked_clients(&self.attach_render_clients);
         for pane in self.panes() {
             shutdown_tracked_clients(&pane.clients);
         }
@@ -1036,6 +1092,7 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             handle_attach_layout_frame(&state, &mut stream, &session)
         }
         Request::AttachEvents { session } => handle_attach_events(&state, &mut stream, &session),
+        Request::AttachRender { session } => handle_attach_render(&state, &mut stream, &session),
     }
 }
 
@@ -1096,7 +1153,7 @@ fn handle_new(
         PtySize { cols: 80, rows: 24 },
         Arc::clone(&attach_events),
     )?;
-    let session = Arc::new(Session::new(Arc::clone(&pane), attach_events));
+    let session = Arc::new(Session::new(name.clone(), Arc::clone(&pane), attach_events));
     pane.set_session(&session);
     sessions.insert(name, session);
     write_ok(stream)
@@ -1942,6 +1999,29 @@ fn handle_attach_events(
     Ok(())
 }
 
+fn handle_attach_render(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    let Some(_registration) = session.register_attach_render_stream(stream)? else {
+        return Ok(());
+    };
+    wait_for_attach_event_client_close(stream);
+    Ok(())
+}
+
 fn attach_pane_snapshot(session: &Session) -> Option<String> {
     attach_pane_snapshot_with_regions(session).map(|snapshot| snapshot.text)
 }
@@ -2053,6 +2133,35 @@ fn format_attach_layout_snapshot_body(snapshot: &RenderedAttachSnapshot) -> Vec<
     let mut bytes = output.into_bytes();
     bytes.extend_from_slice(snapshot.text.as_bytes());
     bytes
+}
+
+fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
+    let context = session.status_context(&session.name)?;
+    let status = format_status_line(ATTACH_RENDER_STATUS_FORMAT, &context);
+    let snapshot = attach_pane_frame_with_regions(session)?;
+    Some(format_attach_render_frame_body(&status, &snapshot))
+}
+
+fn format_attach_render_frame_body(status: &str, snapshot: &RenderedAttachSnapshot) -> Vec<u8> {
+    let layout = format_attach_layout_snapshot_body(snapshot);
+    let mut body = String::new();
+    body.push_str("STATUS\t");
+    body.push_str(&status.len().to_string());
+    body.push('\n');
+
+    let mut bytes = body.into_bytes();
+    bytes.extend_from_slice(status.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&layout);
+    bytes
+}
+
+fn write_attach_render_frame(stream: &mut UnixStream, body: &[u8]) -> bool {
+    let header = format!("FRAME\t{}\n", body.len());
+    stream
+        .write_all(header.as_bytes())
+        .and_then(|_| stream.write_all(body))
+        .is_ok()
 }
 
 fn render_attach_layout(
@@ -2758,7 +2867,11 @@ fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
             let bytes = &buf[..n];
             append_history(&pane.raw_history, bytes);
             pane.terminal.lock().unwrap().apply_bytes(bytes);
-            notify_attach_redraw(&pane.attach_events);
+            if let Some(session) = pane.session() {
+                session.notify_attach_redraw();
+            } else {
+                notify_attach_redraw(&pane.attach_events);
+            }
             broadcast(&pane.clients, bytes);
         }
         shutdown_tracked_clients(&pane.clients);
@@ -2812,6 +2925,31 @@ fn notify_attach_redraw(clients: &AttachEventClients) {
     *clients = live;
 }
 
+fn notify_attach_render(
+    clients: &AttachRenderClients,
+    render_frame: impl FnOnce() -> Option<Vec<u8>>,
+) {
+    if clients.lock().unwrap().is_empty() {
+        return;
+    }
+    let frame = render_frame();
+    let Some(frame) = frame else {
+        return;
+    };
+    let mut clients = clients.lock().unwrap();
+    let mut live = Vec::with_capacity(clients.len());
+
+    for mut client in clients.drain(..) {
+        if write_attach_render_frame(&mut client.stream, &frame) {
+            live.push(client);
+        } else {
+            let _ = client.stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    *clients = live;
+}
+
 fn shutdown_tracked_clients(clients: &TrackedStreamClients) {
     let mut clients = clients.lock().unwrap();
     for client in clients.drain(..) {
@@ -2841,6 +2979,34 @@ fn register_attach_event_client(
     let mut client = stream.try_clone()?;
     client.set_nonblocking(true)?;
     if !write_attach_redraw_event(&mut client) {
+        return Ok(None);
+    }
+
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+    clients
+        .lock()
+        .unwrap()
+        .push(TrackedStream { id, stream: client });
+    Ok(Some(StreamRegistration {
+        clients: Arc::clone(clients),
+        id,
+    }))
+}
+
+fn register_attach_render_client(
+    clients: &AttachRenderClients,
+    next_id: &AtomicUsize,
+    stream: &UnixStream,
+    frame: Option<Vec<u8>>,
+) -> io::Result<Option<StreamRegistration>> {
+    let Some(frame) = frame else {
+        return Ok(None);
+    };
+
+    let mut client = stream.try_clone()?;
+    client.set_write_timeout(Some(std::time::Duration::from_millis(100)))?;
+    if !write_attach_render_frame(&mut client, &frame) {
+        let _ = client.shutdown(std::net::Shutdown::Both);
         return Ok(None);
     }
 
@@ -2953,6 +3119,60 @@ mod tests {
     }
 
     #[test]
+    fn notify_attach_render_does_not_build_frame_without_clients() {
+        let clients = Arc::new(Mutex::new(Vec::new()));
+        let called = std::sync::atomic::AtomicBool::new(false);
+
+        notify_attach_render(&clients, || {
+            called.store(true, Ordering::SeqCst);
+            Some(Vec::new())
+        });
+
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn notify_attach_render_shuts_down_failed_clients() {
+        let clients = Arc::new(Mutex::new(Vec::new()));
+        let (handler, mut client) = UnixStream::pair().unwrap();
+        let tracked = handler.try_clone().unwrap();
+        tracked.set_nonblocking(true).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        clients.lock().unwrap().push(tracked_stream(0, tracked));
+
+        notify_attach_render(&clients, || Some(vec![b'x'; 8 * 1024 * 1024]));
+
+        assert!(clients.lock().unwrap().is_empty());
+        let mut saw_eof = false;
+        let mut buf = [0_u8; 8192];
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) => {
+                    saw_eof = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("unexpected client read error: {error:?}"),
+            }
+        }
+        assert!(
+            saw_eof,
+            "failed render stream stayed open after write failure"
+        );
+        drop(handler);
+    }
+
+    #[test]
     fn notify_attach_redraw_registered_clients_are_nonblocking() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let next_id = AtomicUsize::new(0);
@@ -3003,7 +3223,11 @@ mod tests {
             attach_events: Arc::clone(&attach_events),
             session: Mutex::new(None),
         });
-        let session = Arc::new(Session::new(Arc::clone(&pane), Arc::clone(&attach_events)));
+        let session = Arc::new(Session::new(
+            "test".to_string(),
+            Arc::clone(&pane),
+            Arc::clone(&attach_events),
+        ));
         let state = Arc::new(ServerState {
             sessions: Mutex::new(HashMap::from([("test".to_string(), session)])),
             buffers: Mutex::new(BufferStore::new()),
@@ -3041,7 +3265,11 @@ mod tests {
             attach_events: Arc::clone(&attach_events),
             session: Mutex::new(None),
         });
-        let session = Arc::new(Session::new(Arc::clone(&pane), attach_events));
+        let session = Arc::new(Session::new(
+            "test".to_string(),
+            Arc::clone(&pane),
+            attach_events,
+        ));
         let state = Arc::new(ServerState {
             sessions: Mutex::new(HashMap::from([("test".to_string(), Arc::clone(&session))])),
             buffers: Mutex::new(BufferStore::new()),

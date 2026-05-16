@@ -42,6 +42,9 @@ pub enum Request {
     AttachEvents {
         session: String,
     },
+    AttachRender {
+        session: String,
+    },
     List,
     Capture {
         session: String,
@@ -155,6 +158,10 @@ pub fn encode_attach_layout_frame(session: &str) -> String {
 #[allow(dead_code)]
 pub fn encode_attach_events(session: &str) -> String {
     format!("ATTACH_EVENTS\t{session}\n")
+}
+
+pub fn encode_attach_render(session: &str) -> String {
+    format!("ATTACH_RENDER\t{session}\n")
 }
 
 pub fn encode_list() -> &'static str {
@@ -345,6 +352,9 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
         }),
         ["ATTACH_EVENTS", session] => Ok(Request::AttachEvents {
+            session: (*session).to_string(),
+        }),
+        ["ATTACH_RENDER", session] => Ok(Request::AttachRender {
             session: (*session).to_string(),
         }),
         ["CAPTURE", session] => Ok(Request::Capture {
@@ -1022,6 +1032,17 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::AttachEvents {
+                session: "dev".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_attach_render_request() {
+        let line = encode_attach_render("dev");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::AttachRender {
                 session: "dev".to_string(),
             }
         );
