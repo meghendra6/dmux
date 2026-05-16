@@ -1,6 +1,6 @@
 use crate::protocol::{
-    BufferSelection, CaptureMode, PaneDirection, PaneResizeDirection, PaneSelectTarget,
-    SplitDirection, WindowTarget,
+    BufferSelection, CaptureMode, PaneDirection, PaneResizeDirection, PaneSelectTarget, PaneTarget,
+    SplitDirection, Target, WindowTarget,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,12 +47,12 @@ pub enum Command {
         client_id: Option<usize>,
     },
     CapturePane {
-        session: String,
+        target: Target,
         mode: CaptureMode,
         selection: BufferSelection,
     },
     SaveBuffer {
-        session: String,
+        target: Target,
         buffer: Option<String>,
         mode: CaptureMode,
         selection: BufferSelection,
@@ -67,40 +67,40 @@ pub enum Command {
         format: Option<String>,
     },
     PasteBuffer {
-        session: String,
+        target: Target,
         buffer: Option<String>,
     },
     DeleteBuffer {
         buffer: String,
     },
     ResizePane {
-        session: String,
+        target: Target,
         resize: PaneResize,
     },
     SendKeys {
-        session: String,
+        target: Target,
         keys: Vec<String>,
     },
     SplitWindow {
-        session: String,
+        target: Target,
         direction: SplitDirection,
         command: Vec<String>,
     },
     ListPanes {
         session: String,
+        window: WindowTarget,
         format: Option<String>,
     },
     SelectPane {
         session: String,
+        window: WindowTarget,
         target: PaneSelectTarget,
     },
     KillPane {
-        session: String,
-        pane: Option<usize>,
+        target: Target,
     },
     RespawnPane {
-        session: String,
-        pane: Option<usize>,
+        target: Target,
         force: bool,
         command: Vec<String>,
     },
@@ -129,11 +129,10 @@ pub enum Command {
     },
     KillWindow {
         session: String,
-        window: Option<usize>,
+        target: WindowTarget,
     },
     ZoomPane {
-        session: String,
-        pane: Option<usize>,
+        target: Target,
     },
     StatusLine {
         session: String,
@@ -307,6 +306,11 @@ Commands:\n\
   kill-session -t <name>\n\
   kill-server\n\
 \n\
+Targets:\n\
+  <session>[:<window>[.<pane>]] where numeric values are indexes,\n\
+  @<id> selects a window id, %<id> selects a pane id, and =<name> selects a window name\n\
+  Session names cannot contain ':' because ':' separates structured targets\n\
+\n\
 Help:\n\
   dmux help attach\n\
   dmux attach --help\n"
@@ -460,7 +464,7 @@ fn parse_detach_client(args: Vec<String>) -> Result<Command, String> {
 }
 
 fn parse_capture(args: Vec<String>) -> Result<Command, String> {
-    let mut session = None;
+    let mut target = None;
     let mut mode = None;
     let mut start_line = None;
     let mut end_line = None;
@@ -474,7 +478,7 @@ fn parse_capture(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "capture-pane requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                target = Some(parse_structured_target(value, "capture-pane")?);
                 i += 2;
             }
             "-p" => {
@@ -531,7 +535,7 @@ fn parse_capture(args: Vec<String>) -> Result<Command, String> {
         parse_buffer_selection(start_line, end_line, search, match_index, "capture-pane")?;
 
     Ok(Command::CapturePane {
-        session: session.ok_or_else(|| "capture-pane requires -t <session>".to_string())?,
+        target: target.ok_or_else(|| "capture-pane requires -t <session>".to_string())?,
         mode: mode.unwrap_or(CaptureMode::All),
         selection,
     })
@@ -546,7 +550,7 @@ fn set_capture_mode(mode: &mut Option<CaptureMode>, value: CaptureMode) -> Resul
 }
 
 fn parse_save_buffer(args: Vec<String>) -> Result<Command, String> {
-    let mut session = None;
+    let mut target = None;
     let mut buffer = None;
     let mut mode = None;
     let mut start_line = None;
@@ -561,7 +565,7 @@ fn parse_save_buffer(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "save-buffer requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                target = Some(parse_structured_target(value, "save-buffer")?);
                 i += 2;
             }
             "-b" => {
@@ -622,7 +626,7 @@ fn parse_save_buffer(args: Vec<String>) -> Result<Command, String> {
         parse_buffer_selection(start_line, end_line, search, match_index, "save-buffer")?;
 
     Ok(Command::SaveBuffer {
-        session: session.ok_or_else(|| "save-buffer requires -t <session>".to_string())?,
+        target: target.ok_or_else(|| "save-buffer requires -t <session>".to_string())?,
         buffer,
         mode: mode.unwrap_or(CaptureMode::All),
         selection,
@@ -748,7 +752,7 @@ fn parse_list_buffers(args: Vec<String>) -> Result<Command, String> {
 }
 
 fn parse_paste_buffer(args: Vec<String>) -> Result<Command, String> {
-    let mut session = None;
+    let mut target = None;
     let mut buffer = None;
     let mut i = 0;
 
@@ -758,7 +762,7 @@ fn parse_paste_buffer(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "paste-buffer requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                target = Some(parse_structured_target(value, "paste-buffer")?);
                 i += 2;
             }
             "-b" => {
@@ -773,7 +777,7 @@ fn parse_paste_buffer(args: Vec<String>) -> Result<Command, String> {
     }
 
     Ok(Command::PasteBuffer {
-        session: session.ok_or_else(|| "paste-buffer requires -t <session>".to_string())?,
+        target: target.ok_or_else(|| "paste-buffer requires -t <session>".to_string())?,
         buffer,
     })
 }
@@ -831,7 +835,7 @@ fn parse_kill_session(args: Vec<String>) -> Result<Command, String> {
 }
 
 fn parse_resize_pane(args: Vec<String>) -> Result<Command, String> {
-    let mut session = None;
+    let mut target = None;
     let mut cols = None;
     let mut rows = None;
     let mut directional = None;
@@ -843,7 +847,7 @@ fn parse_resize_pane(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "resize-pane requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                target = Some(parse_structured_target(value, "resize-pane")?);
                 i += 2;
             }
             "-x" => {
@@ -899,24 +903,29 @@ fn parse_resize_pane(args: Vec<String>) -> Result<Command, String> {
         }
     }
 
-    let session = session.ok_or_else(|| "resize-pane requires -t <session>".to_string())?;
+    let target = target.ok_or_else(|| "resize-pane requires -t <session>".to_string())?;
     if directional.is_some() && (cols.is_some() || rows.is_some()) {
         return Err("resize-pane accepts either -x/-y or one of -L/-R/-U/-D".to_string());
     }
     let resize = if let Some(resize) = directional {
         resize
     } else {
+        if target.window != WindowTarget::Active || target.pane != PaneTarget::Active {
+            return Err(
+                "resize-pane -x/-y does not accept an explicit window or pane target".to_string(),
+            );
+        }
         PaneResize::Absolute {
             cols: cols.ok_or_else(|| "resize-pane requires -x <cols>".to_string())?,
             rows: rows.ok_or_else(|| "resize-pane requires -y <rows>".to_string())?,
         }
     };
 
-    Ok(Command::ResizePane { session, resize })
+    Ok(Command::ResizePane { target, resize })
 }
 
 fn parse_send_keys(args: Vec<String>) -> Result<Command, String> {
-    let mut session = None;
+    let mut target = None;
     let mut keys = Vec::new();
     let mut i = 0;
 
@@ -926,7 +935,7 @@ fn parse_send_keys(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "send-keys requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                target = Some(parse_structured_target(value, "send-keys")?);
                 i += 2;
             }
             value if value.starts_with('-') => {
@@ -944,13 +953,13 @@ fn parse_send_keys(args: Vec<String>) -> Result<Command, String> {
     }
 
     Ok(Command::SendKeys {
-        session: session.ok_or_else(|| "send-keys requires -t <session>".to_string())?,
+        target: target.ok_or_else(|| "send-keys requires -t <session>".to_string())?,
         keys,
     })
 }
 
 fn parse_split_window(args: Vec<String>) -> Result<Command, String> {
-    let mut session = None;
+    let mut target = None;
     let mut direction = None;
     let mut command = Vec::new();
     let mut i = 0;
@@ -961,7 +970,7 @@ fn parse_split_window(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "split-window requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                target = Some(parse_structured_target(value, "split-window")?);
                 i += 2;
             }
             "-h" => {
@@ -987,7 +996,7 @@ fn parse_split_window(args: Vec<String>) -> Result<Command, String> {
     }
 
     Ok(Command::SplitWindow {
-        session: session.ok_or_else(|| "split-window requires -t <session>".to_string())?,
+        target: target.ok_or_else(|| "split-window requires -t <session>".to_string())?,
         direction: direction.ok_or_else(|| "split-window requires one of -h or -v".to_string())?,
         command,
     })
@@ -995,6 +1004,7 @@ fn parse_split_window(args: Vec<String>) -> Result<Command, String> {
 
 fn parse_list_panes(args: Vec<String>) -> Result<Command, String> {
     let mut session = None;
+    let mut window = WindowTarget::Active;
     let mut format = None;
     let mut i = 0;
 
@@ -1004,7 +1014,12 @@ fn parse_list_panes(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "list-panes requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                let target = parse_structured_target(value, "list-panes")?;
+                if target.pane != PaneTarget::Active {
+                    return Err("list-panes target must not include a pane".to_string());
+                }
+                session = Some(target.session);
+                window = target.window;
                 i += 2;
             }
             "-F" => {
@@ -1020,12 +1035,14 @@ fn parse_list_panes(args: Vec<String>) -> Result<Command, String> {
 
     Ok(Command::ListPanes {
         session: session.ok_or_else(|| "list-panes requires -t <session>".to_string())?,
+        window,
         format,
     })
 }
 
 fn parse_select_pane(args: Vec<String>) -> Result<Command, String> {
     let mut session = None;
+    let mut window = WindowTarget::Active;
     let mut target = None;
     let mut i = 0;
 
@@ -1035,7 +1052,18 @@ fn parse_select_pane(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "select-pane requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                let parsed = parse_structured_target(value, "select-pane")?;
+                session = Some(parsed.session);
+                window = parsed.window;
+                match parsed.pane {
+                    PaneTarget::Active => {}
+                    PaneTarget::Index(index) => {
+                        set_pane_select_target(&mut target, PaneSelectTarget::Index(index))?;
+                    }
+                    PaneTarget::Id(id) => {
+                        set_pane_select_target(&mut target, PaneSelectTarget::Id(id))?;
+                    }
+                }
                 i += 2;
             }
             "-p" => {
@@ -1079,6 +1107,7 @@ fn parse_select_pane(args: Vec<String>) -> Result<Command, String> {
 
     Ok(Command::SelectPane {
         session: session.ok_or_else(|| "select-pane requires -t <session>".to_string())?,
+        window,
         target: target.ok_or_else(|| {
             "select-pane requires one of -p <index>, --pane-id <id>, or -L/-R/-U/-D".to_string()
         })?,
@@ -1097,7 +1126,7 @@ fn set_pane_select_target(
 }
 
 fn parse_kill_pane(args: Vec<String>) -> Result<Command, String> {
-    let mut session = None;
+    let mut target = None;
     let mut pane = None;
     let mut i = 0;
 
@@ -1107,7 +1136,7 @@ fn parse_kill_pane(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "kill-pane requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                target = Some(parse_structured_target(value, "kill-pane")?);
                 i += 2;
             }
             "-p" => {
@@ -1126,13 +1155,16 @@ fn parse_kill_pane(args: Vec<String>) -> Result<Command, String> {
     }
 
     Ok(Command::KillPane {
-        session: session.ok_or_else(|| "kill-pane requires -t <session>".to_string())?,
-        pane,
+        target: apply_pane_index_target(
+            target.ok_or_else(|| "kill-pane requires -t <session>".to_string())?,
+            pane,
+            "kill-pane",
+        )?,
     })
 }
 
 fn parse_respawn_pane(args: Vec<String>) -> Result<Command, String> {
-    let mut session = None;
+    let mut target = None;
     let mut pane = None;
     let mut force = false;
     let mut command = Vec::new();
@@ -1144,7 +1176,7 @@ fn parse_respawn_pane(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "respawn-pane requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                target = Some(parse_structured_target(value, "respawn-pane")?);
                 i += 2;
             }
             "-p" => {
@@ -1170,8 +1202,11 @@ fn parse_respawn_pane(args: Vec<String>) -> Result<Command, String> {
     }
 
     Ok(Command::RespawnPane {
-        session: session.ok_or_else(|| "respawn-pane requires -t <session>".to_string())?,
-        pane,
+        target: apply_pane_index_target(
+            target.ok_or_else(|| "respawn-pane requires -t <session>".to_string())?,
+            pane,
+            "respawn-pane",
+        )?,
         force,
         command,
     })
@@ -1432,7 +1467,7 @@ fn parse_kill_window(
     index_flags: &[&str],
 ) -> Result<Command, String> {
     let mut session = None;
-    let mut window = None;
+    let mut target = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -1441,7 +1476,14 @@ fn parse_kill_window(
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| format!("{command_name} requires a session name after -t"))?;
-                session = Some(value.clone());
+                let parsed = parse_structured_target(value, command_name)?;
+                if parsed.pane != PaneTarget::Active {
+                    return Err(format!("{command_name} target must not include a pane"));
+                }
+                session = Some(parsed.session);
+                if parsed.window != WindowTarget::Active {
+                    target = Some(parsed.window);
+                }
                 i += 2;
             }
             value if index_flags.contains(&value) => {
@@ -1451,9 +1493,33 @@ fn parse_kill_window(
                         args[i]
                     )
                 })?;
-                window = Some(value.parse::<usize>().map_err(|_| {
-                    format!("{command_name} {} must be a non-negative integer", args[i])
-                })?);
+                set_window_target(
+                    &mut target,
+                    WindowTarget::Index(value.parse::<usize>().map_err(|_| {
+                        format!("{command_name} {} must be a non-negative integer", args[i])
+                    })?),
+                    command_name,
+                )?;
+                i += 2;
+            }
+            "--window-id" | "--tab-id" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    format!("{command_name} requires a window id after {}", args[i])
+                })?;
+                set_window_target(
+                    &mut target,
+                    WindowTarget::Id(value.parse::<usize>().map_err(|_| {
+                        format!("{command_name} {} must be a non-negative integer", args[i])
+                    })?),
+                    command_name,
+                )?;
+                i += 2;
+            }
+            "-n" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command_name} requires a window name after -n"))?;
+                set_window_target(&mut target, WindowTarget::Name(value.clone()), command_name)?;
                 i += 2;
             }
             value => {
@@ -1466,12 +1532,12 @@ fn parse_kill_window(
 
     Ok(Command::KillWindow {
         session: session.ok_or_else(|| format!("{command_name} requires -t <session>"))?,
-        window,
+        target: target.unwrap_or(WindowTarget::Active),
     })
 }
 
 fn parse_zoom_pane(args: Vec<String>) -> Result<Command, String> {
-    let mut session = None;
+    let mut target = None;
     let mut pane = None;
     let mut i = 0;
 
@@ -1481,7 +1547,7 @@ fn parse_zoom_pane(args: Vec<String>) -> Result<Command, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| "zoom-pane requires a session name after -t".to_string())?;
-                session = Some(value.clone());
+                target = Some(parse_structured_target(value, "zoom-pane")?);
                 i += 2;
             }
             "-p" => {
@@ -1500,8 +1566,11 @@ fn parse_zoom_pane(args: Vec<String>) -> Result<Command, String> {
     }
 
     Ok(Command::ZoomPane {
-        session: session.ok_or_else(|| "zoom-pane requires -t <session>".to_string())?,
-        pane,
+        target: apply_pane_index_target(
+            target.ok_or_else(|| "zoom-pane requires -t <session>".to_string())?,
+            pane,
+            "zoom-pane",
+        )?,
     })
 }
 
@@ -1605,9 +1674,97 @@ fn parse_target(args: Vec<String>, command: &str) -> Result<Option<String>, Stri
     Ok(target)
 }
 
+fn parse_structured_target(value: &str, command: &str) -> Result<Target, String> {
+    let (session, rest) = value
+        .split_once(':')
+        .map_or((value, None), |(session, rest)| (session, Some(rest)));
+    if session.is_empty() {
+        return Err(format!("{command} target requires a session name"));
+    }
+    let mut target = Target::active(session.to_string());
+    let Some(rest) = rest else {
+        return Ok(target);
+    };
+    if rest.is_empty() {
+        return Err(format!(
+            "{command} target requires a window or pane after ':'"
+        ));
+    }
+    let (window, pane) = rest
+        .split_once('.')
+        .map_or((rest, None), |(window, pane)| (window, Some(pane)));
+    if pane.is_none()
+        && !window.starts_with('@')
+        && !window.starts_with('=')
+        && window.parse::<usize>().is_err()
+    {
+        return Ok(Target::active(value.to_string()));
+    }
+    if !window.is_empty() {
+        target.window = parse_window_target_token(window, command)?;
+    }
+    if let Some(pane) = pane {
+        if pane.is_empty() {
+            return Err(format!("{command} target requires a pane after '.'"));
+        }
+        target.pane = parse_pane_target_token(pane, command)?;
+    }
+    Ok(target)
+}
+
+fn parse_window_target_token(value: &str, command: &str) -> Result<WindowTarget, String> {
+    if let Some(id) = value.strip_prefix('@') {
+        return id
+            .parse::<usize>()
+            .map(WindowTarget::Id)
+            .map_err(|_| format!("{command} target has invalid window id"));
+    }
+    if let Some(name) = value.strip_prefix('=') {
+        if name.is_empty() {
+            return Err(format!("{command} target has invalid window name"));
+        }
+        return Ok(WindowTarget::Name(name.to_string()));
+    }
+    if let Ok(index) = value.parse::<usize>() {
+        return Ok(WindowTarget::Index(index));
+    }
+    Ok(WindowTarget::Name(value.to_string()))
+}
+
+fn parse_pane_target_token(value: &str, command: &str) -> Result<PaneTarget, String> {
+    if let Some(id) = value.strip_prefix('%') {
+        return id
+            .parse::<usize>()
+            .map(PaneTarget::Id)
+            .map_err(|_| format!("{command} target has invalid pane id"));
+    }
+    value
+        .parse::<usize>()
+        .map(PaneTarget::Index)
+        .map_err(|_| format!("{command} target has invalid pane index"))
+}
+
+fn apply_pane_index_target(
+    mut target: Target,
+    pane: Option<usize>,
+    command: &str,
+) -> Result<Target, String> {
+    if let Some(index) = pane {
+        if target.pane != PaneTarget::Active {
+            return Err(format!("{command} accepts exactly one pane target"));
+        }
+        target.pane = PaneTarget::Index(index);
+    }
+    Ok(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_target(session: &str) -> Target {
+        Target::active(session.to_string())
+    }
 
     #[test]
     fn parses_detached_new_session_with_command() {
@@ -1729,7 +1886,7 @@ mod tests {
         assert_eq!(
             command,
             Command::CapturePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::All,
                 selection: BufferSelection::All,
             }
@@ -1742,7 +1899,7 @@ mod tests {
         assert_eq!(
             command,
             Command::CapturePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::Screen,
                 selection: BufferSelection::All,
             }
@@ -1755,7 +1912,7 @@ mod tests {
         assert_eq!(
             command,
             Command::CapturePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::History,
                 selection: BufferSelection::All,
             }
@@ -1768,7 +1925,7 @@ mod tests {
         assert_eq!(
             command,
             Command::CapturePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::All,
                 selection: BufferSelection::All,
             }
@@ -1792,7 +1949,7 @@ mod tests {
         assert_eq!(
             command,
             Command::CapturePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::All,
                 selection: BufferSelection::LineRange { start: -2, end: -1 },
             }
@@ -1816,7 +1973,7 @@ mod tests {
         assert_eq!(
             command,
             Command::CapturePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::All,
                 selection: BufferSelection::LineRange { start: 2, end: -1 },
             }
@@ -1841,7 +1998,7 @@ mod tests {
         assert_eq!(
             command,
             Command::CapturePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 mode: CaptureMode::Screen,
                 selection: BufferSelection::Search {
                     needle: "needle".to_string(),
@@ -1905,7 +2062,7 @@ mod tests {
         assert_eq!(
             command,
             Command::SaveBuffer {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 buffer: Some("saved".to_string()),
                 mode: CaptureMode::Screen,
                 selection: BufferSelection::All,
@@ -1932,7 +2089,7 @@ mod tests {
         assert_eq!(
             command,
             Command::SaveBuffer {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 buffer: Some("picked".to_string()),
                 mode: CaptureMode::Screen,
                 selection: BufferSelection::LineRange { start: 2, end: 3 },
@@ -1959,7 +2116,7 @@ mod tests {
         assert_eq!(
             command,
             Command::SaveBuffer {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 buffer: Some("picked".to_string()),
                 mode: CaptureMode::Screen,
                 selection: BufferSelection::LineRange { start: 2, end: -1 },
@@ -1983,7 +2140,7 @@ mod tests {
         assert_eq!(
             command,
             Command::SaveBuffer {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 buffer: Some("match".to_string()),
                 mode: CaptureMode::All,
                 selection: BufferSelection::Search {
@@ -2116,7 +2273,7 @@ mod tests {
         assert_eq!(
             command,
             Command::PasteBuffer {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 buffer: Some("saved".to_string()),
             }
         );
@@ -2151,7 +2308,7 @@ mod tests {
         assert_eq!(
             command,
             Command::ResizePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 resize: PaneResize::Absolute {
                     cols: 100,
                     rows: 40
@@ -2166,7 +2323,7 @@ mod tests {
         assert_eq!(
             command,
             Command::ResizePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 resize: PaneResize::Directional {
                     direction: PaneResizeDirection::Left,
                     amount: 1,
@@ -2181,7 +2338,7 @@ mod tests {
         assert_eq!(
             command,
             Command::ResizePane {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 resize: PaneResize::Directional {
                     direction: PaneResizeDirection::Down,
                     amount: 5,
@@ -2219,8 +2376,42 @@ mod tests {
         assert_eq!(
             command,
             Command::SendKeys {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 keys: vec!["echo hi".to_string(), "Enter".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_structured_pane_target() {
+        let command = parse_args(["dmux", "send-keys", "-t", "dev:@7.%42", "Enter"]).unwrap();
+        assert_eq!(
+            command,
+            Command::SendKeys {
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Id(7),
+                    pane: PaneTarget::Id(42),
+                },
+                keys: vec!["Enter".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_structured_pane_target() {
+        let err = parse_args(["dmux", "send-keys", "-t", "dev:1.bad", "Enter"]).unwrap_err();
+        assert!(err.contains("invalid pane index"), "{err}");
+    }
+
+    #[test]
+    fn preserves_colon_session_name_without_structured_target() {
+        let command = parse_args(["dmux", "send-keys", "-t", "dev:api", "Enter"]).unwrap();
+        assert_eq!(
+            command,
+            Command::SendKeys {
+                target: Target::active("dev:api".to_string()),
+                keys: vec!["Enter".to_string()],
             }
         );
     }
@@ -2243,9 +2434,27 @@ mod tests {
         assert_eq!(
             command,
             Command::SplitWindow {
-                session: "dev".to_string(),
+                target: active_target("dev"),
                 direction: crate::protocol::SplitDirection::Horizontal,
                 command: vec!["sh".to_string(), "-c".to_string(), "echo split".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_split_window_structured_target() {
+        let command = parse_args(["dmux", "split-window", "-t", "dev:1.%7", "-v"]).unwrap();
+
+        assert_eq!(
+            command,
+            Command::SplitWindow {
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(1),
+                    pane: PaneTarget::Id(7),
+                },
+                direction: crate::protocol::SplitDirection::Vertical,
+                command: Vec::new(),
             }
         );
     }
@@ -2257,6 +2466,7 @@ mod tests {
             command,
             Command::ListPanes {
                 session: "dev".to_string(),
+                window: WindowTarget::Active,
                 format: None,
             }
         );
@@ -2277,6 +2487,7 @@ mod tests {
             command,
             Command::ListPanes {
                 session: "dev".to_string(),
+                window: WindowTarget::Active,
                 format: Some("#{pane.index}:#{pane.active}:#{pane.zoomed}".to_string()),
             }
         );
@@ -2289,6 +2500,7 @@ mod tests {
             command,
             Command::SelectPane {
                 session: "dev".to_string(),
+                window: WindowTarget::Active,
                 target: PaneSelectTarget::Index(1),
             }
         );
@@ -2301,6 +2513,7 @@ mod tests {
             command,
             Command::SelectPane {
                 session: "dev".to_string(),
+                window: WindowTarget::Active,
                 target: PaneSelectTarget::Id(42),
             }
         );
@@ -2313,6 +2526,7 @@ mod tests {
             command,
             Command::SelectPane {
                 session: "dev".to_string(),
+                window: WindowTarget::Active,
                 target: PaneSelectTarget::Direction(PaneDirection::Left),
             }
         );
@@ -2349,8 +2563,11 @@ mod tests {
         assert_eq!(
             command,
             Command::KillPane {
-                session: "dev".to_string(),
-                pane: Some(1),
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Active,
+                    pane: PaneTarget::Index(1),
+                },
             }
         );
     }
@@ -2361,8 +2578,7 @@ mod tests {
         assert_eq!(
             command,
             Command::KillPane {
-                session: "dev".to_string(),
-                pane: None,
+                target: active_target("dev"),
             }
         );
     }
@@ -2386,8 +2602,11 @@ mod tests {
         assert_eq!(
             command,
             Command::RespawnPane {
-                session: "dev".to_string(),
-                pane: Some(1),
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Active,
+                    pane: PaneTarget::Index(1),
+                },
                 force: true,
                 command: vec!["sh".to_string(), "-c".to_string(), "echo ready".to_string()],
             }
@@ -2576,7 +2795,7 @@ mod tests {
             command,
             Command::KillWindow {
                 session: "dev".to_string(),
-                window: Some(1),
+                target: WindowTarget::Index(1),
             }
         );
     }
@@ -2588,7 +2807,7 @@ mod tests {
             command,
             Command::KillWindow {
                 session: "dev".to_string(),
-                window: Some(1),
+                target: WindowTarget::Index(1),
             }
         );
     }
@@ -2600,7 +2819,7 @@ mod tests {
             command,
             Command::KillWindow {
                 session: "dev".to_string(),
-                window: None,
+                target: WindowTarget::Active,
             }
         );
     }
@@ -2611,8 +2830,7 @@ mod tests {
         assert_eq!(
             command,
             Command::ZoomPane {
-                session: "dev".to_string(),
-                pane: None,
+                target: active_target("dev"),
             }
         );
     }
@@ -2623,8 +2841,11 @@ mod tests {
         assert_eq!(
             command,
             Command::ZoomPane {
-                session: "dev".to_string(),
-                pane: Some(0),
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Active,
+                    pane: PaneTarget::Index(0),
+                },
             }
         );
     }

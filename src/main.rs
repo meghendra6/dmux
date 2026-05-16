@@ -96,7 +96,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         cli::Command::CapturePane {
-            session,
+            target,
             mode,
             selection,
         } => {
@@ -104,14 +104,14 @@ fn run() -> Result<(), String> {
             ensure_server(&socket)?;
             let body = send_request(
                 &socket,
-                &protocol::encode_capture_with_selection(&session, mode, selection),
+                &protocol::encode_capture_target(&target, mode, selection),
                 true,
             )?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
         cli::Command::SaveBuffer {
-            session,
+            target,
             buffer,
             mode,
             selection,
@@ -120,7 +120,7 @@ fn run() -> Result<(), String> {
             ensure_server(&socket)?;
             let body = send_request(
                 &socket,
-                &protocol::encode_save_buffer(&session, buffer.as_deref(), mode, selection),
+                &protocol::encode_save_buffer_target(&target, buffer.as_deref(), mode, selection),
                 true,
             )?;
             print!("{}", String::from_utf8_lossy(&body));
@@ -150,12 +150,12 @@ fn run() -> Result<(), String> {
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
-        cli::Command::PasteBuffer { session, buffer } => {
+        cli::Command::PasteBuffer { target, buffer } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
             send_request(
                 &socket,
-                &protocol::encode_paste_buffer(&session, buffer.as_deref()),
+                &protocol::encode_paste_buffer_target(&target, buffer.as_deref()),
                 true,
             )?;
             Ok(())
@@ -166,29 +166,33 @@ fn run() -> Result<(), String> {
             send_request(&socket, &protocol::encode_delete_buffer(&buffer), true)?;
             Ok(())
         }
-        cli::Command::ResizePane { session, resize } => {
+        cli::Command::ResizePane { target, resize } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
             let request = match resize {
                 cli::PaneResize::Absolute { cols, rows } => {
-                    protocol::encode_resize(&session, cols, rows)
+                    protocol::encode_resize(&target.session, cols, rows)
                 }
                 cli::PaneResize::Directional { direction, amount } => {
-                    protocol::encode_resize_pane(&session, direction, amount)
+                    protocol::encode_resize_pane_target(&target, direction, amount)
                 }
             };
             send_request(&socket, &request, true)?;
             Ok(())
         }
-        cli::Command::SendKeys { session, keys } => {
+        cli::Command::SendKeys { target, keys } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
             let bytes = encode_key_tokens(&keys)?;
-            send_request(&socket, &protocol::encode_send(&session, &bytes), true)?;
+            send_request(
+                &socket,
+                &protocol::encode_send_target(&target, &bytes),
+                true,
+            )?;
             Ok(())
         }
         cli::Command::SplitWindow {
-            session,
+            target,
             direction,
             command,
         } => {
@@ -196,41 +200,48 @@ fn run() -> Result<(), String> {
             ensure_server(&socket)?;
             send_request(
                 &socket,
-                &protocol::encode_split(&session, direction, &command),
+                &protocol::encode_split_target(&target, direction, &command),
                 true,
             )?;
             Ok(())
         }
-        cli::Command::ListPanes { session, format } => {
+        cli::Command::ListPanes {
+            session,
+            window,
+            format,
+        } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
             let body = send_request(
                 &socket,
-                &protocol::encode_list_panes(&session, format.as_deref()),
+                &protocol::encode_list_panes_target(&session, window, format.as_deref()),
                 true,
             )?;
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
-        cli::Command::SelectPane { session, target } => {
+        cli::Command::SelectPane {
+            session,
+            window,
+            target,
+        } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
             send_request(
                 &socket,
-                &protocol::encode_select_pane_target(&session, target),
+                &protocol::encode_select_pane_in_window(&session, window, target),
                 true,
             )?;
             Ok(())
         }
-        cli::Command::KillPane { session, pane } => {
+        cli::Command::KillPane { target } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            send_request(&socket, &protocol::encode_kill_pane(&session, pane), true)?;
+            send_request(&socket, &protocol::encode_kill_pane_target(&target), true)?;
             Ok(())
         }
         cli::Command::RespawnPane {
-            session,
-            pane,
+            target,
             force,
             command,
         } => {
@@ -238,7 +249,7 @@ fn run() -> Result<(), String> {
             ensure_server(&socket)?;
             send_request(
                 &socket,
-                &protocol::encode_respawn_pane(&session, pane, force, &command),
+                &protocol::encode_respawn_pane_target(&target, force, &command),
                 true,
             )?;
             Ok(())
@@ -301,20 +312,20 @@ fn run() -> Result<(), String> {
             send_request(&socket, &protocol::encode_previous_window(&session), true)?;
             Ok(())
         }
-        cli::Command::KillWindow { session, window } => {
+        cli::Command::KillWindow { session, target } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
             send_request(
                 &socket,
-                &protocol::encode_kill_window(&session, window),
+                &protocol::encode_kill_window_target(&session, target),
                 true,
             )?;
             Ok(())
         }
-        cli::Command::ZoomPane { session, pane } => {
+        cli::Command::ZoomPane { target } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            send_request(&socket, &protocol::encode_zoom_pane(&session, pane), true)?;
+            send_request(&socket, &protocol::encode_zoom_pane_target(&target), true)?;
             Ok(())
         }
         cli::Command::StatusLine { session, format } => {

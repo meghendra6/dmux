@@ -2,7 +2,7 @@ use crate::ids::{PaneId, TabId};
 use crate::layout::{LayoutNode, PaneRegion, layout_regions_for_size, split_extent_weighted};
 use crate::protocol::{
     self, BufferSelection, CaptureMode, PaneDirection, PaneResizeDirection, PaneSelectTarget,
-    Request, SplitDirection, WindowTarget,
+    PaneTarget, Request, SplitDirection, Target, WindowTarget,
 };
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::{TerminalChanges, TerminalState};
@@ -492,12 +492,55 @@ impl Session {
         self.windows.lock().unwrap().active_live_pane()
     }
 
-    fn add_pane(&self, direction: SplitDirection, pane: Arc<Pane>) {
-        self.windows.lock().unwrap().add_pane(direction, pane);
+    fn target_pane(&self, target: &Target) -> Result<Arc<Pane>, String> {
+        self.windows
+            .lock()
+            .unwrap()
+            .pane(target.window.clone(), target.pane.clone())
     }
 
-    fn next_split_pane_size(&self, direction: SplitDirection) -> Option<PtySize> {
-        self.windows.lock().unwrap().next_split_pane_size(direction)
+    fn target_live_pane(&self, target: &Target) -> Result<Arc<Pane>, String> {
+        self.windows
+            .lock()
+            .unwrap()
+            .live_pane(target.window.clone(), target.pane.clone())
+    }
+
+    fn add_pane(
+        &self,
+        target: &Target,
+        direction: SplitDirection,
+        pane: Arc<Pane>,
+    ) -> Result<(), String> {
+        self.windows.lock().unwrap().add_pane(
+            target.window.clone(),
+            target.pane.clone(),
+            direction,
+            pane,
+        )
+    }
+
+    fn next_split_pane_size(
+        &self,
+        target: &Target,
+        direction: SplitDirection,
+    ) -> Result<PtySize, String> {
+        self.windows.lock().unwrap().next_split_pane_size(
+            target.window.clone(),
+            target.pane.clone(),
+            direction,
+        )
+    }
+
+    fn target_is_active_window(&self, target: &Target) -> Result<bool, String> {
+        self.windows
+            .lock()
+            .unwrap()
+            .target_is_active_window(target.window.clone())
+    }
+
+    fn window_is_active(&self, window: WindowTarget) -> Result<bool, String> {
+        self.windows.lock().unwrap().target_is_active_window(window)
     }
 
     fn resize_visible_panes(&self, size: PtySize) -> io::Result<bool> {
@@ -512,15 +555,29 @@ impl Session {
         resize_panes(pane_resizes)
     }
 
-    fn resize_active_pane(
+    fn visible_pane_resizes_for_window(
         &self,
-        direction: PaneResizeDirection,
-        amount: usize,
+        window: WindowTarget,
     ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        let size = *self.current_size.lock().unwrap();
         self.windows
             .lock()
             .unwrap()
-            .resize_active_pane(direction, amount)
+            .resize_visible_panes_for_window(window, size)
+    }
+
+    fn resize_pane(
+        &self,
+        target: &Target,
+        direction: PaneResizeDirection,
+        amount: usize,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        self.windows.lock().unwrap().resize_pane(
+            target.window.clone(),
+            target.pane.clone(),
+            direction,
+            amount,
+        )
     }
 
     fn active_window_size(&self) -> Option<PtySize> {
@@ -528,28 +585,33 @@ impl Session {
         Some(*self.current_size.lock().unwrap())
     }
 
-    fn select_pane(&self, target: PaneSelectTarget) -> Result<(), String> {
-        self.windows.lock().unwrap().select_pane(target)
+    fn select_pane(&self, window: WindowTarget, target: PaneSelectTarget) -> Result<bool, String> {
+        self.windows.lock().unwrap().select_pane(window, target)
     }
 
-    fn kill_pane(&self, target: Option<usize>) -> Result<Arc<Pane>, String> {
-        self.windows.lock().unwrap().kill_pane(target)
+    fn kill_pane(&self, target: &Target) -> Result<Arc<Pane>, String> {
+        self.windows
+            .lock()
+            .unwrap()
+            .kill_pane(target.window.clone(), target.pane.clone())
     }
 
     fn respawn_pane(
         self: &Arc<Self>,
-        target: Option<usize>,
+        target: &Target,
         command: Vec<String>,
         force: bool,
     ) -> Result<Option<i32>, String> {
         let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
         let session_name = self.name();
         let attach_events = self.attach_event_clients();
-        let (id, size, old_pid) = self
-            .windows
-            .lock()
-            .unwrap()
-            .prepare_respawn_pane(target, force)?;
+        let reconnect_live_raw =
+            self.target_is_active_window(target)? && !has_attach_pane_snapshot(self);
+        let (id, size, old_pid) = self.windows.lock().unwrap().prepare_respawn_pane(
+            target.window.clone(),
+            target.pane.clone(),
+            force,
+        )?;
         let pane = spawn_pane(
             id,
             session_name,
@@ -560,11 +622,11 @@ impl Session {
             Some(Arc::downgrade(self)),
         )
         .map_err(|err| err.to_string())?;
-        if let Err(message) = self
-            .windows
-            .lock()
-            .unwrap()
-            .replace_pane(id, Arc::clone(&pane))
+        if let Err(message) =
+            self.windows
+                .lock()
+                .unwrap()
+                .replace_pane(target.window.clone(), id, Arc::clone(&pane))
         {
             terminate_pane_if_running_async(&pane);
             return Err(message);
@@ -573,14 +635,25 @@ impl Session {
         if !pane.is_running() {
             self.mark_pane_exited(&pane);
         }
-        if let Err(error) = self.resize_current_visible_panes() {
+        let pane_resizes = match self.visible_pane_resizes_for_window(target.window.clone()) {
+            Ok(pane_resizes) => pane_resizes,
+            Err(message) => {
+                if let Some(pid) = old_pid {
+                    terminate_pane_async(pid);
+                }
+                return Err(message);
+            }
+        };
+        if let Err(error) = resize_panes(pane_resizes) {
             if let Some(pid) = old_pid {
                 terminate_pane_async(pid);
             }
             return Err(error.to_string());
         }
         self.notify_attach_redraw_immediate();
-        self.reconnect_raw_attach_streams();
+        if reconnect_live_raw {
+            self.reconnect_raw_attach_streams();
+        }
         Ok(old_pid)
     }
 
@@ -592,8 +665,19 @@ impl Session {
         }
     }
 
+    #[allow(dead_code)]
     fn pane_descriptions(&self) -> Vec<PaneDescription> {
         self.windows.lock().unwrap().pane_descriptions()
+    }
+
+    fn pane_descriptions_for_window(
+        &self,
+        target: WindowTarget,
+    ) -> Result<Vec<PaneDescription>, String> {
+        self.windows
+            .lock()
+            .unwrap()
+            .pane_descriptions_for_window(target)
     }
 
     fn panes(&self) -> Vec<Arc<Pane>> {
@@ -628,12 +712,15 @@ impl Session {
         self.windows.lock().unwrap().window_descriptions()
     }
 
-    fn kill_window(&self, target: Option<usize>) -> Result<(), String> {
+    fn kill_window(&self, target: WindowTarget) -> Result<(), String> {
         self.windows.lock().unwrap().kill_window(target)
     }
 
-    fn zoom_pane(&self, target: Option<usize>) -> Result<(), String> {
-        self.windows.lock().unwrap().zoom_pane(target)
+    fn zoom_pane(&self, target: &Target) -> Result<bool, String> {
+        self.windows
+            .lock()
+            .unwrap()
+            .zoom_pane(target.window.clone(), target.pane.clone())
     }
 
     fn status_context(&self) -> Option<StatusContext> {
@@ -835,6 +922,13 @@ impl Session {
         self.close_raw_attach_streams();
     }
 
+    fn reconnect_live_raw_pane_streams(&self) {
+        self.mark_raw_attach_layout_transition();
+        for pane in self.panes() {
+            shutdown_tracked_clients(&pane.clients);
+        }
+    }
+
     fn close_raw_attach_streams(&self) {
         shutdown_tracked_clients(&self.attach_streams);
         for pane in self.panes() {
@@ -879,8 +973,45 @@ impl Window {
         self.panes.active().filter(|pane| pane.is_running())
     }
 
+    fn pane(&self, target: PaneTarget) -> Result<Arc<Pane>, String> {
+        let index = self.resolve_pane_target(target)?;
+        self.panes
+            .get(index)
+            .cloned()
+            .ok_or_else(|| "missing pane".to_string())
+    }
+
+    fn live_pane(&self, target: PaneTarget) -> Result<Arc<Pane>, String> {
+        let pane = self.pane(target)?;
+        if pane.is_running() {
+            Ok(pane)
+        } else {
+            Err("pane is not running".to_string())
+        }
+    }
+
+    #[cfg(test)]
     fn add_pane(&mut self, direction: SplitDirection, pane: Arc<Pane>) {
-        let split_index = self.panes.active_index();
+        self.add_pane_at_index(self.panes.active_index(), direction, pane);
+    }
+
+    fn add_pane_to_target(
+        &mut self,
+        target: PaneTarget,
+        direction: SplitDirection,
+        pane: Arc<Pane>,
+    ) -> Result<(), String> {
+        let split_index = self.resolve_pane_target(target)?;
+        self.add_pane_at_index(split_index, direction, pane);
+        Ok(())
+    }
+
+    fn add_pane_at_index(
+        &mut self,
+        split_index: usize,
+        direction: SplitDirection,
+        pane: Arc<Pane>,
+    ) {
         let new_index = self.panes.len();
         self.panes.add(pane);
         let _ = self.layout.split_pane(split_index, direction, new_index);
@@ -889,14 +1020,28 @@ impl Window {
         }
     }
 
-    fn next_split_pane_size(&self, direction: SplitDirection) -> Option<PtySize> {
+    fn next_split_pane_size_for(
+        &self,
+        target: PaneTarget,
+        direction: SplitDirection,
+    ) -> Result<PtySize, String> {
+        let index = self.resolve_pane_target(target)?;
+        self.next_split_pane_size_for_index(index, direction)
+            .ok_or_else(|| "missing pane".to_string())
+    }
+
+    fn next_split_pane_size_for_index(
+        &self,
+        split_index: usize,
+        direction: SplitDirection,
+    ) -> Option<PtySize> {
         if self.zoomed.is_some() {
             return Some(self.size);
         }
 
         let new_index = self.panes.len();
         let mut layout = self.layout.clone();
-        if !layout.split_pane(self.panes.active_index(), direction, new_index) {
+        if !layout.split_pane(split_index, direction, new_index) {
             return None;
         }
 
@@ -912,13 +1057,18 @@ impl Window {
             })
     }
 
+    #[cfg(test)]
     fn select_pane(&mut self, target: PaneSelectTarget) -> Result<(), String> {
         let index = self.resolve_pane_select_target(target)?;
+        self.select_pane_index(index);
+        Ok(())
+    }
+
+    fn select_pane_index(&mut self, index: usize) {
         let selected = self.panes.select(index);
         if selected && self.zoomed.is_some() {
             self.zoomed = Some(index);
         }
-        Ok(())
     }
 
     fn resolve_pane_select_target(&self, target: PaneSelectTarget) -> Result<usize, String> {
@@ -942,14 +1092,36 @@ impl Window {
         }
     }
 
+    fn resolve_pane_target(&self, target: PaneTarget) -> Result<usize, String> {
+        match target {
+            PaneTarget::Active => Ok(self.panes.active_index()),
+            PaneTarget::Index(index) => {
+                if index >= self.panes.len() {
+                    Err("missing pane".to_string())
+                } else {
+                    Ok(index)
+                }
+            }
+            PaneTarget::Id(id) => self
+                .panes
+                .panes
+                .iter()
+                .position(|pane| pane.id == PaneId::new(id))
+                .ok_or_else(|| "missing pane".to_string()),
+        }
+    }
+
     fn directional_pane_target(&self, direction: PaneDirection) -> Option<usize> {
         let active_index = self.panes.active_index();
         let regions = layout_regions_for_size(&self.layout, self.size);
         directional_pane_target_from_regions(&regions, active_index, direction)
     }
 
-    fn kill_pane(&mut self, target: Option<usize>) -> Result<Arc<Pane>, String> {
-        let index = self.panes.kill_index(target).map_err(str::to_string)?;
+    fn kill_pane(&mut self, target: PaneTarget) -> Result<Arc<Pane>, String> {
+        if self.panes.len() <= 1 {
+            return Err("cannot kill last pane; use kill-session".to_string());
+        }
+        let index = self.resolve_pane_target(target)?;
         Ok(self.remove_pane_at(index))
     }
 
@@ -975,10 +1147,10 @@ impl Window {
 
     fn prepare_respawn_pane(
         &self,
-        target: Option<usize>,
+        target: PaneTarget,
         force: bool,
     ) -> Result<(PaneId, PtySize, Option<i32>), String> {
-        let index = target.unwrap_or(self.panes.active_index());
+        let index = self.resolve_pane_target(target)?;
         let pane = self
             .panes
             .get(index)
@@ -1002,10 +1174,6 @@ impl Window {
             .position(|existing| existing.id == id)
             .ok_or_else(|| "missing pane".to_string())?;
         self.panes.panes[index] = pane;
-        self.panes.select(index);
-        if self.zoomed.is_some() {
-            self.zoomed = Some(index);
-        }
         Ok(())
     }
 
@@ -1027,6 +1195,7 @@ impl Window {
         self.panes.all()
     }
 
+    #[allow(dead_code)]
     fn pane_descriptions(&self) -> Vec<PaneDescription> {
         let window_zoomed = self.zoomed.is_some();
         (0..self.panes.len())
@@ -1099,13 +1268,15 @@ impl Window {
         self.visible_pane_resizes()
     }
 
-    fn resize_active_pane(
+    fn resize_pane(
         &mut self,
+        target: PaneTarget,
         direction: PaneResizeDirection,
         amount: usize,
     ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        let index = self.resolve_pane_target(target)?;
         self.layout
-            .resize_pane(self.panes.active_index(), direction, amount, self.size)?;
+            .resize_pane(index, direction, amount, self.size)?;
         Ok(self.visible_pane_resizes())
     }
 
@@ -1153,20 +1324,14 @@ impl Window {
         self.zoomed.is_some()
     }
 
-    fn zoom_pane(&mut self, target: Option<usize>) -> Result<(), String> {
-        let index = target.unwrap_or(self.panes.active_index());
-        if index >= self.panes.len() {
-            return Err("missing pane".to_string());
-        }
-
+    fn zoom_pane_index(&mut self, index: usize) {
         if self.zoomed == Some(index) {
             self.zoomed = None;
-            return Ok(());
+            return;
         }
 
         self.panes.select(index);
         self.zoomed = Some(index);
-        Ok(())
     }
 
     fn adjust_zoom_after_pane_removal(&mut self, removed: usize) {
@@ -1301,26 +1466,57 @@ impl WindowSet {
         self.active_window()?.active_live_pane()
     }
 
-    fn add_pane(&mut self, direction: SplitDirection, pane: Arc<Pane>) {
-        if let Some(window) = self.active_window_mut() {
-            window.add_pane(direction, pane);
-        }
+    fn pane(&self, window: WindowTarget, pane: PaneTarget) -> Result<Arc<Pane>, String> {
+        let window_index = self.resolve_target(window)?;
+        self.windows[window_index].pane(pane)
     }
 
-    fn next_split_pane_size(&self, direction: SplitDirection) -> Option<PtySize> {
-        self.active_window()?.next_split_pane_size(direction)
+    fn live_pane(&self, window: WindowTarget, pane: PaneTarget) -> Result<Arc<Pane>, String> {
+        let window_index = self.resolve_target(window)?;
+        self.windows[window_index].live_pane(pane)
     }
 
-    fn select_pane(&mut self, target: PaneSelectTarget) -> Result<(), String> {
-        self.active_window_mut()
-            .ok_or_else(|| "missing window".to_string())?
-            .select_pane(target)
+    fn add_pane(
+        &mut self,
+        window: WindowTarget,
+        target: PaneTarget,
+        direction: SplitDirection,
+        pane: Arc<Pane>,
+    ) -> Result<(), String> {
+        let window_index = self.resolve_target(window)?;
+        self.windows[window_index].add_pane_to_target(target, direction, pane)
     }
 
-    fn kill_pane(&mut self, target: Option<usize>) -> Result<Arc<Pane>, String> {
-        self.active_window_mut()
-            .ok_or_else(|| "missing window".to_string())?
-            .kill_pane(target)
+    fn next_split_pane_size(
+        &self,
+        window: WindowTarget,
+        target: PaneTarget,
+        direction: SplitDirection,
+    ) -> Result<PtySize, String> {
+        let window_index = self.resolve_target(window)?;
+        self.windows[window_index].next_split_pane_size_for(target, direction)
+    }
+
+    fn target_is_active_window(&self, target: WindowTarget) -> Result<bool, String> {
+        Ok(self.resolve_target(target)? == self.active)
+    }
+
+    fn select_pane(
+        &mut self,
+        window: WindowTarget,
+        target: PaneSelectTarget,
+    ) -> Result<bool, String> {
+        let active_before = self.active;
+        let window_index = self.resolve_target(window)?;
+        let pane_index = self.windows[window_index].resolve_pane_select_target(target)?;
+        self.active = window_index;
+        self.windows[window_index].select_pane_index(pane_index);
+        Ok(active_before != window_index)
+    }
+
+    fn kill_pane(&mut self, window: WindowTarget, target: PaneTarget) -> Result<Arc<Pane>, String> {
+        let window_index = self.resolve_target(window)?;
+        self.windows[window_index].kill_pane(target)
     }
 
     fn mark_pane_exited(&mut self, target: &Arc<Pane>) -> bool {
@@ -1337,18 +1533,22 @@ impl WindowSet {
 
     fn prepare_respawn_pane(
         &self,
-        target: Option<usize>,
+        window: WindowTarget,
+        target: PaneTarget,
         force: bool,
     ) -> Result<(PaneId, PtySize, Option<i32>), String> {
-        self.active_window()
-            .ok_or_else(|| "missing window".to_string())?
-            .prepare_respawn_pane(target, force)
+        let window_index = self.resolve_target(window)?;
+        self.windows[window_index].prepare_respawn_pane(target, force)
     }
 
-    fn replace_pane(&mut self, id: PaneId, pane: Arc<Pane>) -> Result<(), String> {
-        self.active_window_mut()
-            .ok_or_else(|| "missing window".to_string())?
-            .replace_pane(id, pane)
+    fn replace_pane(
+        &mut self,
+        window: WindowTarget,
+        id: PaneId,
+        pane: Arc<Pane>,
+    ) -> Result<(), String> {
+        let window_index = self.resolve_target(window)?;
+        self.windows[window_index].replace_pane(id, pane)
     }
 
     fn panes(&self) -> Vec<Arc<Pane>> {
@@ -1361,6 +1561,14 @@ impl WindowSet {
     fn pane_descriptions(&self) -> Vec<PaneDescription> {
         self.active_window()
             .map_or_else(Vec::new, Window::pane_descriptions)
+    }
+
+    fn pane_descriptions_for_window(
+        &self,
+        target: WindowTarget,
+    ) -> Result<Vec<PaneDescription>, String> {
+        let window_index = self.resolve_target(target)?;
+        Ok(self.windows[window_index].pane_descriptions())
     }
 
     fn window_descriptions(&self) -> Vec<WindowDescription> {
@@ -1392,14 +1600,24 @@ impl WindowSet {
             .map_or_else(Vec::new, |window| window.resize_visible_panes(size))
     }
 
-    fn resize_active_pane(
+    fn resize_visible_panes_for_window(
         &mut self,
+        target: WindowTarget,
+        size: PtySize,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        let window_index = self.resolve_target(target)?;
+        Ok(self.windows[window_index].resize_visible_panes(size))
+    }
+
+    fn resize_pane(
+        &mut self,
+        window: WindowTarget,
+        target: PaneTarget,
         direction: PaneResizeDirection,
         amount: usize,
     ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
-        self.active_window_mut()
-            .ok_or_else(|| "missing window".to_string())?
-            .resize_active_pane(direction, amount)
+        let window_index = self.resolve_target(window)?;
+        self.windows[window_index].resize_pane(target, direction, amount)
     }
 
     fn status_context(&self, session_name: &str) -> Option<StatusContext> {
@@ -1426,15 +1644,12 @@ impl WindowSet {
         self.windows.len()
     }
 
-    fn kill_window(&mut self, target: Option<usize>) -> Result<(), String> {
+    fn kill_window(&mut self, target: WindowTarget) -> Result<(), String> {
         if self.windows.len() <= 1 {
             return Err("cannot kill last window; use kill-session".to_string());
         }
 
-        let index = target.unwrap_or(self.active);
-        if index >= self.windows.len() {
-            return Err("missing window".to_string());
-        }
+        let index = self.resolve_target(target)?;
 
         self.windows[index].terminate_panes()?;
         self.windows.remove(index);
@@ -1446,10 +1661,13 @@ impl WindowSet {
         Ok(())
     }
 
-    fn zoom_pane(&mut self, target: Option<usize>) -> Result<(), String> {
-        self.active_window_mut()
-            .ok_or_else(|| "missing window".to_string())?
-            .zoom_pane(target)
+    fn zoom_pane(&mut self, window: WindowTarget, target: PaneTarget) -> Result<bool, String> {
+        let active_before = self.active;
+        let window_index = self.resolve_target(window)?;
+        let pane_index = self.windows[window_index].resolve_pane_target(target)?;
+        self.active = window_index;
+        self.windows[window_index].zoom_pane_index(pane_index);
+        Ok(active_before != window_index)
     }
 }
 
@@ -1660,6 +1878,7 @@ impl<T> PaneSet<T> {
         Ok(self.kill_at(index))
     }
 
+    #[allow(dead_code)]
     fn kill_index(&self, target: Option<usize>) -> Result<usize, &'static str> {
         if self.panes.len() <= 1 {
             return Err("cannot kill last pane; use kill-session");
@@ -1834,19 +2053,19 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             handle_detach_client(&state, &mut stream, session.as_deref(), client_id)
         }
         Request::Capture {
-            session,
+            target,
             mode,
             selection,
-        } => handle_capture(&state, &mut stream, &session, mode, &selection),
+        } => handle_capture(&state, &mut stream, &target, mode, &selection),
         Request::SaveBuffer {
-            session,
+            target,
             buffer,
             mode,
             selection,
         } => handle_save_buffer(
             &state,
             &mut stream,
-            &session,
+            &target,
             buffer.as_deref(),
             mode,
             &selection,
@@ -1872,8 +2091,8 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::ListBuffers { format } => {
             handle_list_buffers(&state, &mut stream, format.as_deref())
         }
-        Request::PasteBuffer { session, buffer } => {
-            handle_paste_buffer(&state, &mut stream, &session, buffer.as_deref())
+        Request::PasteBuffer { target, buffer } => {
+            handle_paste_buffer(&state, &mut stream, &target, buffer.as_deref())
         }
         Request::DeleteBuffer { buffer } => handle_delete_buffer(&state, &mut stream, &buffer),
         Request::Resize {
@@ -1882,31 +2101,32 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             rows,
         } => handle_resize(&state, &mut stream, &session, cols, rows),
         Request::ResizePane {
-            session,
+            target,
             direction,
             amount,
-        } => handle_resize_pane(&state, &mut stream, &session, direction, amount),
-        Request::Send { session, bytes } => handle_send(&state, &mut stream, &session, &bytes),
+        } => handle_resize_pane(&state, &mut stream, &target, direction, amount),
+        Request::Send { target, bytes } => handle_send(&state, &mut stream, &target, &bytes),
         Request::Split {
-            session,
+            target,
             direction,
             command,
-        } => handle_split(&state, &mut stream, &session, direction, command),
-        Request::ListPanes { session, format } => {
-            handle_list_panes(&state, &mut stream, &session, format.as_deref())
-        }
-        Request::SelectPane { session, target } => {
-            handle_select_pane(&state, &mut stream, &session, target)
-        }
-        Request::KillPane { session, pane } => {
-            handle_kill_pane(&state, &mut stream, &session, pane)
-        }
-        Request::RespawnPane {
+        } => handle_split(&state, &mut stream, &target, direction, command),
+        Request::ListPanes {
             session,
-            pane,
+            window,
+            format,
+        } => handle_list_panes(&state, &mut stream, &session, window, format.as_deref()),
+        Request::SelectPane {
+            session,
+            window,
+            target,
+        } => handle_select_pane(&state, &mut stream, &session, window, target),
+        Request::KillPane { target } => handle_kill_pane(&state, &mut stream, &target),
+        Request::RespawnPane {
+            target,
             force,
             command,
-        } => handle_respawn_pane(&state, &mut stream, &session, pane, force, command),
+        } => handle_respawn_pane(&state, &mut stream, &target, force, command),
         Request::NewWindow { session, command } => {
             handle_new_window(&state, &mut stream, &session, command)
         }
@@ -1927,12 +2147,10 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::PreviousWindow { session } => {
             handle_cycle_window(&state, &mut stream, &session, WindowCycle::Previous)
         }
-        Request::KillWindow { session, window } => {
-            handle_kill_window(&state, &mut stream, &session, window)
+        Request::KillWindow { session, target } => {
+            handle_kill_window(&state, &mut stream, &session, target)
         }
-        Request::ZoomPane { session, pane } => {
-            handle_zoom_pane(&state, &mut stream, &session, pane)
-        }
+        Request::ZoomPane { target } => handle_zoom_pane(&state, &mut stream, &target),
         Request::StatusLine { session, format } => {
             handle_status_line(&state, &mut stream, &session, format.as_deref())
         }
@@ -2161,6 +2379,9 @@ fn validate_session_name(name: &str) -> Result<(), String> {
     }
     if name.chars().any(char::is_control) {
         return Err("session name cannot contain control characters".to_string());
+    }
+    if name.contains(':') {
+        return Err("session name cannot contain ':'".to_string());
     }
     Ok(())
 }
@@ -2407,19 +2628,22 @@ fn handle_detach_client(
 fn handle_capture(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    name: &str,
+    target: &Target,
     mode: CaptureMode,
     selection: &BufferSelection,
 ) -> io::Result<()> {
-    let session = resolve_session(state, name);
+    let session = resolve_session(state, &target.session);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
         return Ok(());
     };
-    let Some(pane) = session.active_pane() else {
-        write_err(stream, "missing pane")?;
-        return Ok(());
+    let pane = match session.target_pane(target) {
+        Ok(pane) => pane,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
     };
 
     let captured = capture_pane_text(&pane, mode);
@@ -2446,20 +2670,23 @@ fn capture_pane_text(pane: &Pane, mode: CaptureMode) -> String {
 fn handle_save_buffer(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    name: &str,
+    target: &Target,
     buffer: Option<&str>,
     mode: CaptureMode,
     selection: &BufferSelection,
 ) -> io::Result<()> {
-    let session = resolve_session(state, name);
+    let session = resolve_session(state, &target.session);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
         return Ok(());
     };
-    let Some(pane) = session.active_pane() else {
-        write_err(stream, "missing pane")?;
-        return Ok(());
+    let pane = match session.target_pane(target) {
+        Ok(pane) => pane,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
     };
 
     let captured = capture_pane_text(&pane, mode);
@@ -2581,10 +2808,10 @@ fn handle_copy_mode(
 fn handle_paste_buffer(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    name: &str,
+    target: &Target,
     buffer: Option<&str>,
 ) -> io::Result<()> {
-    let session = resolve_session(state, name);
+    let session = resolve_session(state, &target.session);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
@@ -2604,9 +2831,12 @@ fn handle_paste_buffer(
         write_err(stream, "buffer exceeds maximum size")?;
         return Ok(());
     }
-    let Some(pane) = session.active_live_pane() else {
-        write_err(stream, "pane is not running")?;
-        return Ok(());
+    let pane = match session.target_live_pane(target) {
+        Ok(pane) => pane,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
     };
 
     pane.writer.lock().unwrap().write_all(text.as_bytes())?;
@@ -2659,18 +2889,18 @@ fn handle_resize(
 fn handle_resize_pane(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    name: &str,
+    target: &Target,
     direction: PaneResizeDirection,
     amount: usize,
 ) -> io::Result<()> {
-    let session = resolve_session(state, name);
+    let session = resolve_session(state, &target.session);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
         return Ok(());
     };
 
-    let pane_resizes = match session.resize_active_pane(direction, amount) {
+    let pane_resizes = match session.resize_pane(target, direction, amount) {
         Ok(pane_resizes) => pane_resizes,
         Err(message) => {
             write_err(stream, &message)?;
@@ -2689,18 +2919,21 @@ fn handle_resize_pane(
 fn handle_send(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    name: &str,
+    target: &Target,
     bytes: &[u8],
 ) -> io::Result<()> {
-    let session = resolve_session(state, name);
+    let session = resolve_session(state, &target.session);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
         return Ok(());
     };
-    let Some(pane) = session.active_live_pane() else {
-        write_err(stream, "pane is not running")?;
-        return Ok(());
+    let pane = match session.target_live_pane(target) {
+        Ok(pane) => pane,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
     };
 
     pane.writer.lock().unwrap().write_all(bytes)?;
@@ -2710,21 +2943,31 @@ fn handle_send(
 fn handle_split(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    name: &str,
+    target: &Target,
     direction: SplitDirection,
     command: Vec<String>,
 ) -> io::Result<()> {
-    let session = resolve_session(state, name);
+    let session = resolve_session(state, &target.session);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
         return Ok(());
     };
-    let Some(size) = session.next_split_pane_size(direction) else {
-        write_err(stream, "missing pane")?;
-        return Ok(());
+    let size = match session.next_split_pane_size(target, direction) {
+        Ok(size) => size,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
     };
-    let close_raw_attach_streams = session.attach_panes().len() == 1;
+    let close_raw_attach_streams = match session.target_is_active_window(target) {
+        Ok(true) => session.attach_panes().len() == 1,
+        Ok(false) => false,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
     let cwd = std::env::current_dir()?;
     let pane = spawn_pane(
         session.next_pane_id(),
@@ -2736,8 +2979,19 @@ fn handle_split(
         Some(Arc::downgrade(&session)),
     )?;
     pane.set_session(&session);
-    session.add_pane(direction, pane);
-    if !session.resize_current_visible_panes()? {
+    if let Err(message) = session.add_pane(target, direction, Arc::clone(&pane)) {
+        terminate_pane_if_running_async(&pane);
+        write_err(stream, &message)?;
+        return Ok(());
+    }
+    let pane_resizes = match session.visible_pane_resizes_for_window(target.window.clone()) {
+        Ok(pane_resizes) => pane_resizes,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    if !resize_panes(pane_resizes)? {
         write_err(stream, "missing pane")?;
         return Ok(());
     }
@@ -2753,6 +3007,7 @@ fn handle_list_panes(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     name: &str,
+    window: WindowTarget,
     _format: Option<&str>,
 ) -> io::Result<()> {
     let session = resolve_session(state, name);
@@ -2762,8 +3017,15 @@ fn handle_list_panes(
         return Ok(());
     };
 
+    let panes = match session.pane_descriptions_for_window(window) {
+        Ok(panes) => panes,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
     write_ok(stream)?;
-    for pane in session.pane_descriptions() {
+    for pane in panes {
         match _format {
             Some(format) => writeln!(stream, "{}", format_pane_line(format, &pane))?,
             None => writeln!(stream, "{}", pane.index)?,
@@ -2806,24 +3068,28 @@ fn format_pane_line(format: &str, pane: &PaneDescription) -> String {
 fn handle_zoom_pane(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    name: &str,
-    pane: Option<usize>,
+    target: &Target,
 ) -> io::Result<()> {
-    let session = resolve_session(state, name);
+    let session = resolve_session(state, &target.session);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
         return Ok(());
     };
 
-    if let Err(message) = session.zoom_pane(pane) {
-        write_err(stream, &message)?;
-        return Ok(());
-    }
+    match session.zoom_pane(target) {
+        Ok(_) => {}
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
     session.resize_current_visible_panes()?;
 
     session.notify_attach_redraw_immediate();
-    write_ok(stream)
+    let result = write_ok(stream);
+    session.reconnect_live_raw_pane_streams();
+    result
 }
 
 fn handle_status_line(
@@ -2995,6 +3261,7 @@ fn handle_select_pane(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     name: &str,
+    window: WindowTarget,
     target: PaneSelectTarget,
 ) -> io::Result<()> {
     let session = resolve_session(state, name);
@@ -3004,37 +3271,49 @@ fn handle_select_pane(
         return Ok(());
     };
 
-    if let Err(error) = session.select_pane(target) {
-        write_err(stream, &error)?;
-        return Ok(());
-    }
+    match session.select_pane(window, target) {
+        Ok(_) => {}
+        Err(error) => {
+            write_err(stream, &error)?;
+            return Ok(());
+        }
+    };
     session.resize_current_visible_panes()?;
 
     session.notify_attach_redraw_immediate();
-    write_ok(stream)
+    let result = write_ok(stream);
+    session.reconnect_live_raw_pane_streams();
+    result
 }
 
 fn handle_kill_pane(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    name: &str,
-    pane: Option<usize>,
+    target: &Target,
 ) -> io::Result<()> {
-    let session = resolve_session(state, name);
+    let session = resolve_session(state, &target.session);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
         return Ok(());
     };
 
-    let removed = match session.kill_pane(pane) {
+    let removed = match session.kill_pane(target) {
         Ok(removed) => removed,
         Err(message) => {
             write_err(stream, &message)?;
             return Ok(());
         }
     };
-    if let Err(error) = session.resize_current_visible_panes() {
+    let pane_resizes = match session.visible_pane_resizes_for_window(target.window.clone()) {
+        Ok(pane_resizes) => pane_resizes,
+        Err(message) => {
+            terminate_pane_if_running_async(&removed);
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = resize_panes(pane_resizes) {
         terminate_pane_if_running_async(&removed);
         write_err(stream, &error.to_string())?;
         return Ok(());
@@ -3048,19 +3327,18 @@ fn handle_kill_pane(
 fn handle_respawn_pane(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    name: &str,
-    pane: Option<usize>,
+    target: &Target,
     force: bool,
     command: Vec<String>,
 ) -> io::Result<()> {
-    let session = resolve_session(state, name);
+    let session = resolve_session(state, &target.session);
 
     let Some(session) = session else {
         write_err(stream, "missing session")?;
         return Ok(());
     };
 
-    let old_pid = match session.respawn_pane(pane, command, force) {
+    let old_pid = match session.respawn_pane(target, command, force) {
         Ok(old_pid) => old_pid,
         Err(message) => {
             write_err(stream, &message)?;
@@ -3244,7 +3522,7 @@ fn handle_kill_window(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     name: &str,
-    window: Option<usize>,
+    target: WindowTarget,
 ) -> io::Result<()> {
     let session = resolve_session(state, name);
 
@@ -3253,7 +3531,15 @@ fn handle_kill_window(
         return Ok(());
     };
 
-    if let Err(message) = session.kill_window(window) {
+    let reconnect_live_raw = match session.window_is_active(target.clone()) {
+        Ok(is_active) => is_active && !has_attach_pane_snapshot(&session),
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+
+    if let Err(message) = session.kill_window(target) {
         write_err(stream, &message)?;
         return Ok(());
     }
@@ -3264,7 +3550,9 @@ fn handle_kill_window(
 
     session.notify_attach_redraw_immediate();
     let result = write_ok(stream);
-    session.reconnect_raw_attach_streams();
+    if reconnect_live_raw {
+        session.reconnect_raw_attach_streams();
+    }
     result
 }
 
@@ -4814,6 +5102,10 @@ mod tests {
         assert_eq!(
             validate_session_name("bad\u{1}name"),
             Err("session name cannot contain control characters".to_string())
+        );
+        assert_eq!(
+            validate_session_name("bad:target"),
+            Err("session name cannot contain ':'".to_string())
         );
         assert!(validate_session_name("good").is_ok());
     }
