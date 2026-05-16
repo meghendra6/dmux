@@ -786,6 +786,12 @@ struct PaneSnapshot {
     screen: String,
 }
 
+#[allow(dead_code)]
+struct PaneRenderSnapshot<'a> {
+    index: usize,
+    terminal: &'a TerminalState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RenderedAttachLayout {
     lines: Vec<String>,
@@ -1025,6 +1031,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         }
         Request::AttachLayoutSnapshot { session } => {
             handle_attach_layout_snapshot(&state, &mut stream, &session)
+        }
+        Request::AttachLayoutFrame { session } => {
+            handle_attach_layout_frame(&state, &mut stream, &session)
         }
         Request::AttachEvents { session } => handle_attach_events(&state, &mut stream, &session),
     }
@@ -1888,6 +1897,28 @@ fn handle_attach_layout_snapshot(
     Ok(())
 }
 
+fn handle_attach_layout_frame(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    if let Some(frame) = attach_pane_frame_with_regions(&session) {
+        stream.write_all(&format_attach_layout_snapshot_body(&frame))?;
+    }
+    Ok(())
+}
+
 fn handle_attach_events(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
@@ -1935,6 +1966,28 @@ fn attach_pane_snapshot_with_regions(session: &Session) -> Option<RenderedAttach
         &panes,
         snapshot.size,
     ))
+}
+
+fn attach_pane_frame_with_regions(session: &Session) -> Option<RenderedAttachSnapshot> {
+    let snapshot = session.attach_layout_snapshot();
+    if snapshot.panes.is_empty() {
+        return None;
+    }
+
+    let terminal_guards = snapshot
+        .panes
+        .iter()
+        .map(|pane| (pane.index, pane.pane.terminal.lock().unwrap()))
+        .collect::<Vec<_>>();
+    let panes = terminal_guards
+        .iter()
+        .map(|(index, terminal)| PaneRenderSnapshot {
+            index: *index,
+            terminal,
+        })
+        .collect::<Vec<_>>();
+
+    render_attach_frame_for_size(&snapshot.layout, &panes, snapshot.size)
 }
 
 #[allow(dead_code)]
@@ -2042,7 +2095,47 @@ fn render_attach_layout_for_size(
     )
 }
 
+#[allow(dead_code)]
+fn render_attach_frame_for_size(
+    layout: &LayoutNode,
+    panes: &[PaneRenderSnapshot<'_>],
+    size: PtySize,
+) -> Option<RenderedAttachSnapshot> {
+    if !layout_matches_render_panes(layout, panes) {
+        return None;
+    }
+
+    let terminals = panes
+        .iter()
+        .map(|pane| (pane.index, pane.terminal))
+        .collect::<HashMap<_, _>>();
+
+    render_styled_sized_layout(
+        layout,
+        &terminals,
+        0,
+        size.rows as usize,
+        0,
+        size.cols as usize,
+    )
+    .map(|rendered| RenderedAttachSnapshot {
+        text: render_client_lines(&rendered.lines),
+        regions: rendered.regions,
+    })
+}
+
 fn layout_matches_panes(layout: &LayoutNode, panes: &[PaneSnapshot]) -> bool {
+    let mut layout_indexes = Vec::new();
+    collect_layout_pane_indexes(layout, &mut layout_indexes);
+    layout_indexes.sort_unstable();
+
+    let mut pane_indexes = panes.iter().map(|pane| pane.index).collect::<Vec<_>>();
+    pane_indexes.sort_unstable();
+
+    layout_indexes == pane_indexes
+}
+
+fn layout_matches_render_panes(layout: &LayoutNode, panes: &[PaneRenderSnapshot<'_>]) -> bool {
     let mut layout_indexes = Vec::new();
     collect_layout_pane_indexes(layout, &mut layout_indexes);
     layout_indexes.sort_unstable();
@@ -2096,6 +2189,161 @@ fn render_layout(
             })
         }
     }
+}
+
+fn render_styled_sized_layout(
+    layout: &LayoutNode,
+    terminals: &HashMap<usize, &TerminalState>,
+    row_start: usize,
+    row_end: usize,
+    col_start: usize,
+    col_end: usize,
+) -> Option<RenderedAttachLayout> {
+    match layout {
+        LayoutNode::Pane(index) => {
+            let width = col_end.saturating_sub(col_start);
+            let height = row_end.saturating_sub(row_start);
+            Some(RenderedAttachLayout {
+                lines: render_terminal_ansi_region_lines(terminals.get(index)?, width, height),
+                regions: vec![PaneRegion {
+                    pane: *index,
+                    row_start,
+                    row_end,
+                    col_start,
+                    col_end,
+                }],
+            })
+        }
+        LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first,
+            second,
+        } => {
+            let ((first_start, first_end), (second_start, second_end)) =
+                split_extent(col_start, col_end, 3);
+            let left = render_styled_sized_layout(
+                first,
+                terminals,
+                row_start,
+                row_end,
+                first_start,
+                first_end,
+            )?;
+            let right = render_styled_sized_layout(
+                second,
+                terminals,
+                row_start,
+                row_end,
+                second_start,
+                second_end,
+            )?;
+            Some(join_styled_sized_horizontal_layout(left, right))
+        }
+        LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first,
+            second,
+        } => {
+            let ((first_start, first_end), (second_start, second_end)) =
+                split_extent(row_start, row_end, 1);
+            let top = render_styled_sized_layout(
+                first,
+                terminals,
+                first_start,
+                first_end,
+                col_start,
+                col_end,
+            )?;
+            let bottom = render_styled_sized_layout(
+                second,
+                terminals,
+                second_start,
+                second_end,
+                col_start,
+                col_end,
+            )?;
+            Some(join_styled_sized_vertical_layout(top, bottom))
+        }
+    }
+}
+
+fn render_terminal_ansi_region_lines(
+    terminal: &TerminalState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    terminal.render_screen_ansi_lines(width, height)
+}
+
+fn join_styled_sized_horizontal_layout(
+    left: RenderedAttachLayout,
+    right: RenderedAttachLayout,
+) -> RenderedAttachLayout {
+    let separator_width = layout_column_gap(&left.regions, &right.regions).unwrap_or(0);
+    let lines =
+        join_styled_horizontal_with_separator_width(left.lines, right.lines, separator_width);
+    let mut regions = left.regions;
+    regions.extend(right.regions);
+    RenderedAttachLayout { lines, regions }
+}
+
+fn join_styled_sized_vertical_layout(
+    top: RenderedAttachLayout,
+    bottom: RenderedAttachLayout,
+) -> RenderedAttachLayout {
+    let separator_height = layout_row_gap(&top.regions, &bottom.regions).unwrap_or(0);
+    let separator_width = region_span_width(&top.regions)
+        .max(region_span_width(&bottom.regions))
+        .max(1);
+    let lines = join_styled_vertical_with_separator_height(
+        top.lines,
+        bottom.lines,
+        separator_height,
+        separator_width,
+    );
+    let mut regions = top.regions;
+    regions.extend(bottom.regions);
+    RenderedAttachLayout { lines, regions }
+}
+
+fn join_styled_horizontal_with_separator_width(
+    left: Vec<String>,
+    right: Vec<String>,
+    separator_width: usize,
+) -> Vec<String> {
+    let rows = left.len().max(right.len());
+    (0..rows)
+        .map(|index| {
+            let mut line = left.get(index).cloned().unwrap_or_default();
+            line.push_str(&horizontal_separator(separator_width));
+            line.push_str(right.get(index).map_or("", String::as_str));
+            line
+        })
+        .collect()
+}
+
+fn join_styled_vertical_with_separator_height(
+    mut top: Vec<String>,
+    bottom: Vec<String>,
+    separator_height: usize,
+    separator_width: usize,
+) -> Vec<String> {
+    top.extend(std::iter::repeat_n(
+        "-".repeat(separator_width),
+        separator_height,
+    ));
+    top.extend(bottom);
+    top
+}
+
+fn region_span_width(regions: &[PaneRegion]) -> usize {
+    let Some(start) = regions.iter().map(|region| region.col_start).min() else {
+        return 0;
+    };
+    let Some(end) = regions.iter().map(|region| region.col_end).max() else {
+        return 0;
+    };
+    end.saturating_sub(start)
 }
 
 fn render_sized_layout(
@@ -3529,6 +3777,153 @@ left | right\r\n"
         assert!(rendered.contains("base-ready"), "{rendered:?}");
         assert!(rendered.contains("-- pane 1 --"), "{rendered:?}");
         assert!(rendered.contains("split-ready"), "{rendered:?}");
+    }
+
+    #[test]
+    fn render_attach_frame_for_size_preserves_styled_pane_output() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let mut left = TerminalState::new(20, 1, 100);
+        left.apply_bytes(b"\x1b[31mleft\x1b[0m");
+        let mut right = TerminalState::new(20, 1, 100);
+        right.apply_bytes(b"\x1b[1;38;2;1;2;3mright\x1b[0m");
+        let panes = vec![
+            PaneRenderSnapshot {
+                index: 0,
+                terminal: &left,
+            },
+            PaneRenderSnapshot {
+                index: 1,
+                terminal: &right,
+            },
+        ];
+
+        let rendered =
+            render_attach_frame_for_size(&layout, &panes, PtySize { cols: 20, rows: 1 }).unwrap();
+
+        assert_eq!(
+            rendered.text,
+            "\x1b[31mleft\x1b[0m     | \x1b[1;38;2;1;2;3mright\x1b[0m    \r\n"
+        );
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 8,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 11,
+                    col_end: 20,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_attach_frame_for_size_clips_styled_content_to_region_width() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Horizontal,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let mut left = TerminalState::new(20, 1, 100);
+        left.apply_bytes(b"\x1b[31mabcdef\x1b[0m");
+        let mut right = TerminalState::new(20, 1, 100);
+        right.apply_bytes(b"right");
+        let panes = vec![
+            PaneRenderSnapshot {
+                index: 0,
+                terminal: &left,
+            },
+            PaneRenderSnapshot {
+                index: 1,
+                terminal: &right,
+            },
+        ];
+
+        let rendered =
+            render_attach_frame_for_size(&layout, &panes, PtySize { cols: 10, rows: 1 }).unwrap();
+
+        assert_eq!(rendered.text, "\x1b[31mabc\x1b[0m | righ\r\n");
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 3,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 6,
+                    col_end: 10,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn render_attach_frame_for_size_uses_visible_width_for_vertical_separator() {
+        let layout = LayoutNode::Split {
+            direction: SplitDirection::Vertical,
+            first: Box::new(LayoutNode::Pane(0)),
+            second: Box::new(LayoutNode::Pane(1)),
+        };
+        let mut top = TerminalState::new(20, 1, 100);
+        top.apply_bytes(b"\x1b[31mt\x1b[0m");
+        let mut bottom = TerminalState::new(20, 1, 100);
+        bottom.apply_bytes(b"bottom");
+        let panes = vec![
+            PaneRenderSnapshot {
+                index: 0,
+                terminal: &top,
+            },
+            PaneRenderSnapshot {
+                index: 1,
+                terminal: &bottom,
+            },
+        ];
+
+        let rendered =
+            render_attach_frame_for_size(&layout, &panes, PtySize { cols: 6, rows: 3 }).unwrap();
+
+        assert_eq!(
+            rendered.text,
+            "\x1b[31mt\x1b[0m     \r\n------\r\nbottom\r\n"
+        );
+        assert_eq!(
+            rendered.regions,
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 6,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 2,
+                    row_end: 3,
+                    col_start: 0,
+                    col_end: 6,
+                },
+            ]
+        );
     }
 
     #[test]
