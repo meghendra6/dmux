@@ -2345,14 +2345,7 @@ fn run_copy_mode_with_reader<R: Read>(
     let output = String::from_utf8_lossy(&body);
     let mut view = CopyModeView::from_numbered_output(&output)?;
 
-    run_copy_mode_view_with_reader(
-        socket,
-        session,
-        initial_input,
-        stdin,
-        &mut view,
-        CopyModeSaveSource::ActivePane,
-    )
+    run_copy_mode_view_with_reader(socket, session, initial_input, stdin, &mut view)
 }
 
 #[allow(dead_code)]
@@ -2366,14 +2359,7 @@ fn run_composed_copy_mode_with_reader<R: Read>(
     let text = String::from_utf8_lossy(&snapshot.snapshot);
     let mut view = CopyModeView::from_plain_text(&text)?;
 
-    run_copy_mode_view_with_reader(
-        socket,
-        session,
-        initial_input,
-        stdin,
-        &mut view,
-        CopyModeSaveSource::ComposedText,
-    )
+    run_copy_mode_view_with_reader(socket, session, initial_input, stdin, &mut view)
 }
 
 fn run_copy_mode_view_with_reader<R: Read>(
@@ -2382,7 +2368,6 @@ fn run_copy_mode_view_with_reader<R: Read>(
     initial_input: &[u8],
     stdin: &mut R,
     view: &mut CopyModeView,
-    save_source: CopyModeSaveSource,
 ) -> io::Result<()> {
     let _mouse = MouseModeGuard::enable()?;
     write_copy_mode_view(view)?;
@@ -2392,14 +2377,7 @@ fn run_copy_mode_view_with_reader<R: Read>(
     }
 
     let mut input_state = CopyModeInputState::default();
-    if handle_copy_mode_input(
-        socket,
-        session,
-        view,
-        save_source,
-        &mut input_state,
-        initial_input,
-    )? {
+    if handle_copy_mode_input(socket, session, view, &mut input_state, initial_input)? {
         return Ok(());
     }
 
@@ -2410,14 +2388,7 @@ fn run_copy_mode_view_with_reader<R: Read>(
             break;
         }
 
-        if handle_copy_mode_input(
-            socket,
-            session,
-            view,
-            save_source,
-            &mut input_state,
-            &buf[..n],
-        )? {
+        if handle_copy_mode_input(socket, session, view, &mut input_state, &buf[..n])? {
             break;
         }
     }
@@ -2425,22 +2396,15 @@ fn run_copy_mode_view_with_reader<R: Read>(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CopyModeSaveSource {
-    ActivePane,
-    ComposedText,
-}
-
 fn handle_copy_mode_input(
     socket: &Path,
     session: &str,
     view: &mut CopyModeView,
-    save_source: CopyModeSaveSource,
     input_state: &mut CopyModeInputState,
     input: &[u8],
 ) -> io::Result<bool> {
     for action in input_state.apply(view, input) {
-        if apply_copy_mode_action(socket, session, view, save_source, action)? {
+        if apply_copy_mode_action(socket, session, view, action)? {
             return Ok(true);
         }
     }
@@ -2452,7 +2416,6 @@ fn apply_copy_mode_action(
     socket: &Path,
     session: &str,
     view: &mut CopyModeView,
-    save_source: CopyModeSaveSource,
     action: CopyModeAction,
 ) -> io::Result<bool> {
     match action {
@@ -2461,11 +2424,11 @@ fn apply_copy_mode_action(
             Ok(false)
         }
         CopyModeAction::CopyLine(line) => {
-            save_copy_mode_range(socket, session, view, save_source, line, line)?;
+            save_copy_mode_range(socket, session, view, line, line)?;
             Ok(true)
         }
         CopyModeAction::CopyLineRange { start, end } => {
-            save_copy_mode_range(socket, session, view, save_source, start, end)?;
+            save_copy_mode_range(socket, session, view, start, end)?;
             Ok(true)
         }
         CopyModeAction::Exit => {
@@ -2480,17 +2443,11 @@ fn save_copy_mode_range(
     socket: &Path,
     session: &str,
     view: &CopyModeView,
-    save_source: CopyModeSaveSource,
     start: usize,
     end: usize,
 ) -> io::Result<()> {
-    let request = encode_copy_mode_save_request(session, view, save_source, start, end)?;
-    let body = match save_source {
-        CopyModeSaveSource::ActivePane => send_control_request(socket, &request)?,
-        CopyModeSaveSource::ComposedText => {
-            send_control_request(socket, &request).map_err(map_composed_copy_mode_save_error)?
-        }
-    };
+    let request = encode_copy_mode_save_request(session, view, start, end)?;
+    let body = send_control_request(socket, &request).map_err(map_copy_mode_save_text_error)?;
     let saved = String::from_utf8_lossy(&body);
     let saved = saved.trim_end();
     if saved.is_empty() {
@@ -2504,27 +2461,16 @@ fn save_copy_mode_range(
 fn encode_copy_mode_save_request(
     session: &str,
     view: &CopyModeView,
-    save_source: CopyModeSaveSource,
     start: usize,
     end: usize,
 ) -> io::Result<String> {
-    match save_source {
-        CopyModeSaveSource::ActivePane => Ok(protocol::encode_save_buffer(
-            session,
-            None,
-            protocol::CaptureMode::All,
-            protocol::BufferSelection::LineRange { start, end },
-        )),
-        CopyModeSaveSource::ComposedText => {
-            let text = view.selected_text_for_line_range(start, end)?;
-            Ok(protocol::encode_save_buffer_text(session, None, &text))
-        }
-    }
+    let text = view.selected_text_for_line_range(start, end)?;
+    Ok(protocol::encode_save_buffer_text(session, None, &text))
 }
 
-fn map_composed_copy_mode_save_error(error: io::Error) -> io::Error {
+fn map_copy_mode_save_text_error(error: io::Error) -> io::Error {
     if is_unknown_request_error(&error) {
-        io::Error::other("composed copy-mode requires an updated dmux server")
+        io::Error::other("copy-mode text save requires an updated dmux server")
     } else {
         error
     }
@@ -3943,18 +3889,12 @@ mod tests {
     }
 
     #[test]
-    fn active_copy_mode_save_request_uses_active_pane_line_range() {
+    fn copy_mode_save_request_uses_selected_view_text() {
         let view = CopyModeView::from_numbered_output("7\tactive\n8\tpane\n").unwrap();
 
         assert_eq!(
-            encode_copy_mode_save_request("dev", &view, CopyModeSaveSource::ActivePane, 7, 8)
-                .unwrap(),
-            protocol::encode_save_buffer(
-                "dev",
-                None,
-                protocol::CaptureMode::All,
-                protocol::BufferSelection::LineRange { start: 7, end: 8 }
-            )
+            encode_copy_mode_save_request("dev", &view, 7, 8).unwrap(),
+            protocol::encode_save_buffer_text("dev", None, "active\npane\n")
         );
     }
 
@@ -3963,21 +3903,20 @@ mod tests {
         let view = CopyModeView::from_plain_text("base | split\r\nsecond\r\n").unwrap();
 
         assert_eq!(
-            encode_copy_mode_save_request("dev", &view, CopyModeSaveSource::ComposedText, 1, 1)
-                .unwrap(),
+            encode_copy_mode_save_request("dev", &view, 1, 1).unwrap(),
             protocol::encode_save_buffer_text("dev", None, "base | split\n")
         );
     }
 
     #[test]
-    fn composed_copy_mode_save_maps_unknown_request_to_unsupported() {
-        let err = map_composed_copy_mode_save_error(io::Error::other(
+    fn copy_mode_text_save_maps_unknown_request_to_unsupported() {
+        let err = map_copy_mode_save_text_error(io::Error::other(
             "unknown request line: \"SAVE_BUFFER_TEXT\"",
         ));
 
         assert_eq!(
             err.to_string(),
-            "composed copy-mode requires an updated dmux server"
+            "copy-mode text save requires an updated dmux server"
         );
     }
 

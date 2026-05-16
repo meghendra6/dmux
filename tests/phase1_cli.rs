@@ -609,6 +609,95 @@ fn save_buffer_can_copy_line_range_and_search_match() {
 }
 
 #[test]
+fn save_buffer_command_uses_current_active_pane_after_split() {
+    let socket = unique_socket("save-buffer-active-pane-after-split");
+    let session = format!("save-buffer-active-pane-after-split-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-save-source; printf '\\n'; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-save-source");
+    assert!(base.contains("base-save-source"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-save-active; printf '\\n'; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-save-active");
+    assert!(split.contains("split-save-active"), "{split:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "save-buffer",
+            "-t",
+            &session,
+            "-b",
+            "active",
+            "--screen",
+            "--start-line",
+            "1",
+            "--end-line",
+            "1",
+        ],
+    ));
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "save-buffer",
+            "-t",
+            &session,
+            "-b",
+            "base",
+            "--screen",
+            "--start-line",
+            "1",
+            "--end-line",
+            "1",
+        ],
+    ));
+
+    let listed = dmux(&socket, &["list-buffers"]);
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.ends_with("\tsplit-save-active")),
+        "{listed:?}"
+    );
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.ends_with("\tbase-save-source")),
+        "{listed:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn copy_mode_prints_numbered_lines_and_search_matches() {
     let socket = unique_socket("copy-mode");
     let session = format!("copy-mode-{}", std::process::id());
@@ -3768,6 +3857,100 @@ fn raw_attach_external_split_waits_for_copy_mode_to_finish() {
     let split = poll_capture(&socket, &session, "copy-split:ok");
     assert!(split.contains("copy-split:ok"), "{split:?}");
 
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn raw_copy_mode_saves_view_text_after_external_active_pane_change() {
+    let socket = unique_socket("raw-copy-mode-stable-source");
+    let session = format!("raw-copy-mode-stable-source-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-copy-source; printf '\\n'; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-copy-source");
+    assert!(base.contains("base-copy-source"), "{base:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["base-copy-source"]);
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02[").expect("write copy-mode entry");
+        stdin.flush().expect("flush copy-mode entry");
+    }
+    child.wait_for_stdout_contains_all(&["-- copy mode --"], "raw copy-mode before split");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-copy-source; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-copy-source");
+    assert!(split.contains("split-copy-source"), "{split:?}");
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"y").expect("write copy key");
+        stdin.flush().expect("flush copy key");
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut listed = String::new();
+    while std::time::Instant::now() < deadline {
+        let output = dmux(&socket, &["list-buffers"]);
+        assert_success(&output);
+        listed = String::from_utf8_lossy(&output.stdout).to_string();
+        if listed
+            .lines()
+            .any(|line| line.ends_with("\tbase-copy-source"))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.ends_with("\tbase-copy-source")),
+        "{listed:?}"
+    );
+    assert!(
+        !listed
+            .lines()
+            .any(|line| line.ends_with("\tsplit-copy-source")),
+        "{listed:?}"
+    );
+
+    child.wait_for_stdout_contains_all(
+        &["split-copy-source"],
+        "external split transition after copy-mode save",
+    );
     {
         let stdin = child.stdin_mut("attach stdin");
         stdin.write_all(b"\x02d").expect("write detach input");
