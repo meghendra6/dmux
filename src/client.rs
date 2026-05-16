@@ -2264,7 +2264,7 @@ fn apply_live_pane_command(
     socket: &Path,
     session: &str,
     command: PaneCommand,
-    frame: &LiveSnapshotFrame,
+    _frame: &LiveSnapshotFrame,
 ) -> io::Result<()> {
     match command {
         PaneCommand::SplitRight => {
@@ -2274,7 +2274,7 @@ fn apply_live_pane_command(
         PaneCommand::FocusLeft
         | PaneCommand::FocusDown
         | PaneCommand::FocusUp
-        | PaneCommand::FocusRight => select_directional_pane(socket, session, command, frame),
+        | PaneCommand::FocusRight => select_directional_pane(socket, session, command),
         PaneCommand::ResizeLeft => resize_pane(
             socket,
             session,
@@ -2328,79 +2328,27 @@ fn resize_pane(
     Ok(())
 }
 
-fn select_directional_pane(
-    socket: &Path,
-    session: &str,
-    command: PaneCommand,
-    frame: &LiveSnapshotFrame,
-) -> io::Result<()> {
-    let entries = pane_entries(socket, session)?;
-    let active = entries
-        .iter()
-        .find(|entry| entry.active)
-        .ok_or_else(|| io::Error::other("missing active pane"))?;
-    let Some(target) = directional_focus_target(frame, active.index, command) else {
-        return Ok(());
-    };
-
-    let _ = send_control_request(socket, &protocol::encode_select_pane(session, target))?;
+fn select_directional_pane(socket: &Path, session: &str, command: PaneCommand) -> io::Result<()> {
+    let direction = pane_command_direction(command)
+        .ok_or_else(|| io::Error::other("not a directional pane command"))?;
+    let _ = send_control_request(
+        socket,
+        &protocol::encode_select_pane_target(
+            session,
+            protocol::PaneSelectTarget::Direction(direction),
+        ),
+    )?;
     Ok(())
 }
 
-fn directional_focus_target(
-    frame: &LiveSnapshotFrame,
-    active_index: usize,
-    command: PaneCommand,
-) -> Option<usize> {
-    let active = frame
-        .regions
-        .iter()
-        .find(|region| region.pane == active_index)?;
-
-    frame
-        .regions
-        .iter()
-        .filter(|region| region.pane != active_index)
-        .filter_map(|region| {
-            directional_focus_score(active, region, command).map(|score| (score, region.pane))
-        })
-        .min_by_key(|(score, pane)| (*score, *pane))
-        .map(|(_, pane)| pane)
-}
-
-fn directional_focus_score(
-    active: &AttachPaneRegion,
-    candidate: &AttachPaneRegion,
-    command: PaneCommand,
-) -> Option<(usize, usize)> {
-    let active_row = region_center(active.row_start, active.row_end);
-    let active_col = region_center(active.col_start, active.col_end);
-    let candidate_row = region_center(candidate.row_start, candidate.row_end);
-    let candidate_col = region_center(candidate.col_start, candidate.col_end);
-
+fn pane_command_direction(command: PaneCommand) -> Option<protocol::PaneDirection> {
     match command {
-        PaneCommand::FocusLeft if candidate.col_end <= active.col_start => Some((
-            active.col_start - candidate.col_end,
-            active_row.abs_diff(candidate_row),
-        )),
-        PaneCommand::FocusRight if candidate.col_start >= active.col_end => Some((
-            candidate.col_start - active.col_end,
-            active_row.abs_diff(candidate_row),
-        )),
-        PaneCommand::FocusUp if candidate.row_end <= active.row_start => Some((
-            active.row_start - candidate.row_end,
-            active_col.abs_diff(candidate_col),
-        )),
-        PaneCommand::FocusDown if candidate.row_start >= active.row_end => Some((
-            candidate.row_start - active.row_end,
-            active_col.abs_diff(candidate_col),
-        )),
+        PaneCommand::FocusLeft => Some(protocol::PaneDirection::Left),
+        PaneCommand::FocusDown => Some(protocol::PaneDirection::Down),
+        PaneCommand::FocusUp => Some(protocol::PaneDirection::Up),
+        PaneCommand::FocusRight => Some(protocol::PaneDirection::Right),
         _ => None,
     }
-}
-
-fn region_center(start: usize, end: usize) -> usize {
-    start + end.saturating_sub(start) / 2
 }
 
 fn pane_at_mouse_position(
@@ -2638,7 +2586,25 @@ where
                         });
                     }
                 }
-                AttachInputAction::PaneCommand(_) => {}
+                AttachInputAction::PaneCommand(PaneCommand::FocusLeft)
+                | AttachInputAction::PaneCommand(PaneCommand::FocusDown)
+                | AttachInputAction::PaneCommand(PaneCommand::FocusUp)
+                | AttachInputAction::PaneCommand(PaneCommand::FocusRight) => {
+                    let AttachInputAction::PaneCommand(command) = action else {
+                        unreachable!();
+                    };
+                    if let Err(error) = select_directional_pane(socket, session, *command) {
+                        write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                input_state.saw_prefix,
+                                RawPendingFocus::Preserve,
+                            ),
+                        });
+                    }
+                }
                 AttachInputAction::SelectNextPane => {
                     if let Err(error) = select_next_pane(socket, session) {
                         write_attach_transient_message(&error.to_string())?;
@@ -4239,6 +4205,36 @@ mod tests {
                 vec![AttachInputAction::PaneCommand(command)]
             );
         }
+    }
+
+    #[test]
+    fn directional_focus_uses_server_select_request() {
+        let socket = std::env::current_dir().unwrap().join(format!(
+            ".dmux-focus-direction-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn({
+            let socket = socket.clone();
+            move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert_eq!(
+                    read_line(&mut stream).unwrap(),
+                    "SELECT_PANE_DIRECTION\tdev\tL\n"
+                );
+                stream.write_all(b"OK\n").unwrap();
+                let _ = std::fs::remove_file(socket);
+            }
+        });
+
+        select_directional_pane(&socket, "dev", PaneCommand::FocusLeft).unwrap();
+
+        server.join().unwrap();
     }
 
     #[test]

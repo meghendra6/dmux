@@ -1,7 +1,8 @@
 use crate::ids::{PaneId, TabId};
 use crate::layout::{LayoutNode, PaneRegion, layout_regions_for_size, split_extent_weighted};
 use crate::protocol::{
-    self, BufferSelection, CaptureMode, PaneResizeDirection, Request, SplitDirection,
+    self, BufferSelection, CaptureMode, PaneDirection, PaneResizeDirection, PaneSelectTarget,
+    Request, SplitDirection,
 };
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::{TerminalChanges, TerminalState};
@@ -328,8 +329,8 @@ impl Session {
         self.windows.lock().unwrap().active_window_size()
     }
 
-    fn select_pane(&self, index: usize) -> bool {
-        self.windows.lock().unwrap().select_pane(index)
+    fn select_pane(&self, target: PaneSelectTarget) -> Result<(), String> {
+        self.windows.lock().unwrap().select_pane(target)
     }
 
     fn kill_pane(&self, target: Option<usize>) -> Result<Arc<Pane>, String> {
@@ -602,12 +603,40 @@ impl Window {
             })
     }
 
-    fn select_pane(&mut self, index: usize) -> bool {
+    fn select_pane(&mut self, target: PaneSelectTarget) -> Result<(), String> {
+        let index = self.resolve_pane_select_target(target)?;
         let selected = self.panes.select(index);
         if selected && self.zoomed.is_some() {
             self.zoomed = Some(index);
         }
-        selected
+        Ok(())
+    }
+
+    fn resolve_pane_select_target(&self, target: PaneSelectTarget) -> Result<usize, String> {
+        match target {
+            PaneSelectTarget::Index(index) => {
+                if index >= self.panes.len() {
+                    Err("missing pane".to_string())
+                } else {
+                    Ok(index)
+                }
+            }
+            PaneSelectTarget::Id(id) => self
+                .panes
+                .panes
+                .iter()
+                .position(|pane| pane.id == PaneId::new(id))
+                .ok_or_else(|| "missing pane".to_string()),
+            PaneSelectTarget::Direction(direction) => self
+                .directional_pane_target(direction)
+                .ok_or_else(|| "missing adjacent pane".to_string()),
+        }
+    }
+
+    fn directional_pane_target(&self, direction: PaneDirection) -> Option<usize> {
+        let active_index = self.panes.active_index();
+        let regions = layout_regions_for_size(&self.layout, self.size);
+        directional_pane_target_from_regions(&regions, active_index, direction)
     }
 
     fn kill_pane(&mut self, target: Option<usize>) -> Result<Arc<Pane>, String> {
@@ -861,9 +890,10 @@ impl WindowSet {
         self.active_window()?.next_split_pane_size(direction)
     }
 
-    fn select_pane(&mut self, index: usize) -> bool {
+    fn select_pane(&mut self, target: PaneSelectTarget) -> Result<(), String> {
         self.active_window_mut()
-            .is_some_and(|window| window.select_pane(index))
+            .ok_or_else(|| "missing window".to_string())?
+            .select_pane(target)
     }
 
     fn kill_pane(&mut self, target: Option<usize>) -> Result<Arc<Pane>, String> {
@@ -1018,6 +1048,93 @@ impl AttachLayoutSnapshot {
             active_pane_index: 0,
         }
     }
+}
+
+fn directional_pane_target_from_regions(
+    regions: &[PaneRegion],
+    active_index: usize,
+    direction: PaneDirection,
+) -> Option<usize> {
+    let active = regions.iter().find(|region| region.pane == active_index)?;
+    regions
+        .iter()
+        .filter(|region| region.pane != active_index)
+        .filter_map(|region| {
+            directional_pane_score(active, region, direction).map(|score| (region.pane, score))
+        })
+        .min_by(|(left_pane, left_score), (right_pane, right_score)| {
+            left_score
+                .distance
+                .cmp(&right_score.distance)
+                .then_with(|| right_score.overlap.cmp(&left_score.overlap))
+                .then_with(|| left_pane.cmp(right_pane))
+        })
+        .map(|(pane, _)| pane)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirectionalPaneScore {
+    distance: usize,
+    overlap: usize,
+}
+
+fn directional_pane_score(
+    active: &PaneRegion,
+    candidate: &PaneRegion,
+    direction: PaneDirection,
+) -> Option<DirectionalPaneScore> {
+    let (distance, overlap) = match direction {
+        PaneDirection::Left if candidate.col_end <= active.col_start => (
+            active.col_start - candidate.col_end,
+            span_overlap(
+                active.row_start,
+                active.row_end,
+                candidate.row_start,
+                candidate.row_end,
+            ),
+        ),
+        PaneDirection::Right if candidate.col_start >= active.col_end => (
+            candidate.col_start - active.col_end,
+            span_overlap(
+                active.row_start,
+                active.row_end,
+                candidate.row_start,
+                candidate.row_end,
+            ),
+        ),
+        PaneDirection::Up if candidate.row_end <= active.row_start => (
+            active.row_start - candidate.row_end,
+            span_overlap(
+                active.col_start,
+                active.col_end,
+                candidate.col_start,
+                candidate.col_end,
+            ),
+        ),
+        PaneDirection::Down if candidate.row_start >= active.row_end => (
+            candidate.row_start - active.row_end,
+            span_overlap(
+                active.col_start,
+                active.col_end,
+                candidate.col_start,
+                candidate.col_end,
+            ),
+        ),
+        _ => return None,
+    };
+
+    (overlap > 0).then_some(DirectionalPaneScore { distance, overlap })
+}
+
+fn span_overlap(
+    first_start: usize,
+    first_end: usize,
+    second_start: usize,
+    second_end: usize,
+) -> usize {
+    first_end
+        .min(second_end)
+        .saturating_sub(first_start.max(second_start))
 }
 
 struct PaneSnapshot {
@@ -1245,8 +1362,8 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::ListPanes { session, format } => {
             handle_list_panes(&state, &mut stream, &session, format.as_deref())
         }
-        Request::SelectPane { session, pane } => {
-            handle_select_pane(&state, &mut stream, &session, pane)
+        Request::SelectPane { session, target } => {
+            handle_select_pane(&state, &mut stream, &session, target)
         }
         Request::KillPane { session, pane } => {
             handle_kill_pane(&state, &mut stream, &session, pane)
@@ -1899,7 +2016,7 @@ fn handle_select_pane(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     name: &str,
-    index: usize,
+    target: PaneSelectTarget,
 ) -> io::Result<()> {
     let session = {
         let sessions = state.sessions.lock().unwrap();
@@ -1911,8 +2028,8 @@ fn handle_select_pane(
         return Ok(());
     };
 
-    if !session.select_pane(index) {
-        write_err(stream, "missing pane")?;
+    if let Err(error) = session.select_pane(target) {
+        write_err(stream, &error)?;
         return Ok(());
     }
     session.resize_current_visible_panes()?;
@@ -3474,8 +3591,12 @@ mod tests {
     }
 
     fn test_pane() -> (Arc<Pane>, PathBuf) {
-        let writer_path = std::env::temp_dir().join(format!(
-            "dmux-test-pane-{}-{}",
+        test_pane_with_id(0)
+    }
+
+    fn test_pane_with_id(id: usize) -> (Arc<Pane>, PathBuf) {
+        let writer_path = std::env::current_dir().unwrap().join(format!(
+            ".dmux-test-pane-{id}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3484,7 +3605,7 @@ mod tests {
         ));
         let writer = File::create(&writer_path).unwrap();
         let pane = Arc::new(Pane {
-            id: PaneId::new(0),
+            id: PaneId::new(id),
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
@@ -3903,6 +4024,139 @@ mod tests {
             Err("cannot kill last pane; use kill-session")
         );
         assert_eq!(panes.active(), Some("base"));
+    }
+
+    #[test]
+    fn directional_target_selects_adjacent_in_simple_geometry() {
+        let regions = vec![
+            PaneRegion {
+                pane: 0,
+                row_start: 0,
+                row_end: 10,
+                col_start: 0,
+                col_end: 10,
+            },
+            PaneRegion {
+                pane: 1,
+                row_start: 0,
+                row_end: 10,
+                col_start: 13,
+                col_end: 20,
+            },
+        ];
+
+        assert_eq!(
+            directional_pane_target_from_regions(&regions, 0, PaneDirection::Right),
+            Some(1)
+        );
+        assert_eq!(
+            directional_pane_target_from_regions(&regions, 1, PaneDirection::Left),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn directional_target_uses_distance_overlap_and_index_tiebreaks_for_nested_geometry() {
+        let regions = vec![
+            PaneRegion {
+                pane: 0,
+                row_start: 0,
+                row_end: 10,
+                col_start: 10,
+                col_end: 20,
+            },
+            PaneRegion {
+                pane: 1,
+                row_start: 0,
+                row_end: 4,
+                col_start: 0,
+                col_end: 8,
+            },
+            PaneRegion {
+                pane: 2,
+                row_start: 4,
+                row_end: 10,
+                col_start: 0,
+                col_end: 8,
+            },
+            PaneRegion {
+                pane: 3,
+                row_start: 0,
+                row_end: 10,
+                col_start: 22,
+                col_end: 30,
+            },
+        ];
+
+        assert_eq!(
+            directional_pane_target_from_regions(&regions, 0, PaneDirection::Left),
+            Some(2)
+        );
+        assert_eq!(
+            directional_pane_target_from_regions(&regions, 0, PaneDirection::Right),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn directional_target_rejects_non_overlapping_candidates() {
+        let regions = vec![
+            PaneRegion {
+                pane: 0,
+                row_start: 10,
+                row_end: 20,
+                col_start: 10,
+                col_end: 20,
+            },
+            PaneRegion {
+                pane: 1,
+                row_start: 0,
+                row_end: 5,
+                col_start: 0,
+                col_end: 5,
+            },
+        ];
+
+        assert_eq!(
+            directional_pane_target_from_regions(&regions, 0, PaneDirection::Left),
+            None
+        );
+    }
+
+    #[test]
+    fn window_directional_select_without_adjacent_preserves_active_pane() {
+        let (pane0, path0) = test_pane_with_id(0);
+        let (pane1, path1) = test_pane_with_id(1);
+        let mut window = Window::new(TabId::new(0), pane0);
+        window.add_pane(SplitDirection::Horizontal, pane1);
+        window.select_pane(PaneSelectTarget::Index(0)).unwrap();
+
+        let error = window
+            .select_pane(PaneSelectTarget::Direction(PaneDirection::Up))
+            .unwrap_err();
+
+        assert_eq!(error, "missing adjacent pane");
+        assert_eq!(window.active_pane_index(), 0);
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+    }
+
+    #[test]
+    fn window_selects_pane_by_stable_id_after_index_changes() {
+        let (pane0, path0) = test_pane_with_id(10);
+        let (pane1, path1) = test_pane_with_id(11);
+        let (pane2, path2) = test_pane_with_id(12);
+        let mut window = Window::new(TabId::new(0), pane0);
+        window.add_pane(SplitDirection::Horizontal, pane1);
+        window.add_pane(SplitDirection::Vertical, pane2);
+        window.remove_pane_at(1);
+
+        window.select_pane(PaneSelectTarget::Id(12)).unwrap();
+
+        assert_eq!(window.active_pane_index(), 1);
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+        let _ = std::fs::remove_file(path2);
     }
 
     #[test]

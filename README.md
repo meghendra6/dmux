@@ -29,7 +29,7 @@ Implemented Phase 0/1 commands:
 - `dmux split-window -t <name> -h|-v [-- command...]`
 - `dmux split -t <name> -h|-v [-- command...]`
 - `dmux list-panes -t <name> [-F <format>]`
-- `dmux select-pane -t <name> -p <index>`
+- `dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D`
 - `dmux kill-pane -t <name> [-p <index>]`
 - `dmux zoom-pane -t <name> [-p <index>]`
 - `dmux status-line -t <name> [-F <format>]`
@@ -67,9 +67,11 @@ digit to select a pane by number, `C-b x` to close the active pane, `C-b z` to
 toggle zoom, and mouse click to select a pane. `C-b %` and `C-b "` also work
 from a fresh single-pane attach and transition automatically into the multi-pane
 layout view. Pane splitting is also available with
-`dmux split-window -t <name> -h|-v [-- command...]`; active pane resizing is
-available with `dmux resize-pane -t <name> -L|-R|-U|-D [amount]`; use
-`dmux attach --help` or `dmux help attach` to list attach-time bindings.
+`dmux split-window -t <name> -h|-v [-- command...]`; active pane focus is
+available with `dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D`;
+active pane resizing is available with
+`dmux resize-pane -t <name> -L|-R|-U|-D [amount]`; use `dmux attach --help` or
+`dmux help attach` to list attach-time bindings.
 Unzoomed multi-pane attach redraws from server change events and keeps a polling
 fallback for mixed-version daemons or missed events.
 
@@ -95,7 +97,7 @@ Implemented Phase 2 groundwork:
 - Zellij-style tab command aliases over the window model
 - window removal while keeping the session alive
 - split-pane sessions with a server-side active pane
-- active pane selection by pane index
+- active pane selection by pane index, stable ID, or layout direction
 - pane removal while keeping the session alive
 - pane zoom state while keeping all panes alive
 - server-side statusline format expansion

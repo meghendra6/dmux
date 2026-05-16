@@ -16,6 +16,21 @@ pub enum PaneResizeDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneSelectTarget {
+    Index(usize),
+    Id(usize),
+    Direction(PaneDirection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureMode {
     Screen,
     History,
@@ -110,7 +125,7 @@ pub enum Request {
     },
     SelectPane {
         session: String,
-        pane: usize,
+        target: PaneSelectTarget,
     },
     KillPane {
         session: String,
@@ -282,6 +297,19 @@ pub fn encode_list_panes(session: &str, format: Option<&str>) -> String {
 
 pub fn encode_select_pane(session: &str, pane: usize) -> String {
     format!("SELECT_PANE\t{session}\t{pane}\n")
+}
+
+pub fn encode_select_pane_target(session: &str, target: PaneSelectTarget) -> String {
+    match target {
+        PaneSelectTarget::Index(pane) => encode_select_pane(session, pane),
+        PaneSelectTarget::Id(id) => format!("SELECT_PANE_ID\t{session}\t{id}\n"),
+        PaneSelectTarget::Direction(direction) => {
+            format!(
+                "SELECT_PANE_DIRECTION\t{session}\t{}\n",
+                encode_pane_direction(direction)
+            )
+        }
+    }
 }
 
 pub fn encode_kill_pane(session: &str, pane: Option<usize>) -> String {
@@ -489,9 +517,24 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         }),
         ["SELECT_PANE", session, pane] => Ok(Request::SelectPane {
             session: (*session).to_string(),
-            pane: pane
-                .parse::<usize>()
-                .map_err(|_| "SELECT_PANE has invalid pane index".to_string())?,
+            target: PaneSelectTarget::Index(
+                pane.parse::<usize>()
+                    .map_err(|_| "SELECT_PANE has invalid pane index".to_string())?,
+            ),
+        }),
+        ["SELECT_PANE_ID", session, id] => Ok(Request::SelectPane {
+            session: (*session).to_string(),
+            target: PaneSelectTarget::Id(
+                id.parse::<usize>()
+                    .map_err(|_| "SELECT_PANE_ID has invalid pane id".to_string())?,
+            ),
+        }),
+        ["SELECT_PANE_DIRECTION", session, direction] => Ok(Request::SelectPane {
+            session: (*session).to_string(),
+            target: PaneSelectTarget::Direction(decode_pane_direction(
+                direction,
+                "SELECT_PANE_DIRECTION has invalid direction",
+            )?),
         }),
         ["KILL_PANE", session, pane] => Ok(Request::KillPane {
             session: (*session).to_string(),
@@ -567,6 +610,15 @@ fn encode_pane_resize_direction(direction: PaneResizeDirection) -> &'static str 
     }
 }
 
+fn encode_pane_direction(direction: PaneDirection) -> &'static str {
+    match direction {
+        PaneDirection::Left => "L",
+        PaneDirection::Right => "R",
+        PaneDirection::Up => "U",
+        PaneDirection::Down => "D",
+    }
+}
+
 fn encode_capture_mode(mode: CaptureMode) -> &'static str {
     match mode {
         CaptureMode::Screen => "screen",
@@ -599,6 +651,16 @@ fn decode_pane_resize_direction(value: &str) -> Result<PaneResizeDirection, Stri
         "U" => Ok(PaneResizeDirection::Up),
         "D" => Ok(PaneResizeDirection::Down),
         _ => Err("RESIZE_PANE has invalid direction".to_string()),
+    }
+}
+
+fn decode_pane_direction(value: &str, invalid_message: &str) -> Result<PaneDirection, String> {
+    match value {
+        "L" => Ok(PaneDirection::Left),
+        "R" => Ok(PaneDirection::Right),
+        "U" => Ok(PaneDirection::Up),
+        "D" => Ok(PaneDirection::Down),
+        _ => Err(invalid_message.to_string()),
     }
 }
 
@@ -922,7 +984,34 @@ mod tests {
             decode_request(&line).unwrap(),
             Request::SelectPane {
                 session: "dev".to_string(),
-                pane: 1,
+                target: PaneSelectTarget::Index(1),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_select_pane_id_request() {
+        let line = encode_select_pane_target("dev", PaneSelectTarget::Id(42));
+        assert_eq!(line, "SELECT_PANE_ID\tdev\t42\n");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::SelectPane {
+                session: "dev".to_string(),
+                target: PaneSelectTarget::Id(42),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_select_pane_direction_request() {
+        let line =
+            encode_select_pane_target("dev", PaneSelectTarget::Direction(PaneDirection::Left));
+        assert_eq!(line, "SELECT_PANE_DIRECTION\tdev\tL\n");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::SelectPane {
+                session: "dev".to_string(),
+                target: PaneSelectTarget::Direction(PaneDirection::Left),
             }
         );
     }
