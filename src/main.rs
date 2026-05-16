@@ -1,5 +1,6 @@
 mod cli;
 mod client;
+mod layout;
 mod paths;
 mod protocol;
 mod pty;
