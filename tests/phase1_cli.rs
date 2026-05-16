@@ -5527,6 +5527,59 @@ fn attach_render_stream_pushes_frame_after_pane_output() {
 }
 
 #[test]
+fn attach_render_stream_pushes_split_frame_after_structural_change() {
+    let socket = unique_socket("attach-render-fast-split");
+    let session = format!("attach-render-fast-split-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    let mut stream = attach_render_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT_META\n");
+    let initial = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
+    assert!(initial.contains("base-ready"), "{initial:?}");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set fast split render timeout");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+
+    let pushed = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
+    assert!(pushed.contains("REGIONS\t2"), "{pushed:?}");
+    assert!(pushed.contains("│"), "{pushed:?}");
+    assert!(!pushed.contains("STATUS\t"), "{pushed:?}");
+    assert!(!pushed.contains("\nSNAPSHOT\t"), "{pushed:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_render_stream_coalesces_bursty_pane_output() {
     let socket = unique_socket("attach-render-coalesce");
     let session = format!("attach-render-coalesce-{}", std::process::id());

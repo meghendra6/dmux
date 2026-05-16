@@ -241,6 +241,9 @@ struct Session {
     attach_streams: AttachLifetimeStreams,
     attach_render_clients: AttachRenderClients,
     attach_render_pending: AtomicBool,
+    attach_render_immediate_pending: AtomicBool,
+    attach_render_epoch: AtomicU64,
+    attach_render_rendered_epoch: AtomicU64,
     raw_attach_layout_epoch: AtomicU64,
     next_attach_event_id: AtomicUsize,
     next_attach_stream_id: AtomicUsize,
@@ -256,6 +259,9 @@ impl Session {
             attach_streams: Arc::new(Mutex::new(Vec::new())),
             attach_render_clients: Arc::new(Mutex::new(Vec::new())),
             attach_render_pending: AtomicBool::new(false),
+            attach_render_immediate_pending: AtomicBool::new(false),
+            attach_render_epoch: AtomicU64::new(0),
+            attach_render_rendered_epoch: AtomicU64::new(0),
             raw_attach_layout_epoch: AtomicU64::new(0),
             next_attach_event_id: AtomicUsize::new(0),
             next_attach_stream_id: AtomicUsize::new(0),
@@ -346,10 +352,16 @@ impl Session {
         self.schedule_attach_render();
     }
 
+    fn notify_attach_redraw_immediate(self: &Arc<Self>) {
+        notify_attach_redraw(&self.attach_events);
+        self.schedule_attach_render_immediate();
+    }
+
     fn schedule_attach_render(self: &Arc<Self>) {
         if self.attach_render_clients.lock().unwrap().is_empty() {
             return;
         }
+        self.mark_attach_render_dirty();
         if self
             .attach_render_pending
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -365,10 +377,24 @@ impl Session {
                 return;
             };
             session.attach_render_pending.store(false, Ordering::SeqCst);
-            notify_attach_render(&session.attach_render_clients, || {
-                session.attach_render_frame()
-            });
+            session.notify_attach_render_if_dirty();
         });
+    }
+
+    fn schedule_attach_render_immediate(self: &Arc<Self>) {
+        if self.attach_render_clients.lock().unwrap().is_empty() {
+            return;
+        }
+        self.mark_attach_render_dirty();
+        if self
+            .attach_render_immediate_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let session = Arc::downgrade(self);
+        std::thread::spawn(move || run_attach_render_immediate_scheduler(session));
     }
 
     fn register_attach_stream(&self, stream: &UnixStream) -> io::Result<StreamRegistration> {
@@ -396,6 +422,32 @@ impl Session {
 
     fn attach_render_frame(&self) -> Option<Vec<u8>> {
         format_attach_render_stream_frame(self)
+    }
+
+    fn mark_attach_render_dirty(&self) {
+        self.attach_render_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn notify_attach_render_if_dirty(&self) {
+        let epoch = self.attach_render_epoch.load(Ordering::SeqCst);
+        loop {
+            let rendered = self.attach_render_rendered_epoch.load(Ordering::SeqCst);
+            if rendered >= epoch {
+                return;
+            }
+            if self
+                .attach_render_rendered_epoch
+                .compare_exchange(rendered, epoch, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.notify_attach_render_now();
+                return;
+            }
+        }
+    }
+
+    fn notify_attach_render_now(&self) {
+        notify_attach_render(&self.attach_render_clients, || self.attach_render_frame());
     }
 
     fn raw_attach_layout_epoch(&self) -> u64 {
@@ -1457,7 +1509,7 @@ fn handle_resize(
         return Ok(());
     }
 
-    session.notify_attach_redraw();
+    session.notify_attach_redraw_immediate();
     write_ok(stream)
 }
 
@@ -1521,7 +1573,7 @@ fn handle_split(
         write_err(stream, "missing pane")?;
         return Ok(());
     }
-    session.notify_attach_redraw();
+    session.notify_attach_redraw_immediate();
     let result = write_ok(stream);
     if close_raw_attach_streams {
         session.mark_raw_attach_layout_transition();
@@ -1589,7 +1641,7 @@ fn handle_zoom_pane(
     }
     session.resize_current_visible_panes()?;
 
-    session.notify_attach_redraw();
+    session.notify_attach_redraw_immediate();
     write_ok(stream)
 }
 
@@ -1708,7 +1760,7 @@ fn handle_select_pane(
     }
     session.resize_current_visible_panes()?;
 
-    session.notify_attach_redraw();
+    session.notify_attach_redraw_immediate();
     write_ok(stream)
 }
 
@@ -1737,7 +1789,7 @@ fn handle_kill_pane(
     };
     session.resize_current_visible_panes()?;
 
-    session.notify_attach_redraw();
+    session.notify_attach_redraw_immediate();
     write_ok(stream)
 }
 
@@ -1772,7 +1824,7 @@ fn handle_new_window(
     )?;
     pane.set_session(&session);
     session.add_window(pane);
-    session.notify_attach_redraw();
+    session.notify_attach_redraw_immediate();
     write_ok(stream)
 }
 
@@ -1819,7 +1871,7 @@ fn handle_select_window(
         return Ok(());
     }
 
-    session.notify_attach_redraw();
+    session.notify_attach_redraw_immediate();
     write_ok(stream)
 }
 
@@ -1844,7 +1896,7 @@ fn handle_kill_window(
         return Ok(());
     }
 
-    session.notify_attach_redraw();
+    session.notify_attach_redraw_immediate();
     write_ok(stream)
 }
 
@@ -3132,6 +3184,30 @@ fn notify_attach_redraw(clients: &AttachEventClients) {
     *clients = live;
 }
 
+fn run_attach_render_immediate_scheduler(session: Weak<Session>) {
+    loop {
+        let Some(session) = session.upgrade() else {
+            return;
+        };
+        session.notify_attach_render_if_dirty();
+        session
+            .attach_render_immediate_pending
+            .store(false, Ordering::SeqCst);
+        if session.attach_render_rendered_epoch.load(Ordering::SeqCst)
+            >= session.attach_render_epoch.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        if session
+            .attach_render_immediate_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 fn notify_attach_render(
     clients: &AttachRenderClients,
     render_frame: impl FnOnce() -> Option<Vec<u8>>,
@@ -3274,6 +3350,46 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    fn read_attach_render_frame_body(stream: &mut UnixStream) -> Vec<u8> {
+        let line = read_socket_line(stream);
+        let Some(len) = line
+            .strip_prefix("FRAME\t")
+            .and_then(|line| line.strip_suffix('\n'))
+        else {
+            panic!("invalid render frame header: {line:?}");
+        };
+        let len = len.parse::<usize>().expect("parse render frame length");
+        let mut body = vec![0_u8; len];
+        stream
+            .read_exact(&mut body)
+            .expect("read attach render frame body");
+        body
+    }
+
+    fn test_pane() -> (Arc<Pane>, PathBuf) {
+        let writer_path = std::env::temp_dir().join(format!(
+            "dmux-test-pane-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let writer = File::create(&writer_path).unwrap();
+        let pane = Arc::new(Pane {
+            child_pid: 0,
+            writer: Arc::new(Mutex::new(writer)),
+            size: Mutex::new(PtySize { cols: 80, rows: 24 }),
+            raw_history: Arc::new(Mutex::new(Vec::new())),
+            terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
+            clients: Arc::new(Mutex::new(Vec::new())),
+            next_client_id: AtomicUsize::new(0),
+            attach_events: Arc::new(Mutex::new(Vec::new())),
+            session: Mutex::new(None),
+        });
+        (pane, writer_path)
+    }
+
     fn wait_for_tracked_stream_count(clients: &TrackedStreamClients, expected: usize) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
@@ -3336,6 +3452,32 @@ mod tests {
         });
 
         assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn notify_attach_redraw_immediate_sends_render_frame() {
+        let (pane, writer_path) = test_pane();
+        let session = Arc::new(Session::new(
+            "test".to_string(),
+            Arc::clone(&pane),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let _registration = session
+            .register_attach_render_stream(&server)
+            .unwrap()
+            .unwrap();
+        let _initial = read_attach_render_frame_body(&mut client);
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        session.notify_attach_redraw_immediate();
+
+        let body = String::from_utf8(read_attach_render_frame_body(&mut client))
+            .expect("render frame utf8");
+        assert!(body.contains("OUTPUT\t"), "{body:?}");
+        let _ = std::fs::remove_file(writer_path);
     }
 
     #[test]
