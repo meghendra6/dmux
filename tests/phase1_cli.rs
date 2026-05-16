@@ -215,6 +215,39 @@ fn read_socket_line(stream: &mut UnixStream) -> String {
     String::from_utf8(bytes).expect("utf8 socket response")
 }
 
+fn try_read_socket_line(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                bytes.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 fn attach_events_stream(socket: &std::path::Path, session: &str) -> UnixStream {
     let mut stream = UnixStream::connect(socket).expect("connect event stream");
     stream
@@ -251,6 +284,22 @@ fn read_attach_render_frame_body(stream: &mut UnixStream) -> Vec<u8> {
         .read_exact(&mut body)
         .expect("read attach render frame body");
     body
+}
+
+fn try_read_attach_render_frame_body(stream: &mut UnixStream) -> std::io::Result<Option<Vec<u8>>> {
+    let Some(line) = try_read_socket_line(stream)? else {
+        return Ok(None);
+    };
+    let Some(len) = line
+        .strip_prefix("FRAME\t")
+        .and_then(|line| line.strip_suffix('\n'))
+    else {
+        panic!("invalid render frame header: {line:?}");
+    };
+    let len = len.parse::<usize>().expect("parse render frame length");
+    let mut body = vec![0_u8; len];
+    stream.read_exact(&mut body)?;
+    Ok(Some(body))
 }
 
 fn attach_render_output_from_frame_body(body: &[u8]) -> Vec<u8> {
@@ -337,8 +386,12 @@ fn count_attach_render_output_frames_until_contains(
     let mut last_output = String::new();
 
     while std::time::Instant::now() < deadline {
+        let Some(body) =
+            try_read_attach_render_frame_body(stream).expect("read attach render frame body")
+        else {
+            continue;
+        };
         count += 1;
-        let body = read_attach_render_frame_body(stream);
         last_body = String::from_utf8_lossy(&body).to_string();
         last_output =
             String::from_utf8_lossy(&attach_render_output_from_frame_body(&body)).to_string();
@@ -5986,6 +6039,113 @@ fn attach_render_stream_returns_to_primary_screen_after_real_vim_exit() {
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
     let _ = std::fs::remove_file(file);
+}
+
+#[test]
+fn attach_render_stream_preserves_streaming_output_across_resize() {
+    let socket = unique_socket("attach-render-stream-resize");
+    let session = format!("attach-render-stream-resize-{}", std::process::id());
+    let stop_file = unique_temp_file("attach-render-stream-resize-stop");
+    let _ = std::fs::remove_file(&stop_file);
+    let stop_file_arg = stop_file.to_string_lossy().into_owned();
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "stop_file=$1; printf stream-ready; read line; i=0; while [ ! -e \"$stop_file\" ] && [ $i -lt 200 ]; do i=$((i + 1)); printf 'stream-%03d\\n' \"$i\"; sleep 0.03; done; if [ -e \"$stop_file\" ]; then printf 'stream-done\\n'; else printf 'stream-aborted\\n'; fi; sleep 30",
+            "sh",
+            &stop_file_arg,
+        ],
+    ));
+    let stream_ready = poll_capture(&socket, &session, "stream-ready");
+    assert!(stream_ready.contains("stream-ready"), "{stream_ready:?}");
+
+    let mut stream = attach_render_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT_META\n");
+    let initial = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
+    assert!(initial.contains("base-ready"), "{initial:?}");
+    assert!(initial.contains("stream-ready"), "{initial:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "go", "Enter"],
+    ));
+    let (_start_frames, start_frame_body, start_output) =
+        count_attach_render_output_frames_until_contains(&mut stream, "stream-005");
+    assert!(start_output.contains("stream-005"), "{start_output:?}");
+    assert!(
+        !start_frame_body.contains("STATUS\t"),
+        "{start_frame_body:?}"
+    );
+    assert!(
+        !start_frame_body.contains("\nSNAPSHOT\t"),
+        "{start_frame_body:?}"
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "100", "-y", "30"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["resize-pane", "-t", &session, "-x", "80", "-y", "24"],
+    ));
+    let (_after_resize_frames, after_resize_frame_body, after_resize_output) =
+        count_attach_render_output_frames_until_contains(&mut stream, "stream-010");
+    assert!(
+        after_resize_output.contains("stream-010"),
+        "{after_resize_output:?}"
+    );
+    assert!(
+        !after_resize_frame_body.contains("STATUS\t"),
+        "{after_resize_frame_body:?}"
+    );
+    assert!(
+        !after_resize_frame_body.contains("\nSNAPSHOT\t"),
+        "{after_resize_frame_body:?}"
+    );
+
+    drop(File::create(&stop_file).expect("create stream stop file"));
+    let (_frames, frame_body, output) =
+        count_attach_render_output_frames_until_contains(&mut stream, "stream-done");
+    assert!(output.contains("stream-done"), "{output:?}");
+    assert!(!frame_body.contains("STATUS\t"), "{frame_body:?}");
+    assert!(!frame_body.contains("\nSNAPSHOT\t"), "{frame_body:?}");
+
+    let captured = poll_capture(&socket, &session, "stream-done");
+    for i in 1..=10 {
+        let line = format!("stream-{i:03}");
+        assert!(captured.contains(&line), "missing {line} in {captured:?}");
+    }
+    assert!(captured.contains("stream-done"), "{captured:?}");
+    assert!(!captured.contains('\x1b'), "{captured:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(&stop_file);
 }
 
 #[test]
