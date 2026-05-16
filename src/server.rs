@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -241,6 +241,7 @@ struct Session {
     attach_streams: AttachLifetimeStreams,
     attach_render_clients: AttachRenderClients,
     attach_render_pending: AtomicBool,
+    raw_attach_layout_epoch: AtomicU64,
     next_attach_event_id: AtomicUsize,
     next_attach_stream_id: AtomicUsize,
     next_attach_render_id: AtomicUsize,
@@ -255,6 +256,7 @@ impl Session {
             attach_streams: Arc::new(Mutex::new(Vec::new())),
             attach_render_clients: Arc::new(Mutex::new(Vec::new())),
             attach_render_pending: AtomicBool::new(false),
+            raw_attach_layout_epoch: AtomicU64::new(0),
             next_attach_event_id: AtomicUsize::new(0),
             next_attach_stream_id: AtomicUsize::new(0),
             next_attach_render_id: AtomicUsize::new(0),
@@ -394,6 +396,14 @@ impl Session {
 
     fn attach_render_frame(&self) -> Option<Vec<u8>> {
         format_attach_render_stream_frame(self)
+    }
+
+    fn raw_attach_layout_epoch(&self) -> u64 {
+        self.raw_attach_layout_epoch.load(Ordering::SeqCst)
+    }
+
+    fn mark_raw_attach_layout_transition(&self) {
+        self.raw_attach_layout_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     fn close_raw_attach_streams(&self) {
@@ -1089,6 +1099,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
         Request::Attach { session } => handle_attach(&state, stream, &session),
+        Request::AttachRawState { session } => {
+            handle_attach_raw_state(&state, &mut stream, &session)
+        }
         Request::AttachSnapshot { session } => {
             handle_attach_snapshot(&state, &mut stream, &session)
         }
@@ -1500,6 +1513,7 @@ fn handle_split(
     session.notify_attach_redraw();
     let result = write_ok(stream);
     if close_raw_attach_streams {
+        session.mark_raw_attach_layout_transition();
         session.close_raw_attach_streams();
     }
     result
@@ -1879,7 +1893,7 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
         return forward_multi_pane_attach_input(&session, &mut stream);
     }
 
-    write_ok(&mut stream)?;
+    write_attach_live_ok(&mut stream, session.raw_attach_layout_epoch())?;
     {
         let history = pane.raw_history.lock().unwrap();
         stream.write_all(&history)?;
@@ -1898,8 +1912,35 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
     Ok(())
 }
 
+fn handle_attach_raw_state(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(name).cloned()
+    };
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    write_ok(stream)?;
+    writeln!(
+        stream,
+        "RAW_LAYOUT_EPOCH\t{}",
+        session.raw_attach_layout_epoch()
+    )
+}
+
 fn has_attach_pane_snapshot(session: &Session) -> bool {
     session.attach_panes().len() > 1
+}
+
+fn write_attach_live_ok(stream: &mut UnixStream, raw_layout_epoch: u64) -> io::Result<()> {
+    writeln!(stream, "OK\tLIVE\t{raw_layout_epoch}")
 }
 
 fn write_attach_snapshot_ok(stream: &mut UnixStream) -> io::Result<()> {
@@ -3370,7 +3411,7 @@ mod tests {
         let (server, mut client) = UnixStream::pair().unwrap();
         let handle = std::thread::spawn(move || handle_attach(&state, server, "test").unwrap());
 
-        assert_eq!(read_socket_line(&mut client), "OK\n");
+        assert_eq!(read_socket_line(&mut client), "OK\tLIVE\t0\n");
         drop(client);
         handle.join().unwrap();
 

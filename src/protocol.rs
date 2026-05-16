@@ -30,6 +30,9 @@ pub enum Request {
     Attach {
         session: String,
     },
+    AttachRawState {
+        session: String,
+    },
     AttachSnapshot {
         session: String,
     },
@@ -140,6 +143,10 @@ pub fn encode_new(session: &str, command: &[String]) -> String {
 
 pub fn encode_attach(session: &str) -> String {
     format!("ATTACH\t{session}\n")
+}
+
+pub fn encode_attach_raw_state(session: &str) -> String {
+    format!("ATTACH_RAW_STATE\t{session}\n")
 }
 
 #[allow(dead_code)]
@@ -339,6 +346,9 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             })
         }
         ["ATTACH", session] => Ok(Request::Attach {
+            session: (*session).to_string(),
+        }),
+        ["ATTACH_RAW_STATE", session] => Ok(Request::AttachRawState {
             session: (*session).to_string(),
         }),
         ["LIST"] => Ok(Request::List),
@@ -999,6 +1009,17 @@ mod tests {
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::AttachSnapshot {
+                session: "dev".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_attach_raw_state_request() {
+        let line = encode_attach_raw_state("dev");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::AttachRawState {
                 session: "dev".to_string(),
             }
         );
