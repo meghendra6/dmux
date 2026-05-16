@@ -1867,7 +1867,7 @@ fn run_live_snapshot_attach(
         match input.recv_timeout(timeout) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
                 let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
-                forward_live_snapshot_input(socket, session, &bytes)?;
+                forward_live_snapshot_input(stream, &bytes)?;
                 if !redraw_paused
                     && (resized
                         || (!event_stream_active
@@ -2119,13 +2119,12 @@ fn sync_live_mouse_mode(
     Ok(())
 }
 
-fn forward_live_snapshot_input(socket: &Path, session: &str, bytes: &[u8]) -> io::Result<()> {
+fn forward_live_snapshot_input(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
 
-    let _ = send_control_request(socket, &protocol::encode_send(session, bytes))?;
-    Ok(())
+    stream.write_all(bytes)
 }
 
 fn write_live_snapshot_frame_with_pane_number_message(

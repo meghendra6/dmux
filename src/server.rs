@@ -303,7 +303,7 @@ impl Session {
         self.windows.lock().unwrap().select_pane(index)
     }
 
-    fn kill_pane(&self, target: Option<usize>) -> Result<(), String> {
+    fn kill_pane(&self, target: Option<usize>) -> Result<Arc<Pane>, String> {
         self.windows.lock().unwrap().kill_pane(target)
     }
 
@@ -612,17 +612,12 @@ impl Window {
         selected
     }
 
-    fn kill_pane(&mut self, target: Option<usize>) -> Result<(), String> {
+    fn kill_pane(&mut self, target: Option<usize>) -> Result<Arc<Pane>, String> {
         let index = self.panes.kill_index(target).map_err(str::to_string)?;
-        let pane = self
-            .panes
-            .get(index)
-            .expect("validated pane index must exist while session lock is held");
-        pty::terminate(pane.child_pid).map_err(|err| err.to_string())?;
-        self.panes.kill_at(index);
+        let pane = self.panes.kill_at(index);
         self.layout.remove_pane(index);
         self.adjust_zoom_after_pane_removal(index);
-        Ok(())
+        Ok(pane)
     }
 
     fn panes(&self) -> Vec<Arc<Pane>> {
@@ -814,7 +809,7 @@ impl WindowSet {
             .is_some_and(|window| window.select_pane(index))
     }
 
-    fn kill_pane(&mut self, target: Option<usize>) -> Result<(), String> {
+    fn kill_pane(&mut self, target: Option<usize>) -> Result<Arc<Pane>, String> {
         self.active_window_mut()
             .ok_or_else(|| "missing window".to_string())?
             .kill_pane(target)
@@ -1800,16 +1795,21 @@ fn handle_kill_pane(
         return Ok(());
     };
 
-    match session.kill_pane(pane) {
-        Ok(()) => {}
+    let removed = match session.kill_pane(pane) {
+        Ok(removed) => removed,
         Err(message) => {
             write_err(stream, &message)?;
             return Ok(());
         }
     };
-    session.resize_current_visible_panes()?;
+    if let Err(error) = session.resize_current_visible_panes() {
+        terminate_pane_async(removed.child_pid);
+        write_err(stream, &error.to_string())?;
+        return Ok(());
+    }
 
     session.notify_attach_redraw_immediate();
+    terminate_pane_async(removed.child_pid);
     write_ok(stream)
 }
 
@@ -3173,6 +3173,12 @@ fn close_attach_streams_if_only_visible_pane(pane: &Arc<Pane>) {
     if panes.len() == 1 && Arc::ptr_eq(&panes[0].pane, pane) {
         session.close_attach_streams();
     }
+}
+
+fn terminate_pane_async(child_pid: i32) {
+    std::thread::spawn(move || {
+        let _ = pty::terminate(child_pid);
+    });
 }
 
 fn append_history(history: &Mutex<Vec<u8>>, bytes: &[u8]) {
