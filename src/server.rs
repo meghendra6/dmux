@@ -354,6 +354,10 @@ impl Session {
         self.windows.lock().unwrap().active_pane()
     }
 
+    fn active_live_pane(&self) -> Option<Arc<Pane>> {
+        self.windows.lock().unwrap().active_live_pane()
+    }
+
     fn add_pane(&self, direction: SplitDirection, pane: Arc<Pane>) {
         self.windows.lock().unwrap().add_pane(direction, pane);
     }
@@ -398,26 +402,59 @@ impl Session {
         self.windows.lock().unwrap().kill_pane(target)
     }
 
-    fn remove_exited_pane(self: &Arc<Self>, pane: &Arc<Pane>) {
-        let size = *self.current_size.lock().unwrap();
-        let (removal, pane_resizes) = {
-            let mut windows = self.windows.lock().unwrap();
-            let removal = windows.remove_exited_pane(pane);
-            let pane_resizes = if removal.needs_layout_redraw() {
-                windows.resize_visible_panes(size)
-            } else {
-                Vec::new()
-            };
-            (removal, pane_resizes)
-        };
-
-        match removal {
-            ExitedPaneRemoval::Removed => {
-                let _ = resize_panes(pane_resizes);
-                self.notify_attach_redraw_immediate();
+    fn respawn_pane(
+        self: &Arc<Self>,
+        target: Option<usize>,
+        command: Vec<String>,
+        force: bool,
+    ) -> Result<Option<i32>, String> {
+        let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+        let session_name = self.name();
+        let attach_events = self.attach_event_clients();
+        let (id, size, old_pid) = self
+            .windows
+            .lock()
+            .unwrap()
+            .prepare_respawn_pane(target, force)?;
+        let pane = spawn_pane(
+            id,
+            session_name,
+            command,
+            cwd,
+            size,
+            attach_events,
+            Some(Arc::downgrade(self)),
+        )
+        .map_err(|err| err.to_string())?;
+        if let Err(message) = self
+            .windows
+            .lock()
+            .unwrap()
+            .replace_pane(id, Arc::clone(&pane))
+        {
+            terminate_pane_if_running_async(&pane);
+            return Err(message);
+        }
+        pane.set_session(self);
+        if !pane.is_running() {
+            self.mark_pane_exited(&pane);
+        }
+        if let Err(error) = self.resize_current_visible_panes() {
+            if let Some(pid) = old_pid {
+                terminate_pane_async(pid);
             }
-            ExitedPaneRemoval::LastPane => self.close_attach_streams(),
-            ExitedPaneRemoval::NotFound => {}
+            return Err(error.to_string());
+        }
+        self.notify_attach_redraw_immediate();
+        self.reconnect_raw_attach_streams();
+        Ok(old_pid)
+    }
+
+    fn mark_pane_exited(self: &Arc<Self>, pane: &Arc<Pane>) {
+        let changed = self.windows.lock().unwrap().mark_pane_exited(pane);
+        if changed {
+            self.notify_attach_redraw_immediate();
+            self.reconnect_raw_attach_streams();
         }
     }
 
@@ -702,6 +739,10 @@ impl Window {
         self.panes.active()
     }
 
+    fn active_live_pane(&self) -> Option<Arc<Pane>> {
+        self.panes.active().filter(|pane| pane.is_running())
+    }
+
     fn add_pane(&mut self, direction: SplitDirection, pane: Arc<Pane>) {
         let split_index = self.panes.active_index();
         let new_index = self.panes.len();
@@ -776,7 +817,7 @@ impl Window {
         Ok(self.remove_pane_at(index))
     }
 
-    fn remove_exited_pane(&mut self, target: &Arc<Pane>) -> bool {
+    fn mark_pane_exited(&mut self, target: &Arc<Pane>) -> bool {
         let Some(index) = self
             .panes
             .panes
@@ -785,11 +826,51 @@ impl Window {
         else {
             return false;
         };
-        if self.panes.len() <= 1 {
-            return false;
+        if self.panes.active_index() == index {
+            if let Some(live_index) = self.panes.panes.iter().position(|pane| pane.is_running()) {
+                self.panes.select(live_index);
+                if self.zoomed.is_some() {
+                    self.zoomed = Some(live_index);
+                }
+            }
         }
-        self.remove_pane_at(index);
         true
+    }
+
+    fn prepare_respawn_pane(
+        &self,
+        target: Option<usize>,
+        force: bool,
+    ) -> Result<(PaneId, PtySize, Option<i32>), String> {
+        let index = target.unwrap_or(self.panes.active_index());
+        let pane = self
+            .panes
+            .get(index)
+            .ok_or_else(|| "missing pane".to_string())?;
+        let old_pid = if pane.is_running() {
+            if !force {
+                return Err("pane is still running; use -k to force".to_string());
+            }
+            Some(pane.child_pid)
+        } else {
+            None
+        };
+        Ok((pane.id, *pane.size.lock().unwrap(), old_pid))
+    }
+
+    fn replace_pane(&mut self, id: PaneId, pane: Arc<Pane>) -> Result<(), String> {
+        let index = self
+            .panes
+            .panes
+            .iter()
+            .position(|existing| existing.id == id)
+            .ok_or_else(|| "missing pane".to_string())?;
+        self.panes.panes[index] = pane;
+        self.panes.select(index);
+        if self.zoomed.is_some() {
+            self.zoomed = Some(index);
+        }
+        Ok(())
     }
 
     fn remove_pane_at(&mut self, index: usize) -> Arc<Pane> {
@@ -820,6 +901,7 @@ impl Window {
                     active: index == self.panes.active_index(),
                     zoomed: self.zoomed == Some(index),
                     window_zoomed,
+                    process: pane.process_status(),
                 })
             })
             .collect()
@@ -925,6 +1007,12 @@ impl Window {
         self.zoomed == Some(self.panes.active_index())
     }
 
+    fn active_pane_process(&self) -> Option<PaneProcessStatus> {
+        self.panes
+            .get(self.panes.active_index())
+            .map(|pane| pane.process_status())
+    }
+
     fn is_zoomed(&self) -> bool {
         self.zoomed.is_some()
     }
@@ -955,7 +1043,7 @@ impl Window {
 
     fn terminate_panes(&self) -> Result<(), String> {
         for pane in self.panes() {
-            pty::terminate(pane.child_pid).map_err(|err| err.to_string())?;
+            terminate_pane_if_running_async(&pane);
         }
         Ok(())
     }
@@ -964,19 +1052,6 @@ impl Window {
 struct WindowSet {
     windows: Vec<Window>,
     active: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExitedPaneRemoval {
-    Removed,
-    LastPane,
-    NotFound,
-}
-
-impl ExitedPaneRemoval {
-    fn needs_layout_redraw(self) -> bool {
-        matches!(self, Self::Removed)
-    }
 }
 
 impl WindowSet {
@@ -1086,6 +1161,10 @@ impl WindowSet {
         self.active_window()?.active_pane()
     }
 
+    fn active_live_pane(&self) -> Option<Arc<Pane>> {
+        self.active_window()?.active_live_pane()
+    }
+
     fn add_pane(&mut self, direction: SplitDirection, pane: Arc<Pane>) {
         if let Some(window) = self.active_window_mut() {
             window.add_pane(direction, pane);
@@ -1108,30 +1187,32 @@ impl WindowSet {
             .kill_pane(target)
     }
 
-    fn remove_exited_pane(&mut self, target: &Arc<Pane>) -> ExitedPaneRemoval {
+    fn mark_pane_exited(&mut self, target: &Arc<Pane>) -> bool {
         let Some(window_index) = self
             .windows
             .iter()
             .position(|window| window.contains_pane(target))
         else {
-            return ExitedPaneRemoval::NotFound;
+            return false;
         };
 
-        if self.windows[window_index].remove_exited_pane(target) {
-            return ExitedPaneRemoval::Removed;
-        }
+        self.windows[window_index].mark_pane_exited(target)
+    }
 
-        if self.windows.len() <= 1 {
-            return ExitedPaneRemoval::LastPane;
-        }
+    fn prepare_respawn_pane(
+        &self,
+        target: Option<usize>,
+        force: bool,
+    ) -> Result<(PaneId, PtySize, Option<i32>), String> {
+        self.active_window()
+            .ok_or_else(|| "missing window".to_string())?
+            .prepare_respawn_pane(target, force)
+    }
 
-        self.windows.remove(window_index);
-        if self.active == window_index {
-            self.active = window_index.saturating_sub(1).min(self.windows.len() - 1);
-        } else if self.active > window_index {
-            self.active -= 1;
-        }
-        ExitedPaneRemoval::Removed
+    fn replace_pane(&mut self, id: PaneId, pane: Arc<Pane>) -> Result<(), String> {
+        self.active_window_mut()
+            .ok_or_else(|| "missing window".to_string())?
+            .replace_pane(id, pane)
     }
 
     fn panes(&self) -> Vec<Arc<Pane>> {
@@ -1197,6 +1278,7 @@ impl WindowSet {
             pane_id: window.active_pane_id()?,
             pane_zoomed: window.active_pane_zoomed(),
             window_zoomed: window.is_zoomed(),
+            pane_process: window.active_pane_process()?,
             session_attached_count: 0,
             session_created_at: 0,
         })
@@ -1239,6 +1321,7 @@ struct PaneDescription {
     active: bool,
     zoomed: bool,
     window_zoomed: bool,
+    process: PaneProcessStatus,
 }
 
 struct IndexedPane {
@@ -1394,6 +1477,7 @@ struct StatusContext {
     pane_id: PaneId,
     pane_zoomed: bool,
     window_zoomed: bool,
+    pane_process: PaneProcessStatus,
 }
 
 struct WindowDescription {
@@ -1486,6 +1570,7 @@ struct Pane {
     id: PaneId,
     child_pid: i32,
     writer: Arc<Mutex<File>>,
+    process: Mutex<PaneProcessStatus>,
     size: Mutex<PtySize>,
     raw_history: Arc<Mutex<Vec<u8>>>,
     terminal: Arc<Mutex<TerminalState>>,
@@ -1494,6 +1579,33 @@ struct Pane {
     next_client_id: AtomicUsize,
     attach_events: AttachEventClients,
     session: Mutex<Option<Weak<Session>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneProcessStatus {
+    Running {
+        pid: i32,
+    },
+    Exited {
+        pid: i32,
+        exit_status: Option<i32>,
+        exit_signal: Option<i32>,
+    },
+}
+
+impl PaneProcessStatus {
+    fn state(self) -> &'static str {
+        match self {
+            Self::Running { .. } => "running",
+            Self::Exited { .. } => "exited",
+        }
+    }
+
+    fn pid(self) -> i32 {
+        match self {
+            Self::Running { pid } | Self::Exited { pid, .. } => pid,
+        }
+    }
 }
 
 impl Pane {
@@ -1517,6 +1629,30 @@ impl Pane {
             .unwrap()
             .as_ref()
             .and_then(Weak::upgrade)
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(
+            *self.process.lock().unwrap(),
+            PaneProcessStatus::Running { .. }
+        )
+    }
+
+    fn process_status(&self) -> PaneProcessStatus {
+        *self.process.lock().unwrap()
+    }
+
+    fn mark_exited(&self, status: pty::PtyExitStatus) -> bool {
+        let mut process = self.process.lock().unwrap();
+        let PaneProcessStatus::Running { pid } = *process else {
+            return false;
+        };
+        *process = PaneProcessStatus::Exited {
+            pid,
+            exit_status: status.code,
+            exit_signal: status.signal,
+        };
+        true
     }
 }
 
@@ -1611,6 +1747,12 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::KillPane { session, pane } => {
             handle_kill_pane(&state, &mut stream, &session, pane)
         }
+        Request::RespawnPane {
+            session,
+            pane,
+            force,
+            command,
+        } => handle_respawn_pane(&state, &mut stream, &session, pane, force, command),
         Request::NewWindow { session, command } => {
             handle_new_window(&state, &mut stream, &session, command)
         }
@@ -1761,6 +1903,9 @@ fn spawn_pane(
         id,
         child_pid: process.child_pid,
         writer: Arc::new(Mutex::new(process.master)),
+        process: Mutex::new(PaneProcessStatus::Running {
+            pid: process.child_pid,
+        }),
         size: Mutex::new(spec.size),
         raw_history: Arc::new(Mutex::new(Vec::new())),
         terminal: Arc::new(Mutex::new(TerminalState::new(
@@ -2248,8 +2393,8 @@ fn handle_paste_buffer(
         write_err(stream, "missing session")?;
         return Ok(());
     };
-    let Some(pane) = session.active_pane() else {
-        write_err(stream, "missing pane")?;
+    let Some(pane) = session.active_live_pane() else {
+        write_err(stream, "pane is not running")?;
         return Ok(());
     };
     let Some(text) = state
@@ -2351,8 +2496,8 @@ fn handle_send(
         write_err(stream, "missing session")?;
         return Ok(());
     };
-    let Some(pane) = session.active_pane() else {
-        write_err(stream, "missing pane")?;
+    let Some(pane) = session.active_live_pane() else {
+        write_err(stream, "pane is not running")?;
         return Ok(());
     };
 
@@ -2426,11 +2571,30 @@ fn handle_list_panes(
 }
 
 fn format_pane_line(format: &str, pane: &PaneDescription) -> String {
+    let pid = pane.process.pid().to_string();
+    let exit_status = match pane.process {
+        PaneProcessStatus::Exited {
+            exit_status: Some(status),
+            ..
+        } => status.to_string(),
+        _ => String::new(),
+    };
+    let exit_signal = match pane.process {
+        PaneProcessStatus::Exited {
+            exit_signal: Some(signal),
+            ..
+        } => signal.to_string(),
+        _ => String::new(),
+    };
     format
         .replace("#{pane.id}", &pane.id.as_usize().to_string())
         .replace("#{pane.index}", &pane.index.to_string())
         .replace("#{pane.active}", if pane.active { "1" } else { "0" })
         .replace("#{pane.zoomed}", if pane.zoomed { "1" } else { "0" })
+        .replace("#{pane.state}", pane.process.state())
+        .replace("#{pane.pid}", &pid)
+        .replace("#{pane.exit_status}", &exit_status)
+        .replace("#{pane.exit_signal}", &exit_signal)
         .replace(
             "#{window.zoomed_flag}",
             if pane.window_zoomed { "1" } else { "0" },
@@ -2515,6 +2679,21 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
     let pane_id = context.pane_id.as_usize().to_string();
     let pane_zoomed = if context.pane_zoomed { "1" } else { "0" };
     let window_zoomed = if context.window_zoomed { "1" } else { "0" };
+    let pane_pid = context.pane_process.pid().to_string();
+    let pane_exit_status = match context.pane_process {
+        PaneProcessStatus::Exited {
+            exit_status: Some(status),
+            ..
+        } => status.to_string(),
+        _ => String::new(),
+    };
+    let pane_exit_signal = match context.pane_process {
+        PaneProcessStatus::Exited {
+            exit_signal: Some(signal),
+            ..
+        } => signal.to_string(),
+        _ => String::new(),
+    };
     let replacements = [
         ("#{session.name}", context.session_name.as_str()),
         ("#{session.attached}", session_attached),
@@ -2536,6 +2715,10 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{pane.id}", pane_id.as_str()),
         ("#{pane.index}", pane_index.as_str()),
         ("#{pane.zoomed}", pane_zoomed),
+        ("#{pane.state}", context.pane_process.state()),
+        ("#{pane.pid}", pane_pid.as_str()),
+        ("#{pane.exit_status}", pane_exit_status.as_str()),
+        ("#{pane.exit_signal}", pane_exit_signal.as_str()),
         ("#{window.zoomed_flag}", window_zoomed),
         ("#{status.help}", "C-b ? help"),
     ];
@@ -2623,13 +2806,41 @@ fn handle_kill_pane(
         }
     };
     if let Err(error) = session.resize_current_visible_panes() {
-        terminate_pane_async(removed.child_pid);
+        terminate_pane_if_running_async(&removed);
         write_err(stream, &error.to_string())?;
         return Ok(());
     }
 
     session.notify_attach_redraw_immediate();
-    terminate_pane_async(removed.child_pid);
+    terminate_pane_if_running_async(&removed);
+    write_ok(stream)
+}
+
+fn handle_respawn_pane(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    pane: Option<usize>,
+    force: bool,
+    command: Vec<String>,
+) -> io::Result<()> {
+    let session = resolve_session(state, name);
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    let old_pid = match session.respawn_pane(pane, command, force) {
+        Ok(old_pid) => old_pid,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    if let Some(pid) = old_pid {
+        terminate_pane_async(pid);
+    }
     write_ok(stream)
 }
 
@@ -2837,7 +3048,7 @@ fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) ->
 
     session.close_attach_streams();
     for pane in session.panes() {
-        let _ = pty::terminate(pane.child_pid);
+        terminate_pane_if_running_async(&pane);
     }
     write_ok(stream)
 }
@@ -2853,7 +3064,9 @@ fn handle_kill_server(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::
     for session in sessions {
         session.close_attach_streams();
         for pane in session.panes() {
-            let _ = pty::terminate(pane.child_pid);
+            if pane.is_running() {
+                let _ = pty::terminate(pane.child_pid);
+            }
         }
     }
 
@@ -2870,10 +3083,10 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
         write_err(&mut stream, "missing session")?;
         return Ok(());
     };
-    let Some(pane) = session.active_pane() else {
+    if session.active_pane().is_none() {
         write_err(&mut stream, "missing pane")?;
         return Ok(());
-    };
+    }
 
     let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
     let raw_layout_epoch = session.raw_attach_layout_epoch();
@@ -2882,6 +3095,10 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
         write_attach_snapshot_ok(&mut stream)?;
         forward_multi_pane_attach_input(&session, &mut stream)
     } else {
+        let Some(pane) = session.active_live_pane() else {
+            write_err(&mut stream, "pane is not running")?;
+            return Ok(());
+        };
         write_attach_live_ok(&mut stream, session.raw_attach_layout_epoch())?;
         {
             let history = pane.raw_history.lock().unwrap();
@@ -2929,7 +3146,7 @@ fn handle_attach_raw_state(
 }
 
 fn has_attach_pane_snapshot(session: &Session) -> bool {
-    session.attach_panes().len() > 1
+    session.attach_panes().len() > 1 || session.active_live_pane().is_none()
 }
 
 fn write_attach_live_ok(stream: &mut UnixStream, raw_layout_epoch: u64) -> io::Result<()> {
@@ -2951,8 +3168,9 @@ fn forward_multi_pane_attach_input(
             break;
         }
 
-        let Some(pane) = session.active_pane() else {
-            break;
+        let Some(pane) = session.active_live_pane() else {
+            stream.write_all(b"pane is not running\r\n")?;
+            continue;
         };
         pane.writer.lock().unwrap().write_all(&buf[..n])?;
     }
@@ -3834,7 +4052,7 @@ fn resize_panes(pane_resizes: Vec<(Arc<Pane>, PtySize)>) -> io::Result<bool> {
 }
 
 fn resize_pane(pane: &Pane, size: PtySize) -> io::Result<()> {
-    {
+    if pane.is_running() {
         let writer = pane.writer.lock().unwrap();
         pty::resize(&writer, size)?;
     }
@@ -3966,7 +4184,7 @@ fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
         }
         flush_pane_output_filter(&pane);
         shutdown_tracked_clients(&pane.clients);
-        remove_exited_pane_from_session(&pane);
+        mark_exited_pane_in_session(&pane);
     });
 }
 
@@ -3997,17 +4215,30 @@ fn publish_pane_output(pane: &Arc<Pane>, bytes: &[u8]) {
     broadcast(&pane.clients, bytes);
 }
 
-fn remove_exited_pane_from_session(pane: &Arc<Pane>) {
+fn mark_exited_pane_in_session(pane: &Arc<Pane>) {
+    let status = pty::wait_exit_status(pane.child_pid).unwrap_or(pty::PtyExitStatus {
+        code: None,
+        signal: None,
+    });
+    if !pane.mark_exited(status) {
+        return;
+    }
     let Some(session) = pane.session() else {
         return;
     };
-    session.remove_exited_pane(pane);
+    session.mark_pane_exited(pane);
 }
 
 fn terminate_pane_async(child_pid: i32) {
     std::thread::spawn(move || {
         let _ = pty::terminate(child_pid);
     });
+}
+
+fn terminate_pane_if_running_async(pane: &Pane) {
+    if pane.is_running() {
+        terminate_pane_async(pane.child_pid);
+    }
 }
 
 fn append_history(history: &Mutex<Vec<u8>>, bytes: &[u8]) {
@@ -4302,6 +4533,7 @@ mod tests {
             id: PaneId::new(id),
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
+            process: Mutex::new(PaneProcessStatus::Running { pid: 0 }),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
@@ -4677,6 +4909,7 @@ mod tests {
             id: PaneId::new(0),
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
+            process: Mutex::new(PaneProcessStatus::Running { pid: 0 }),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
@@ -4725,6 +4958,7 @@ mod tests {
             id: PaneId::new(0),
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
+            process: Mutex::new(PaneProcessStatus::Running { pid: 0 }),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),

@@ -41,6 +41,7 @@ Implemented Phase 0/1 commands:
 - `dmux list-panes -t <name> [-F <format>]`
 - `dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D`
 - `dmux kill-pane -t <name> [-p <index>]`
+- `dmux respawn-pane -t <name> [-p <index>] [-k] [-- command...]`
 - `dmux zoom-pane -t <name> [-p <index>]`
 - `dmux status-line -t <name> [-F <format>]`
 - `dmux display-message -t <name> -p <format>`
@@ -117,6 +118,10 @@ Implemented Phase 2 groundwork:
 - split-pane sessions with a server-side active pane
 - active pane selection by pane index, stable ID, or layout direction
 - pane removal while keeping the session alive
+- exited panes remain listed/inspectable until killed or respawned
+- pane lifecycle formats: `#{pane.state}`, `#{pane.pid}`,
+  `#{pane.exit_status}`, and `#{pane.exit_signal}`
+- in-place pane respawn, with `-k` required to replace a running pane
 - pane zoom state while keeping all panes alive
 - server-side statusline format expansion
 - stable pane IDs exposed as `#{pane.id}` in pane/status formats
