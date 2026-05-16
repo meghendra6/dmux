@@ -21,6 +21,10 @@ Implemented Phase 0/1 commands:
 - `dmux list-windows -t <name>`
 - `dmux select-window -t <name> -w <index>`
 - `dmux kill-window -t <name> [-w <index>]`
+- `dmux new-tab -t <name> [-- command...]`
+- `dmux list-tabs -t <name>`
+- `dmux select-tab -t <name> -i <index>`
+- `dmux kill-tab -t <name> [-i <index>]`
 - `dmux split-window -t <name> -h|-v [-- command...]`
 - `dmux split -t <name> -h|-v [-- command...]`
 - `dmux list-panes -t <name> [-F <format>]`
@@ -85,6 +89,7 @@ Implemented Phase 2 groundwork:
 - attach-time PTY resize to the current terminal size when available
 - attached clients request PTY resize on terminal `SIGWINCH`
 - minimal window tracking with active window selection
+- Zellij-style tab command aliases over the window model
 - window removal while keeping the session alive
 - split-pane sessions with a server-side active pane
 - active pane selection by pane index

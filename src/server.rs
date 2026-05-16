@@ -1838,6 +1838,8 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{session.name}", context.session_name.as_str()),
         ("#{window.index}", window_index.as_str()),
         ("#{window.list}", window_list.as_str()),
+        ("#{tab.index}", window_index.as_str()),
+        ("#{tab.list}", window_list.as_str()),
         ("#{pane.id}", pane_id.as_str()),
         ("#{pane.index}", pane_index.as_str()),
         ("#{pane.zoomed}", pane_zoomed),
