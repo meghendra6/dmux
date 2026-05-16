@@ -1616,6 +1616,7 @@ fn live_snapshot_redraw_timeout(
     event_stream_active: bool,
     redraw_paused: bool,
     message_expiry: Option<Instant>,
+    input_repaint_deadline: Option<Instant>,
     now: Instant,
 ) -> Duration {
     let base = if event_stream_active {
@@ -1624,12 +1625,24 @@ fn live_snapshot_redraw_timeout(
         LIVE_SNAPSHOT_REDRAW_INTERVAL
     };
 
-    match message_expiry {
-        _ if redraw_paused => base,
-        Some(expiry) if expiry <= now => Duration::ZERO,
-        Some(expiry) => base.min(expiry.duration_since(now)),
-        None => base,
+    if redraw_paused {
+        return base;
     }
+
+    let mut timeout = base;
+    if let Some(expiry) = message_expiry {
+        if expiry <= now {
+            return Duration::ZERO;
+        }
+        timeout = timeout.min(expiry.duration_since(now));
+    }
+    if let Some(deadline) = input_repaint_deadline {
+        if deadline <= now {
+            return Duration::ZERO;
+        }
+        timeout = timeout.min(deadline.duration_since(now));
+    }
+    timeout
 }
 
 fn run_live_snapshot_attach(
@@ -1662,6 +1675,7 @@ fn run_live_snapshot_attach(
     let mut event_stream_active = false;
     let mut fallback_event_stream_started = false;
     let mut pane_number_message = None;
+    let mut pending_input_repaint_deadline = None;
 
     loop {
         let message_expiry = pane_number_message.as_ref().map(|(_, until)| *until);
@@ -1669,6 +1683,7 @@ fn run_live_snapshot_attach(
             event_stream_active,
             redraw_paused,
             message_expiry,
+            pending_input_repaint_deadline,
             Instant::now(),
         );
         match input.recv_timeout(timeout) {
@@ -1676,7 +1691,9 @@ fn run_live_snapshot_attach(
                 let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 forward_live_snapshot_input(socket, session, &bytes)?;
                 if !redraw_paused
-                    && (resized || last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL)
+                    && (resized
+                        || (!event_stream_active
+                            && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL))
                 {
                     frame = write_live_snapshot_frame_with_pane_number_message(
                         socket,
@@ -1685,6 +1702,10 @@ fn run_live_snapshot_attach(
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     last_redraw = Instant::now();
+                    pending_input_repaint_deadline = None;
+                } else if event_stream_active && !bytes.is_empty() {
+                    pending_input_repaint_deadline =
+                        Some(Instant::now() + LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL);
                 }
             }
             Ok(LiveSnapshotInputEvent::PaneCommand(command)) => {
@@ -1795,6 +1816,7 @@ fn run_live_snapshot_attach(
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     last_redraw = Instant::now();
+                    pending_input_repaint_deadline = None;
                 }
             }
             Ok(LiveSnapshotInputEvent::RenderFrame(render_frame)) => {
@@ -1825,6 +1847,7 @@ fn run_live_snapshot_attach(
                         write_live_render_output(&output)?;
                     }
                     last_redraw = Instant::now();
+                    pending_input_repaint_deadline = None;
                 }
             }
             Ok(LiveSnapshotInputEvent::RenderStreamReady) => {
@@ -1866,7 +1889,11 @@ fn run_live_snapshot_attach(
                 let message_expired = pane_number_message
                     .as_ref()
                     .is_some_and(|(_, until)| Instant::now() >= *until);
-                if !redraw_paused && (!event_stream_active || resized || message_expired) {
+                let input_repaint_due = pending_input_repaint_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline);
+                if !redraw_paused
+                    && (!event_stream_active || resized || message_expired || input_repaint_due)
+                {
                     frame = write_live_snapshot_frame_with_pane_number_message(
                         socket,
                         session,
@@ -1874,6 +1901,7 @@ fn run_live_snapshot_attach(
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     last_redraw = Instant::now();
+                    pending_input_repaint_deadline = None;
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -3237,7 +3265,7 @@ mod tests {
     #[test]
     fn live_snapshot_timeout_uses_polling_when_events_are_inactive() {
         assert_eq!(
-            live_snapshot_redraw_timeout(false, false, None, Instant::now()),
+            live_snapshot_redraw_timeout(false, false, None, None, Instant::now()),
             LIVE_SNAPSHOT_REDRAW_INTERVAL
         );
     }
@@ -3245,7 +3273,7 @@ mod tests {
     #[test]
     fn live_snapshot_timeout_uses_safety_interval_when_events_are_active() {
         assert_eq!(
-            live_snapshot_redraw_timeout(true, false, None, Instant::now()),
+            live_snapshot_redraw_timeout(true, false, None, None, Instant::now()),
             LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL
         );
     }
@@ -3255,7 +3283,13 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            live_snapshot_redraw_timeout(true, false, Some(now + Duration::from_millis(25)), now),
+            live_snapshot_redraw_timeout(
+                true,
+                false,
+                Some(now + Duration::from_millis(25)),
+                None,
+                now
+            ),
             Duration::from_millis(25)
         );
     }
@@ -3265,7 +3299,7 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            live_snapshot_redraw_timeout(true, false, Some(now), now),
+            live_snapshot_redraw_timeout(true, false, Some(now), None, now),
             Duration::ZERO
         );
     }
@@ -3275,8 +3309,34 @@ mod tests {
         let now = Instant::now();
 
         assert_eq!(
-            live_snapshot_redraw_timeout(true, true, Some(now), now),
+            live_snapshot_redraw_timeout(true, true, Some(now), Some(now), now),
             LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL
+        );
+    }
+
+    #[test]
+    fn live_snapshot_timeout_shortens_for_pending_input_repaint_deadline() {
+        let now = Instant::now();
+
+        assert_eq!(
+            live_snapshot_redraw_timeout(
+                true,
+                false,
+                None,
+                Some(now + Duration::from_millis(25)),
+                now
+            ),
+            Duration::from_millis(25)
+        );
+    }
+
+    #[test]
+    fn live_snapshot_timeout_redraws_immediately_for_expired_input_repaint_deadline() {
+        let now = Instant::now();
+
+        assert_eq!(
+            live_snapshot_redraw_timeout(true, false, None, Some(now), now),
+            Duration::ZERO
         );
     }
 
