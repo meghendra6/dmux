@@ -10,6 +10,7 @@ pub struct TerminalState {
     scrollback: Scrollback,
     parser: vte::Parser,
     style: CellStyle,
+    last_printed_char: Option<char>,
     changes: TerminalChanges,
     render_next_primary_output_immediately: bool,
 }
@@ -36,6 +37,7 @@ impl TerminalState {
             scrollback: Scrollback::new(max_scrollback_lines),
             parser: vte::Parser::new(),
             style: CellStyle::default(),
+            last_printed_char: None,
             changes: TerminalChanges::default(),
             render_next_primary_output_immediately: false,
         }
@@ -112,9 +114,16 @@ impl TerminalState {
 
     fn tab(&mut self) {
         let next_tab = ((self.active_screen().cursor_col / 8) + 1) * 8;
-        while self.active_screen().cursor_col < next_tab {
-            self.put_char(' ');
-        }
+        self.move_to_next_tab_stop(next_tab);
+    }
+
+    fn forward_tab(&mut self) {
+        let next_tab = ((self.active_screen().cursor_col / 8) + 1) * 8;
+        self.move_to_next_tab_stop(next_tab);
+    }
+
+    fn move_to_next_tab_stop(&mut self, next_tab: usize) {
+        self.active_screen_mut().move_cursor_to_tab_stop(next_tab);
     }
 
     fn put_char(&mut self, ch: char) {
@@ -167,6 +176,7 @@ impl TerminalState {
         self.cursor_visible = true;
         self.scrollback.clear();
         self.style = CellStyle::default();
+        self.last_printed_char = None;
     }
 
     fn mark_primary_output_after_alternate_screen_exit(&mut self) {
@@ -194,6 +204,8 @@ impl TerminalState {
                 3 => self.style.italic = true,
                 4 => self.style.underline = true,
                 7 => self.style.inverse = true,
+                8 => self.style.hidden = true,
+                9 => self.style.strikethrough = true,
                 22 => {
                     self.style.bold = false;
                     self.style.dim = false;
@@ -201,6 +213,8 @@ impl TerminalState {
                 23 => self.style.italic = false,
                 24 => self.style.underline = false,
                 27 => self.style.inverse = false,
+                28 => self.style.hidden = false,
+                29 => self.style.strikethrough = false,
                 30..=37 => self.style.fg = Some(Color::Ansi(code as u8 - 30)),
                 39 => self.style.fg = None,
                 40..=47 => self.style.bg = Some(Color::Ansi(code as u8 - 40)),
@@ -228,6 +242,7 @@ impl vte::Perform for TerminalState {
     fn print(&mut self, c: char) {
         self.mark_primary_output_after_alternate_screen_exit();
         self.put_char(c);
+        self.last_printed_char = Some(c);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -294,6 +309,8 @@ impl vte::Perform for TerminalState {
                 screen.carriage_return();
             }
             'G' => self.active_screen_mut().move_to_col(first_param(params, 1)),
+            '`' => self.active_screen_mut().move_to_col(first_param(params, 1)),
+            'a' => self.active_screen_mut().move_right(first_param(params, 1)),
             'd' => self.active_screen_mut().move_to_row(first_param(params, 1)),
             'r' => {
                 let top = nth_param(params, 0, 1);
@@ -332,6 +349,33 @@ impl vte::Perform for TerminalState {
                 let count = first_param(params, 1);
                 let style = self.style;
                 self.active_screen_mut().erase_chars(count, style);
+            }
+            '@' => {
+                let count = first_param(params, 1);
+                let style = self.style;
+                self.active_screen_mut().insert_chars(count, style);
+            }
+            'P' => {
+                let count = first_param(params, 1);
+                let style = self.style;
+                self.active_screen_mut().delete_chars(count, style);
+            }
+            'b' => {
+                if let Some(ch) = self.last_printed_char {
+                    for _ in 0..first_param(params, 1) {
+                        self.put_char(ch);
+                    }
+                }
+            }
+            'I' => {
+                for _ in 0..first_param(params, 1) {
+                    self.forward_tab();
+                }
+            }
+            'Z' => {
+                for _ in 0..first_param(params, 1) {
+                    self.active_screen_mut().back_tab();
+                }
             }
             's' => self.active_screen_mut().save_cursor(),
             'u' => self.active_screen_mut().restore_cursor(),
@@ -496,6 +540,15 @@ impl TerminalScreen {
         while self.cursor_col > 0 && self.rows[self.cursor_row][self.cursor_col].wide_continuation {
             self.cursor_col -= 1;
         }
+    }
+
+    fn back_tab(&mut self) {
+        self.cursor_col =
+            (self.cursor_col / 8 * 8).saturating_sub(usize::from(self.cursor_col % 8 == 0) * 8);
+    }
+
+    fn move_cursor_to_tab_stop(&mut self, next_tab: usize) {
+        self.cursor_col = next_tab.min(self.width - 1);
     }
 
     fn clear_display(&mut self, style: CellStyle) {
@@ -707,6 +760,38 @@ impl TerminalScreen {
         }
     }
 
+    fn insert_chars(&mut self, count: usize, style: CellStyle) {
+        let count = count.min(self.width.saturating_sub(self.cursor_col));
+        if count == 0 {
+            return;
+        }
+
+        let row = &mut self.rows[self.cursor_row];
+        for col in (self.cursor_col + count..self.width).rev() {
+            row[col] = row[col - count];
+        }
+        for cell in row.iter_mut().skip(self.cursor_col).take(count) {
+            *cell = Cell::blank_with_style(style);
+        }
+        normalize_wide_cells(row, style);
+    }
+
+    fn delete_chars(&mut self, count: usize, style: CellStyle) {
+        let count = count.min(self.width.saturating_sub(self.cursor_col));
+        if count == 0 {
+            return;
+        }
+
+        let row = &mut self.rows[self.cursor_row];
+        for col in self.cursor_col..self.width - count {
+            row[col] = row[col + count];
+        }
+        for cell in row.iter_mut().skip(self.width - count) {
+            *cell = Cell::blank_with_style(style);
+        }
+        normalize_wide_cells(row, style);
+    }
+
     fn cursor_in_scroll_region(&self) -> bool {
         self.cursor_row >= self.scroll_top && self.cursor_row <= self.scroll_bottom
     }
@@ -868,6 +953,8 @@ struct CellStyle {
     italic: bool,
     underline: bool,
     inverse: bool,
+    hidden: bool,
+    strikethrough: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1018,6 +1105,12 @@ fn style_transition(style: CellStyle) -> String {
     if style.inverse {
         params.push("7".to_string());
     }
+    if style.hidden {
+        params.push("8".to_string());
+    }
+    if style.strikethrough {
+        params.push("9".to_string());
+    }
     if let Some(color) = style.fg {
         push_color_params(&mut params, 30, 90, "38", color);
     }
@@ -1084,6 +1177,31 @@ fn char_cell_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
 }
 
+fn normalize_wide_cells(row: &mut [Cell], style: CellStyle) {
+    for col in 0..row.len() {
+        if row[col].wide_continuation {
+            let valid_continuation =
+                col > 0 && !row[col - 1].wide_continuation && char_cell_width(row[col - 1].ch) > 1;
+            if !valid_continuation {
+                row[col] = Cell::blank_with_style(style);
+            }
+            continue;
+        }
+
+        if char_cell_width(row[col].ch) > 1 {
+            if col + 1 >= row.len() || !row[col + 1].wide_continuation {
+                row[col] = Cell::blank_with_style(style);
+            } else {
+                row[col + 1] = Cell {
+                    ch: ' ',
+                    style: row[col].style,
+                    wide_continuation: true,
+                };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1124,6 +1242,17 @@ mod tests {
         assert_eq!(
             state.render_screen_ansi_text(),
             "\x1b[1;38;2;1;2;3mhi\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn styled_render_preserves_hidden_and_strikethrough_sgr() {
+        let mut state = TerminalState::new(20, 3, 100);
+        state.apply_bytes(b"\x1b[8;9msecret\x1b[28mstrike\x1b[29mplain");
+
+        assert_eq!(
+            state.render_screen_ansi_text(),
+            "\x1b[8;9msecret\x1b[0m\x1b[9mstrike\x1b[0mplain\n"
         );
     }
 
@@ -1336,6 +1465,62 @@ mod tests {
         let mut state = TerminalState::new(20, 3, 100);
         state.apply_bytes(b"ab\x1b[scd\x1b[uZ");
         assert_eq!(state.capture_screen_text(), "abZd\n");
+    }
+
+    #[test]
+    fn insert_and_delete_character_sequences_shift_within_line() {
+        let mut state = TerminalState::new(10, 2, 100);
+        state.apply_bytes(b"abcdef\x1b[1;3H\x1b[2@XY");
+        assert_eq!(state.capture_screen_text(), "abXYcdef\n");
+
+        let mut state = TerminalState::new(10, 2, 100);
+        state.apply_bytes(b"abcdef\x1b[1;3H\x1b[2PZ");
+        assert_eq!(state.capture_screen_text(), "abZf\n");
+    }
+
+    #[test]
+    fn insert_and_delete_character_sequences_repair_wide_cell_boundaries() {
+        let mut state = TerminalState::new(8, 2, 100);
+        state.apply_bytes("a한bc".as_bytes());
+        state.apply_bytes(b"\x1b[1;2H\x1b[@");
+        assert_eq!(state.capture_screen_text(), "a 한bc\n");
+
+        let mut state = TerminalState::new(3, 2, 100);
+        state.apply_bytes("a한".as_bytes());
+        state.apply_bytes(b"\x1b[1;2H\x1b[@");
+        assert_eq!(state.capture_screen_text(), "a\n");
+
+        let mut state = TerminalState::new(8, 2, 100);
+        state.apply_bytes("a한bc".as_bytes());
+        state.apply_bytes(b"\x1b[1;3H\x1b[P");
+        assert_eq!(state.capture_screen_text(), "a bc\n");
+    }
+
+    #[test]
+    fn repeat_and_horizontal_position_sequences_match_common_tui_output() {
+        let mut state = TerminalState::new(20, 2, 100);
+        state.apply_bytes(b"A\x1b[3b\x1b[10`Z\x1b[2aQ");
+        assert_eq!(state.capture_screen_text(), "AAAA     Z  Q\n");
+    }
+
+    #[test]
+    fn forward_and_backward_tab_sequences_clamp_to_line() {
+        let mut state = TerminalState::new(10, 2, 100);
+        state.apply_bytes(b"A\x1b[IB");
+        assert_eq!(state.capture_screen_text(), "A       B\n");
+
+        let mut state = TerminalState::new(12, 2, 100);
+        state.apply_bytes(b"abcdefghij\x1b[1G\x1b[IZ");
+        assert_eq!(state.capture_screen_text(), "abcdefghZj\n");
+
+        let mut state = TerminalState::new(10, 2, 100);
+        state.apply_bytes(b"\x1b[2IZ");
+        assert_eq!(state.cursor_position(), (0, 10));
+        assert_eq!(state.capture_screen_text(), "         Z\n");
+
+        let mut state = TerminalState::new(10, 2, 100);
+        state.apply_bytes(b"\x1b[9G\x1b[ZD");
+        assert_eq!(state.capture_screen_text(), "D\n");
     }
 
     #[test]
