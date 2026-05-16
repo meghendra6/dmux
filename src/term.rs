@@ -10,6 +10,20 @@ pub struct TerminalState {
     scrollback: Scrollback,
     parser: vte::Parser,
     style: CellStyle,
+    changes: TerminalChanges,
+    render_next_primary_output_immediately: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalChanges {
+    pub alternate_screen: bool,
+    pub post_alternate_screen_exit: bool,
+}
+
+impl TerminalChanges {
+    pub fn requires_immediate_render(self) -> bool {
+        self.alternate_screen || self.post_alternate_screen_exit
+    }
 }
 
 impl TerminalState {
@@ -22,15 +36,25 @@ impl TerminalState {
             scrollback: Scrollback::new(max_scrollback_lines),
             parser: vte::Parser::new(),
             style: CellStyle::default(),
+            changes: TerminalChanges::default(),
+            render_next_primary_output_immediately: false,
         }
     }
 
-    pub fn apply_bytes(&mut self, bytes: &[u8]) {
+    pub fn apply_bytes(&mut self, bytes: &[u8]) -> TerminalChanges {
+        self.changes = TerminalChanges {
+            post_alternate_screen_exit: self.render_next_primary_output_immediately
+                && !bytes.is_empty(),
+            ..TerminalChanges::default()
+        };
         let mut parser = std::mem::take(&mut self.parser);
         for byte in bytes {
             parser.advance(self, *byte);
         }
         self.parser = parser;
+        let changes = self.changes;
+        self.changes = TerminalChanges::default();
+        changes
     }
 
     pub fn capture_text(&self) -> String {
@@ -121,21 +145,35 @@ impl TerminalState {
     }
 
     fn enter_alternate_screen(&mut self) {
+        self.changes.alternate_screen = true;
         self.alternate_screen = Some(TerminalScreen::new(self.screen.width, self.screen.height));
         self.use_alternate_screen = true;
     }
 
     fn exit_alternate_screen(&mut self) {
+        self.changes.alternate_screen = true;
+        self.render_next_primary_output_immediately = true;
         self.use_alternate_screen = false;
     }
 
     fn reset_terminal(&mut self) {
+        if self.use_alternate_screen || self.alternate_screen.is_some() {
+            self.changes.alternate_screen = true;
+            self.render_next_primary_output_immediately = true;
+        }
         self.screen = TerminalScreen::new(self.screen.width, self.screen.height);
         self.alternate_screen = None;
         self.use_alternate_screen = false;
         self.cursor_visible = true;
         self.scrollback.clear();
         self.style = CellStyle::default();
+    }
+
+    fn mark_primary_output_after_alternate_screen_exit(&mut self) {
+        if !self.use_alternate_screen && self.render_next_primary_output_immediately {
+            self.changes.post_alternate_screen_exit = true;
+            self.render_next_primary_output_immediately = false;
+        }
     }
 
     fn apply_sgr(&mut self, params: &vte::Params) {
@@ -188,10 +226,12 @@ impl TerminalState {
 
 impl vte::Perform for TerminalState {
     fn print(&mut self, c: char) {
+        self.mark_primary_output_after_alternate_screen_exit();
         self.put_char(c);
     }
 
     fn execute(&mut self, byte: u8) {
+        self.mark_primary_output_after_alternate_screen_exit();
         match byte {
             b'\r' => self.active_screen_mut().carriage_return(),
             b'\n' | 0x0b | 0x0c => self.line_feed(),
@@ -1170,6 +1210,73 @@ mod tests {
 
         state.apply_bytes(b"\x1b[?1049l");
         assert_eq!(state.capture_screen_text(), "primary\n");
+    }
+
+    #[test]
+    fn apply_bytes_reports_alternate_screen_transitions() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        assert!(!state.apply_bytes(b"primary").alternate_screen);
+        assert!(state.apply_bytes(b"\x1b[?1049halternate").alternate_screen);
+        assert!(!state.apply_bytes(b"more").alternate_screen);
+        assert!(state.apply_bytes(b"\x1b[?1049lprimary").alternate_screen);
+        assert!(
+            state
+                .apply_bytes(b"\x1b[?1049hshort\x1b[?1049l")
+                .alternate_screen
+        );
+    }
+
+    #[test]
+    fn apply_bytes_reports_first_primary_output_after_alternate_screen_exit() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        state.apply_bytes(b"\x1b[?1049halternate");
+        let exit = state.apply_bytes(b"\x1b[?1049l");
+        assert!(exit.alternate_screen);
+        assert!(!exit.post_alternate_screen_exit);
+
+        let prompt = state.apply_bytes(b"prompt");
+        assert!(!prompt.alternate_screen);
+        assert!(prompt.post_alternate_screen_exit);
+        assert!(prompt.requires_immediate_render());
+
+        assert_eq!(state.apply_bytes(b"ordinary"), TerminalChanges::default());
+
+        let mut combined = TerminalState::new(20, 3, 100);
+        combined.apply_bytes(b"\x1b[?1049halternate");
+        let exit_and_prompt = combined.apply_bytes(b"\x1b[?1049lprompt");
+        assert!(exit_and_prompt.alternate_screen);
+        assert!(exit_and_prompt.post_alternate_screen_exit);
+        assert_eq!(
+            combined.apply_bytes(b"ordinary"),
+            TerminalChanges::default()
+        );
+
+        let mut cursor_restore = TerminalState::new(20, 3, 100);
+        cursor_restore.apply_bytes(b"\x1b[?1049halternate");
+        let restore_only = cursor_restore.apply_bytes(b"\x1b[?1049l\x1b[?25h");
+        assert!(restore_only.alternate_screen);
+        assert!(!restore_only.post_alternate_screen_exit);
+        assert!(
+            cursor_restore
+                .apply_bytes(b"prompt")
+                .post_alternate_screen_exit
+        );
+
+        let mut split_restore = TerminalState::new(20, 3, 100);
+        split_restore.apply_bytes(b"\x1b[?1049halternate");
+        assert!(split_restore.apply_bytes(b"\x1b[?1049l").alternate_screen);
+        assert!(
+            split_restore
+                .apply_bytes(b"\x1b[?25h")
+                .post_alternate_screen_exit
+        );
+        assert!(
+            split_restore
+                .apply_bytes(b"prompt")
+                .post_alternate_screen_exit
+        );
     }
 
     #[test]
