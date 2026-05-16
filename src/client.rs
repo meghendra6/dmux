@@ -1645,6 +1645,14 @@ fn live_snapshot_redraw_timeout(
     timeout
 }
 
+fn handle_render_stream_ready(_event_stream_active: &mut bool) {
+    // The OK response proves the stream connected, but not that frames are flowing yet.
+}
+
+fn handle_render_frame_received(event_stream_active: &mut bool) {
+    *event_stream_active = true;
+}
+
 fn run_live_snapshot_attach(
     socket: &Path,
     session: &str,
@@ -1821,6 +1829,7 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::RenderFrame(render_frame)) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                handle_render_frame_received(&mut event_stream_active);
                 if !redraw_paused {
                     let AttachRenderFrame {
                         output,
@@ -1851,7 +1860,7 @@ fn run_live_snapshot_attach(
                 }
             }
             Ok(LiveSnapshotInputEvent::RenderStreamReady) => {
-                event_stream_active = true;
+                handle_render_stream_ready(&mut event_stream_active);
             }
             Ok(LiveSnapshotInputEvent::RenderStreamUnavailable) => {
                 if !fallback_event_stream_started {
@@ -3338,6 +3347,26 @@ mod tests {
             live_snapshot_redraw_timeout(true, false, None, Some(now), now),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn render_stream_ready_does_not_activate_safety_timeout_before_first_frame() {
+        let mut active = false;
+
+        handle_render_stream_ready(&mut active);
+        assert!(!active);
+
+        handle_render_frame_received(&mut active);
+        assert!(active);
+    }
+
+    #[test]
+    fn render_stream_ready_does_not_clear_existing_active_fallback_stream() {
+        let mut active = true;
+
+        handle_render_stream_ready(&mut active);
+
+        assert!(active);
     }
 
     #[test]
