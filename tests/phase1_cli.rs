@@ -189,6 +189,14 @@ fn assert_vertical_layout(text: &str, top: &str, bottom: &str) {
     );
 }
 
+fn command_exists(name: &str) -> bool {
+    Command::new("sh")
+        .args(["-c", "command -v \"$1\" >/dev/null 2>&1", "sh", name])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn read_socket_line(stream: &mut UnixStream) -> String {
     let mut bytes = Vec::new();
     let mut byte = [0_u8; 1];
@@ -837,6 +845,23 @@ fn poll_capture(socket: &std::path::Path, session: &str, needle: &str) -> String
 
     while std::time::Instant::now() < deadline {
         let output = dmux(socket, &["capture-pane", "-t", session, "-p"]);
+        assert_success(&output);
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if last.contains(needle) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
+}
+
+fn poll_capture_screen(socket: &std::path::Path, session: &str, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(socket, &["capture-pane", "-t", session, "-p", "--screen"]);
         assert_success(&output);
         last = String::from_utf8_lossy(&output.stdout).to_string();
         if last.contains(needle) {
@@ -5900,6 +5925,67 @@ fn attach_render_stream_pushes_primary_output_promptly_after_alternate_screen_ex
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_render_stream_returns_to_primary_screen_after_real_vim_exit() {
+    assert!(
+        command_exists("vim"),
+        "real vim smoke test requires vim on PATH"
+    );
+
+    let socket = unique_socket("attach-render-real-vim-exit");
+    let session = format!("attach-render-real-vim-exit-{}", std::process::id());
+    let file = unique_temp_file("attach-render-real-vim-exit.md");
+    std::fs::write(&file, "# dmux-vim-smoke-ready\nbody\n").expect("write vim smoke file");
+    let file = file.to_string_lossy().to_string();
+    let script = "printf 'primary-before-vim\\r\\n'; vim -Nu NONE -n -i NONE \"$1\"; printf 'after-real-vim-ready'; sleep 30";
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new", "-d", "-s", &session, "--", "sh", "-c", script, "sh", &file,
+        ],
+    ));
+
+    let mut stream = attach_render_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT_META\n");
+    let vim_screen = read_attach_render_output_until_contains(&mut stream, "dmux-vim-smoke-ready");
+    assert!(
+        vim_screen.contains("dmux-vim-smoke-ready"),
+        "{vim_screen:?}"
+    );
+
+    let started = std::time::Instant::now();
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "Escape", ":q!", "Enter"],
+    ));
+    let (frames, frame_body, output) =
+        count_attach_render_output_frames_until_contains(&mut stream, "after-real-vim-ready");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "primary output after real vim exit was delayed: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        frames <= 8,
+        "primary output after real vim exit took too many frames: {frames}\n{frame_body:?}"
+    );
+    assert!(output.contains("primary-before-vim"), "{output:?}");
+    assert!(output.contains("after-real-vim-ready"), "{output:?}");
+    assert!(!output.contains("dmux-vim-smoke-ready"), "{output:?}");
+    assert!(!frame_body.contains("STATUS\t"), "{frame_body:?}");
+    assert!(!frame_body.contains("\nSNAPSHOT\t"), "{frame_body:?}");
+
+    let captured = poll_capture_screen(&socket, &session, "after-real-vim-ready");
+    assert!(captured.contains("primary-before-vim"), "{captured:?}");
+    assert!(captured.contains("after-real-vim-ready"), "{captured:?}");
+    assert!(!captured.contains("dmux-vim-smoke-ready"), "{captured:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(file);
 }
 
 #[test]
