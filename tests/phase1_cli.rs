@@ -6042,6 +6042,193 @@ fn attach_render_stream_returns_to_primary_screen_after_real_vim_exit() {
 }
 
 #[test]
+fn attach_render_stream_recovers_real_vim_after_split_closes() {
+    assert!(
+        command_exists("vim"),
+        "real vim split/close test requires vim on PATH"
+    );
+
+    let socket = unique_socket("attach-render-real-vim-split-close");
+    let session = format!("attach-render-real-vim-split-close-{}", std::process::id());
+    let file = unique_temp_file("attach-render-real-vim-split-close.md");
+    std::fs::write(&file, "# dmux-vim-split-close-ready\nbody\n")
+        .expect("write vim split/close file");
+    let file = file.to_string_lossy().to_string();
+    struct DmuxTestCleanup {
+        socket: std::path::PathBuf,
+        session: String,
+        file: String,
+        kill_session: bool,
+    }
+    impl DmuxTestCleanup {
+        fn disarm_session(&mut self) {
+            self.kill_session = false;
+        }
+    }
+    impl Drop for DmuxTestCleanup {
+        fn drop(&mut self) {
+            if self.kill_session {
+                let _ = Command::new(env!("CARGO_BIN_EXE_dmux"))
+                    .env("DEVMUX_SOCKET", &self.socket)
+                    .arg("kill-session")
+                    .arg("-t")
+                    .arg(&self.session)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let _ = Command::new(env!("CARGO_BIN_EXE_dmux"))
+                    .env("DEVMUX_SOCKET", &self.socket)
+                    .arg("kill-server")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            let _ = std::fs::remove_file(&self.file);
+        }
+    }
+    let mut cleanup = DmuxTestCleanup {
+        socket: socket.clone(),
+        session: session.clone(),
+        file: file.clone(),
+        kill_session: true,
+    };
+    let script = "printf 'primary-before-vim-split-close\\r\\n'; vim -Nu NONE -n -i NONE \"$1\"; printf 'after-vim-split-close-ready'; sleep 30";
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new", "-d", "-s", &session, "--", "sh", "-c", script, "sh", &file,
+        ],
+    ));
+
+    let mut stream = attach_render_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT_META\n");
+    let vim_screen =
+        read_attach_render_output_until_contains(&mut stream, "dmux-vim-split-close-ready");
+    assert!(
+        vim_screen.contains("dmux-vim-split-close-ready"),
+        "{vim_screen:?}"
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-close-pane-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-close-pane-ready");
+    assert!(split.contains("split-close-pane-ready"), "{split:?}");
+    let panes = poll_pane_count(&socket, &session, 2);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
+    let (_split_frames, split_frame_body, split_output) =
+        count_attach_render_output_frames_until_contains(&mut stream, "split-close-pane-ready");
+    assert!(
+        split_output.contains("dmux-vim-split-close-ready"),
+        "{split_output:?}"
+    );
+    assert!(
+        !split_frame_body.contains("STATUS\t"),
+        "{split_frame_body:?}"
+    );
+    assert!(
+        !split_frame_body.contains("\nSNAPSHOT\t"),
+        "{split_frame_body:?}"
+    );
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    let active = poll_active_pane(&socket, &session, 0);
+    assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "1"]));
+    let panes = poll_pane_count(&socket, &session, 1);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
+    let active = poll_active_pane(&socket, &session, 0);
+    assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut last_body = String::new();
+    let mut last_output = String::new();
+    while std::time::Instant::now() < deadline {
+        let Some(body) =
+            try_read_attach_render_frame_body(&mut stream).expect("read attach render frame body")
+        else {
+            continue;
+        };
+        last_body = String::from_utf8_lossy(&body).to_string();
+        last_output =
+            String::from_utf8_lossy(&attach_render_output_from_frame_body(&body)).to_string();
+        if last_output.contains("dmux-vim-split-close-ready")
+            && !last_output.contains("split-close-pane-ready")
+        {
+            break;
+        }
+    }
+    assert!(
+        last_output.contains("dmux-vim-split-close-ready"),
+        "{last_output:?}"
+    );
+    assert!(
+        !last_output.contains("split-close-pane-ready"),
+        "{last_output:?}"
+    );
+    assert!(!last_body.contains("STATUS\t"), "{last_body:?}");
+    assert!(!last_body.contains("\nSNAPSHOT\t"), "{last_body:?}");
+
+    let captured = poll_capture_screen(&socket, &session, "dmux-vim-split-close-ready");
+    assert!(
+        captured.contains("dmux-vim-split-close-ready"),
+        "{captured:?}"
+    );
+    assert!(!captured.contains("split-close-pane-ready"), "{captured:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &["send-keys", "-t", &session, "Escape", ":q!", "Enter"],
+    ));
+    let (_frames, frame_body, output) = count_attach_render_output_frames_until_contains(
+        &mut stream,
+        "after-vim-split-close-ready",
+    );
+    assert!(
+        output.contains("primary-before-vim-split-close"),
+        "{output:?}"
+    );
+    assert!(output.contains("after-vim-split-close-ready"), "{output:?}");
+    assert!(!output.contains("dmux-vim-split-close-ready"), "{output:?}");
+    assert!(!output.contains("split-close-pane-ready"), "{output:?}");
+    assert!(!frame_body.contains("STATUS\t"), "{frame_body:?}");
+    assert!(!frame_body.contains("\nSNAPSHOT\t"), "{frame_body:?}");
+
+    let captured = poll_capture_screen(&socket, &session, "after-vim-split-close-ready");
+    assert!(
+        captured.contains("primary-before-vim-split-close"),
+        "{captured:?}"
+    );
+    assert!(
+        captured.contains("after-vim-split-close-ready"),
+        "{captured:?}"
+    );
+    assert!(
+        !captured.contains("dmux-vim-split-close-ready"),
+        "{captured:?}"
+    );
+    assert!(!captured.contains("split-close-pane-ready"), "{captured:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    cleanup.disarm_session();
+}
+
+#[test]
 fn attach_render_stream_preserves_streaming_output_across_resize() {
     let socket = unique_socket("attach-render-stream-resize");
     let session = format!("attach-render-stream-resize-{}", std::process::id());
