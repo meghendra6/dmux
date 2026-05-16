@@ -218,6 +218,21 @@ fn run() -> Result<(), String> {
             send_request(&socket, &protocol::encode_kill_pane(&session, pane), true)?;
             Ok(())
         }
+        cli::Command::RespawnPane {
+            session,
+            pane,
+            force,
+            command,
+        } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_respawn_pane(&session, pane, force, &command),
+                true,
+            )?;
+            Ok(())
+        }
         cli::Command::NewWindow { session, command } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;

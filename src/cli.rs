@@ -94,6 +94,12 @@ pub enum Command {
         session: String,
         pane: Option<usize>,
     },
+    RespawnPane {
+        session: String,
+        pane: Option<usize>,
+        force: bool,
+        command: Vec<String>,
+    },
     NewWindow {
         session: String,
         command: Vec<String>,
@@ -182,6 +188,7 @@ where
         "list-panes" => parse_list_panes(args),
         "select-pane" => parse_select_pane(args),
         "kill-pane" => parse_kill_pane(args),
+        "respawn-pane" => parse_respawn_pane(args),
         "new-window" => parse_new_window(args, "new-window"),
         "new-tab" => parse_new_window(args, "new-tab"),
         "list-windows" => parse_list_windows(args, "list-windows"),
@@ -280,6 +287,7 @@ Commands:\n\
   split-window -t <name> -h|-v [-- command...]\n\
   list-panes -t <name> [-F <format>]\n\
   select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D\n\
+  respawn-pane -t <name> [-p <index>] [-k] [-- command...]\n\
   new-window -t <name> [-- command...]\n\
   list-windows -t <name> [-F <format>]\n\
   select-window -t <name> -w <index>|--window-id <id>|-n <name>\n\
@@ -1019,6 +1027,52 @@ fn parse_kill_pane(args: Vec<String>) -> Result<Command, String> {
     Ok(Command::KillPane {
         session: session.ok_or_else(|| "kill-pane requires -t <session>".to_string())?,
         pane,
+    })
+}
+
+fn parse_respawn_pane(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut pane = None;
+    let mut force = false;
+    let mut command = Vec::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "respawn-pane requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            "-p" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "respawn-pane requires a pane index after -p".to_string())?;
+                pane =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        "respawn-pane -p must be a non-negative integer".to_string()
+                    })?);
+                i += 2;
+            }
+            "-k" => {
+                force = true;
+                i += 1;
+            }
+            "--" => {
+                command = args[i + 1..].to_vec();
+                break;
+            }
+            value => return Err(format!("respawn-pane does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::RespawnPane {
+        session: session.ok_or_else(|| "respawn-pane requires -t <session>".to_string())?,
+        pane,
+        force,
+        command,
     })
 }
 
@@ -2038,6 +2092,33 @@ mod tests {
             Command::KillPane {
                 session: "dev".to_string(),
                 pane: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_respawn_pane_target_force_and_command() {
+        let command = parse_args([
+            "dmux",
+            "respawn-pane",
+            "-t",
+            "dev",
+            "-p",
+            "1",
+            "-k",
+            "--",
+            "sh",
+            "-c",
+            "echo ready",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::RespawnPane {
+                session: "dev".to_string(),
+                pane: Some(1),
+                force: true,
+                command: vec!["sh".to_string(), "-c".to_string(), "echo ready".to_string()],
             }
         );
     }

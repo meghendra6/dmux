@@ -1132,6 +1132,29 @@ fn poll_capture_screen(socket: &std::path::Path, session: &str, needle: &str) ->
         if last.contains(needle) {
             return last;
         }
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
+}
+
+fn poll_list_panes_contains(
+    socket: &std::path::Path,
+    session: &str,
+    format: &str,
+    needle: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(socket, &["list-panes", "-t", session, "-F", format]);
+        assert_success(&output);
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if last.contains(needle) {
+            return last;
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
@@ -3312,9 +3335,9 @@ fn kill_pane_resizes_remaining_child_pty_to_full_layout_region() {
 }
 
 #[test]
-fn exited_split_pane_is_removed_and_remaining_pane_resizes() {
-    let socket = unique_socket("split-pane-exit-removal");
-    let session = format!("split-pane-exit-removal-{}", std::process::id());
+fn exited_split_pane_stays_inspectable_and_active_moves_to_live_pane() {
+    let socket = unique_socket("split-pane-exit-state");
+    let session = format!("split-pane-exit-state-{}", std::process::id());
 
     assert_success(&dmux(
         &socket,
@@ -3357,8 +3380,16 @@ fn exited_split_pane_is_removed_and_remaining_pane_resizes() {
         &["send-keys", "-t", &session, "close", "Enter"],
     ));
 
-    let panes = poll_pane_count(&socket, &session, 1);
-    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
+    let panes = poll_list_panes_contains(
+        &socket,
+        &session,
+        "#{pane.index}:#{pane.id}:#{pane.active}:#{pane.state}:#{pane.exit_status}",
+        "1:1:0:exited:0",
+    );
+    assert_eq!(
+        panes.lines().collect::<Vec<_>>(),
+        vec!["0:0:1:running:", "1:1:0:exited:0"]
+    );
     let active = poll_active_pane(&socket, &session, 0);
     assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
 
@@ -3366,8 +3397,172 @@ fn exited_split_pane_is_removed_and_remaining_pane_resizes() {
         &socket,
         &["send-keys", "-t", &session, "after-exit", "Enter"],
     ));
-    let base = poll_capture(&socket, &session, "base-after-exit:24 83");
-    assert!(base.contains("base-after-exit:24 83"), "{base:?}");
+    let base = poll_capture(&socket, &session, "base-after-exit:24 40");
+    assert!(base.contains("base-after-exit:24 40"), "{base:?}");
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "1"]));
+    let panes = poll_pane_count(&socket, &session, 1);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn last_exited_pane_can_be_listed_captured_and_respawned_in_place() {
+    let socket = unique_socket("last-exited-pane-respawn");
+    let session = format!("last-exited-pane-respawn-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf before-exit; exit 7",
+        ],
+    ));
+
+    let panes = poll_list_panes_contains(
+        &socket,
+        &session,
+        "#{pane.index}:#{pane.id}:#{pane.active}:#{pane.state}:#{pane.exit_status}:#{pane.pid}",
+        "0:0:1:exited:7:",
+    );
+    assert!(
+        panes.lines().any(|line| {
+            let parts = line.split(':').collect::<Vec<_>>();
+            matches!(parts.as_slice(), ["0", "0", "1", "exited", "7", pid] if !pid.is_empty())
+        }),
+        "{panes:?}"
+    );
+
+    let captured = poll_capture(&socket, &session, "before-exit");
+    assert!(captured.contains("before-exit"), "{captured:?}");
+
+    let send = dmux(&socket, &["send-keys", "-t", &session, "ignored"]);
+    assert!(!send.status.success(), "send-keys unexpectedly succeeded");
+    assert!(
+        String::from_utf8_lossy(&send.stderr).contains("pane is not running"),
+        "{}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "respawn-pane",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf respawned-ready; sleep 30",
+        ],
+    ));
+    let panes = poll_list_panes_contains(
+        &socket,
+        &session,
+        "#{pane.index}:#{pane.id}:#{pane.active}:#{pane.state}:#{pane.exit_status}",
+        "0:0:1:running:",
+    );
+    assert_eq!(panes.trim_end(), "0:0:1:running:");
+    let captured = poll_capture(&socket, &session, "respawned-ready");
+    assert!(captured.contains("respawned-ready"), "{captured:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "respawn-pane",
+            "-k",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf fast-exit; exit 3",
+        ],
+    ));
+    let panes = poll_list_panes_contains(
+        &socket,
+        &session,
+        "#{pane.index}:#{pane.id}:#{pane.active}:#{pane.state}:#{pane.exit_status}",
+        "0:0:1:exited:3",
+    );
+    assert_eq!(panes.trim_end(), "0:0:1:exited:3");
+    let captured = poll_capture(&socket, &session, "fast-exit");
+    assert!(captured.contains("fast-exit"), "{captured:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn respawn_running_pane_requires_force_and_preserves_pane_identity() {
+    let socket = unique_socket("force-respawn-running-pane");
+    let session = format!("force-respawn-running-pane-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf original-ready; sleep 30",
+        ],
+    ));
+    let original = poll_capture(&socket, &session, "original-ready");
+    assert!(original.contains("original-ready"), "{original:?}");
+
+    let rejected = dmux(
+        &socket,
+        &[
+            "respawn-pane",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf should-not-run; sleep 30",
+        ],
+    );
+    assert!(!rejected.status.success(), "respawn unexpectedly succeeded");
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("pane is still running"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "respawn-pane",
+            "-k",
+            "-t",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf forced-ready; sleep 30",
+        ],
+    ));
+    let panes = poll_list_panes_contains(
+        &socket,
+        &session,
+        "#{pane.index}:#{pane.id}:#{pane.active}:#{pane.state}",
+        "0:0:1:running",
+    );
+    assert_eq!(panes.trim_end(), "0:0:1:running");
+    let forced = poll_capture(&socket, &session, "forced-ready");
+    assert!(forced.contains("forced-ready"), "{forced:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -3930,7 +4125,7 @@ fn active_attach_exits_when_kill_server_runs_from_another_process() {
 }
 
 #[test]
-fn active_attach_exits_when_pane_process_exits() {
+fn active_attach_redraws_when_pane_process_exits() {
     let socket = unique_socket("active-attach-pane-exit");
     let session = format!("active-attach-pane-exit-{}", std::process::id());
 
@@ -3950,9 +4145,23 @@ fn active_attach_exits_when_pane_process_exits() {
     let base = poll_capture(&socket, &session, "base-ready");
     assert!(base.contains("base-ready"), "{base:?}");
 
-    let child = spawn_attached_to_session(&socket, &session, &["base-ready"]);
+    let mut child = spawn_attached_to_session(&socket, &session, &["base-ready"]);
 
-    let output = assert_child_exits_within(child, "raw attach after pane process exit");
+    let panes = poll_list_panes_contains(
+        &socket,
+        &session,
+        "#{pane.index}:#{pane.state}:#{pane.exit_status}",
+        "0:exited:0",
+    );
+    assert_eq!(panes.trim_end(), "0:exited:0");
+    child.wait_for_stdout_contains_all(&["pane 0"], "raw attach redraw after pane process exit");
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+
+    let output = wait_for_child_exit(child);
     assert_success(&output);
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

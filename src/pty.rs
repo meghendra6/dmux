@@ -55,6 +55,12 @@ pub struct PtyProcess {
     pub master: File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtyExitStatus {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
 pub fn spawn(spec: &SpawnSpec) -> io::Result<PtyProcess> {
     let mut master: c_int = -1;
     let winsize = WinSize::from(spec.size);
@@ -101,6 +107,48 @@ pub fn terminate(pid: c_int) -> io::Result<()> {
         io::ErrorKind::TimedOut,
         format!("process group {pid} did not exit after SIGKILL"),
     ))
+}
+
+pub fn wait_exit_status(pid: c_int) -> io::Result<PtyExitStatus> {
+    let mut status = 0;
+    let result = unsafe { waitpid(pid, &mut status, 0) };
+    if result == pid {
+        Ok(decode_exit_status(status))
+    } else if result == -1 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ECHILD) {
+            Ok(PtyExitStatus {
+                code: None,
+                signal: None,
+            })
+        } else {
+            Err(err)
+        }
+    } else {
+        Err(io::Error::other(format!(
+            "waitpid returned {result} for {pid}"
+        )))
+    }
+}
+
+fn decode_exit_status(status: c_int) -> PtyExitStatus {
+    let signal = status & 0x7f;
+    if signal == 0 {
+        PtyExitStatus {
+            code: Some((status >> 8) & 0xff),
+            signal: None,
+        }
+    } else if signal == 0x7f {
+        PtyExitStatus {
+            code: None,
+            signal: None,
+        }
+    } else {
+        PtyExitStatus {
+            code: None,
+            signal: Some(signal),
+        }
+    }
 }
 
 fn signal_process_group(pgid: c_int, signal: c_int) -> io::Result<()> {

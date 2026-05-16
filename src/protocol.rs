@@ -154,6 +154,12 @@ pub enum Request {
         session: String,
         pane: Option<usize>,
     },
+    RespawnPane {
+        session: String,
+        pane: Option<usize>,
+        force: bool,
+        command: Vec<String>,
+    },
     NewWindow {
         session: String,
         command: Vec<String>,
@@ -383,6 +389,21 @@ pub fn encode_kill_pane(session: &str, pane: Option<usize>) -> String {
         Some(pane) => format!("KILL_PANE\t{session}\t{pane}\n"),
         None => format!("KILL_PANE\t{session}\tactive\n"),
     }
+}
+
+pub fn encode_respawn_pane(
+    session: &str,
+    pane: Option<usize>,
+    force: bool,
+    command: &[String],
+) -> String {
+    let joined = command.join(&ARG_SEPARATOR.to_string());
+    format!(
+        "RESPAWN_PANE\t{session}\t{}\t{}\t{}\t{joined}\n",
+        pane.map_or_else(|| "active".to_string(), |pane| pane.to_string()),
+        usize::from(force),
+        command.len()
+    )
 }
 
 pub fn encode_new_window(session: &str, command: &[String]) -> String {
@@ -665,6 +686,29 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
             pane: decode_optional_pane(pane)?,
         }),
+        ["RESPAWN_PANE", session, pane, force, argc, joined] => {
+            let argc = argc
+                .parse::<usize>()
+                .map_err(|_| "RESPAWN_PANE has invalid argc".to_string())?;
+            let command = if *joined == "" {
+                Vec::new()
+            } else {
+                joined.split(ARG_SEPARATOR).map(str::to_string).collect()
+            };
+            if command.len() != argc {
+                return Err("RESPAWN_PANE argc does not match command".to_string());
+            }
+            Ok(Request::RespawnPane {
+                session: (*session).to_string(),
+                pane: decode_optional_pane(pane)?,
+                force: match *force {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err("RESPAWN_PANE has invalid force flag".to_string()),
+                },
+                command,
+            })
+        }
         ["NEW_WINDOW", session, argc, joined] => {
             let argc = argc
                 .parse::<usize>()
@@ -1264,6 +1308,25 @@ mod tests {
             Request::KillPane {
                 session: "dev".to_string(),
                 pane: None,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_respawn_pane_request() {
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf ready".to_string(),
+        ];
+        let line = encode_respawn_pane("dev", Some(1), true, &command);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::RespawnPane {
+                session: "dev".to_string(),
+                pane: Some(1),
+                force: true,
+                command,
             }
         );
     }
