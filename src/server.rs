@@ -132,8 +132,11 @@ struct Buffer {
 }
 
 struct BufferDescription {
+    index: usize,
     name: String,
     bytes: usize,
+    lines: usize,
+    latest: bool,
     preview: String,
 }
 
@@ -176,11 +179,16 @@ impl BufferStore {
     }
 
     fn list(&self) -> Vec<BufferDescription> {
+        let latest_index = self.buffers.len().checked_sub(1);
         self.buffers
             .iter()
-            .map(|buffer| BufferDescription {
+            .enumerate()
+            .map(|(index, buffer)| BufferDescription {
+                index,
                 name: buffer.name.clone(),
                 bytes: buffer.text.len(),
+                lines: buffer_line_count(&buffer.text),
+                latest: latest_index == Some(index),
                 preview: buffer_preview(&buffer.text),
             })
             .collect()
@@ -222,33 +230,65 @@ fn buffer_preview(text: &str) -> String {
         .collect()
 }
 
-fn format_copy_mode_lines(text: &str, search: Option<&str>) -> String {
+fn buffer_line_count(text: &str) -> usize {
+    text.lines().count()
+}
+
+fn format_copy_mode_lines(
+    text: &str,
+    search: Option<&str>,
+    match_index: Option<usize>,
+) -> Result<String, String> {
     let mut output = String::new();
+    let mut matched = 0;
     for (index, line) in text.lines().enumerate() {
         if search.is_none_or(|needle| line.contains(needle)) {
+            matched += 1;
+            if match_index.is_some_and(|wanted| wanted != matched) {
+                continue;
+            }
             output.push_str(&(index + 1).to_string());
             output.push('\t');
             output.push_str(line);
             output.push('\n');
         }
     }
-    output
+    if search.is_some() && matched == 0 {
+        return Err("missing match".to_string());
+    }
+    if let Some(match_index) = match_index {
+        if match_index == 0 {
+            return Err("invalid match index".to_string());
+        }
+        if matched < match_index {
+            return Err("missing match".to_string());
+        }
+    }
+    Ok(output)
 }
 
 fn select_buffer_text(text: &str, selection: &BufferSelection) -> Result<String, String> {
     match selection {
         BufferSelection::All => Ok(text.to_string()),
         BufferSelection::LineRange { start, end } => select_line_range(text, *start, *end),
-        BufferSelection::Search(needle) => select_search_match(text, needle),
+        BufferSelection::Search {
+            needle,
+            match_index,
+        } => select_search_match(text, needle, *match_index),
     }
 }
 
-fn select_line_range(text: &str, start: usize, end: usize) -> Result<String, String> {
-    if start == 0 || end == 0 || start > end {
+fn select_line_range(text: &str, start: isize, end: isize) -> Result<String, String> {
+    if start == 0 || end == 0 {
         return Err("invalid line range".to_string());
     }
 
     let lines = text.lines().collect::<Vec<_>>();
+    let start = resolve_line_offset(start, lines.len())?;
+    let end = resolve_line_offset(end, lines.len())?;
+    if start > end {
+        return Err("invalid line range".to_string());
+    }
     if end > lines.len() {
         return Err("missing line".to_string());
     }
@@ -256,12 +296,31 @@ fn select_line_range(text: &str, start: usize, end: usize) -> Result<String, Str
     Ok(join_selected_lines(&lines[start - 1..end]))
 }
 
-fn select_search_match(text: &str, needle: &str) -> Result<String, String> {
+fn resolve_line_offset(value: isize, len: usize) -> Result<usize, String> {
+    if value > 0 {
+        return usize::try_from(value).map_err(|_| "invalid line range".to_string());
+    }
+    let len = isize::try_from(len).map_err(|_| "invalid line range".to_string())?;
+    let resolved = len + value + 1;
+    if resolved <= 0 {
+        return Err("missing line".to_string());
+    }
+    usize::try_from(resolved).map_err(|_| "invalid line range".to_string())
+}
+
+fn select_search_match(text: &str, needle: &str, match_index: usize) -> Result<String, String> {
     if needle.is_empty() {
         return Err("search text cannot be empty".to_string());
     }
+    if match_index == 0 {
+        return Err("invalid match index".to_string());
+    }
 
-    let Some(line) = text.lines().find(|line| line.contains(needle)) else {
+    let Some(line) = text
+        .lines()
+        .filter(|line| line.contains(needle))
+        .nth(match_index - 1)
+    else {
         return Err("missing match".to_string());
     };
 
@@ -1693,7 +1752,11 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::DetachClient { session, client_id } => {
             handle_detach_client(&state, &mut stream, session.as_deref(), client_id)
         }
-        Request::Capture { session, mode } => handle_capture(&state, &mut stream, &session, mode),
+        Request::Capture {
+            session,
+            mode,
+            selection,
+        } => handle_capture(&state, &mut stream, &session, mode, &selection),
         Request::SaveBuffer {
             session,
             buffer,
@@ -1716,8 +1779,18 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             session,
             mode,
             search,
-        } => handle_copy_mode(&state, &mut stream, &session, mode, search.as_deref()),
-        Request::ListBuffers => handle_list_buffers(&state, &mut stream),
+            match_index,
+        } => handle_copy_mode(
+            &state,
+            &mut stream,
+            &session,
+            mode,
+            search.as_deref(),
+            match_index,
+        ),
+        Request::ListBuffers { format } => {
+            handle_list_buffers(&state, &mut stream, format.as_deref())
+        }
         Request::PasteBuffer { session, buffer } => {
             handle_paste_buffer(&state, &mut stream, &session, buffer.as_deref())
         }
@@ -2253,6 +2326,7 @@ fn handle_capture(
     stream: &mut UnixStream,
     name: &str,
     mode: CaptureMode,
+    selection: &BufferSelection,
 ) -> io::Result<()> {
     let session = resolve_session(state, name);
 
@@ -2265,9 +2339,16 @@ fn handle_capture(
         return Ok(());
     };
 
-    write_ok(stream)?;
     let captured = capture_pane_text(&pane, mode);
-    stream.write_all(captured.as_bytes())
+    let selected = match select_buffer_text(&captured, selection) {
+        Ok(text) => text,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    write_ok(stream)?;
+    stream.write_all(selected.as_bytes())
 }
 
 fn capture_pane_text(pane: &Pane, mode: CaptureMode) -> String {
@@ -2343,18 +2424,42 @@ fn handle_save_buffer_text(
     writeln!(stream, "{saved_name}")
 }
 
-fn handle_list_buffers(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::Result<()> {
+fn handle_list_buffers(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    format: Option<&str>,
+) -> io::Result<()> {
     let buffers = state.buffers.lock().unwrap().list();
 
     write_ok(stream)?;
     for buffer in buffers {
-        writeln!(
-            stream,
-            "{}\t{}\t{}",
-            buffer.name, buffer.bytes, buffer.preview
-        )?;
+        if let Some(format) = format {
+            writeln!(stream, "{}", format_buffer_description(format, &buffer))?;
+        } else {
+            writeln!(
+                stream,
+                "{}\t{}\t{}",
+                buffer.name, buffer.bytes, buffer.preview
+            )?;
+        }
     }
     Ok(())
+}
+
+fn format_buffer_description(format: &str, buffer: &BufferDescription) -> String {
+    let index = buffer.index.to_string();
+    let bytes = buffer.bytes.to_string();
+    let lines = buffer.lines.to_string();
+    let latest = if buffer.latest { "1" } else { "0" };
+    let replacements = [
+        ("#{buffer.index}", index.as_str()),
+        ("#{buffer.name}", buffer.name.as_str()),
+        ("#{buffer.bytes}", bytes.as_str()),
+        ("#{buffer.lines}", lines.as_str()),
+        ("#{buffer.latest}", latest),
+        ("#{buffer.preview}", buffer.preview.as_str()),
+    ];
+    apply_replacements(format, &replacements)
 }
 
 fn handle_copy_mode(
@@ -2363,6 +2468,7 @@ fn handle_copy_mode(
     name: &str,
     mode: CaptureMode,
     search: Option<&str>,
+    match_index: Option<usize>,
 ) -> io::Result<()> {
     let session = resolve_session(state, name);
 
@@ -2376,7 +2482,13 @@ fn handle_copy_mode(
     };
 
     let captured = capture_pane_text(&pane, mode);
-    let output = format_copy_mode_lines(&captured, search);
+    let output = match format_copy_mode_lines(&captured, search, match_index) {
+        Ok(output) => output,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
     write_ok(stream)?;
     stream.write_all(output.as_bytes())
 }
@@ -2393,10 +2505,6 @@ fn handle_paste_buffer(
         write_err(stream, "missing session")?;
         return Ok(());
     };
-    let Some(pane) = session.active_live_pane() else {
-        write_err(stream, "pane is not running")?;
-        return Ok(());
-    };
     let Some(text) = state
         .buffers
         .lock()
@@ -2405,6 +2513,14 @@ fn handle_paste_buffer(
         .map(|buffer| buffer.text.clone())
     else {
         write_err(stream, "missing buffer")?;
+        return Ok(());
+    };
+    if text.len() > MAX_BUFFER_BYTES {
+        write_err(stream, "buffer exceeds maximum size")?;
+        return Ok(());
+    }
+    let Some(pane) = session.active_live_pane() else {
+        write_err(stream, "pane is not running")?;
         return Ok(());
     };
 
@@ -6339,10 +6455,36 @@ left | right\r\n"
     fn selected_buffer_text_returns_first_search_match() {
         let text = select_buffer_text(
             "first\nneedle-one\nneedle-two\n",
-            &BufferSelection::Search("needle".to_string()),
+            &BufferSelection::Search {
+                needle: "needle".to_string(),
+                match_index: 1,
+            },
         )
         .unwrap();
         assert_eq!(text, "needle-one\n");
+    }
+
+    #[test]
+    fn selected_buffer_text_returns_requested_search_match() {
+        let text = select_buffer_text(
+            "first\nneedle-one\nneedle-two\n",
+            &BufferSelection::Search {
+                needle: "needle".to_string(),
+                match_index: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(text, "needle-two\n");
+    }
+
+    #[test]
+    fn selected_buffer_text_supports_negative_tail_line_range() {
+        let text = select_buffer_text(
+            "first\nmiddle\ntail-one\ntail-two\n",
+            &BufferSelection::LineRange { start: -2, end: -1 },
+        )
+        .unwrap();
+        assert_eq!(text, "tail-one\ntail-two\n");
     }
 
     #[test]
@@ -6359,7 +6501,10 @@ left | right\r\n"
     fn selected_buffer_text_rejects_missing_search_match() {
         let err = select_buffer_text(
             "first\nsecond\n",
-            &BufferSelection::Search("needle".to_string()),
+            &BufferSelection::Search {
+                needle: "needle".to_string(),
+                match_index: 1,
+            },
         )
         .unwrap_err();
         assert_eq!(err, "missing match");
@@ -6367,13 +6512,29 @@ left | right\r\n"
 
     #[test]
     fn format_copy_mode_lines_numbers_all_lines() {
-        let text = format_copy_mode_lines("first\nsecond\n", None);
+        let text = format_copy_mode_lines("first\nsecond\n", None, None).unwrap();
         assert_eq!(text, "1\tfirst\n2\tsecond\n");
     }
 
     #[test]
     fn format_copy_mode_lines_filters_search_matches() {
-        let text = format_copy_mode_lines("first\nneedle-one\nlast\nneedle-two\n", Some("needle"));
+        let text = format_copy_mode_lines(
+            "first\nneedle-one\nlast\nneedle-two\n",
+            Some("needle"),
+            None,
+        )
+        .unwrap();
         assert_eq!(text, "2\tneedle-one\n4\tneedle-two\n");
+    }
+
+    #[test]
+    fn format_copy_mode_lines_filters_search_match_index() {
+        let text = format_copy_mode_lines(
+            "first\nneedle-one\nlast\nneedle-two\n",
+            Some("needle"),
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(text, "4\tneedle-two\n");
     }
 }

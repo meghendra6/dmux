@@ -49,6 +49,7 @@ pub enum Command {
     CapturePane {
         session: String,
         mode: CaptureMode,
+        selection: BufferSelection,
     },
     SaveBuffer {
         session: String,
@@ -60,8 +61,11 @@ pub enum Command {
         session: String,
         mode: CaptureMode,
         search: Option<String>,
+        match_index: Option<usize>,
     },
-    ListBuffers,
+    ListBuffers {
+        format: Option<String>,
+    },
     PasteBuffer {
         session: String,
         buffer: Option<String>,
@@ -458,6 +462,10 @@ fn parse_detach_client(args: Vec<String>) -> Result<Command, String> {
 fn parse_capture(args: Vec<String>) -> Result<Command, String> {
     let mut session = None;
     let mut mode = None;
+    let mut start_line = None;
+    let mut end_line = None;
+    let mut search = None;
+    let mut match_index = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -484,13 +492,48 @@ fn parse_capture(args: Vec<String>) -> Result<Command, String> {
                 set_capture_mode(&mut mode, CaptureMode::All)?;
                 i += 1;
             }
+            "--start-line" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "capture-pane requires a line number after --start-line".to_string()
+                })?;
+                start_line = Some(parse_line_offset(value, "capture-pane --start-line")?);
+                i += 2;
+            }
+            "--end-line" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "capture-pane requires a line number after --end-line".to_string()
+                })?;
+                end_line = Some(parse_line_offset(value, "capture-pane --end-line")?);
+                i += 2;
+            }
+            "--search" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "capture-pane requires text after --search".to_string())?;
+                if value.is_empty() {
+                    return Err("capture-pane --search requires non-empty text".to_string());
+                }
+                search = Some(value.clone());
+                i += 2;
+            }
+            "--match" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "capture-pane requires a match index after --match".to_string()
+                })?;
+                match_index = Some(parse_positive_usize(value, "capture-pane --match")?);
+                i += 2;
+            }
             value => return Err(format!("capture-pane does not support argument {value:?}")),
         }
     }
 
+    let selection =
+        parse_buffer_selection(start_line, end_line, search, match_index, "capture-pane")?;
+
     Ok(Command::CapturePane {
         session: session.ok_or_else(|| "capture-pane requires -t <session>".to_string())?,
         mode: mode.unwrap_or(CaptureMode::All),
+        selection,
     })
 }
 
@@ -509,6 +552,7 @@ fn parse_save_buffer(args: Vec<String>) -> Result<Command, String> {
     let mut start_line = None;
     let mut end_line = None;
     let mut search = None;
+    let mut match_index = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -543,14 +587,14 @@ fn parse_save_buffer(args: Vec<String>) -> Result<Command, String> {
                 let value = args.get(i + 1).ok_or_else(|| {
                     "save-buffer requires a line number after --start-line".to_string()
                 })?;
-                start_line = Some(parse_positive_usize(value, "save-buffer --start-line")?);
+                start_line = Some(parse_line_offset(value, "save-buffer --start-line")?);
                 i += 2;
             }
             "--end-line" => {
                 let value = args.get(i + 1).ok_or_else(|| {
                     "save-buffer requires a line number after --end-line".to_string()
                 })?;
-                end_line = Some(parse_positive_usize(value, "save-buffer --end-line")?);
+                end_line = Some(parse_line_offset(value, "save-buffer --end-line")?);
                 i += 2;
             }
             "--search" => {
@@ -563,11 +607,19 @@ fn parse_save_buffer(args: Vec<String>) -> Result<Command, String> {
                 search = Some(value.clone());
                 i += 2;
             }
+            "--match" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "save-buffer requires a match index after --match".to_string()
+                })?;
+                match_index = Some(parse_positive_usize(value, "save-buffer --match")?);
+                i += 2;
+            }
             value => return Err(format!("save-buffer does not support argument {value:?}")),
         }
     }
 
-    let selection = parse_buffer_selection(start_line, end_line, search)?;
+    let selection =
+        parse_buffer_selection(start_line, end_line, search, match_index, "save-buffer")?;
 
     Ok(Command::SaveBuffer {
         session: session.ok_or_else(|| "save-buffer requires -t <session>".to_string())?,
@@ -581,6 +633,7 @@ fn parse_copy_mode(args: Vec<String>) -> Result<Command, String> {
     let mut session = None;
     let mut mode = None;
     let mut search = None;
+    let mut match_index = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -614,44 +667,84 @@ fn parse_copy_mode(args: Vec<String>) -> Result<Command, String> {
                 search = Some(value.clone());
                 i += 2;
             }
+            "--match" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "copy-mode requires a match index after --match".to_string())?;
+                match_index = Some(parse_positive_usize(value, "copy-mode --match")?);
+                i += 2;
+            }
             value => return Err(format!("copy-mode does not support argument {value:?}")),
         }
+    }
+    if match_index.is_some() && search.is_none() {
+        return Err("copy-mode --match requires --search".to_string());
     }
 
     Ok(Command::CopyMode {
         session: session.ok_or_else(|| "copy-mode requires -t <session>".to_string())?,
         mode: mode.unwrap_or(CaptureMode::All),
         search,
+        match_index,
     })
 }
 
 fn parse_buffer_selection(
-    start_line: Option<usize>,
-    end_line: Option<usize>,
+    start_line: Option<isize>,
+    end_line: Option<isize>,
     search: Option<String>,
+    match_index: Option<usize>,
+    command: &str,
 ) -> Result<BufferSelection, String> {
     if search.is_some() && (start_line.is_some() || end_line.is_some()) {
-        return Err("save-buffer accepts either a line range or --search".to_string());
+        return Err(format!("{command} accepts either a line range or --search"));
     }
 
     if let Some(search) = search {
-        return Ok(BufferSelection::Search(search));
+        return Ok(BufferSelection::Search {
+            needle: search,
+            match_index: match_index.unwrap_or(1),
+        });
     }
 
+    if match_index.is_some() {
+        return Err(format!("{command} --match requires --search"));
+    }
+
+    parse_line_range_selection(start_line, end_line, command)
+}
+
+fn parse_line_range_selection(
+    start_line: Option<isize>,
+    end_line: Option<isize>,
+    command: &str,
+) -> Result<BufferSelection, String> {
     match (start_line, end_line) {
         (None, None) => Ok(BufferSelection::All),
-        (Some(start), Some(end)) if start <= end => Ok(BufferSelection::LineRange { start, end }),
-        (Some(_), Some(_)) => Err("save-buffer line range requires start <= end".to_string()),
-        _ => Err("save-buffer line range requires --start-line and --end-line".to_string()),
+        (Some(start), Some(end)) => Ok(BufferSelection::LineRange { start, end }),
+        _ => Err(format!(
+            "{command} line range requires --start-line and --end-line"
+        )),
     }
 }
 
 fn parse_list_buffers(args: Vec<String>) -> Result<Command, String> {
-    if let Some(value) = args.first() {
-        return Err(format!("list-buffers does not support argument {value:?}"));
+    let mut format = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-F" | "--format" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "list-buffers requires a format after --format".to_string())?;
+                format = Some(value.clone());
+                i += 2;
+            }
+            value => return Err(format!("list-buffers does not support argument {value:?}")),
+        }
     }
 
-    Ok(Command::ListBuffers)
+    Ok(Command::ListBuffers { format })
 }
 
 fn parse_paste_buffer(args: Vec<String>) -> Result<Command, String> {
@@ -721,6 +814,14 @@ fn parse_positive_usize(value: &str, label: &str) -> Result<usize, String> {
         .ok()
         .filter(|value| *value > 0)
         .ok_or_else(|| format!("{label} must be a positive integer"))
+}
+
+fn parse_line_offset(value: &str, label: &str) -> Result<isize, String> {
+    value
+        .parse::<isize>()
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| format!("{label} must be a non-zero integer"))
 }
 
 fn parse_kill_session(args: Vec<String>) -> Result<Command, String> {
@@ -1630,6 +1731,7 @@ mod tests {
             Command::CapturePane {
                 session: "dev".to_string(),
                 mode: CaptureMode::All,
+                selection: BufferSelection::All,
             }
         );
     }
@@ -1642,6 +1744,7 @@ mod tests {
             Command::CapturePane {
                 session: "dev".to_string(),
                 mode: CaptureMode::Screen,
+                selection: BufferSelection::All,
             }
         );
     }
@@ -1654,6 +1757,7 @@ mod tests {
             Command::CapturePane {
                 session: "dev".to_string(),
                 mode: CaptureMode::History,
+                selection: BufferSelection::All,
             }
         );
     }
@@ -1666,8 +1770,109 @@ mod tests {
             Command::CapturePane {
                 session: "dev".to_string(),
                 mode: CaptureMode::All,
+                selection: BufferSelection::All,
             }
         );
+    }
+
+    #[test]
+    fn parses_capture_pane_tail_line_range() {
+        let command = parse_args([
+            "dmux",
+            "capture-pane",
+            "-t",
+            "dev",
+            "-p",
+            "--start-line",
+            "-2",
+            "--end-line",
+            "-1",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::CapturePane {
+                session: "dev".to_string(),
+                mode: CaptureMode::All,
+                selection: BufferSelection::LineRange { start: -2, end: -1 },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_capture_pane_mixed_positive_tail_line_range() {
+        let command = parse_args([
+            "dmux",
+            "capture-pane",
+            "-t",
+            "dev",
+            "-p",
+            "--start-line",
+            "2",
+            "--end-line",
+            "-1",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::CapturePane {
+                session: "dev".to_string(),
+                mode: CaptureMode::All,
+                selection: BufferSelection::LineRange { start: 2, end: -1 },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_capture_pane_search_match_selection() {
+        let command = parse_args([
+            "dmux",
+            "capture-pane",
+            "-t",
+            "dev",
+            "-p",
+            "--screen",
+            "--search",
+            "needle",
+            "--match",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::CapturePane {
+                session: "dev".to_string(),
+                mode: CaptureMode::Screen,
+                selection: BufferSelection::Search {
+                    needle: "needle".to_string(),
+                    match_index: 2,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_capture_pane_search_with_line_range() {
+        let err = parse_args([
+            "dmux",
+            "capture-pane",
+            "-t",
+            "dev",
+            "--start-line",
+            "1",
+            "--end-line",
+            "2",
+            "--search",
+            "needle",
+        ])
+        .unwrap_err();
+        assert!(err.contains("either a line range or --search"), "{err}");
+    }
+
+    #[test]
+    fn rejects_capture_pane_match_without_search() {
+        let err = parse_args(["dmux", "capture-pane", "-t", "dev", "--match", "2"]).unwrap_err();
+        assert!(err.contains("--match requires --search"), "{err}");
     }
 
     #[test]
@@ -1736,6 +1941,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_save_buffer_mixed_positive_tail_line_range() {
+        let command = parse_args([
+            "dmux",
+            "save-buffer",
+            "-t",
+            "dev",
+            "-b",
+            "picked",
+            "--screen",
+            "--start-line",
+            "2",
+            "--end-line",
+            "-1",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::SaveBuffer {
+                session: "dev".to_string(),
+                buffer: Some("picked".to_string()),
+                mode: CaptureMode::Screen,
+                selection: BufferSelection::LineRange { start: 2, end: -1 },
+            }
+        );
+    }
+
+    #[test]
     fn parses_save_buffer_search_selection() {
         let command = parse_args([
             "dmux",
@@ -1754,7 +1986,10 @@ mod tests {
                 session: "dev".to_string(),
                 buffer: Some("match".to_string()),
                 mode: CaptureMode::All,
-                selection: BufferSelection::Search("needle".to_string()),
+                selection: BufferSelection::Search {
+                    needle: "needle".to_string(),
+                    match_index: 1,
+                },
             }
         );
     }
@@ -1802,6 +2037,31 @@ mod tests {
                 session: "dev".to_string(),
                 mode: CaptureMode::History,
                 search: Some("needle".to_string()),
+                match_index: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_copy_mode_search_match_index() {
+        let command = parse_args([
+            "dmux",
+            "copy-mode",
+            "-t",
+            "dev",
+            "--search",
+            "needle",
+            "--match",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::CopyMode {
+                session: "dev".to_string(),
+                mode: CaptureMode::All,
+                search: Some("needle".to_string()),
+                match_index: Some(2),
             }
         );
     }
@@ -1814,6 +2074,7 @@ mod tests {
                 session: "dev".to_string(),
                 mode: CaptureMode::All,
                 search: None,
+                match_index: None,
             }
         );
     }
@@ -1835,7 +2096,17 @@ mod tests {
     fn parses_list_buffers() {
         assert_eq!(
             parse_args(["dmux", "list-buffers"]).unwrap(),
-            Command::ListBuffers
+            Command::ListBuffers { format: None }
+        );
+    }
+
+    #[test]
+    fn parses_list_buffers_format() {
+        assert_eq!(
+            parse_args(["dmux", "list-buffers", "-F", "#{buffer.name}"]).unwrap(),
+            Command::ListBuffers {
+                format: Some("#{buffer.name}".to_string())
+            }
         );
     }
 

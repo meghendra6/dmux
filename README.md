@@ -13,10 +13,10 @@ Implemented Phase 0/1 commands:
 - `dmux rename-session -t <old-name> <new-name>`
 - `dmux list-clients [-t <name>] [-F <format>]`
 - `dmux detach-client [-t <name>] [-c <client-id>]`
-- `dmux capture-pane -t <name> -p [--screen|--history|--all]`
-- `dmux copy-mode -t <name> [--screen|--history|--all] [--search <text>]`
-- `dmux save-buffer -t <name> [-b <buffer>] [--screen|--history|--all] [--start-line <n> --end-line <n>|--search <text>]`
-- `dmux list-buffers`
+- `dmux capture-pane -t <name> -p [--screen|--history|--all] [--start-line <n> --end-line <n>|--search <text> [--match <n>]]`
+- `dmux copy-mode -t <name> [--screen|--history|--all] [--search <text> [--match <n>]]`
+- `dmux save-buffer -t <name> [-b <buffer>] [--screen|--history|--all] [--start-line <n> --end-line <n>|--search <text> [--match <n>]]`
+- `dmux list-buffers [-F|--format <format>]`
 - `dmux paste-buffer -t <name> [-b <buffer>]`
 - `dmux delete-buffer -b <buffer>`
 - `dmux resize-pane -t <name> -x <cols> -y <rows>`
@@ -56,7 +56,8 @@ scrollback, or `--all` for the combined output explicitly.
 `<line-number><tab><text>` from the same `--screen`, `--history`, and `--all`
 capture sources as `capture-pane`; default and `--all` are combined history plus
 screen. Use `--search` to show only matching lines while preserving their
-original line numbers.
+original line numbers, and `--match <n>` to show one indexed match. Missing
+matches are reported as errors.
 
 Running `dmux` with no command opens the `default` session, creating it first
 when needed. `dmux attach` without `-t` also targets `default`. Explicit
@@ -88,12 +89,18 @@ active pane resizing is available with
 Unzoomed multi-pane attach redraws from server change events and keeps a polling
 fallback for mixed-version daemons or missed events.
 
-`save-buffer` currently stores captured active-pane text in an in-memory buffer
-with a 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name
-the buffer, omit `-b` to create an automatic name, and omit `-b` on
-`paste-buffer` to paste the latest saved buffer. Selection is command-driven
-for now: `--start-line`/`--end-line` saves a 1-based inclusive line range, and
-`--search` saves the first matching line.
+`save-buffer` stores captured active-pane text in an in-memory buffer with a
+1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name the
+buffer, omit `-b` to create an automatic name, and omit `-b` on `paste-buffer`
+to paste the latest saved buffer. Re-saving a named buffer replaces it and makes
+it latest. `capture-pane` and `save-buffer` support 1-based inclusive
+`--start-line`/`--end-line` ranges; negative values count back from the captured
+tail, so `--start-line -2 --end-line -1` selects the last two lines.
+`--search` selects matching lines, and `--match <n>` selects a specific match.
+`list-buffers` defaults to `<name><tab><bytes><tab><preview>` and supports
+format fields `#{buffer.index}`, `#{buffer.name}`, `#{buffer.bytes}`,
+`#{buffer.lines}`, `#{buffer.latest}`, and `#{buffer.preview}`. Missing buffers,
+missing matches, and pastes into exited panes are explicit errors.
 
 Implemented Phase 2 groundwork:
 
@@ -127,8 +134,11 @@ Implemented Phase 2 groundwork:
 - stable pane IDs exposed as `#{pane.id}` in pane/status formats
 - stable tab/window IDs plus active name/index/count exposed in status formats
 - in-memory buffers backed by pane capture and paste into active panes
-- command-driven line range and search selection for buffer saves
-- command-driven line-numbered copy-mode inspection with search filtering
+- command-driven line range, tail range, and search-match selection for capture
+  and buffer saves
+- command-driven line-numbered copy-mode inspection with search filtering and
+  indexed match selection
+- formatted buffer listing with latest marker, byte/line counts, and previews
 - attach-time basic copy-mode key handling for line copy
 - attach-time basic copy-mode mouse selection for line ranges
 - attach-time statusline snapshot rendering
