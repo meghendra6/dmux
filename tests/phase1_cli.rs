@@ -285,6 +285,21 @@ fn read_attach_render_frame_body_until_contains(stream: &mut UnixStream, needle:
     panic!("render stream frame did not contain {needle:?}; last:\n{last:?}");
 }
 
+fn read_attach_render_output_until_contains(stream: &mut UnixStream, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let body = read_attach_render_frame_body(stream);
+        last = String::from_utf8_lossy(&attach_render_output_from_frame_body(&body)).to_string();
+        if last.contains(needle) {
+            return last;
+        }
+    }
+
+    panic!("render stream output did not contain {needle:?}; last:\n{last:?}");
+}
+
 fn count_attach_render_frames_until_contains(
     stream: &mut UnixStream,
     needle: &str,
@@ -5672,13 +5687,13 @@ fn attach_render_stream_refreshes_scroll_region_redraw_after_split() {
             "--",
             "sh",
             "-c",
-            "printf '\\033[?1049h\\033[H\\033[2Jheader\\r\\nview-a-01\\r\\nview-a-02\\r\\nview-a-03\\r\\nfooter'; sleep 0.1; printf '\\033[2;4r\\033[2;1H\\033[3M\\033[2;1Hview-b-01\\r\\nview-b-02\\r\\nview-b-03\\033[6;1Hscroll-region-ready'; sleep 30",
+            "printf '\\033[?1049h\\033[H\\033[2Jheader\\r\\nview-a-01\\r\\nview-a-02\\r\\nview-a-03\\r\\nfooter\\033[2;4r\\033[2;1H\\033[3M\\033[2;1Hview-b-01\\r\\nview-b-02\\r\\nview-b-03\\033[6;1Hscroll-region-ready'; sleep 30",
         ],
     ));
     let captured = poll_capture(&socket, &session, "scroll-region-ready");
     assert!(captured.contains("view-b-03"), "{captured:?}");
 
-    let pushed = read_attach_render_frame_body_until_contains(&mut stream, "scroll-region-ready");
+    let pushed = read_attach_render_output_until_contains(&mut stream, "scroll-region-ready");
     assert!(pushed.contains("view-b-01"), "{pushed:?}");
     assert!(pushed.contains("view-b-02"), "{pushed:?}");
     assert!(pushed.contains("view-b-03"), "{pushed:?}");

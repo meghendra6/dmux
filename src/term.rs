@@ -250,16 +250,8 @@ impl vte::Perform for TerminalState {
             'M' => {
                 let count = first_param(params, 1);
                 let style = self.style;
-                if self.use_alternate_screen {
-                    self.active_screen_mut()
-                        .delete_lines_in_scroll_region(count, style, None);
-                } else {
-                    self.screen.delete_lines_in_scroll_region(
-                        count,
-                        style,
-                        Some(&mut self.scrollback),
-                    );
-                }
+                self.active_screen_mut()
+                    .delete_lines_in_scroll_region(count, style);
             }
             'L' => {
                 let count = first_param(params, 1);
@@ -626,25 +618,16 @@ impl TerminalScreen {
         }
     }
 
-    fn delete_lines_in_scroll_region(
-        &mut self,
-        count: usize,
-        style: CellStyle,
-        mut scrollback: Option<&mut Scrollback>,
-    ) {
+    fn delete_lines_in_scroll_region(&mut self, count: usize, style: CellStyle) {
         if !self.cursor_in_scroll_region() {
             return;
         }
         let count = count.min(self.scroll_bottom - self.cursor_row + 1);
         for _ in 0..count {
-            if self.cursor_row == 0 && self.scroll_top == 0 {
-                if let Some(scrollback) = scrollback.as_deref_mut() {
-                    scrollback.push(self.row_to_string(0));
-                }
-            }
             self.rows.remove(self.cursor_row);
             self.rows.insert(self.scroll_bottom, self.blank_row(style));
         }
+        self.cursor_col = 0;
     }
 
     fn insert_lines_in_scroll_region(&mut self, count: usize, style: CellStyle) {
@@ -656,6 +639,7 @@ impl TerminalScreen {
             self.rows.remove(self.scroll_bottom);
             self.rows.insert(self.cursor_row, self.blank_row(style));
         }
+        self.cursor_col = 0;
     }
 
     fn cursor_in_scroll_region(&self) -> bool {
@@ -1248,6 +1232,17 @@ mod tests {
     }
 
     #[test]
+    fn delete_line_does_not_transfer_removed_rows_to_scrollback() {
+        let mut state = TerminalState::new(12, 4, 100);
+        state.apply_bytes(b"one\r\ntwo\r\nthree");
+
+        state.apply_bytes(b"\x1b[1;1H\x1b[M");
+
+        assert_screen_rows(&state, &["two", "three", "", ""]);
+        assert_eq!(state.capture_history_text(), "");
+    }
+
+    #[test]
     fn insert_line_shifts_rows_inside_scroll_region_only() {
         let mut state = TerminalState::new(12, 5, 100);
         state.apply_bytes(b"header\r\nbody-1\r\nbody-2\r\nbody-3\r\nfooter");
@@ -1256,6 +1251,19 @@ mod tests {
 
         assert_screen_rows(&state, &["header", "new", "body-1", "body-2", "footer"]);
         assert_eq!(state.capture_history_text(), "");
+    }
+
+    #[test]
+    fn insert_and_delete_line_reset_cursor_to_first_column() {
+        let mut state = TerminalState::new(12, 4, 100);
+        state.apply_bytes(b"one\r\ntwo\r\nthree");
+        state.apply_bytes(b"\x1b[2;4H\x1b[M");
+        assert_eq!(state.cursor_position(), (1, 0));
+
+        let mut state = TerminalState::new(12, 4, 100);
+        state.apply_bytes(b"one\r\ntwo\r\nthree");
+        state.apply_bytes(b"\x1b[2;4H\x1b[L");
+        assert_eq!(state.cursor_position(), (1, 0));
     }
 
     #[test]
@@ -1269,6 +1277,65 @@ mod tests {
         state.apply_bytes(b"header\r\nbody-1\r\nbody-2\r\nbody-3\r\nfooter");
         state.apply_bytes(b"\x1b[2;4r\x1b[T\x1b[2;1Hnew");
         assert_screen_rows(&state, &["header", "new", "body-1", "body-2", "footer"]);
+    }
+
+    #[test]
+    fn scroll_region_accepts_defaults_and_ignores_invalid_margins() {
+        let mut state = TerminalState::new(12, 5, 100);
+
+        state.apply_bytes(b"\x1b[2;4r");
+        assert_eq!(
+            (
+                state.active_screen().scroll_top,
+                state.active_screen().scroll_bottom,
+            ),
+            (1, 3)
+        );
+
+        state.apply_bytes(b"\x1b[r");
+        assert_eq!(
+            (
+                state.active_screen().scroll_top,
+                state.active_screen().scroll_bottom,
+            ),
+            (0, 4)
+        );
+
+        state.apply_bytes(b"\x1b[0;0r");
+        assert_eq!(
+            (
+                state.active_screen().scroll_top,
+                state.active_screen().scroll_bottom,
+            ),
+            (0, 4)
+        );
+
+        state.apply_bytes(b"\x1b[;4r");
+        assert_eq!(
+            (
+                state.active_screen().scroll_top,
+                state.active_screen().scroll_bottom,
+            ),
+            (0, 3)
+        );
+
+        state.apply_bytes(b"\x1b[2r");
+        assert_eq!(
+            (
+                state.active_screen().scroll_top,
+                state.active_screen().scroll_bottom,
+            ),
+            (1, 4)
+        );
+
+        state.apply_bytes(b"\x1b[4;2r");
+        assert_eq!(
+            (
+                state.active_screen().scroll_top,
+                state.active_screen().scroll_bottom,
+            ),
+            (1, 4)
+        );
     }
 
     #[test]
