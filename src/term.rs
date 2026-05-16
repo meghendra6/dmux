@@ -47,7 +47,6 @@ impl TerminalState {
                 && !bytes.is_empty(),
             ..TerminalChanges::default()
         };
-        self.render_next_primary_output_immediately = false;
         let mut parser = std::mem::take(&mut self.parser);
         for byte in bytes {
             parser.advance(self, *byte);
@@ -1261,6 +1260,20 @@ mod tests {
         assert!(!restore_only.post_alternate_screen_exit);
         assert!(
             cursor_restore
+                .apply_bytes(b"prompt")
+                .post_alternate_screen_exit
+        );
+
+        let mut split_restore = TerminalState::new(20, 3, 100);
+        split_restore.apply_bytes(b"\x1b[?1049halternate");
+        assert!(split_restore.apply_bytes(b"\x1b[?1049l").alternate_screen);
+        assert!(
+            split_restore
+                .apply_bytes(b"\x1b[?25h")
+                .post_alternate_screen_exit
+        );
+        assert!(
+            split_restore
                 .apply_bytes(b"prompt")
                 .post_alternate_screen_exit
         );
