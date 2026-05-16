@@ -16,6 +16,8 @@ const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l";
 const EXIT_ALTERNATE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?1049l";
+const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const LIVE_SNAPSHOT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL: Duration = Duration::from_millis(1000);
 const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
@@ -738,10 +740,22 @@ fn split_trailing_cursor_position(output: &[u8]) -> (&[u8], &[u8]) {
         .filter(|index| output[*index] == b'\x1b')
     {
         if is_cursor_position_escape(&output[start..]) {
-            return (&output[..start], &output[start..]);
+            let cursor_start = cursor_state_start(output, start);
+            return (&output[..cursor_start], &output[cursor_start..]);
         }
     }
     (output, &[])
+}
+
+fn cursor_state_start(output: &[u8], cursor_position_start: usize) -> usize {
+    let before_cursor = &output[..cursor_position_start];
+    if before_cursor.ends_with(SHOW_CURSOR) {
+        cursor_position_start - SHOW_CURSOR.len()
+    } else if before_cursor.ends_with(HIDE_CURSOR) {
+        cursor_position_start - HIDE_CURSOR.len()
+    } else {
+        cursor_position_start
+    }
 }
 
 fn is_cursor_position_escape(bytes: &[u8]) -> bool {
@@ -3442,6 +3456,18 @@ mod tests {
         let output = diff_live_render_output(&render_frame(second), &mut state);
 
         assert_eq!(output, b"\x1b[2;6H");
+    }
+
+    #[test]
+    fn diff_live_render_output_writes_cursor_visibility_when_rows_match() {
+        let mut state = LiveRenderOutputState::default();
+        let first = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Ksame\x1b[?25h\x1b[2;5H";
+        let second = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Ksame\x1b[?25l\x1b[2;5H";
+        let _ = diff_live_render_output(&render_frame(first), &mut state);
+
+        let output = diff_live_render_output(&render_frame(second), &mut state);
+
+        assert_eq!(output, b"\x1b[?25l\x1b[2;5H");
     }
 
     #[test]

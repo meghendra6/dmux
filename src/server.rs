@@ -18,9 +18,11 @@ const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
 const ATTACH_RENDER_STATUS_FORMAT: &str =
     "#{session.name} #{window.list} pane #{pane.index} | #{status.help}";
 const ATTACH_RENDER_RESPONSE: &[u8] = b"OK\tRENDER_OUTPUT_META\n";
-const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(50);
+const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(16);
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
+const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 
 type TrackedStreamClients = Arc<Mutex<Vec<TrackedStream>>>;
 type AttachEventClients = TrackedStreamClients;
@@ -938,6 +940,7 @@ struct RenderedAttachSnapshot {
 struct RenderedCursor {
     row: usize,
     col: usize,
+    visible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2340,6 +2343,11 @@ fn write_cursor_position(
     }
     let row = header_rows + cursor.row.min(snapshot_rows - 1) + 1;
     let col = cursor.col + 1;
+    output.extend_from_slice(if cursor.visible {
+        SHOW_CURSOR
+    } else {
+        HIDE_CURSOR
+    });
     output.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
 }
 
@@ -2489,6 +2497,7 @@ fn rendered_cursor_for_active_pane(
     Some(RenderedCursor {
         row: region.row_start + row.min(height - 1),
         col: region.col_start + col.min(width - 1),
+        visible: terminal.cursor_visible(),
     })
 }
 
@@ -3455,6 +3464,11 @@ mod tests {
     }
 
     #[test]
+    fn attach_render_debounce_interval_stays_within_frame_budget() {
+        assert!(ATTACH_RENDER_DEBOUNCE_INTERVAL <= Duration::from_millis(16));
+    }
+
+    #[test]
     fn notify_attach_redraw_immediate_sends_render_frame() {
         let (pane, writer_path) = test_pane();
         let session = Arc::new(Session::new(
@@ -4132,13 +4146,45 @@ left | right\r\n"
                     col_end: 12,
                 },
             ],
-            cursor: Some(RenderedCursor { row: 0, col: 9 }),
+            cursor: Some(RenderedCursor {
+                row: 0,
+                col: 9,
+                visible: true,
+            }),
         };
 
         let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 10))
             .expect("render frame utf8");
 
-        assert!(body.contains("\x1b[2Kleft │ right\x1b[2;10H"), "{body:?}");
+        assert!(
+            body.contains("\x1b[2Kleft │ right\x1b[?25h\x1b[2;10H"),
+            "{body:?}"
+        );
+    }
+
+    #[test]
+    fn format_attach_render_frame_preserves_hidden_cursor_state() {
+        let snapshot = RenderedAttachSnapshot {
+            text: "hidden\r\n".to_string(),
+            regions: vec![PaneRegion {
+                pane: 0,
+                row_start: 0,
+                row_end: 1,
+                col_start: 0,
+                col_end: 10,
+            }],
+            cursor: Some(RenderedCursor {
+                row: 0,
+                col: 6,
+                visible: false,
+            }),
+        };
+
+        let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 10))
+            .expect("render frame utf8");
+
+        assert!(body.contains("\x1b[2Khidden\x1b[?25l\x1b[2;7H"), "{body:?}");
+        assert!(!body.contains("\x1b[?25h\x1b[2;7H"), "{body:?}");
     }
 
     #[test]
@@ -4152,13 +4198,17 @@ left | right\r\n"
                 col_start: 0,
                 col_end: 10,
             }],
-            cursor: Some(RenderedCursor { row: 1, col: 2 }),
+            cursor: Some(RenderedCursor {
+                row: 1,
+                col: 2,
+                visible: true,
+            }),
         };
 
         let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 1))
             .expect("render frame utf8");
 
-        assert!(body.contains("\x1b[2;3H"), "{body:?}");
+        assert!(body.contains("\x1b[?25h\x1b[2;3H"), "{body:?}");
         assert!(!body.contains("\x1b[3;3H"), "{body:?}");
     }
 
@@ -4599,7 +4649,14 @@ left | right\r\n"
         )
         .unwrap();
 
-        assert_eq!(rendered.cursor, Some(RenderedCursor { row: 0, col: 13 }));
+        assert_eq!(
+            rendered.cursor,
+            Some(RenderedCursor {
+                row: 0,
+                col: 13,
+                visible: true,
+            })
+        );
     }
 
     #[test]
