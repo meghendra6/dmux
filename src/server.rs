@@ -1,3 +1,4 @@
+use crate::ids::{PaneId, TabId};
 use crate::layout::LayoutNode;
 use crate::protocol::{self, BufferSelection, CaptureMode, Request, SplitDirection};
 use crate::pty::{self, PtySize, SpawnSpec};
@@ -262,7 +263,7 @@ impl Session {
         let next_pane_id = pane.id.as_usize() + 1;
         Self {
             name,
-            windows: Mutex::new(WindowSet::new(Window::new(TabId(0), pane))),
+            windows: Mutex::new(WindowSet::new(Window::new(TabId::new(0), pane))),
             next_pane_id: AtomicUsize::new(next_pane_id),
             next_tab_id: AtomicUsize::new(1),
             attach_events,
@@ -281,11 +282,11 @@ impl Session {
     }
 
     fn next_pane_id(&self) -> PaneId {
-        PaneId(self.next_pane_id.fetch_add(1, Ordering::SeqCst))
+        PaneId::new(self.next_pane_id.fetch_add(1, Ordering::SeqCst))
     }
 
     fn next_tab_id(&self) -> TabId {
-        TabId(self.next_tab_id.fetch_add(1, Ordering::SeqCst))
+        TabId::new(self.next_tab_id.fetch_add(1, Ordering::SeqCst))
     }
 
     fn active_pane(&self) -> Option<Arc<Pane>> {
@@ -537,24 +538,6 @@ struct Window {
     layout: LayoutNode,
     size: PtySize,
     zoomed: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct PaneId(usize);
-
-impl PaneId {
-    fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct TabId(usize);
-
-impl TabId {
-    fn as_usize(self) -> usize {
-        self.0
-    }
 }
 
 impl Window {
@@ -1329,7 +1312,7 @@ fn handle_new(
     let cwd = std::env::current_dir()?;
     let attach_events = Arc::new(Mutex::new(Vec::new()));
     let pane = spawn_pane(
-        PaneId(0),
+        PaneId::new(0),
         name.clone(),
         command,
         cwd,
@@ -3524,7 +3507,7 @@ mod tests {
         ));
         let writer = File::create(&writer_path).unwrap();
         let pane = Arc::new(Pane {
-            id: PaneId(0),
+            id: PaneId::new(0),
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
@@ -3844,7 +3827,7 @@ mod tests {
         ));
         let writer = File::create(&writer_path).unwrap();
         let pane = Arc::new(Pane {
-            id: PaneId(0),
+            id: PaneId::new(0),
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
@@ -3888,7 +3871,7 @@ mod tests {
             std::env::temp_dir().join(format!("dmux-attach-lifetime-{}", std::process::id()));
         let writer = File::create(&writer_path).unwrap();
         let pane = Arc::new(Pane {
-            id: PaneId(0),
+            id: PaneId::new(0),
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
