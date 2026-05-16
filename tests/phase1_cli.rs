@@ -609,6 +609,95 @@ fn save_buffer_can_copy_line_range_and_search_match() {
 }
 
 #[test]
+fn save_buffer_command_uses_current_active_pane_after_split() {
+    let socket = unique_socket("save-buffer-active-pane-after-split");
+    let session = format!("save-buffer-active-pane-after-split-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-save-source; printf '\\n'; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-save-source");
+    assert!(base.contains("base-save-source"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-save-active; printf '\\n'; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-save-active");
+    assert!(split.contains("split-save-active"), "{split:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "save-buffer",
+            "-t",
+            &session,
+            "-b",
+            "active",
+            "--screen",
+            "--start-line",
+            "1",
+            "--end-line",
+            "1",
+        ],
+    ));
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "save-buffer",
+            "-t",
+            &session,
+            "-b",
+            "base",
+            "--screen",
+            "--start-line",
+            "1",
+            "--end-line",
+            "1",
+        ],
+    ));
+
+    let listed = dmux(&socket, &["list-buffers"]);
+    assert_success(&listed);
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.ends_with("\tsplit-save-active")),
+        "{listed:?}"
+    );
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.ends_with("\tbase-save-source")),
+        "{listed:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn copy_mode_prints_numbered_lines_and_search_matches() {
     let socket = unique_socket("copy-mode");
     let session = format!("copy-mode-{}", std::process::id());
