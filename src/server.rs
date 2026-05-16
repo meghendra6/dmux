@@ -21,10 +21,10 @@ const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFERS: usize = 50;
 const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 + 4096;
 const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
-const ATTACH_RENDER_STATUS_FORMAT: &str =
-    "#{session.name} #{window.list} pane #{pane.index} | #{status.help}";
+const ATTACH_RENDER_STATUS_FORMAT: &str = "#{session.name} #{window.list} pane #{pane.index} clients #{client.count} buffers #{buffer.count} | #{status.help}";
 const ATTACH_RENDER_RESPONSE: &[u8] = b"OK\tRENDER_OUTPUT_META\n";
 const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(16);
+const TRANSIENT_MESSAGE_DURATION: Duration = Duration::from_millis(1500);
 const RAW_ATTACH_RECONNECT_ALIAS_GRACE: Duration = Duration::from_millis(500);
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
@@ -126,11 +126,33 @@ struct ServerState {
     next_client_id: AtomicUsize,
 }
 
+impl ServerState {
+    fn buffer_status_summary(&self) -> BufferStatusSummary {
+        self.buffers.lock().unwrap().status_summary()
+    }
+
+    fn publish_buffer_status(&self) {
+        let summary = self.buffer_status_summary();
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for session in sessions {
+            session.set_buffer_summary(summary.clone());
+            session.notify_attach_redraw_immediate();
+        }
+    }
+}
+
 struct Buffer {
     name: String,
     text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BufferDescription {
     index: usize,
     name: String,
@@ -138,6 +160,12 @@ struct BufferDescription {
     lines: usize,
     latest: bool,
     preview: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BufferStatusSummary {
+    count: usize,
+    latest: Option<BufferDescription>,
 }
 
 struct BufferStore {
@@ -192,6 +220,13 @@ impl BufferStore {
                 preview: buffer_preview(&buffer.text),
             })
             .collect()
+    }
+
+    fn status_summary(&self) -> BufferStatusSummary {
+        BufferStatusSummary {
+            count: self.buffers.len(),
+            latest: self.list().pop(),
+        }
     }
 
     fn resolve(&self, name: Option<&str>) -> Option<&Buffer> {
@@ -341,6 +376,8 @@ struct Session {
     name: Mutex<String>,
     created_at: usize,
     windows: Mutex<WindowSet>,
+    buffer_summary: Mutex<BufferStatusSummary>,
+    transient_message: Mutex<Option<String>>,
     current_size: Mutex<PtySize>,
     next_pane_id: AtomicUsize,
     next_tab_id: AtomicUsize,
@@ -352,6 +389,7 @@ struct Session {
     attach_render_epoch: AtomicU64,
     attach_render_immediate_epoch: AtomicU64,
     attach_render_rendered_epoch: AtomicU64,
+    transient_message_epoch: AtomicU64,
     raw_attach_layout_epoch: AtomicU64,
     next_attach_event_id: AtomicUsize,
     next_attach_stream_id: AtomicUsize,
@@ -375,6 +413,8 @@ impl Session {
                 "0".to_string(),
                 pane,
             ))),
+            buffer_summary: Mutex::new(BufferStatusSummary::default()),
+            transient_message: Mutex::new(None),
             current_size: Mutex::new(current_size),
             next_pane_id: AtomicUsize::new(next_pane_id),
             next_tab_id: AtomicUsize::new(1),
@@ -386,6 +426,7 @@ impl Session {
             attach_render_epoch: AtomicU64::new(0),
             attach_render_immediate_epoch: AtomicU64::new(0),
             attach_render_rendered_epoch: AtomicU64::new(0),
+            transient_message_epoch: AtomicU64::new(0),
             raw_attach_layout_epoch: AtomicU64::new(0),
             next_attach_event_id: AtomicUsize::new(0),
             next_attach_stream_id: AtomicUsize::new(0),
@@ -399,6 +440,40 @@ impl Session {
 
     fn rename(&self, new_name: String) {
         *self.name.lock().unwrap() = new_name;
+    }
+
+    fn set_buffer_summary(&self, summary: BufferStatusSummary) {
+        *self.buffer_summary.lock().unwrap() = summary;
+    }
+
+    fn set_transient_message(self: &Arc<Self>, message: String) {
+        let epoch = {
+            let mut current = self.transient_message.lock().unwrap();
+            let epoch = self.transient_message_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            *current = Some(message);
+            epoch
+        };
+        self.notify_attach_redraw_immediate();
+
+        let session = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            std::thread::sleep(TRANSIENT_MESSAGE_DURATION);
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            if session.clear_transient_message_if_epoch(epoch) {
+                session.notify_attach_redraw_immediate();
+            }
+        });
+    }
+
+    fn clear_transient_message_if_epoch(&self, epoch: u64) -> bool {
+        let mut message = self.transient_message.lock().unwrap();
+        if self.transient_message_epoch.load(Ordering::SeqCst) != epoch {
+            return false;
+        }
+        *message = None;
+        true
     }
 
     fn next_pane_id(&self) -> PaneId {
@@ -566,6 +641,8 @@ impl Session {
         let attached_count = self.attached_count();
         context.session_attached_count = attached_count;
         context.session_created_at = self.created_at;
+        context.buffer_summary = self.buffer_summary.lock().unwrap().clone();
+        context.transient_message = self.transient_message.lock().unwrap().clone();
         Some(context)
     }
 
@@ -1338,6 +1415,8 @@ impl WindowSet {
             pane_zoomed: window.active_pane_zoomed(),
             window_zoomed: window.is_zoomed(),
             pane_process: window.active_pane_process()?,
+            buffer_summary: BufferStatusSummary::default(),
+            transient_message: None,
             session_attached_count: 0,
             session_created_at: 0,
         })
@@ -1537,6 +1616,8 @@ struct StatusContext {
     pane_zoomed: bool,
     window_zoomed: bool,
     pane_process: PaneProcessStatus,
+    buffer_summary: BufferStatusSummary,
+    transient_message: Option<String>,
 }
 
 struct WindowDescription {
@@ -1947,6 +2028,7 @@ fn handle_new(
         Arc::clone(&pane),
         attach_events,
     ));
+    session.set_buffer_summary(state.buffer_status_summary());
     pane.set_session(&session);
     if !insert_session_if_name_available(state, &name, session) {
         terminate_pane_async(pane.child_pid);
@@ -2316,6 +2398,7 @@ fn handle_detach_client(
         return Ok(());
     }
     if let Some(session) = cleanup_session {
+        session.notify_attach_redraw_immediate();
         cleanup_rename_aliases_if_detached(state, &session);
     }
     write_ok(stream)
@@ -2394,6 +2477,7 @@ fn handle_save_buffer(
             return Ok(());
         }
     };
+    state.publish_buffer_status();
 
     write_ok(stream)?;
     writeln!(stream, "{saved_name}")
@@ -2419,6 +2503,7 @@ fn handle_save_buffer_text(
             return Ok(());
         }
     };
+    state.publish_buffer_status();
 
     write_ok(stream)?;
     writeln!(stream, "{saved_name}")
@@ -2537,6 +2622,7 @@ fn handle_delete_buffer(
         write_err(stream, "missing buffer")?;
         return Ok(());
     }
+    state.publish_buffer_status();
 
     write_ok(stream)
 }
@@ -2769,14 +2855,20 @@ fn handle_display_message(
         return Ok(());
     };
 
+    let rendered = format_status_line(format, &context);
+    if let Some(session) = resolve_session(state, name) {
+        session.set_transient_message(rendered.clone());
+    }
     write_ok(stream)?;
-    writeln!(stream, "{}", format_status_line(format, &context))
+    writeln!(stream, "{rendered}")
 }
 
 fn status_context(state: &Arc<ServerState>, name: &str) -> Option<StatusContext> {
     let session = resolve_session(state, name)?;
 
-    session.status_context()
+    let mut context = session.status_context()?;
+    context.buffer_summary = state.buffer_status_summary();
+    Some(context)
 }
 
 fn format_status_line(format: &str, context: &StatusContext) -> String {
@@ -2810,6 +2902,20 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         } => signal.to_string(),
         _ => String::new(),
     };
+    let buffer_count = context.buffer_summary.count.to_string();
+    let (buffer_index, buffer_name, buffer_bytes, buffer_lines, buffer_latest, buffer_preview) =
+        if let Some(buffer) = &context.buffer_summary.latest {
+            (
+                buffer.index.to_string(),
+                buffer.name.as_str(),
+                buffer.bytes.to_string(),
+                buffer.lines.to_string(),
+                "1",
+                buffer.preview.as_str(),
+            )
+        } else {
+            (String::new(), "", String::new(), String::new(), "0", "")
+        };
     let replacements = [
         ("#{session.name}", context.session_name.as_str()),
         ("#{session.attached}", session_attached),
@@ -2835,6 +2941,13 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{pane.pid}", pane_pid.as_str()),
         ("#{pane.exit_status}", pane_exit_status.as_str()),
         ("#{pane.exit_signal}", pane_exit_signal.as_str()),
+        ("#{buffer.count}", buffer_count.as_str()),
+        ("#{buffer.index}", buffer_index.as_str()),
+        ("#{buffer.name}", buffer_name),
+        ("#{buffer.bytes}", buffer_bytes.as_str()),
+        ("#{buffer.lines}", buffer_lines.as_str()),
+        ("#{buffer.latest}", buffer_latest),
+        ("#{buffer.preview}", buffer_preview),
         ("#{window.zoomed_flag}", window_zoomed),
         ("#{status.help}", "C-b ? help"),
     ];
@@ -3207,6 +3320,7 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
     let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
     let raw_layout_epoch = session.raw_attach_layout_epoch();
     let _attach_registration = session.register_attach_stream(&stream, client_id)?;
+    session.notify_attach_redraw_immediate();
     let result = if has_attach_pane_snapshot(&session) {
         write_attach_snapshot_ok(&mut stream)?;
         forward_multi_pane_attach_input(&session, &mut stream)
@@ -3233,6 +3347,7 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
         Ok(())
     };
     drop(_attach_registration);
+    session.notify_attach_redraw_immediate();
     if session.raw_attach_layout_epoch() == raw_layout_epoch {
         cleanup_rename_aliases_if_detached(state, &session);
     } else {
@@ -3518,7 +3633,8 @@ fn format_attach_layout_snapshot_body(snapshot: &RenderedAttachSnapshot) -> Vec<
 fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
     let context = session.status_context()?;
     let status = format_status_line(ATTACH_RENDER_STATUS_FORMAT, &context);
-    let header_rows = usize::from(!status.is_empty());
+    let message = context.transient_message.as_deref();
+    let header_rows = usize::from(!status.is_empty()) + usize::from(message.is_some());
     let snapshot_rows = session
         .active_window_size()
         .map(|size| usize::from(size.rows).saturating_sub(header_rows))
@@ -3526,6 +3642,7 @@ fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
     let snapshot = attach_pane_frame_with_regions(session)?;
     Some(format_attach_render_frame_body(
         &status,
+        message,
         &snapshot,
         snapshot_rows,
     ))
@@ -3533,6 +3650,7 @@ fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
 
 fn format_attach_render_frame_body(
     status: &str,
+    message: Option<&str>,
     snapshot: &RenderedAttachSnapshot,
     snapshot_rows: usize,
 ) -> Vec<u8> {
@@ -3541,19 +3659,23 @@ fn format_attach_render_frame_body(
     if !status.is_empty() {
         write_render_output_line(&mut output, status.as_bytes(), true);
     }
+    if let Some(message) = message {
+        write_render_output_line(&mut output, message.as_bytes(), true);
+    }
     write_render_output_rows(&mut output, snapshot.text.as_bytes(), snapshot_rows);
     if let Some(cursor) = snapshot.cursor {
         write_cursor_position(
             &mut output,
             cursor,
-            usize::from(!status.is_empty()),
+            usize::from(!status.is_empty()) + usize::from(message.is_some()),
             snapshot_rows,
         );
     }
 
     let mut header = String::new();
     header.push_str("HEADER_ROWS\t");
-    header.push_str(&usize::from(!status.is_empty()).to_string());
+    header
+        .push_str(&(usize::from(!status.is_empty()) + usize::from(message.is_some())).to_string());
     header.push('\n');
     header.push_str("REGIONS\t");
     header.push_str(&snapshot.regions.len().to_string());
@@ -4941,6 +5063,29 @@ mod tests {
     }
 
     #[test]
+    fn transient_message_expiry_keeps_newer_message() {
+        let (pane, writer_path) = test_pane();
+        let session = Arc::new(Session::new(
+            "test".to_string(),
+            1,
+            Arc::clone(&pane),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        session.transient_message_epoch.store(2, Ordering::SeqCst);
+        *session.transient_message.lock().unwrap() = Some("newer".to_string());
+
+        assert!(!session.clear_transient_message_if_epoch(1));
+        assert_eq!(
+            session.transient_message.lock().unwrap().as_deref(),
+            Some("newer")
+        );
+
+        assert!(session.clear_transient_message_if_epoch(2));
+        assert!(session.transient_message.lock().unwrap().is_none());
+        let _ = std::fs::remove_file(writer_path);
+    }
+
+    #[test]
     fn notify_attach_render_shuts_down_failed_clients() {
         let clients = Arc::new(Mutex::new(Vec::new()));
         let (handler, mut client) = UnixStream::pair().unwrap();
@@ -5790,8 +5935,10 @@ left | right\r\n"
             cursor: None,
         };
 
-        let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 10))
-            .expect("render frame utf8");
+        let body = String::from_utf8(format_attach_render_frame_body(
+            "status", None, &snapshot, 10,
+        ))
+        .expect("render frame utf8");
 
         assert!(body.starts_with("HEADER_ROWS\t1\nREGIONS\t2\n"), "{body:?}");
         assert!(
@@ -5831,8 +5978,10 @@ left | right\r\n"
             }),
         };
 
-        let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 10))
-            .expect("render frame utf8");
+        let body = String::from_utf8(format_attach_render_frame_body(
+            "status", None, &snapshot, 10,
+        ))
+        .expect("render frame utf8");
 
         assert!(
             body.contains("\x1b[2Kleft │ right\x1b[?25h\x1b[2;10H"),
@@ -5858,8 +6007,10 @@ left | right\r\n"
             }),
         };
 
-        let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 10))
-            .expect("render frame utf8");
+        let body = String::from_utf8(format_attach_render_frame_body(
+            "status", None, &snapshot, 10,
+        ))
+        .expect("render frame utf8");
 
         assert!(body.contains("\x1b[2Khidden\x1b[?25l\x1b[2;7H"), "{body:?}");
         assert!(!body.contains("\x1b[?25h\x1b[2;7H"), "{body:?}");
@@ -5883,8 +6034,10 @@ left | right\r\n"
             }),
         };
 
-        let body = String::from_utf8(format_attach_render_frame_body("status", &snapshot, 1))
-            .expect("render frame utf8");
+        let body = String::from_utf8(format_attach_render_frame_body(
+            "status", None, &snapshot, 1,
+        ))
+        .expect("render frame utf8");
 
         assert!(body.contains("\x1b[?25h\x1b[2;3H"), "{body:?}");
         assert!(!body.contains("\x1b[3;3H"), "{body:?}");

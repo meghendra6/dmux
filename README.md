@@ -102,6 +102,13 @@ format fields `#{buffer.index}`, `#{buffer.name}`, `#{buffer.bytes}`,
 `#{buffer.lines}`, `#{buffer.latest}`, and `#{buffer.preview}`. Missing buffers,
 missing matches, and pastes into exited panes are explicit errors.
 
+`status-line -F` and `display-message -p` expand session/window/tab/pane/client
+fields plus latest-buffer fields: `#{buffer.count}`, `#{buffer.index}`,
+`#{buffer.name}`, `#{buffer.bytes}`, `#{buffer.lines}`, `#{buffer.latest}`, and
+`#{buffer.preview}`. Unknown `#{...}` tokens are left literal, and expanded data
+is not expanded a second time. Attached status includes client and buffer counts;
+`display-message` also shows a bounded transient message in attached layout UIs.
+
 Implemented Phase 2 groundwork:
 
 - basic terminal screen state for printable shell output
@@ -139,6 +146,8 @@ Implemented Phase 2 groundwork:
 - command-driven line-numbered copy-mode inspection with search filtering and
   indexed match selection
 - formatted buffer listing with latest marker, byte/line counts, and previews
+- latest-buffer status/display-message format fields with token-like data safety
+- bounded transient display messages in attach render output
 - attach-time basic copy-mode key handling for line copy
 - attach-time basic copy-mode mouse selection for line ranges
 - attach-time statusline snapshot rendering

@@ -337,7 +337,9 @@ fn read_attach_status_line(socket: &Path, session: &str) -> io::Result<String> {
         socket,
         &protocol::encode_status_line(
             session,
-            Some("#{session.name} #{window.list} pane #{pane.index} | #{status.help}"),
+            Some(
+                "#{session.name} #{window.list} pane #{pane.index} clients #{client.count} buffers #{buffer.count} | #{status.help}",
+            ),
         ),
     )?;
     Ok(String::from_utf8_lossy(&body).trim_end().to_string())
