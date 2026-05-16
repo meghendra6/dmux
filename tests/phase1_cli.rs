@@ -245,6 +245,32 @@ fn read_attach_render_frame_body(stream: &mut UnixStream) -> Vec<u8> {
     body
 }
 
+fn attach_render_output_from_frame_body(body: &[u8]) -> Vec<u8> {
+    let marker = b"OUTPUT\t";
+    let output_header_start = body
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("render frame output header");
+    let len_start = output_header_start + marker.len();
+    let len_end = body[len_start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| len_start + offset)
+        .expect("render frame output header newline");
+    let len = std::str::from_utf8(&body[len_start..len_end])
+        .expect("render frame output length utf8")
+        .parse::<usize>()
+        .expect("render frame output length");
+    let output_start = len_end + 1;
+    let output_end = output_start + len;
+    assert!(
+        output_end <= body.len(),
+        "render frame output length exceeds body"
+    );
+    assert_eq!(output_end, body.len(), "extra render frame body bytes");
+    body[output_start..output_end].to_vec()
+}
+
 fn read_attach_render_frame_body_until_contains(stream: &mut UnixStream, needle: &str) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut last = String::new();
@@ -3408,6 +3434,91 @@ fn attach_prefix_h_l_focuses_horizontal_panes_for_live_input() {
 }
 
 #[test]
+fn attach_prefix_l_uses_regions_from_external_split_render_frame() {
+    let socket = unique_socket("attach-prefix-external-split-focus");
+    let session = format!("attach-prefix-external-split-focus-{}", std::process::id());
+    let base_file = unique_temp_file("attach-prefix-external-split-focus-base");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf initial-right; read line; echo initial-right:$line; sleep 30",
+        ],
+    ));
+    let initial_right = poll_capture(&socket, &session, "initial-right");
+    assert!(initial_right.contains("initial-right"), "{initial_right:?}");
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+
+    let mut child = spawn_pty_attached_dmux(
+        &socket,
+        &["attach", "-t", &session],
+        80,
+        24,
+        &["base-ready", "initial-right"],
+    );
+    std::thread::sleep(Duration::from_millis(150));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf external-right; read line; echo external-right:$line; sleep 30",
+        ],
+    ));
+    child.wait_for_stdout_contains_all(&["external-right"], "external split render frame");
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    let active = poll_active_pane(&socket, &session, 0);
+    assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
+
+    {
+        child.write_all(b"\x02lok\r");
+    }
+
+    let split = poll_capture(&socket, &session, "external-right:ok");
+    assert!(split.contains("external-right:ok"), "{split:?}");
+    let active = poll_active_pane(&socket, &session, 2);
+    assert!(active.lines().any(|line| line == "2\t1"), "{active:?}");
+
+    {
+        child.write_all(b"\x02d");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_prefix_j_k_focuses_vertical_panes_for_live_input() {
     let socket = unique_socket("attach-prefix-j-k");
     let session = format!("attach-prefix-j-k-{}", std::process::id());
@@ -4614,17 +4725,24 @@ fn attach_render_stream_sends_initial_terminal_output_frame() {
     assert!(split.contains("split-ready"), "{split:?}");
 
     let mut stream = attach_render_stream(&socket, &session);
-    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT\n");
-    let body = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT_META\n");
+    let body = read_attach_render_frame_body(&mut stream);
+    let body_text = String::from_utf8_lossy(&body).to_string();
+    let output = String::from_utf8_lossy(&attach_render_output_from_frame_body(&body)).to_string();
 
-    assert!(body.starts_with("\x1b[H"), "{body:?}");
-    assert!(body.contains("\x1b[2K"), "{body:?}");
-    assert!(!body.contains("STATUS\t"), "{body:?}");
-    assert!(!body.contains("\nREGIONS\t"), "{body:?}");
-    assert!(!body.contains("\nSNAPSHOT\t"), "{body:?}");
-    assert!(body.contains(&session), "{body:?}");
-    assert!(body.contains("base-ready"), "{body:?}");
-    assert!(body.contains("split-ready"), "{body:?}");
+    assert!(
+        body_text.starts_with("HEADER_ROWS\t1\nREGIONS\t"),
+        "{body_text:?}"
+    );
+    assert!(body_text.contains("\nREGION\t"), "{body_text:?}");
+    assert!(body_text.contains("\nOUTPUT\t"), "{body_text:?}");
+    assert!(output.starts_with("\x1b[H"), "{output:?}");
+    assert!(output.contains("\x1b[2K"), "{output:?}");
+    assert!(!body_text.contains("STATUS\t"), "{body_text:?}");
+    assert!(!body_text.contains("\nSNAPSHOT\t"), "{body_text:?}");
+    assert!(output.contains(&session), "{output:?}");
+    assert!(output.contains("base-ready"), "{output:?}");
+    assert!(output.contains("split-ready"), "{output:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -4668,7 +4786,7 @@ fn attach_render_stream_pushes_frame_after_pane_output() {
     assert!(split.contains("split-ready"), "{split:?}");
 
     let mut stream = attach_render_stream(&socket, &session);
-    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT\n");
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT_META\n");
     let initial = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
     assert!(initial.contains("split-ready"), "{initial:?}");
     assert!(!initial.contains("STATUS\t"), "{initial:?}");
@@ -4727,7 +4845,7 @@ fn attach_render_stream_coalesces_bursty_pane_output() {
     assert!(split.contains("split-ready"), "{split:?}");
 
     let mut stream = attach_render_stream(&socket, &session);
-    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT\n");
+    assert_eq!(read_socket_line(&mut stream), "OK\tRENDER_OUTPUT_META\n");
     let initial = String::from_utf8_lossy(&read_attach_render_frame_body(&mut stream)).to_string();
     assert!(initial.contains("split-ready"), "{initial:?}");
     assert!(!initial.contains("STATUS\t"), "{initial:?}");

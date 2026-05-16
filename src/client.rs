@@ -21,6 +21,7 @@ const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
+const ATTACH_RENDER_RESPONSE: &str = "OK\tRENDER_OUTPUT_META\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachMode {
@@ -51,6 +52,13 @@ struct AttachLayoutSnapshotResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveSnapshotFrame {
+    regions: Vec<AttachPaneRegion>,
+    header_rows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachRenderFrame {
+    output: Vec<u8>,
     regions: Vec<AttachPaneRegion>,
     header_rows: usize,
 }
@@ -273,7 +281,7 @@ fn read_attach_layout_frame(
     }
 }
 
-fn read_attach_render_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+fn read_attach_render_frame(stream: &mut UnixStream) -> io::Result<AttachRenderFrame> {
     let header = read_line(stream)?;
     let Some(len) = header
         .strip_prefix("FRAME\t")
@@ -286,7 +294,53 @@ fn read_attach_render_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
         .map_err(|_| io::Error::other("invalid attach render frame length"))?;
     let mut body = vec![0_u8; len];
     stream.read_exact(&mut body)?;
-    Ok(body)
+    parse_attach_render_frame_body(&body)
+}
+
+fn parse_attach_render_frame_body(body: &[u8]) -> io::Result<AttachRenderFrame> {
+    let mut cursor = 0;
+    let header_rows = read_body_line(body, &mut cursor)?;
+    let Some(header_rows) = header_rows.strip_prefix("HEADER_ROWS\t") else {
+        return Err(io::Error::other("missing render header rows"));
+    };
+    let header_rows = header_rows
+        .parse::<usize>()
+        .map_err(|_| io::Error::other("invalid render header rows"))?;
+
+    let regions = read_body_line(body, &mut cursor)?;
+    let Some(count) = regions.strip_prefix("REGIONS\t") else {
+        return Err(io::Error::other("missing render regions header"));
+    };
+    let count = count
+        .parse::<usize>()
+        .map_err(|_| io::Error::other("invalid render region count"))?;
+
+    let mut regions = Vec::new();
+    for _ in 0..count {
+        let line = read_body_line(body, &mut cursor)?;
+        regions.push(parse_attach_pane_region(line)?);
+    }
+
+    let output = read_body_line(body, &mut cursor)?;
+    let Some(len) = output.strip_prefix("OUTPUT\t") else {
+        return Err(io::Error::other("missing render output header"));
+    };
+    let len = len
+        .parse::<usize>()
+        .map_err(|_| io::Error::other("invalid render output length"))?;
+    let remaining = body.len().saturating_sub(cursor);
+    if remaining < len {
+        return Err(io::Error::other("truncated render output body"));
+    }
+    if remaining > len {
+        return Err(io::Error::other("extra render output body bytes"));
+    }
+
+    Ok(AttachRenderFrame {
+        output: body[cursor..cursor + len].to_vec(),
+        regions,
+        header_rows,
+    })
 }
 
 fn is_unknown_request_error(error: &io::Error) -> bool {
@@ -1175,7 +1229,7 @@ enum LiveSnapshotInputEvent {
     PauseRedraw(mpsc::Sender<()>),
     RedrawNow,
     RedrawHint,
-    RenderFrame(Vec<u8>),
+    RenderFrame(AttachRenderFrame),
     RenderStreamReady,
     RenderStreamUnavailable,
     RenderStreamClosed,
@@ -1405,7 +1459,7 @@ fn spawn_live_snapshot_render_thread(
                 return;
             }
         };
-        if response != "OK\tRENDER_OUTPUT\n" {
+        if response != ATTACH_RENDER_RESPONSE {
             let _ = sender.send(LiveSnapshotInputEvent::RenderStreamUnavailable);
             return;
         }
@@ -1661,9 +1715,19 @@ fn run_live_snapshot_attach(
                     last_redraw = Instant::now();
                 }
             }
-            Ok(LiveSnapshotInputEvent::RenderFrame(render_output)) => {
+            Ok(LiveSnapshotInputEvent::RenderFrame(render_frame)) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 if !redraw_paused {
+                    let AttachRenderFrame {
+                        output,
+                        regions,
+                        header_rows,
+                    } = render_frame;
+                    frame = LiveSnapshotFrame {
+                        regions,
+                        header_rows,
+                    };
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     if pane_number_message
                         .as_ref()
                         .is_some_and(|(_, until)| Instant::now() < *until)
@@ -1676,7 +1740,7 @@ fn run_live_snapshot_attach(
                         sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     } else {
                         pane_number_message = None;
-                        write_live_render_output(&render_output)?;
+                        write_live_render_output(&output)?;
                     }
                     last_redraw = Instant::now();
                 }
@@ -2958,13 +3022,28 @@ mod tests {
     }
 
     #[test]
-    fn reads_attach_render_frame_as_raw_output_bytes() {
+    fn reads_attach_render_frame_with_metadata_and_output_bytes() {
         let (mut server, mut client) = UnixStream::pair().unwrap();
-        server.write_all(b"FRAME\t6\n\x1b[Habc").unwrap();
+        let body = b"HEADER_ROWS\t1\nREGIONS\t1\nREGION\t2\t3\t4\t5\t6\nOUTPUT\t6\n\x1b[Habc";
+        server
+            .write_all(format!("FRAME\t{}\n", body.len()).as_bytes())
+            .unwrap();
+        server.write_all(body).unwrap();
 
         let frame = read_attach_render_frame(&mut client).unwrap();
 
-        assert_eq!(frame, b"\x1b[Habc");
+        assert_eq!(frame.output, b"\x1b[Habc");
+        assert_eq!(frame.header_rows, 1);
+        assert_eq!(
+            frame.regions,
+            vec![AttachPaneRegion {
+                pane: 2,
+                row_start: 3,
+                row_end: 4,
+                col_start: 5,
+                col_end: 6,
+            }]
+        );
     }
 
     #[test]
