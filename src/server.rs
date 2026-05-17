@@ -2814,27 +2814,45 @@ fn handle_rename_session(
         write_err(stream, &message)?;
         return Ok(());
     }
+    let requested_name = old_name.to_string();
     let session = {
         let mut aliases = state.session_aliases.lock().unwrap();
         let mut sessions = state.sessions.lock().unwrap();
-        if !sessions.contains_key(old_name) {
-            write_err(stream, "missing session")?;
-            return Ok(());
-        }
+        let canonical_old_name = if sessions.contains_key(old_name) {
+            old_name.to_string()
+        } else {
+            let Some(alias_target) = aliases.get(old_name).cloned() else {
+                write_err(stream, "missing session")?;
+                return Ok(());
+            };
+            if !sessions.contains_key(&alias_target) {
+                write_err(stream, "missing session")?;
+                return Ok(());
+            }
+            alias_target
+        };
         if aliases.contains_key(&new_name) || sessions.contains_key(&new_name) {
             write_err(stream, "session name already exists")?;
             return Ok(());
         }
-        let session = sessions.remove(old_name).expect("checked session exists");
+        let session = sessions
+            .remove(&canonical_old_name)
+            .expect("checked canonical session exists");
         session.rename(new_name.clone());
-        for target in aliases.values_mut() {
-            if target == old_name {
-                *target = session.name();
-            }
-        }
-        aliases.remove(old_name);
         if session.attached_count() > 0 {
-            aliases.insert(old_name.to_string(), session.name());
+            for target in aliases.values_mut() {
+                if target == &canonical_old_name {
+                    *target = session.name();
+                }
+            }
+            aliases.insert(canonical_old_name.clone(), session.name());
+            aliases.insert(requested_name, session.name());
+        } else {
+            aliases.retain(|alias, target| {
+                alias != &requested_name
+                    && alias != &canonical_old_name
+                    && target != &canonical_old_name
+            });
         }
         sessions.insert(new_name, Arc::clone(&session));
         session
@@ -4283,19 +4301,41 @@ fn handle_kill_server(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::
         .drain()
         .map(|(_, session)| session)
         .collect::<Vec<_>>();
+    let mut child_pids = Vec::new();
     for session in sessions {
         session.close_attach_streams();
         for pane in session.panes() {
             if pane.is_running() {
-                let _ = pty::terminate(pane.child_pid);
+                child_pids.push(pane.child_pid);
             }
         }
     }
 
-    write_ok(stream)?;
-    stream.flush()?;
+    let result = write_ok(stream).and_then(|_| stream.flush());
     let _ = std::fs::remove_file(&state.socket_path);
-    std::process::exit(0);
+    exit_after_kill_server_cleanup(child_pids);
+    result
+}
+
+fn exit_after_kill_server_cleanup(child_pids: Vec<i32>) {
+    std::thread::spawn(move || {
+        terminate_child_pids_concurrently(child_pids);
+        std::process::exit(0);
+    });
+}
+
+fn terminate_child_pids_concurrently(child_pids: Vec<i32>) {
+    let handles = child_pids
+        .into_iter()
+        .map(|pid| {
+            std::thread::spawn(move || {
+                let _ = pty::terminate(pid);
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        let _ = handle.join();
+    }
 }
 
 fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -> io::Result<()> {

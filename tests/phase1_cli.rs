@@ -8573,6 +8573,44 @@ fn kill_pane_returns_before_slow_process_termination() {
 }
 
 #[test]
+fn kill_server_returns_before_slow_process_termination() {
+    let socket = unique_socket("kill-server-fast-return");
+    let session = format!("kill-server-fast-return-{}", std::process::id());
+    let pid_file = unique_temp_file("kill-server-fast-return-pid");
+    let _ = std::fs::remove_file(&pid_file);
+    let command = format!(
+        "trap '' TERM HUP; printf $$ > {}; printf base-ready; while :; do sleep 1; done",
+        pid_file.display()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", &command],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+    assert!(
+        poll_file_exists(&pid_file),
+        "missing {}",
+        pid_file.display()
+    );
+    let pid = std::fs::read_to_string(&pid_file).expect("read pid file");
+    let pid = pid.trim();
+    assert!(process_exists(pid), "process {pid} should be alive");
+
+    let started = std::time::Instant::now();
+    let output = dmux_with_timeout(&socket, &["kill-server"], Duration::from_secs(3));
+    let elapsed = started.elapsed();
+    assert_success(&output);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "kill-server waited for PTY process termination before returning: {elapsed:?}"
+    );
+    assert!(poll_process_gone(pid), "process {pid} should be gone");
+    let _ = std::fs::remove_file(&pid_file);
+}
+
+#[test]
 fn kill_pane_terminates_removed_pane_process_group() {
     let socket = unique_socket("kill-pane-process-group");
     let session = format!("kill-pane-process-group-{}", std::process::id());
@@ -10741,6 +10779,62 @@ fn attached_client_commands_survive_session_rename() {
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-session", "-t", &renamed]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn rename_session_accepts_attached_rename_alias_again() {
+    let socket = unique_socket("attached-rename-alias-again");
+    let session = format!("attached-rename-alias-again-{}", std::process::id());
+    let renamed = format!("attached-rename-alias-again-new-{}", std::process::id());
+    let renamed_again = format!("attached-rename-alias-again-newer-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "ready");
+    assert!(ready.contains("ready"), "{ready:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["ready"]);
+    assert_success(&dmux(
+        &socket,
+        &["rename-session", "-t", &session, &renamed],
+    ));
+    let old_alias_capture = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
+    assert_success(&old_alias_capture);
+    assert!(String::from_utf8_lossy(&old_alias_capture.stdout).contains("ready"));
+
+    assert_success(&dmux(
+        &socket,
+        &["rename-session", "-t", &session, &renamed_again],
+    ));
+
+    let old_alias_capture = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
+    assert_success(&old_alias_capture);
+    assert!(String::from_utf8_lossy(&old_alias_capture.stdout).contains("ready"));
+    let previous_name_alias_capture = dmux(&socket, &["capture-pane", "-t", &renamed, "-p"]);
+    assert_success(&previous_name_alias_capture);
+    assert!(String::from_utf8_lossy(&previous_name_alias_capture.stdout).contains("ready"));
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &renamed_again]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
 
