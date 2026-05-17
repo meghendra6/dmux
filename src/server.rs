@@ -1,8 +1,9 @@
 use crate::ids::{PaneId, TabId};
 use crate::layout::{LayoutNode, PaneRegion, layout_regions_for_size, split_extent_weighted};
 use crate::protocol::{
-    self, BufferSelection, CaptureMode, LayoutPreset, PaneDirection, PaneResizeDirection,
-    PaneSelectTarget, PaneTarget, Request, SplitDirection, Target, WindowTarget,
+    self, BufferSelection, CaptureMode, KeyBinding, LayoutPreset, OptionEntry, PaneDirection,
+    PaneResizeDirection, PaneSelectTarget, PaneTarget, Request, SplitDirection, Target,
+    WindowTarget,
 };
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::{TerminalChanges, TerminalState};
@@ -98,6 +99,8 @@ pub fn run(socket_path: PathBuf) -> io::Result<()> {
         sessions: Mutex::new(HashMap::new()),
         session_aliases: Mutex::new(HashMap::new()),
         buffers: Mutex::new(BufferStore::new()),
+        key_bindings: Mutex::new(default_key_binding_map()),
+        options: Mutex::new(default_option_map()),
         socket_path,
         next_session_created_id: AtomicUsize::new(1),
         next_client_id: AtomicUsize::new(1),
@@ -122,9 +125,25 @@ struct ServerState {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     session_aliases: Mutex<HashMap<String, String>>,
     buffers: Mutex<BufferStore>,
+    key_bindings: Mutex<HashMap<String, String>>,
+    options: Mutex<HashMap<String, String>>,
     socket_path: PathBuf,
     next_session_created_id: AtomicUsize,
     next_client_id: AtomicUsize,
+}
+
+fn default_key_binding_map() -> HashMap<String, String> {
+    crate::config::default_key_bindings()
+        .into_iter()
+        .map(|binding| (binding.key, binding.command))
+        .collect()
+}
+
+fn default_option_map() -> HashMap<String, String> {
+    crate::config::default_options()
+        .into_iter()
+        .map(|option| (option.name, option.value))
+        .collect()
 }
 
 impl ServerState {
@@ -379,6 +398,8 @@ struct Session {
     windows: Mutex<WindowSet>,
     buffer_summary: Mutex<BufferStatusSummary>,
     transient_message: Mutex<Option<String>>,
+    prefix_key: Mutex<String>,
+    status_hints: Mutex<bool>,
     current_size: Mutex<PtySize>,
     next_pane_id: AtomicUsize,
     next_tab_id: AtomicUsize,
@@ -416,6 +437,8 @@ impl Session {
             ))),
             buffer_summary: Mutex::new(BufferStatusSummary::default()),
             transient_message: Mutex::new(None),
+            prefix_key: Mutex::new(crate::config::DEFAULT_PREFIX_KEY.to_string()),
+            status_hints: Mutex::new(true),
             current_size: Mutex::new(current_size),
             next_pane_id: AtomicUsize::new(next_pane_id),
             next_tab_id: AtomicUsize::new(1),
@@ -445,6 +468,11 @@ impl Session {
 
     fn set_buffer_summary(&self, summary: BufferStatusSummary) {
         *self.buffer_summary.lock().unwrap() = summary;
+    }
+
+    fn set_runtime_options(&self, prefix_key: String, status_hints: bool) {
+        *self.prefix_key.lock().unwrap() = prefix_key;
+        *self.status_hints.lock().unwrap() = status_hints;
     }
 
     fn set_transient_message(self: &Arc<Self>, message: String) {
@@ -780,6 +808,8 @@ impl Session {
         context.session_created_at = self.created_at;
         context.buffer_summary = self.buffer_summary.lock().unwrap().clone();
         context.transient_message = self.transient_message.lock().unwrap().clone();
+        context.prefix_key = self.prefix_key.lock().unwrap().clone();
+        context.status_hints = *self.status_hints.lock().unwrap();
         Some(context)
     }
 
@@ -1889,6 +1919,8 @@ impl WindowSet {
             transient_message: None,
             session_attached_count: 0,
             session_created_at: 0,
+            status_hints: true,
+            prefix_key: crate::config::DEFAULT_PREFIX_KEY.to_string(),
         })
     }
 
@@ -2117,6 +2149,8 @@ struct StatusContext {
     pane_process: PaneProcessStatus,
     buffer_summary: BufferStatusSummary,
     transient_message: Option<String>,
+    status_hints: bool,
+    prefix_key: String,
 }
 
 struct WindowDescription {
@@ -2460,6 +2494,13 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::DisplayMessage { session, format } => {
             handle_display_message(&state, &mut stream, &session, &format)
         }
+        Request::ListKeys { format } => handle_list_keys(&state, &mut stream, format.as_deref()),
+        Request::BindKey { key, command } => handle_bind_key(&state, &mut stream, &key, &command),
+        Request::UnbindKey { key } => handle_unbind_key(&state, &mut stream, &key),
+        Request::ShowOptions { format } => {
+            handle_show_options(&state, &mut stream, format.as_deref())
+        }
+        Request::SetOption { name, value } => handle_set_option(&state, &mut stream, &name, &value),
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
         Request::Attach { session } => handle_attach(&state, stream, &session),
@@ -2550,6 +2591,8 @@ fn handle_new(
         attach_events,
     ));
     session.set_buffer_summary(state.buffer_status_summary());
+    let (prefix, status_hints) = current_runtime_options(state);
+    session.set_runtime_options(prefix, status_hints);
     pane.set_session(&session);
     if !insert_session_if_name_available(state, &name, session) {
         terminate_pane_async(pane.child_pid);
@@ -3462,11 +3505,215 @@ fn handle_display_message(
     writeln!(stream, "{rendered}")
 }
 
+fn handle_list_keys(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    format: Option<&str>,
+) -> io::Result<()> {
+    let mut bindings = state
+        .key_bindings
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(key, command)| KeyBinding {
+            key: key.clone(),
+            command: command.clone(),
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by(|left, right| left.key.cmp(&right.key));
+    let format = format.unwrap_or("#{key}\t#{command}");
+    write_ok(stream)?;
+    for binding in bindings {
+        writeln!(stream, "{}", format_key_binding(format, &binding))?;
+    }
+    Ok(())
+}
+
+fn handle_bind_key(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    key: &str,
+    command: &str,
+) -> io::Result<()> {
+    let key = match crate::config::canonical_key(key) {
+        Ok(key) => key,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    let command = match crate::config::validate_binding_command(command) {
+        Ok(command) => command,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    state.key_bindings.lock().unwrap().insert(key, command);
+    notify_all_attach_redraws(state);
+    write_ok(stream)
+}
+
+fn handle_unbind_key(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    key: &str,
+) -> io::Result<()> {
+    let key = match crate::config::canonical_key(key) {
+        Ok(key) => key,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    state.key_bindings.lock().unwrap().remove(&key);
+    notify_all_attach_redraws(state);
+    write_ok(stream)
+}
+
+fn handle_show_options(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    format: Option<&str>,
+) -> io::Result<()> {
+    let mut options = state
+        .options
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(name, value)| OptionEntry {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect::<Vec<_>>();
+    options.sort_by(|left, right| left.name.cmp(&right.name));
+    let format = format.unwrap_or("#{option.name}\t#{option.value}");
+    write_ok(stream)?;
+    for option in options {
+        writeln!(stream, "{}", format_option(format, &option))?;
+    }
+    Ok(())
+}
+
+fn handle_set_option(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    value: &str,
+) -> io::Result<()> {
+    let old_prefix = if name == crate::config::OPTION_PREFIX {
+        Some(current_runtime_options(state).0)
+    } else {
+        None
+    };
+    let value = match crate::config::validate_option_value(name, value) {
+        Ok(value) => value,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    state
+        .options
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), value);
+    if let Some(old_prefix) = old_prefix {
+        sync_send_prefix_binding(state, &old_prefix);
+    }
+    apply_runtime_options_to_sessions(state);
+    write_ok(stream)
+}
+
+fn sync_send_prefix_binding(state: &Arc<ServerState>, old_prefix: &str) {
+    let new_prefix = current_runtime_options(state).0;
+    let mut bindings = state.key_bindings.lock().unwrap();
+    if bindings
+        .get(old_prefix)
+        .is_some_and(|command| command == "send-prefix")
+    {
+        bindings.remove(old_prefix);
+        bindings.insert(new_prefix, "send-prefix".to_string());
+    }
+}
+
+fn notify_all_attach_redraws(state: &Arc<ServerState>) {
+    let sessions = state
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for session in sessions {
+        session.notify_attach_redraw_immediate();
+    }
+}
+
+fn current_runtime_options(state: &Arc<ServerState>) -> (String, bool) {
+    let options = state.options.lock().unwrap();
+    let prefix = options
+        .get(crate::config::OPTION_PREFIX)
+        .cloned()
+        .unwrap_or_else(|| crate::config::DEFAULT_PREFIX_KEY.to_string());
+    let status_hints = options
+        .get(crate::config::OPTION_STATUS_HINTS)
+        .is_none_or(|value| value == "on");
+    (prefix, status_hints)
+}
+
+fn apply_runtime_options_to_sessions(state: &Arc<ServerState>) {
+    let (prefix, status_hints) = current_runtime_options(state);
+    let sessions = state
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    for session in sessions {
+        session.set_runtime_options(prefix.clone(), status_hints);
+        session.notify_attach_redraw_immediate();
+    }
+}
+
+fn format_key_binding(format: &str, binding: &KeyBinding) -> String {
+    apply_replacements(
+        format,
+        &[
+            ("#{key}", binding.key.as_str()),
+            ("#{command}", binding.command.as_str()),
+        ],
+    )
+}
+
+fn format_option(format: &str, option: &OptionEntry) -> String {
+    apply_replacements(
+        format,
+        &[
+            ("#{option.name}", option.name.as_str()),
+            ("#{option.value}", option.value.as_str()),
+        ],
+    )
+}
+
 fn status_context(state: &Arc<ServerState>, name: &str) -> Option<StatusContext> {
     let session = resolve_session(state, name)?;
-
     let mut context = session.status_context()?;
     context.buffer_summary = state.buffer_status_summary();
+    context.status_hints = state
+        .options
+        .lock()
+        .unwrap()
+        .get(crate::config::OPTION_STATUS_HINTS)
+        .is_none_or(|value| value == "on");
+    context.prefix_key = state
+        .options
+        .lock()
+        .unwrap()
+        .get(crate::config::OPTION_PREFIX)
+        .cloned()
+        .unwrap_or_else(|| crate::config::DEFAULT_PREFIX_KEY.to_string());
     Some(context)
 }
 
@@ -3515,6 +3762,14 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         } else {
             (String::new(), "", String::new(), String::new(), "0", "")
         };
+    let status_help = if context.status_hints {
+        format!(
+            "prefix {} | {} ? help | : command | [ copy",
+            context.prefix_key, context.prefix_key
+        )
+    } else {
+        String::new()
+    };
     let replacements = [
         ("#{session.name}", context.session_name.as_str()),
         ("#{session.attached}", session_attached),
@@ -3548,10 +3803,7 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{buffer.latest}", buffer_latest),
         ("#{buffer.preview}", buffer_preview),
         ("#{window.zoomed_flag}", window_zoomed),
-        (
-            "#{status.help}",
-            "prefix C-b | C-b ? help | : command | [ copy",
-        ),
+        ("#{status.help}", status_help.as_str()),
     ];
     apply_replacements(format, &replacements)
 }
@@ -5629,6 +5881,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_key_bindings_and_options_are_inspectable_and_mutable() {
+        let mut bindings = default_key_binding_map();
+        assert_eq!(bindings.get("d").map(String::as_str), Some("detach-client"));
+        bindings.remove("d");
+        assert!(!bindings.contains_key("d"));
+        bindings.insert("m".to_string(), "copy-mode".to_string());
+        assert_eq!(bindings.get("m").map(String::as_str), Some("copy-mode"));
+
+        let mut options = default_option_map();
+        assert_eq!(
+            options
+                .get(crate::config::OPTION_PREFIX)
+                .map(String::as_str),
+            Some(crate::config::DEFAULT_PREFIX_KEY)
+        );
+        let value = crate::config::validate_option_value(crate::config::OPTION_PREFIX, "C-a")
+            .expect("prefix option validates");
+        options.insert(crate::config::OPTION_PREFIX.to_string(), value);
+        assert_eq!(
+            options
+                .get(crate::config::OPTION_PREFIX)
+                .map(String::as_str),
+            Some("C-a")
+        );
+        assert!(crate::config::validate_option_value("unknown", "x").is_err());
+    }
+
     fn tracked_stream(id: usize, stream: UnixStream) -> TrackedStream {
         TrackedStream {
             id,
@@ -6026,6 +6306,8 @@ mod tests {
             sessions: Mutex::new(HashMap::from([("test".to_string(), session)])),
             session_aliases: Mutex::new(HashMap::new()),
             buffers: Mutex::new(BufferStore::new()),
+            key_bindings: Mutex::new(default_key_binding_map()),
+            options: Mutex::new(default_option_map()),
             socket_path: writer_path.with_extension("sock"),
             next_session_created_id: AtomicUsize::new(1),
             next_client_id: AtomicUsize::new(1),
@@ -6075,6 +6357,8 @@ mod tests {
             sessions: Mutex::new(HashMap::from([("test".to_string(), Arc::clone(&session))])),
             session_aliases: Mutex::new(HashMap::new()),
             buffers: Mutex::new(BufferStore::new()),
+            key_bindings: Mutex::new(default_key_binding_map()),
+            options: Mutex::new(default_option_map()),
             socket_path: writer_path.with_extension("sock"),
             next_session_created_id: AtomicUsize::new(1),
             next_client_id: AtomicUsize::new(1),

@@ -1,5 +1,6 @@
 mod cli;
 mod client;
+mod config;
 mod ids;
 mod layout;
 mod paths;
@@ -420,6 +421,46 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
                 true,
             )?;
             print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
+        cli::Command::ListKeys { format } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            let body = send_request(
+                &socket,
+                &protocol::encode_list_keys(format.as_deref()),
+                false,
+            )?;
+            print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
+        cli::Command::BindKey { key, command } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            send_request(&socket, &protocol::encode_bind_key(&key, &command), false)?;
+            Ok(())
+        }
+        cli::Command::UnbindKey { key } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            send_request(&socket, &protocol::encode_unbind_key(&key), false)?;
+            Ok(())
+        }
+        cli::Command::ShowOptions { format } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            let body = send_request(
+                &socket,
+                &protocol::encode_show_options(format.as_deref()),
+                false,
+            )?;
+            print!("{}", String::from_utf8_lossy(&body));
+            Ok(())
+        }
+        cli::Command::SetOption { name, value } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            send_request(&socket, &protocol::encode_set_option(&name, &value), false)?;
             Ok(())
         }
         cli::Command::Run { sequence } => execute_command_sequence(&sequence),

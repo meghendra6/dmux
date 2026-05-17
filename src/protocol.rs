@@ -86,6 +86,18 @@ pub enum BufferSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBinding {
+    pub key: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionEntry {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     New {
         session: String,
@@ -256,6 +268,23 @@ pub enum Request {
     DisplayMessage {
         session: String,
         format: String,
+    },
+    ListKeys {
+        format: Option<String>,
+    },
+    BindKey {
+        key: String,
+        command: String,
+    },
+    UnbindKey {
+        key: String,
+    },
+    ShowOptions {
+        format: Option<String>,
+    },
+    SetOption {
+        name: String,
+        value: String,
     },
     Kill {
         session: String,
@@ -752,6 +781,44 @@ pub fn encode_display_message(session: &str, format: &str) -> String {
     format!(
         "DISPLAY_MESSAGE\t{session}\t{}\n",
         encode_hex(format.as_bytes())
+    )
+}
+
+pub fn encode_list_keys(format: Option<&str>) -> String {
+    format!(
+        "LIST_KEYS\t{}\n",
+        format
+            .map(|value| encode_hex(value.as_bytes()))
+            .unwrap_or_default()
+    )
+}
+
+pub fn encode_bind_key(key: &str, command: &str) -> String {
+    format!(
+        "BIND_KEY\t{}\t{}\n",
+        encode_hex(key.as_bytes()),
+        encode_hex(command.as_bytes())
+    )
+}
+
+pub fn encode_unbind_key(key: &str) -> String {
+    format!("UNBIND_KEY\t{}\n", encode_hex(key.as_bytes()))
+}
+
+pub fn encode_show_options(format: Option<&str>) -> String {
+    format!(
+        "SHOW_OPTIONS\t{}\n",
+        format
+            .map(|value| encode_hex(value.as_bytes()))
+            .unwrap_or_default()
+    )
+}
+
+pub fn encode_set_option(name: &str, value: &str) -> String {
+    format!(
+        "SET_OPTION\t{}\t{}\n",
+        encode_hex(name.as_bytes()),
+        encode_hex(value.as_bytes())
     )
 }
 
@@ -1422,6 +1489,23 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["DISPLAY_MESSAGE", session, format] => Ok(Request::DisplayMessage {
             session: (*session).to_string(),
             format: decode_utf8_hex(format, "DISPLAY_MESSAGE")?,
+        }),
+        ["LIST_KEYS", format] => Ok(Request::ListKeys {
+            format: decode_optional_text(format, "LIST_KEYS")?,
+        }),
+        ["BIND_KEY", key, command] => Ok(Request::BindKey {
+            key: decode_utf8_hex(key, "BIND_KEY")?,
+            command: decode_utf8_hex(command, "BIND_KEY")?,
+        }),
+        ["UNBIND_KEY", key] => Ok(Request::UnbindKey {
+            key: decode_utf8_hex(key, "UNBIND_KEY")?,
+        }),
+        ["SHOW_OPTIONS", format] => Ok(Request::ShowOptions {
+            format: decode_optional_text(format, "SHOW_OPTIONS")?,
+        }),
+        ["SET_OPTION", name, value] => Ok(Request::SetOption {
+            name: decode_utf8_hex(name, "SET_OPTION")?,
+            value: decode_utf8_hex(value, "SET_OPTION")?,
         }),
         ["KILL", session] => Ok(Request::Kill {
             session: (*session).to_string(),
@@ -2453,6 +2537,42 @@ mod tests {
             Request::DisplayMessage {
                 session: "dev".to_string(),
                 format: "#{window.list}".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_key_and_option_requests() {
+        assert_eq!(
+            decode_request(&encode_list_keys(Some("#{key}\t#{command}"))).unwrap(),
+            Request::ListKeys {
+                format: Some("#{key}\t#{command}".to_string()),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_bind_key("C-a", "copy-mode")).unwrap(),
+            Request::BindKey {
+                key: "C-a".to_string(),
+                command: "copy-mode".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_unbind_key("x")).unwrap(),
+            Request::UnbindKey {
+                key: "x".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_show_options(Some("#{option.name}=#{option.value}"))).unwrap(),
+            Request::ShowOptions {
+                format: Some("#{option.name}=#{option.value}".to_string()),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_set_option("prefix", "C-a")).unwrap(),
+            Request::SetOption {
+                name: "prefix".to_string(),
+                value: "C-a".to_string(),
             }
         );
     }

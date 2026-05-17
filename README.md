@@ -54,6 +54,11 @@ Implemented Phase 0/1 commands:
 - `dmux command <command; command...>`
 - `dmux source-file <path>`
 - `dmux run-shell <shell-command>`
+- `dmux list-keys [-F <format>]`
+- `dmux bind-key <key> <supported-live-action>`
+- `dmux unbind-key <key>`
+- `dmux show-options [-F <format>]`
+- `dmux set-option <name> <value>`
 - `dmux kill-session -t <name>`
 - `dmux kill-server`
 
@@ -100,6 +105,16 @@ commands report a hint to use `C-b ?` and show common examples. The prompt
 also accepts semicolon-separated prompt commands and `:source-file <path>` for
 newline-separated prompt commands with blank lines and leading-`#` comments
 ignored.
+
+Key bindings and options are runtime/server-scoped and reset when the dmux
+server exits. Use `dmux list-keys` to inspect prefix bindings and
+`dmux bind-key <key> <action>`/`dmux unbind-key <key>` to customize supported
+live actions such as `copy-mode`, `detach-client`, `command-prompt`,
+`split-window -h|-v`, `select-pane -L|-D|-U|-R`, `resize-pane -L|-D|-U|-R`,
+`next-pane`, `new-window`, `next-window`, `previous-window`, `kill-pane`, and
+`zoom-pane`.
+Use `dmux show-options` and `dmux set-option prefix C-a` to inspect or change
+validated runtime options; `status-hints` accepts `on` or `off`.
 
 Attached clients can enter the current basic copy-mode view with `C-b [`.
 Inside copy-mode, `j`/`k`, arrows, `Ctrl-n`/`Ctrl-p`, PageUp/PageDown, and
