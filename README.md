@@ -94,10 +94,12 @@ include the file line. `dmux run-shell <shell-command>` runs one host shell
 command synchronously, returns a non-zero status on failure, and prints at most
 64 KiB from each output stream.
 
-Attached clients show a status line with the active session/window/pane plus
-quick affordances: `prefix C-b | C-b ? help | : command | [ copy`. Press `C-b ?` for
-a grouped attach help overlay covering session, window, pane, copy-mode, and
-command-prompt workflows. Press `C-b :` for an attached command prompt that
+Attached clients show a top tab line for windows and a bottom info line with
+the active session, pane, client/buffer counts, alerts, and quick affordances
+such as `C-b ? help`, `C-b : command`, and Alt-arrow focus. Press `C-b ?` to
+toggle a boxed attach help popup covering session, window, pane, copy-mode, and
+command-prompt workflows; the popup stays visible until closed. Press `C-b :`
+for an attached command prompt that
 shows the typed command and controls (`Enter` run, Escape/`C-c` cancel,
 Backspace edit), with examples such as `:split -h`, `:split -v`,
 `:layout tiled`, `:swap-pane 1`, `:break-pane`, and `:list-windows`. Unknown attached
@@ -126,7 +128,7 @@ rendered line; mouse drag saves an inclusive line range. Mouse selection is
 currently basic line-level selection. In unzoomed multi-pane attach, copy-mode
 copies lines from the rendered composed layout, including pane separators and
 visible content from multiple panes, while input is routed to the server active
-pane. Unzoomed multi-pane attach handles `C-b d` to detach (`C-b D` also detaches), `C-b ?` to show
+pane. Unzoomed multi-pane attach handles `C-b d` to detach (`C-b D` also detaches), `C-b ?` to toggle
 attach help, `C-b :` to run attached commands such as rename/select/kill/list/paste/split/layout, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
 `C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` or `C-b` arrows to focus by
 direction, `Alt-h/j/k/l` or `Alt` arrows to focus without prefix, `C-b H/J/K/L`
@@ -220,10 +222,11 @@ Implemented Phase 2 groundwork:
 - formatted buffer listing with latest marker, byte/line counts, and previews
 - latest-buffer status/display-message format fields with token-like data safety
 - bounded transient display messages in attach render output
-- grouped attach help overlay plus visible command-prompt input and controls
+- top tab line, bottom info line, persistent attach help popup, and visible
+  command-prompt input and controls
 - attach-time basic copy-mode key handling for line copy
 - attach-time basic copy-mode mouse selection for line ranges
-- attach-time statusline snapshot rendering with prefix/help/command/copy affordances
+- attach-time TUI chrome with tabs, footer info, and prefix/help/command affordances
 - attach-time split-pane layout snapshot rendering
 - event-driven live redraw for multi-pane attach with polling fallback
 - synchronized-output redraw gating with an end-marker flush and timeout guard
@@ -239,7 +242,7 @@ Current limits:
 
 - multi-pane attach routes input to the server active pane
 - zoomed panes are tracked server-side and keep single-pane live attach behavior
-- attach-time statusline rendering is snapshot-only for raw single-pane attach
+- raw single-pane attach still receives one-time attach chrome before raw PTY streaming
 - in-memory screen and scrollback only
 - copy-mode selection is line-based only
 - buffer contents are in-memory only
