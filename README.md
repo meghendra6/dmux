@@ -164,7 +164,8 @@ missing matches, and pastes into exited panes are explicit errors.
 
 `status-line -F` and `display-message -p` expand session/window/tab/pane/client
 fields, including pane metadata fields `#{pane.cwd}`, `#{pane.title}`,
-`#{pane.bell}`, and `#{pane.activity}`, plus latest-buffer fields:
+`#{pane.bell}`, `#{pane.activity}`, and `#{pane.clipboard_blocked}`, plus
+latest-buffer fields:
 `#{buffer.count}`, `#{buffer.index}`,
 `#{buffer.name}`, `#{buffer.bytes}`, `#{buffer.lines}`, `#{buffer.latest}`, and
 `#{buffer.preview}`. Unknown `#{...}` tokens are left literal, and expanded data
@@ -184,6 +185,8 @@ Implemented Phase 2 groundwork:
 - OSC 7 pane cwd tracking for child-reported directory changes
 - OSC 0/2 pane title tracking
 - pane bell and activity state exposed through pane/status formats
+- OSC 52 clipboard writes blocked by default and counted as
+  `#{pane.clipboard_blocked}`
 - attach-time PTY resize to the current terminal size when available
 - session formats: `#{session.name}`, `#{session.windows}`, `#{session.window_count}`, `#{session.attached}`, `#{session.attached_count}`, `#{session.created_at}`, and `#{client.count}`
 - client formats: `#{client.id}`, `#{client.session}`, `#{client.type}`, `#{client.attached}`, `#{client.width}`, and `#{client.height}`
