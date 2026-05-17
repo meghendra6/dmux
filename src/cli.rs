@@ -567,6 +567,7 @@ info line, and quick hints for prefix, help, command prompt, and focus.\n\
 \n\
 Session:\n\
   C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
+  C-b ! attention popup\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
@@ -595,6 +596,7 @@ CLI equivalents:\n\
 pub fn attach_help_overlay() -> &'static str {
     "Session:\n\
   C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
+  C-b ! attention popup\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\

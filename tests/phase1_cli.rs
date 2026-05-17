@@ -3114,6 +3114,55 @@ fn attach_prefix_question_prints_help_and_keeps_attach_running() {
 }
 
 #[test]
+fn attach_prefix_bang_prints_attention_and_keeps_attach_running() {
+    let socket = unique_socket("attach-attention");
+    let session = format!("attach-attention-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf attention-ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "attention-ready");
+    assert!(ready.contains("attention-ready"), "{ready:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["attention-ready"]);
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02!").expect("write attention");
+        stdin.flush().expect("flush attention");
+    }
+    child.wait_for_stdout_contains_all(
+        &["dmux attention", "C-b ! close", "No attention items."],
+        "attach attention output",
+    );
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("dmux attention"), "{stdout:?}");
+    assert!(stdout.contains("No attention items."), "{stdout:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_prefix_question_prints_multi_pane_help_and_keeps_attach_running() {
     let socket = unique_socket("attach-multi-help");
     let session = format!("attach-multi-help-{}", std::process::id());

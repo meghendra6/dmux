@@ -59,6 +59,50 @@ enum AttachMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachPopup {
+    None,
+    Help,
+    Attention,
+}
+
+impl AttachPopup {
+    fn toggle_help(self) -> Self {
+        match self {
+            Self::Help => Self::None,
+            Self::None | Self::Attention => Self::Help,
+        }
+    }
+
+    fn toggle_attention(self) -> Self {
+        match self {
+            Self::Attention => Self::None,
+            Self::None | Self::Help => Self::Attention,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PopupOverlayText {
+    title: &'static str,
+    content: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PopupOverlay<'a> {
+    title: &'static str,
+    content: &'a str,
+}
+
+impl PopupOverlayText {
+    fn as_overlay(&self) -> PopupOverlay<'_> {
+        PopupOverlay {
+            title: self.title,
+            content: &self.content,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MousePosition {
     col: u16,
     row: u16,
@@ -556,7 +600,7 @@ fn write_live_snapshot_frame_with_message_and_clear(
     socket: &Path,
     session: &str,
     message: Option<&str>,
-    overlay: Option<&str>,
+    overlay: Option<PopupOverlay<'_>>,
     clear: bool,
     prioritize_message: bool,
 ) -> io::Result<LiveSnapshotFrame> {
@@ -575,7 +619,7 @@ fn write_live_snapshot_frame_with_message_and_clear(
 fn write_live_frame_to_stdout(
     status: &str,
     message: Option<&str>,
-    overlay: Option<&str>,
+    overlay: Option<PopupOverlay<'_>>,
     snapshot: &AttachLayoutSnapshotResponse,
     clear: bool,
     prioritize_message: bool,
@@ -612,7 +656,7 @@ fn write_live_frame_to_stdout(
         write_snapshot_rows_for_repaint(&mut stdout, &snapshot.snapshot, snapshot_rows)?;
     }
     if let (Some(overlay), Some(size)) = (overlay, attach_size) {
-        append_help_popup_overlay(&mut stdout, overlay, size, header_rows)?;
+        append_popup_overlay(&mut stdout, overlay, size, header_rows)?;
     }
     stdout.flush()?;
 
@@ -751,15 +795,15 @@ fn write_snapshot_rows(
 fn write_live_render_output(
     frame: &AttachRenderFrame,
     state: &mut LiveRenderOutputState,
-    overlay: Option<&str>,
+    overlay: Option<PopupOverlay<'_>>,
 ) -> io::Result<()> {
     let mut output = diff_live_render_output(frame, state);
     if let Some(overlay) = overlay {
         let size = detect_attach_size().unwrap_or_else(default_attach_size);
         append_centered_popup_overlay(
             &mut output,
-            "dmux help",
-            &popup_content_lines(overlay),
+            overlay.title,
+            &popup_content_lines(overlay.content),
             size,
             frame.header_rows,
         );
@@ -773,17 +817,17 @@ fn default_attach_size() -> PtySize {
     PtySize { cols: 80, rows: 24 }
 }
 
-fn append_help_popup_overlay(
+fn append_popup_overlay(
     stdout: &mut impl Write,
-    overlay: &str,
+    overlay: PopupOverlay<'_>,
     size: PtySize,
     header_rows: usize,
 ) -> io::Result<()> {
     let mut output = Vec::new();
     append_centered_popup_overlay(
         &mut output,
-        "dmux help",
-        &popup_content_lines(overlay),
+        overlay.title,
+        &popup_content_lines(overlay.content),
         size,
         header_rows,
     );
@@ -1218,6 +1262,7 @@ enum AttachInputAction {
     EnterCopyMode {
         initial_input: Vec<u8>,
     },
+    ShowAttention,
     ShowHelp,
     Detach,
 }
@@ -1237,6 +1282,7 @@ enum LiveSnapshotInputAction {
     Detach,
     SelectNextPane,
     ShowPaneNumbers,
+    ShowAttention,
     ShowHelp,
     SelectPane(usize),
     EnterCopyMode {
@@ -1275,6 +1321,7 @@ enum LiveKeyAction {
     CopyMode,
     SelectNextPane,
     ShowPaneNumbers,
+    ShowAttention,
     ShowHelp,
     CommandPrompt,
     PaneCommand(PaneCommand),
@@ -1335,6 +1382,7 @@ fn live_key_action(command: &str) -> Option<LiveKeyAction> {
         "copy-mode" => Some(LiveKeyAction::CopyMode),
         "next-pane" => Some(LiveKeyAction::SelectNextPane),
         "display-panes" => Some(LiveKeyAction::ShowPaneNumbers),
+        "show-attention" => Some(LiveKeyAction::ShowAttention),
         "show-help" => Some(LiveKeyAction::ShowHelp),
         "command-prompt" => Some(LiveKeyAction::CommandPrompt),
         "new-window" => Some(LiveKeyAction::PaneCommand(PaneCommand::NewWindow)),
@@ -1580,6 +1628,10 @@ fn push_attach_key_action(
             state.selecting_pane = true;
             actions.push(AttachInputAction::ShowPaneNumbers);
         }
+        LiveKeyAction::ShowAttention => {
+            state.selecting_pane = true;
+            actions.push(AttachInputAction::ShowAttention);
+        }
         LiveKeyAction::ShowHelp => actions.push(AttachInputAction::ShowHelp),
         LiveKeyAction::CommandPrompt => {
             state.command_prompt = Some(Vec::new());
@@ -1619,6 +1671,10 @@ fn push_live_snapshot_key_action(
         LiveKeyAction::ShowPaneNumbers => {
             state.selecting_pane = true;
             actions.push(LiveSnapshotInputAction::ShowPaneNumbers);
+        }
+        LiveKeyAction::ShowAttention => {
+            state.selecting_pane = true;
+            actions.push(LiveSnapshotInputAction::ShowAttention);
         }
         LiveKeyAction::ShowHelp => actions.push(LiveSnapshotInputAction::ShowHelp),
         LiveKeyAction::CommandPrompt => {
@@ -2185,6 +2241,23 @@ struct PaneListEntry {
     active: bool,
 }
 
+const ATTENTION_FIELD_SEPARATOR: char = '\u{1f}';
+const ATTENTION_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneAttentionEntry {
+    index: usize,
+    active: bool,
+    state: String,
+    exit_status: Option<i32>,
+    exit_signal: Option<i32>,
+    bell: bool,
+    activity: bool,
+    clipboard_blocked: usize,
+    title: String,
+    cwd: String,
+}
+
 #[cfg(test)]
 fn next_pane_index_from_listing(listing: &str) -> io::Result<usize> {
     let entries = parse_pane_listing(listing)?;
@@ -2236,6 +2309,7 @@ enum LiveSnapshotInputEvent {
     CommandPromptCancel,
     SelectNextPane,
     ShowPaneNumbers,
+    ShowAttention,
     ShowHelp,
     SelectPane(usize),
     PauseRedraw(mpsc::Sender<()>),
@@ -2447,6 +2521,9 @@ fn send_live_snapshot_input_actions<R: Read>(
             }
             LiveSnapshotInputAction::ShowPaneNumbers => {
                 let _ = sender.send(LiveSnapshotInputEvent::ShowPaneNumbers);
+            }
+            LiveSnapshotInputAction::ShowAttention => {
+                let _ = sender.send(LiveSnapshotInputEvent::ShowAttention);
             }
             LiveSnapshotInputAction::ShowHelp => {
                 let _ = sender.send(LiveSnapshotInputEvent::ShowHelp);
@@ -2706,7 +2783,7 @@ fn run_live_snapshot_attach(
     let mut fallback_event_stream_started = false;
     let mut pane_number_message = None;
     let mut command_prompt_message: Option<String> = None;
-    let mut help_popup_visible = false;
+    let mut active_popup = AttachPopup::None;
     let mut pending_input_repaint_deadline = None;
     let mut render_output_state = LiveRenderOutputState::default();
 
@@ -2733,7 +2810,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2760,7 +2837,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2768,7 +2845,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::CommandPromptStart) => {
-                help_popup_visible = false;
+                active_popup = AttachPopup::None;
                 pane_number_message = None;
                 command_prompt_message = Some(attach_command_prompt_text(""));
                 if !redraw_paused {
@@ -2777,7 +2854,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2785,7 +2862,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::CommandPromptUpdate(command)) => {
-                help_popup_visible = false;
+                active_popup = AttachPopup::None;
                 pane_number_message = None;
                 command_prompt_message = Some(attach_command_prompt_text(&command));
                 if !redraw_paused {
@@ -2794,7 +2871,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2802,7 +2879,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::CommandPromptCancel) => {
-                help_popup_visible = false;
+                active_popup = AttachPopup::None;
                 command_prompt_message = None;
                 pane_number_message = Some((
                     "cancelled".to_string(),
@@ -2814,7 +2891,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2826,7 +2903,7 @@ fn run_live_snapshot_attach(
                 dispatch_done,
             }) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
-                help_popup_visible = false;
+                active_popup = AttachPopup::None;
                 command_prompt_message = None;
                 let command_result = dispatch_attach_command(socket, session, &command);
                 pane_number_message = match command_result {
@@ -2853,7 +2930,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2870,7 +2947,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2887,7 +2964,7 @@ fn run_live_snapshot_attach(
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
-                    help_popup_visible,
+                    active_popup,
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -2895,7 +2972,7 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::ShowHelp) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
-                help_popup_visible = !help_popup_visible;
+                active_popup = active_popup.toggle_help();
                 pane_number_message = None;
                 command_prompt_message = None;
                 frame = write_live_snapshot_frame_with_active_message(
@@ -2903,7 +2980,23 @@ fn run_live_snapshot_attach(
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
-                    help_popup_visible,
+                    active_popup,
+                )?;
+                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                reset_live_render_output_state(&mut render_output_state);
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::ShowAttention) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                active_popup = active_popup.toggle_attention();
+                pane_number_message = None;
+                command_prompt_message = None;
+                frame = write_live_snapshot_frame_with_active_message(
+                    socket,
+                    session,
+                    &mut pane_number_message,
+                    command_prompt_message.as_deref(),
+                    active_popup,
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -2919,7 +3012,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2934,7 +3027,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2951,7 +3044,7 @@ fn run_live_snapshot_attach(
                             session,
                             &mut pane_number_message,
                             command_prompt_message.as_deref(),
-                            help_popup_visible,
+                            active_popup,
                         )?;
                         sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                         reset_live_render_output_state(&mut render_output_state);
@@ -2971,7 +3064,7 @@ fn run_live_snapshot_attach(
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
-                    help_popup_visible,
+                    active_popup,
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -2986,7 +3079,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3016,19 +3109,20 @@ fn run_live_snapshot_attach(
                             session,
                             &mut pane_number_message,
                             command_prompt_message.as_deref(),
-                            help_popup_visible,
+                            active_popup,
                         )?;
                         sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                         reset_live_render_output_state(&mut render_output_state);
                     } else {
-                        if command_prompt_message.is_none() && !help_popup_visible {
+                        if command_prompt_message.is_none() && active_popup == AttachPopup::None {
                             pane_number_message = None;
                         }
-                        let help_popup_message = help_popup_visible.then(attach_help_overlay_text);
+                        let popup_overlay =
+                            attach_popup_overlay_text(socket, session, active_popup)?;
                         write_live_render_output(
                             &render_frame,
                             &mut render_output_state,
-                            help_popup_message.as_deref(),
+                            popup_overlay.as_ref().map(PopupOverlayText::as_overlay),
                         )?;
                     }
                     last_redraw = Instant::now();
@@ -3084,7 +3178,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
-                        help_popup_visible,
+                        active_popup,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3131,15 +3225,15 @@ fn write_live_snapshot_frame_with_active_message(
     session: &str,
     pane_number_message: &mut Option<(String, Instant)>,
     command_prompt_message: Option<&str>,
-    help_popup_visible: bool,
+    active_popup: AttachPopup,
 ) -> io::Result<LiveSnapshotFrame> {
-    let help_popup_message = help_popup_visible.then(attach_help_overlay_text);
+    let popup_overlay = attach_popup_overlay_text(socket, session, active_popup)?;
     let message = active_live_message(pane_number_message, command_prompt_message, Instant::now());
     write_live_snapshot_frame_with_message_and_clear(
         socket,
         session,
         message,
-        help_popup_message.as_deref(),
+        popup_overlay.as_ref().map(PopupOverlayText::as_overlay),
         false,
         command_prompt_message.is_some(),
     )
@@ -3194,6 +3288,176 @@ fn pane_number_message_text(socket: &Path, session: &str) -> io::Result<String> 
         return Err(io::Error::other("missing pane"));
     }
     Ok(format_pane_number_message(&entries))
+}
+
+fn pane_attention_entries(socket: &Path, session: &str) -> io::Result<Vec<PaneAttentionEntry>> {
+    let body = send_control_request(
+        socket,
+        &protocol::encode_list_panes(session, Some(ATTENTION_LIST_PANES_FORMAT)),
+    )?;
+    let listing = String::from_utf8_lossy(&body);
+    parse_pane_attention_listing(&listing)
+}
+
+fn parse_pane_attention_listing(listing: &str) -> io::Result<Vec<PaneAttentionEntry>> {
+    let mut entries = Vec::new();
+    for line in listing.lines() {
+        let fields = line.split(ATTENTION_FIELD_SEPARATOR).collect::<Vec<_>>();
+        let [
+            index,
+            active,
+            state,
+            exit_status,
+            exit_signal,
+            bell,
+            activity,
+            clipboard_blocked,
+            title,
+            cwd,
+        ] = fields.as_slice()
+        else {
+            return Err(io::Error::other("invalid attention listing"));
+        };
+
+        entries.push(PaneAttentionEntry {
+            index: parse_usize_field(index, "invalid attention pane index")?,
+            active: parse_bool_flag(active, "invalid attention active flag")?,
+            state: (*state).to_string(),
+            exit_status: parse_optional_i32(exit_status, "invalid attention exit status")?,
+            exit_signal: parse_optional_i32(exit_signal, "invalid attention exit signal")?,
+            bell: parse_bool_flag(bell, "invalid attention bell flag")?,
+            activity: parse_bool_flag(activity, "invalid attention activity flag")?,
+            clipboard_blocked: parse_usize_field(
+                clipboard_blocked,
+                "invalid attention clipboard count",
+            )?,
+            title: (*title).to_string(),
+            cwd: (*cwd).to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_usize_field(value: &str, message: &str) -> io::Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|_| io::Error::other(message))
+}
+
+fn parse_optional_i32(value: &str, message: &str) -> io::Result<Option<i32>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<i32>()
+        .map(Some)
+        .map_err(|_| io::Error::other(message))
+}
+
+fn parse_bool_flag(value: &str, message: &str) -> io::Result<bool> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(io::Error::other(message)),
+    }
+}
+
+fn attach_attention_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
+    let entries = pane_attention_entries(socket, session)?;
+    Ok(format_attention_popup(&entries))
+}
+
+fn format_attention_popup(entries: &[PaneAttentionEntry]) -> String {
+    let mut lines = vec!["C-b ! close    digit focus pane".to_string()];
+    if entries.is_empty() {
+        lines.push("No panes.".to_string());
+        return lines.join("\n");
+    }
+
+    let attention_entries = entries
+        .iter()
+        .filter(|entry| pane_attention_reasons(entry).next().is_some())
+        .collect::<Vec<_>>();
+    if attention_entries.is_empty() {
+        lines.push("No attention items.".to_string());
+        lines.extend(entries.iter().map(format_attention_row));
+        return lines.join("\n");
+    }
+
+    lines.extend(attention_entries.into_iter().map(format_attention_row));
+    lines.extend(
+        entries
+            .iter()
+            .filter(|entry| pane_attention_reasons(entry).next().is_none())
+            .map(format_attention_row),
+    );
+    lines.join("\n")
+}
+
+fn format_attention_row(entry: &PaneAttentionEntry) -> String {
+    let active = if entry.active { "*" } else { " " };
+    let reasons = pane_attention_reasons(entry).collect::<Vec<_>>().join(", ");
+    let reasons = if reasons.is_empty() {
+        "quiet".to_string()
+    } else {
+        reasons
+    };
+    let label = pane_attention_label(entry);
+    format!("{active}{}  {reasons}  {label}", entry.index)
+}
+
+fn pane_attention_reasons(entry: &PaneAttentionEntry) -> impl Iterator<Item = String> + '_ {
+    let mut reasons = Vec::new();
+    if entry.bell {
+        reasons.push("bell".to_string());
+    }
+    if entry.activity {
+        reasons.push("activity".to_string());
+    }
+    if entry.state == "exited" {
+        if let Some(status) = entry.exit_status {
+            reasons.push(format!("exited {status}"));
+        } else if let Some(signal) = entry.exit_signal {
+            reasons.push(format!("signal {signal}"));
+        } else {
+            reasons.push("exited".to_string());
+        }
+    }
+    if entry.clipboard_blocked > 0 {
+        reasons.push(format!("clip {}", entry.clipboard_blocked));
+    }
+    reasons.into_iter()
+}
+
+fn pane_attention_label(entry: &PaneAttentionEntry) -> String {
+    let title = entry.title.trim();
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    Path::new(&entry.cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("pane")
+        .to_string()
+}
+
+fn attach_popup_overlay_text(
+    socket: &Path,
+    session: &str,
+    popup: AttachPopup,
+) -> io::Result<Option<PopupOverlayText>> {
+    match popup {
+        AttachPopup::None => Ok(None),
+        AttachPopup::Help => Ok(Some(PopupOverlayText {
+            title: "dmux help",
+            content: attach_help_overlay_text(),
+        })),
+        AttachPopup::Attention => Ok(Some(PopupOverlayText {
+            title: "dmux attention",
+            content: attach_attention_overlay_text(socket, session)?,
+        })),
+    }
 }
 
 fn pane_index_exists(entries: &[PaneListEntry], index: usize) -> bool {
@@ -3365,6 +3629,9 @@ fn raw_pending_input(
             AttachInputAction::ShowPaneNumbers => {
                 push_pending_bound_action(&mut pending, controls, LiveKeyAction::ShowPaneNumbers);
             }
+            AttachInputAction::ShowAttention => {
+                push_pending_bound_action(&mut pending, controls, LiveKeyAction::ShowAttention);
+            }
             AttachInputAction::SelectPane(index) => {
                 if *index < 10 {
                     pending.push(b'0' + *index as u8);
@@ -3429,7 +3696,7 @@ where
     let mut input_state = RawAttachInputState::default();
     let mut initial_input = Some(initial_input);
     let mut controls = load_live_controls(socket);
-    let mut help_popup_visible = false;
+    let mut active_popup = AttachPopup::None;
 
     loop {
         tick()?;
@@ -3699,16 +3966,32 @@ where
                     }
                 }
                 AttachInputAction::EnterCopyMode { initial_input } => {
-                    help_popup_visible = false;
+                    active_popup = AttachPopup::None;
                     copy_mode_active.store(true, Ordering::SeqCst);
                     let result = enter_copy_mode(initial_input);
                     copy_mode_active.store(false, Ordering::SeqCst);
                     result?;
                 }
                 AttachInputAction::ShowHelp => {
-                    help_popup_visible = !help_popup_visible;
-                    if help_popup_visible {
-                        write_attach_help_message()?;
+                    active_popup = active_popup.toggle_help();
+                    if active_popup == AttachPopup::Help {
+                        let overlay =
+                            attach_popup_overlay_text(socket, session, AttachPopup::Help)?
+                                .expect("help popup");
+                        write_attach_popup_message(overlay.as_overlay())?;
+                    } else {
+                        let _ = write_live_snapshot_frame_with_message_and_clear(
+                            socket, session, None, None, false, false,
+                        )?;
+                    }
+                }
+                AttachInputAction::ShowAttention => {
+                    active_popup = active_popup.toggle_attention();
+                    if active_popup == AttachPopup::Attention {
+                        let overlay =
+                            attach_popup_overlay_text(socket, session, AttachPopup::Attention)?
+                                .expect("attention popup");
+                        write_attach_popup_message(overlay.as_overlay())?;
                     } else {
                         let _ = write_live_snapshot_frame_with_message_and_clear(
                             socket, session, None, None, false, false,
@@ -3716,7 +3999,7 @@ where
                     }
                 }
                 AttachInputAction::Detach => {
-                    if help_popup_visible {
+                    if active_popup != AttachPopup::None {
                         let _ = write_live_snapshot_frame_with_message_and_clear(
                             socket, session, None, None, false, false,
                         )?;
@@ -3954,14 +4237,14 @@ fn cell_padding(line: &str, target_width: usize) -> String {
     " ".repeat(target_width.saturating_sub(display_cell_width(line)))
 }
 
-fn write_attach_help_message() -> io::Result<()> {
+fn write_attach_popup_message(overlay: PopupOverlay<'_>) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     let size = detect_attach_size().unwrap_or_else(default_attach_size);
     let mut output = Vec::new();
     append_centered_popup_overlay(
         &mut output,
-        "dmux help",
-        &attach_help_popup_content(),
+        overlay.title,
+        &popup_content_lines(overlay.content),
         size,
         0,
     );
@@ -7473,6 +7756,24 @@ mod tests {
     }
 
     #[test]
+    fn attach_input_shows_attention_on_prefix_bang() {
+        let actions = translate_attach_input(b"\x02!", &mut false);
+
+        assert_eq!(actions, vec![AttachInputAction::ShowAttention]);
+    }
+
+    #[test]
+    fn default_controls_bind_prefix_bang_to_attention() {
+        let controls = LiveControls::default();
+        let key = crate::config::parse_key_stroke("!").expect("parse key");
+
+        assert_eq!(
+            controls.action_for_key(key),
+            Some(LiveKeyAction::ShowAttention)
+        );
+    }
+
+    #[test]
     fn attach_input_detaches_on_prefix_d_without_forwarding_bytes() {
         let actions = translate_attach_input(b"\x02d", &mut false);
 
@@ -7534,6 +7835,71 @@ mod tests {
         assert!(popup.contains("C-b ? close"), "{popup}");
         assert!(popup.contains("Alt-h/j/k/l"), "{popup}");
         assert!(popup.contains("Prompt examples:"), "{popup}");
+    }
+
+    #[test]
+    fn parse_attention_entries_rejects_invalid_flags() {
+        let sep = ATTENTION_FIELD_SEPARATOR;
+        let listing =
+            format!("0{sep}x{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}shell{sep}/tmp\n");
+
+        assert!(parse_pane_attention_listing(&listing).is_err());
+    }
+
+    #[test]
+    fn format_attention_popup_lists_attention_before_quiet_panes() {
+        let quiet = PaneAttentionEntry {
+            index: 0,
+            active: true,
+            state: "running".to_string(),
+            exit_status: None,
+            exit_signal: None,
+            bell: false,
+            activity: false,
+            clipboard_blocked: 0,
+            title: "shell".to_string(),
+            cwd: "/tmp/project".to_string(),
+        };
+        let attention = PaneAttentionEntry {
+            index: 1,
+            active: false,
+            state: "running".to_string(),
+            exit_status: None,
+            exit_signal: None,
+            bell: true,
+            activity: true,
+            clipboard_blocked: 2,
+            title: "codex".to_string(),
+            cwd: "/tmp/project".to_string(),
+        };
+
+        let popup = format_attention_popup(&[quiet, attention]);
+
+        let attention_at = popup.find(" 1  bell, activity, clip 2  codex").unwrap();
+        let quiet_at = popup.find("*0  quiet  shell").unwrap();
+        assert!(attention_at < quiet_at, "{popup}");
+        assert!(popup.contains("C-b ! close"), "{popup}");
+    }
+
+    #[test]
+    fn format_attention_popup_reports_empty_attention() {
+        let quiet = PaneAttentionEntry {
+            index: 0,
+            active: true,
+            state: "running".to_string(),
+            exit_status: None,
+            exit_signal: None,
+            bell: false,
+            activity: false,
+            clipboard_blocked: 0,
+            title: String::new(),
+            cwd: "/tmp/project".to_string(),
+        };
+
+        let popup = format_attention_popup(&[quiet]);
+
+        assert!(popup.contains("No attention items."), "{popup}");
+        assert!(popup.contains("*0  quiet  project"), "{popup}");
     }
 
     #[test]
@@ -7686,6 +8052,16 @@ mod tests {
         let actions = translate_live_snapshot_input(b"\x02?", &mut state);
 
         assert_eq!(actions, vec![LiveSnapshotInputAction::ShowHelp]);
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_shows_attention_on_prefix_bang() {
+        let mut state = LiveSnapshotInputState::default();
+
+        let actions = translate_live_snapshot_input(b"\x02!", &mut state);
+
+        assert_eq!(actions, vec![LiveSnapshotInputAction::ShowAttention]);
         assert!(!state.saw_prefix);
     }
 
