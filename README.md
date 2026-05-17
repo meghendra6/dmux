@@ -50,6 +50,10 @@ Implemented Phase 0/1 commands:
 - `dmux zoom-pane -t <name> [-p <index>]`
 - `dmux status-line -t <name> [-F <format>]`
 - `dmux display-message -t <name> -p <format>`
+- `dmux run <command; command...>`
+- `dmux command <command; command...>`
+- `dmux source-file <path>`
+- `dmux run-shell <shell-command>`
 - `dmux kill-session -t <name>`
 - `dmux kill-server`
 
@@ -75,6 +79,16 @@ when needed. `dmux attach` without `-t` also targets `default`. Explicit
 `dmux ls`, `dmux attach -t <name>`, and `dmux kill-session -t <name>` report
 when no server is running instead of starting an empty daemon.
 
+Automation commands parse dmux commands directly without shell evaluation.
+`dmux run 'new -d -s dev; split-window -t dev -v'` executes commands in order
+and stops on the first parse or server error, reporting which command failed.
+Use quotes or backslashes for spaces and semicolons inside one argument.
+`dmux source-file <path>` reads newline-separated dmux commands; blank lines
+and lines whose first non-whitespace character is `#` are ignored, and errors
+include the file line. `dmux run-shell <shell-command>` runs one host shell
+command synchronously, returns a non-zero status on failure, and prints at most
+64 KiB from each output stream.
+
 Attached clients show a status line with the active session/window/pane plus
 quick affordances: `prefix C-b | C-b ? help | : command | [ copy`. Press `C-b ?` for
 a grouped attach help overlay covering session, window, pane, copy-mode, and
@@ -82,7 +96,10 @@ command-prompt workflows. Press `C-b :` for an attached command prompt that
 shows the typed command and controls (`Enter` run, Escape/`C-c` cancel,
 Backspace edit), with examples such as `:split -h`, `:split -v`,
 `:layout tiled`, `:swap-pane 1`, `:break-pane`, and `:list-windows`. Unknown attached
-commands report a hint to use `C-b ?` and show common examples.
+commands report a hint to use `C-b ?` and show common examples. The prompt
+also accepts semicolon-separated prompt commands and `:source-file <path>` for
+newline-separated prompt commands with blank lines and leading-`#` comments
+ignored.
 
 Attached clients can enter the current basic copy-mode view with `C-b [`.
 Inside copy-mode, `j`/`k`, arrows, `Ctrl-n`/`Ctrl-p`, PageUp/PageDown, and

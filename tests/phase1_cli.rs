@@ -146,6 +146,30 @@ fn unique_temp_file(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from("/tmp").join(format!("dmux-{name}-{}-{nanos}.tmp", std::process::id()))
 }
 
+fn unique_project_artifact(name: &str, extension: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::current_dir()
+        .expect("current dir")
+        .join("target")
+        .join("dmux-test-artifacts");
+    std::fs::create_dir_all(&dir).expect("create test artifact dir");
+    dir.join(format!(
+        "dmux-{name}-{}-{nanos}.{extension}",
+        std::process::id()
+    ))
+}
+
+fn unique_project_socket(name: &str) -> std::path::PathBuf {
+    unique_project_artifact(name, "sock")
+}
+
+fn unique_project_command_file(name: &str) -> std::path::PathBuf {
+    unique_project_artifact(name, "dmux")
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -394,6 +418,144 @@ fn read_attach_render_frame_body_until_contains(stream: &mut UnixStream, needle:
     }
 
     panic!("render stream frame did not contain {needle:?}; last:\n{last:?}");
+}
+
+#[test]
+fn run_sequence_executes_commands_in_order() {
+    let socket = unique_project_socket("run-sequence");
+    let session = format!("run-sequence-{}", std::process::id());
+    let sequence = format!(
+        "new -d -s {session} -- sh -c 'printf batch-base; sleep 30'; \
+         split-window -t {session} -v -- sh -c 'printf batch-split; sleep 30'; \
+         rename-window -t {session} automation"
+    );
+
+    let output = dmux(&socket, &["run", &sequence]);
+    assert_success(&output);
+
+    let panes = dmux(
+        &socket,
+        &["list-panes", "-t", &session, "-F", "#{pane.index}"],
+    );
+    assert_success(&panes);
+    assert_eq!(String::from_utf8_lossy(&panes.stdout).lines().count(), 2);
+    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    assert_success(&windows);
+    assert!(String::from_utf8_lossy(&windows.stdout).contains("automation"));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn source_file_executes_commands_and_reports_line_errors() {
+    let socket = unique_project_socket("source-file");
+    let session = format!("source-file-{}", std::process::id());
+    let file = unique_project_command_file("source-file");
+    std::fs::write(
+        &file,
+        format!(
+            "# comments and blank lines are ignored\n\
+             new -d -s {session} -- sh -c 'printf source-base; sleep 30'\n\
+             \n\
+             split-window -t {session} -v -- sh -c 'printf source-split; sleep 30'\n\
+             rename-window -t {session} sourced\n"
+        ),
+    )
+    .expect("write source file");
+
+    let output = dmux(
+        &socket,
+        &["source-file", file.to_str().expect("source file path")],
+    );
+    assert_success(&output);
+    let windows = dmux(&socket, &["list-windows", "-t", &session]);
+    assert_success(&windows);
+    assert!(String::from_utf8_lossy(&windows.stdout).contains("sourced"));
+
+    let bad_file = unique_project_command_file("source-file-bad");
+    std::fs::write(
+        &bad_file,
+        format!("rename-window -t {session} before-error\nsplit-window -t {session} -z\n"),
+    )
+    .expect("write bad source file");
+    let failed = dmux(
+        &socket,
+        &[
+            "source-file",
+            bad_file.to_str().expect("bad source file path"),
+        ],
+    );
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("line 2"), "{stderr}");
+    assert!(stderr.contains("split-window"), "{stderr}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(file);
+    let _ = std::fs::remove_file(bad_file);
+}
+
+#[test]
+fn run_shell_reports_success_output_and_failure_status() {
+    let socket = unique_project_socket("run-shell");
+
+    let success = dmux(&socket, &["run-shell", "printf shell-ok"]);
+    assert_success(&success);
+    assert_eq!(String::from_utf8_lossy(&success.stdout), "shell-ok");
+
+    let failure = dmux(&socket, &["run-shell", "exit 7"]);
+    assert!(!failure.status.success());
+    let stderr = String::from_utf8_lossy(&failure.stderr);
+    assert!(
+        stderr.contains("run-shell exited with status 7"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn run_shell_bounds_large_output_while_child_is_running() {
+    let socket = unique_project_socket("run-shell-large-output");
+    let output = dmux(&socket, &["run-shell", "yes x | head -c 70000"]);
+
+    assert_success(&output);
+    assert_eq!(output.stdout.len(), 64 * 1024);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("run-shell output truncated after 65536 bytes"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn run_and_source_file_preserve_run_shell_quoting() {
+    let socket = unique_project_socket("run-shell-quoting");
+    let sequence = "run-shell printf '%s\\n' 'hello world'";
+    let output = dmux(&socket, &["run", sequence]);
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "hello world\n");
+
+    let file = unique_project_command_file("run-shell-quoting");
+    std::fs::write(&file, format!("{sequence}\n")).expect("write command file");
+    let sourced = dmux(
+        &socket,
+        &["source-file", file.to_str().expect("command file path")],
+    );
+
+    assert_success(&sourced);
+    assert_eq!(String::from_utf8_lossy(&sourced.stdout), "hello world\n");
+    let _ = std::fs::remove_file(file);
+}
+
+#[test]
+fn run_shell_in_run_preserves_single_quoted_backslash() {
+    let socket = unique_project_socket("run-shell-single-quote-backslash");
+    let output = dmux(&socket, &["run", r"run-shell printf '%s\n' '\'"]);
+
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "\\\n");
 }
 
 fn read_attach_render_output_until_contains(stream: &mut UnixStream, needle: &str) -> String {

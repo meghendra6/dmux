@@ -10,6 +10,7 @@ mod term;
 mod terminal_query;
 
 const DEFAULT_LIST_WINDOWS_FORMAT: &str = "#{window.index}\tid=#{window.id}\tname=#{window.name}\tactive=#{window.active}\tpanes=#{window.panes}";
+const MAX_RUN_SHELL_OUTPUT_BYTES: usize = 64 * 1024;
 
 fn main() {
     if let Err(err) = run() {
@@ -19,7 +20,12 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    match cli::parse_args(std::env::args())? {
+    let command = cli::parse_args(std::env::args())?;
+    execute_command(command)
+}
+
+fn execute_command(command: cli::Command) -> Result<(), String> {
+    match command {
         cli::Command::Server => server::run(paths::socket_path()).map_err(|err| err.to_string()),
         cli::Command::OpenDefault => {
             let socket = paths::socket_path();
@@ -416,6 +422,9 @@ fn run() -> Result<(), String> {
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
+        cli::Command::Run { sequence } => execute_command_sequence(&sequence),
+        cli::Command::SourceFile { path } => execute_command_file(&path),
+        cli::Command::RunShell { command } => run_shell_command(&command),
         cli::Command::KillSession { session } => {
             let socket = paths::socket_path();
             require_running_server(&socket)?;
@@ -441,6 +450,197 @@ fn run() -> Result<(), String> {
             require_running_server(&socket)?;
             attach_session(&socket, &session)
         }
+    }
+}
+
+fn execute_command_sequence(sequence: &str) -> Result<(), String> {
+    let commands = cli::parse_command_sequence(sequence).map_err(|err| format!("run: {err}"))?;
+    if commands.is_empty() {
+        return Err("run requires at least one command".to_string());
+    }
+
+    for (index, command) in commands.iter().enumerate() {
+        let context = format!("run command {}", index + 1);
+        execute_script_command(command, &context)?;
+    }
+    Ok(())
+}
+
+fn execute_command_file(path: &str) -> Result<(), String> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|err| format!("source-file {path:?}: {err}"))?;
+    let commands =
+        cli::parse_command_file(&contents).map_err(|err| format!("source-file {path:?}: {err}"))?;
+
+    for entry in commands {
+        let context = format!("source-file {path:?} line {}", entry.line);
+        execute_script_command(&entry.command, &context)?;
+    }
+    Ok(())
+}
+
+fn execute_script_command(command: &cli::ScriptCommand, context: &str) -> Result<(), String> {
+    let name = command
+        .argv
+        .first()
+        .ok_or_else(|| format!("{context}: empty command"))?;
+    let parsed = if name == "run-shell" {
+        let shell_command = script_command_tail(&command.source, name)
+            .ok_or_else(|| format!("{context} ({name}): run-shell requires a shell command"))?;
+        if shell_command.trim().is_empty() {
+            return Err(format!(
+                "{context} ({name}): run-shell requires a shell command"
+            ));
+        }
+        cli::Command::RunShell {
+            command: shell_command.to_string(),
+        }
+    } else {
+        cli::parse_args(std::iter::once("dmux".to_string()).chain(command.argv.iter().cloned()))
+            .map_err(|err| format!("{context} ({name}): {err}"))?
+    };
+
+    if let Some(reason) = script_command_rejection(&parsed) {
+        return Err(format!("{context} ({name}): {reason}"));
+    }
+
+    execute_command(parsed).map_err(|err| format!("{context} ({name}) failed: {err}"))
+}
+
+fn script_command_tail<'a>(source: &'a str, command_name: &str) -> Option<&'a str> {
+    let source = source.trim_start();
+    let tail = source.strip_prefix(command_name)?;
+    if tail.is_empty() {
+        return Some(tail);
+    }
+    if tail.chars().next().is_some_and(char::is_whitespace) {
+        Some(tail.trim_start())
+    } else {
+        None
+    }
+}
+
+fn script_command_rejection(command: &cli::Command) -> Option<&'static str> {
+    match command {
+        cli::Command::OpenDefault => Some("the default attach command is not allowed in scripts"),
+        cli::Command::Server => Some("internal server command is not allowed in scripts"),
+        cli::Command::Attach { .. } => Some("attach is interactive and is not allowed in scripts"),
+        cli::Command::Help { .. } => Some("help is not allowed in scripts"),
+        cli::Command::New { detach: false, .. } => {
+            Some("new would attach interactively; use new -d in scripts")
+        }
+        cli::Command::Run { .. } => Some("nested run is not allowed in scripts"),
+        cli::Command::SourceFile { .. } => Some("nested source-file is not allowed in scripts"),
+        _ => None,
+    }
+}
+
+fn run_shell_command(command: &str) -> Result<(), String> {
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("run-shell failed to start shell: {err}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "run-shell failed to capture stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "run-shell failed to capture stderr".to_string())?;
+    let stdout_reader = std::thread::spawn(move || read_bounded_output(stdout));
+    let stderr_reader = std::thread::spawn(move || read_bounded_output(stderr));
+    let status = child
+        .wait()
+        .map_err(|err| format!("run-shell failed to wait for shell: {err}"))?;
+
+    let stdout = join_bounded_output(stdout_reader, "stdout")?;
+    let stderr = join_bounded_output(stderr_reader, "stderr")?;
+    write_bounded_output(&stdout, true)?;
+    write_bounded_output(&stderr, false)?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "run-shell exited with {}",
+        format_exit_status(status)
+    ))
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_bounded_output<R: std::io::Read>(mut reader: R) -> std::io::Result<BoundedOutput> {
+    let mut bytes = Vec::new();
+    let mut total = 0usize;
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total = total.saturating_add(count);
+        let remaining = MAX_RUN_SHELL_OUTPUT_BYTES.saturating_sub(bytes.len());
+        if remaining > 0 {
+            bytes.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
+    }
+
+    Ok(BoundedOutput {
+        truncated: total > bytes.len(),
+        bytes,
+    })
+}
+
+fn join_bounded_output(
+    reader: std::thread::JoinHandle<std::io::Result<BoundedOutput>>,
+    stream: &str,
+) -> Result<BoundedOutput, String> {
+    reader
+        .join()
+        .map_err(|_| format!("run-shell {stream} reader panicked"))?
+        .map_err(|err| format!("run-shell failed to read {stream}: {err}"))
+}
+
+fn write_bounded_output(output: &BoundedOutput, stdout: bool) -> Result<(), String> {
+    if stdout {
+        std::io::Write::write_all(&mut std::io::stdout(), &output.bytes)
+    } else {
+        std::io::Write::write_all(&mut std::io::stderr(), &output.bytes)
+    }
+    .map_err(|err| err.to_string())?;
+
+    if output.truncated {
+        let message = format!(
+            "\n[dmux: run-shell output truncated after {MAX_RUN_SHELL_OUTPUT_BYTES} bytes]\n"
+        );
+        std::io::Write::write_all(&mut std::io::stderr(), message.as_bytes())
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn format_exit_status(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        format!("status {code}")
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(signal) = status.signal() {
+                return format!("signal {signal}");
+            }
+        }
+        "unknown status".to_string()
     }
 }
 
@@ -613,5 +813,22 @@ mod tests {
             "session already exists; use dmux attach -t other"
         ));
         assert!(!is_duplicate_default_create_error("missing session"));
+    }
+
+    #[test]
+    fn script_command_tail_preserves_shell_quoting() {
+        assert_eq!(
+            script_command_tail("run-shell printf '%s\\n' 'hello world'", "run-shell"),
+            Some("printf '%s\\n' 'hello world'")
+        );
+    }
+
+    #[test]
+    fn bounded_output_reader_retains_cap_while_draining_extra_bytes() {
+        let input = vec![b'x'; MAX_RUN_SHELL_OUTPUT_BYTES + 1024];
+        let output = read_bounded_output(std::io::Cursor::new(input)).unwrap();
+
+        assert_eq!(output.bytes.len(), MAX_RUN_SHELL_OUTPUT_BYTES);
+        assert!(output.truncated);
     }
 }
