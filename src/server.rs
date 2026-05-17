@@ -23,8 +23,6 @@ const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFERS: usize = 50;
 const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 + 4096;
 const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
-const ATTACH_RENDER_TABS_FORMAT: &str = "#{ui.tabs}";
-const ATTACH_RENDER_INFO_FORMAT: &str = "#{ui.info}";
 const ATTACH_RENDER_RESPONSE: &[u8] = b"OK\tRENDER_OUTPUT_META\n";
 const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(16);
 const SYNCHRONIZED_OUTPUT_REDRAW_TIMEOUT: Duration = Duration::from_millis(100);
@@ -43,6 +41,7 @@ type AttachRenderClients = TrackedStreamClients;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientType {
     Raw,
+    Snapshot,
     Event,
     Render,
 }
@@ -51,6 +50,7 @@ impl ClientType {
     fn as_str(self) -> &'static str {
         match self {
             Self::Raw => "raw",
+            Self::Snapshot => "snapshot",
             Self::Event => "event",
             Self::Render => "render",
         }
@@ -757,6 +757,7 @@ impl Session {
     fn mark_pane_exited(self: &Arc<Self>, pane: &Arc<Pane>) {
         let changed = self.windows.lock().unwrap().mark_pane_exited(pane);
         if changed {
+            let _ = self.resize_current_visible_panes();
             self.notify_attach_redraw_immediate();
             self.reconnect_raw_attach_streams();
         }
@@ -945,13 +946,14 @@ impl Session {
         &self,
         stream: &UnixStream,
         client_id: usize,
+        client_type: ClientType,
     ) -> io::Result<StreamRegistration> {
         register_tracked_stream(
             &self.attach_streams,
             &self.next_attach_stream_id,
             stream,
             client_id,
-            ClientType::Raw,
+            client_type,
         )
     }
 
@@ -1042,14 +1044,17 @@ impl Session {
     }
 
     fn close_raw_attach_streams(&self) {
-        shutdown_tracked_clients(&self.attach_streams);
+        shutdown_tracked_clients_by_type(&self.attach_streams, ClientType::Raw);
         for pane in self.panes() {
             shutdown_tracked_clients(&pane.clients);
         }
     }
 
     fn close_attach_streams(&self) {
-        self.close_raw_attach_streams();
+        shutdown_tracked_clients(&self.attach_streams);
+        for pane in self.panes() {
+            shutdown_tracked_clients(&pane.clients);
+        }
         shutdown_tracked_clients(&self.attach_events);
         shutdown_tracked_clients(&self.attach_render_clients);
     }
@@ -1287,6 +1292,10 @@ impl Window {
             return false;
         };
         if self.panes.active_index() == index {
+            if self.panes.len() > 1 {
+                self.remove_pane_at(index);
+                return true;
+            }
             if let Some(live_index) = self.panes.panes.iter().position(|pane| pane.is_running()) {
                 self.panes.select(live_index);
                 if self.zoomed.is_some() {
@@ -2062,12 +2071,29 @@ fn directional_pane_target_from_regions(
     direction: PaneDirection,
 ) -> Option<usize> {
     let active = regions.iter().find(|region| region.pane == active_index)?;
+    if let Some(pane) =
+        directional_pane_target_from_scored_regions(regions, active_index, |region| {
+            directional_pane_score(active, region, direction)
+        })
+    {
+        return Some(pane);
+    }
+
+    let bounds = pane_region_bounds(regions)?;
+    directional_pane_target_from_scored_regions(regions, active_index, |region| {
+        wrapping_directional_pane_score(active, region, direction, bounds)
+    })
+}
+
+fn directional_pane_target_from_scored_regions(
+    regions: &[PaneRegion],
+    active_index: usize,
+    score: impl Fn(&PaneRegion) -> Option<DirectionalPaneScore>,
+) -> Option<usize> {
     regions
         .iter()
         .filter(|region| region.pane != active_index)
-        .filter_map(|region| {
-            directional_pane_score(active, region, direction).map(|score| (region.pane, score))
-        })
+        .filter_map(|region| score(region).map(|score| (region.pane, score)))
         .min_by(|(left_pane, left_score), (right_pane, right_score)| {
             left_score
                 .distance
@@ -2076,6 +2102,12 @@ fn directional_pane_target_from_regions(
                 .then_with(|| left_pane.cmp(right_pane))
         })
         .map(|(pane, _)| pane)
+}
+
+fn pane_region_bounds(regions: &[PaneRegion]) -> Option<(usize, usize)> {
+    let max_col = regions.iter().map(|region| region.col_end).max()?;
+    let max_row = regions.iter().map(|region| region.row_end).max()?;
+    Some((max_col, max_row))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2119,6 +2151,55 @@ fn directional_pane_score(
         ),
         PaneDirection::Down if candidate.row_start >= active.row_end => (
             candidate.row_start - active.row_end,
+            span_overlap(
+                active.col_start,
+                active.col_end,
+                candidate.col_start,
+                candidate.col_end,
+            ),
+        ),
+        _ => return None,
+    };
+
+    (overlap > 0).then_some(DirectionalPaneScore { distance, overlap })
+}
+
+fn wrapping_directional_pane_score(
+    active: &PaneRegion,
+    candidate: &PaneRegion,
+    direction: PaneDirection,
+    (max_col, max_row): (usize, usize),
+) -> Option<DirectionalPaneScore> {
+    let (distance, overlap) = match direction {
+        PaneDirection::Left if candidate.col_start >= active.col_end => (
+            active.col_start + max_col.saturating_sub(candidate.col_end),
+            span_overlap(
+                active.row_start,
+                active.row_end,
+                candidate.row_start,
+                candidate.row_end,
+            ),
+        ),
+        PaneDirection::Right if candidate.col_end <= active.col_start => (
+            max_col.saturating_sub(active.col_end) + candidate.col_start,
+            span_overlap(
+                active.row_start,
+                active.row_end,
+                candidate.row_start,
+                candidate.row_end,
+            ),
+        ),
+        PaneDirection::Up if candidate.row_start >= active.row_end => (
+            active.row_start + max_row.saturating_sub(candidate.row_end),
+            span_overlap(
+                active.col_start,
+                active.col_end,
+                candidate.col_start,
+                candidate.col_end,
+            ),
+        ),
+        PaneDirection::Down if candidate.row_end <= active.row_start => (
+            max_row.saturating_sub(active.row_end) + candidate.row_start,
             span_overlap(
                 active.col_start,
                 active.col_end,
@@ -4610,9 +4691,15 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
 
     let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
     let raw_layout_epoch = session.raw_attach_layout_epoch();
-    let _attach_registration = session.register_attach_stream(&stream, client_id)?;
+    let snapshot_attach = has_attach_pane_snapshot(&session);
+    let attach_type = if snapshot_attach {
+        ClientType::Snapshot
+    } else {
+        ClientType::Raw
+    };
+    let _attach_registration = session.register_attach_stream(&stream, client_id, attach_type)?;
     session.notify_attach_redraw_immediate();
-    let result = if has_attach_pane_snapshot(&session) {
+    let result = if snapshot_attach {
         write_attach_snapshot_ok(&mut stream)?;
         forward_multi_pane_attach_input(&session, &mut stream)
     } else {
@@ -4923,18 +5010,11 @@ fn format_attach_layout_snapshot_body(snapshot: &RenderedAttachSnapshot) -> Vec<
 
 fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
     let context = session.status_context()?;
-    let tabs = format_status_line(ATTACH_RENDER_TABS_FORMAT, &context);
-    let info = format_status_line(ATTACH_RENDER_INFO_FORMAT, &context);
     let message = context.transient_message.as_deref();
     let size = session.active_window_size();
     let width = size.map(|size| usize::from(size.cols));
-    let max_header_rows = size.map(|size| max_attach_render_header_rows(size).min(1));
-    let header_lines = cap_attach_render_header_lines(
-        attach_render_header_lines(&tabs, None, width),
-        max_header_rows,
-        width,
-    );
-    let footer_lines = attach_render_footer_lines(&info, message, width);
+    let header_lines = Vec::new();
+    let footer_lines = attach_render_footer_lines("", message, width);
     let max_footer_rows = size.map(|size| {
         usize::from(size.rows)
             .saturating_sub(header_lines.len())
@@ -5026,11 +5106,13 @@ fn format_attach_render_frame_body_with_ui_lines(
     bytes
 }
 
+#[cfg(test)]
 fn max_attach_render_header_rows(size: PtySize) -> usize {
     let rows = usize::from(size.rows);
     if rows > 1 { rows - 1 } else { rows }
 }
 
+#[cfg(test)]
 fn attach_render_header_lines(
     status: &str,
     message: Option<&str>,
@@ -6060,6 +6142,19 @@ fn shutdown_tracked_clients(clients: &TrackedStreamClients) {
     }
 }
 
+fn shutdown_tracked_clients_by_type(clients: &TrackedStreamClients, client_type: ClientType) {
+    let mut clients = clients.lock().unwrap();
+    let mut keep = Vec::with_capacity(clients.len());
+    for client in clients.drain(..) {
+        if client.client_type == client_type {
+            let _ = client.stream.shutdown(std::net::Shutdown::Both);
+        } else {
+            keep.push(client);
+        }
+    }
+    *clients = keep;
+}
+
 fn detach_all_tracked_clients(clients: &TrackedStreamClients) -> usize {
     let mut clients = clients.lock().unwrap();
     let count = clients.len();
@@ -7003,19 +7098,71 @@ mod tests {
     }
 
     #[test]
-    fn window_directional_select_without_adjacent_preserves_active_pane() {
+    fn directional_target_wraps_at_layout_edges() {
+        let horizontal = vec![
+            PaneRegion {
+                pane: 0,
+                row_start: 0,
+                row_end: 10,
+                col_start: 0,
+                col_end: 10,
+            },
+            PaneRegion {
+                pane: 1,
+                row_start: 0,
+                row_end: 10,
+                col_start: 13,
+                col_end: 20,
+            },
+        ];
+        let vertical = vec![
+            PaneRegion {
+                pane: 0,
+                row_start: 0,
+                row_end: 10,
+                col_start: 0,
+                col_end: 20,
+            },
+            PaneRegion {
+                pane: 1,
+                row_start: 12,
+                row_end: 20,
+                col_start: 0,
+                col_end: 20,
+            },
+        ];
+
+        assert_eq!(
+            directional_pane_target_from_regions(&horizontal, 0, PaneDirection::Left),
+            Some(1)
+        );
+        assert_eq!(
+            directional_pane_target_from_regions(&horizontal, 1, PaneDirection::Right),
+            Some(0)
+        );
+        assert_eq!(
+            directional_pane_target_from_regions(&vertical, 0, PaneDirection::Up),
+            Some(1)
+        );
+        assert_eq!(
+            directional_pane_target_from_regions(&vertical, 1, PaneDirection::Down),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn window_directional_select_wraps_without_adjacent_pane() {
         let (pane0, path0) = test_pane_with_id(0);
         let (pane1, path1) = test_pane_with_id(1);
         let mut window = Window::new(TabId::new(0), "0".to_string(), pane0);
         window.add_pane(SplitDirection::Horizontal, pane1);
         window.select_pane(PaneSelectTarget::Index(0)).unwrap();
 
-        let error = window
-            .select_pane(PaneSelectTarget::Direction(PaneDirection::Up))
-            .unwrap_err();
+        window
+            .select_pane(PaneSelectTarget::Direction(PaneDirection::Left))
+            .unwrap();
 
-        assert_eq!(error, "missing adjacent pane");
-        assert_eq!(window.active_pane_index(), 0);
+        assert_eq!(window.active_pane_index(), 1);
         let _ = std::fs::remove_file(path0);
         let _ = std::fs::remove_file(path1);
     }

@@ -337,11 +337,8 @@ fn read_raw_attach_layout_epoch(socket: &Path, session: &str) -> io::Result<u64>
 }
 
 fn read_attach_status_line(socket: &Path, session: &str) -> io::Result<String> {
-    let body = send_control_request(
-        socket,
-        &protocol::encode_status_line(session, Some("#{ui.tabs}\n#{ui.info}")),
-    )?;
-    Ok(String::from_utf8_lossy(&body).trim_end().to_string())
+    let _ = (socket, session);
+    Ok(String::new())
 }
 
 fn read_attach_layout_snapshot(

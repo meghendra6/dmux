@@ -1507,14 +1507,8 @@ fn select_pane_direction_moves_focus_using_nested_layout_geometry() {
     assert_eq!(active_pane_index_and_id(&socket, &session).0, 1);
 
     assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
-    let failed = dmux(&socket, &["select-pane", "-t", &session, "-U"]);
-    assert!(!failed.status.success());
-    assert!(
-        String::from_utf8_lossy(&failed.stderr).contains("missing adjacent pane"),
-        "stderr:\n{}",
-        String::from_utf8_lossy(&failed.stderr)
-    );
-    assert_eq!(active_pane_index_and_id(&socket, &session).0, 0);
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-U"]));
+    assert_eq!(active_pane_index_and_id(&socket, &session).0, 2);
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -2453,7 +2447,7 @@ fn list_sessions_reports_created_session() {
 fn dmux_without_args_creates_default_and_detaches() {
     let socket = unique_socket("open-default");
 
-    let mut child = spawn_attached_dmux(&socket, &[], &["default", "C-b ? help"]);
+    let mut child = spawn_attached_dmux(&socket, &[], &[]);
 
     let listed = poll_list_sessions(&socket, "default");
     assert!(listed.lines().any(|line| line == "default"), "{listed:?}");
@@ -2639,7 +2633,7 @@ fn interactive_new_default_shell_splits_and_remains_usable_in_real_pty() {
         &["new", "-s", &session],
         80,
         24,
-        &[&session, "C-b ? help"],
+        &["$ "],
         &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
     );
 
@@ -2681,7 +2675,7 @@ fn interactive_split_preserves_unsubmitted_input_in_original_pane() {
         &["new", "-s", &session],
         80,
         24,
-        &[&session, "C-b ? help"],
+        &["$ "],
         &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
     );
 
@@ -2714,7 +2708,7 @@ fn live_snapshot_attach_does_not_spam_idle_full_frame_redraws() {
         &["new", "-s", &session],
         80,
         24,
-        &[&session, "C-b ? help"],
+        &["$ "],
         &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
     );
 
@@ -2748,7 +2742,7 @@ fn live_snapshot_attach_repaints_pane_output_without_repeating_full_clear() {
         &["new", "-s", &session],
         80,
         24,
-        &[&session, "C-b ? help"],
+        &["$ "],
         &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
     );
 
@@ -2791,7 +2785,7 @@ fn live_snapshot_attach_does_not_repaint_stale_frame_before_forwarded_input_echo
         &["new", "-s", &session],
         80,
         24,
-        &[&session, "C-b ? help"],
+        &["$ "],
         &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
     );
 
@@ -2832,7 +2826,7 @@ fn live_snapshot_attach_renders_utf8_output_after_split() {
         &["new", "-s", &session],
         80,
         24,
-        &[&session, "C-b ? help"],
+        &["$ "],
         &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
     );
 
@@ -2863,7 +2857,7 @@ fn live_snapshot_attach_applies_cursor_restore_output_after_split() {
         &["new", "-s", &session],
         80,
         24,
-        &[&session, "C-b ? help"],
+        &["$ "],
         &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
     );
 
@@ -2894,7 +2888,7 @@ fn live_snapshot_attach_uses_alternate_screen_and_restores_on_detach() {
         &["new", "-s", &session],
         80,
         24,
-        &[&session, "C-b ? help"],
+        &["$ "],
         &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
     );
 
@@ -2927,7 +2921,7 @@ fn live_snapshot_frame_output_fits_attach_pty_rows() {
         &["new", "-s", &session],
         80,
         24,
-        &[&session, "C-b ? help"],
+        &["$ "],
         &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
     );
 
@@ -2964,7 +2958,7 @@ fn live_snapshot_attach_repaints_after_resize_with_render_diff_cache() {
         &["new", "-s", &session],
         80,
         24,
-        &[&session, "C-b ? help"],
+        &["$ "],
         &[("SHELL", "/bin/sh"), ("PS1", "$ ")],
     );
 
@@ -2976,10 +2970,7 @@ fn live_snapshot_attach_repaints_after_resize_with_render_diff_cache() {
     child.clear_stdout();
 
     child.resize(100, 30);
-    child.wait_for_stdout_contains_all(
-        &["pane 1", "clients 1", "│"],
-        "resize redraw with diff cache",
-    );
+    child.wait_for_stdout_contains_all(&["│"], "resize redraw with diff cache");
 
     child.clear_stdout();
     child.write_all(b"printf after-resize\\n\r");
@@ -3919,9 +3910,9 @@ fn kill_pane_resizes_remaining_child_pty_to_full_layout_region() {
 }
 
 #[test]
-fn exited_split_pane_stays_inspectable_and_active_moves_to_live_pane() {
-    let socket = unique_socket("split-pane-exit-state");
-    let session = format!("split-pane-exit-state-{}", std::process::id());
+fn active_split_pane_exit_removes_pane_and_keeps_session() {
+    let socket = unique_socket("active-split-pane-exit-removes");
+    let session = format!("active-split-pane-exit-removes-{}", std::process::id());
 
     assert_success(&dmux(
         &socket,
@@ -3964,16 +3955,8 @@ fn exited_split_pane_stays_inspectable_and_active_moves_to_live_pane() {
         &["send-keys", "-t", &session, "close", "Enter"],
     ));
 
-    let panes = poll_list_panes_contains(
-        &socket,
-        &session,
-        "#{pane.index}:#{pane.id}:#{pane.active}:#{pane.state}:#{pane.exit_status}",
-        "1:1:0:exited:0",
-    );
-    assert_eq!(
-        panes.lines().collect::<Vec<_>>(),
-        vec!["0:0:1:running:", "1:1:0:exited:0"]
-    );
+    let panes = poll_pane_count(&socket, &session, 1);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
     let active = poll_active_pane(&socket, &session, 0);
     assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
 
@@ -3981,12 +3964,8 @@ fn exited_split_pane_stays_inspectable_and_active_moves_to_live_pane() {
         &socket,
         &["send-keys", "-t", &session, "after-exit", "Enter"],
     ));
-    let base = poll_capture(&socket, &session, "base-after-exit:24 40");
-    assert!(base.contains("base-after-exit:24 40"), "{base:?}");
-
-    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "1"]));
-    let panes = poll_pane_count(&socket, &session, 1);
-    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
+    let base = poll_capture(&socket, &session, "base-after-exit:24 83");
+    assert!(base.contains("base-after-exit:24 83"), "{base:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -4293,9 +4272,9 @@ fn select_pane_while_zoomed_resizes_new_visible_child_pty_to_full_region() {
 }
 
 #[test]
-fn attach_renders_status_line_snapshot() {
-    let socket = unique_socket("attach-status-line");
-    let session = format!("attach-status-line-{}", std::process::id());
+fn attach_renders_plain_pane_snapshot_without_status_chrome() {
+    let socket = unique_socket("attach-no-status-chrome");
+    let session = format!("attach-no-status-chrome-{}", std::process::id());
 
     assert_success(&dmux(
         &socket,
@@ -4321,12 +4300,15 @@ fn attach_renders_status_line_snapshot() {
         .expect("run attach");
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("tabs: [0:0*]"), "{stdout:?}");
-    assert!(stdout.contains(&format!("session {session}")), "{stdout:?}");
-    assert!(stdout.contains("pane 0"), "{stdout:?}");
-    assert!(stdout.contains("C-b ? help"), "{stdout:?}");
-    assert!(stdout.contains("C-b : command"), "{stdout:?}");
-    assert!(stdout.contains("Alt-arrows focus"), "{stdout:?}");
+    assert!(stdout.contains("ready"), "{stdout:?}");
+    assert!(!stdout.contains("tabs:"), "{stdout:?}");
+    assert!(
+        !stdout.contains(&format!("session {session}")),
+        "{stdout:?}"
+    );
+    assert!(!stdout.contains("C-b ? help"), "{stdout:?}");
+    assert!(!stdout.contains("C-b : command"), "{stdout:?}");
+    assert!(!stdout.contains("Alt-arrows focus"), "{stdout:?}");
 
     let captured = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
     assert_success(&captured);
@@ -4739,7 +4721,7 @@ fn active_attach_redraws_when_pane_process_exits() {
         "0:exited:0",
     );
     assert_eq!(panes.trim_end(), "0:exited:0");
-    child.wait_for_stdout_contains_all(&["pane 0"], "raw attach redraw after pane process exit");
+    child.assert_running("raw attach after pane process exit");
     {
         let stdin = child.stdin_mut("attach stdin");
         stdin.write_all(b"\x02d").expect("write detach input");
@@ -4999,7 +4981,7 @@ fn attach_prefix_percent_applies_coalesced_raw_focus_after_split() {
 }
 
 #[test]
-fn active_live_attach_exits_when_remaining_pane_process_exits_after_collapse() {
+fn active_live_attach_stays_open_when_remaining_pane_process_exits_after_collapse() {
     let socket = unique_socket("active-live-attach-pane-exit-after-collapse");
     let session = format!(
         "active-live-attach-pane-exit-after-collapse-{}",
@@ -5054,10 +5036,20 @@ fn active_live_attach_exits_when_remaining_pane_process_exits_after_collapse() {
         "{remaining:?}"
     );
 
-    let output = assert_child_exits_within(
-        child,
-        "live attach after remaining pane process exits after collapse",
+    let panes = poll_list_panes_contains(
+        &socket,
+        &session,
+        "#{pane.index}:#{pane.state}:#{pane.exit_status}",
+        "0:exited:0",
     );
+    assert_eq!(panes.trim_end(), "0:exited:0");
+    child.assert_running("live attach after remaining pane process exits after collapse");
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
     assert_success(&output);
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
@@ -5984,6 +5976,72 @@ fn attach_prefix_x_closes_active_pane_and_reports_last_pane_error() {
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_ctrl_d_closes_active_terminal_pane_without_detaching_session() {
+    let socket = unique_socket("attach-ctrl-d-closes-pane");
+    let session = format!("attach-ctrl-d-closes-pane-{}", std::process::id());
+    let base_file = unique_temp_file("attach-ctrl-d-base");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; cat",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["base-ready", "split-ready"]);
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x04").expect("write ctrl-d");
+        stdin.flush().expect("flush ctrl-d");
+    }
+    let panes = poll_pane_count(&socket, &session, 1);
+    assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0"]);
+    child.assert_running("attach after ctrl-d pane close");
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"base-after-ctrl-d\n\x02d")
+            .expect("write remaining pane input and detach");
+        stdin.flush().expect("flush remaining pane input");
+    }
+    assert!(poll_file_contains(&base_file, "base-after-ctrl-d"));
+
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(base_file);
 }
 
 #[test]
@@ -7057,7 +7115,7 @@ fn attach_render_stream_sends_initial_terminal_output_frame() {
     let output = String::from_utf8_lossy(&attach_render_output_from_frame_body(&body)).to_string();
 
     assert!(
-        body_text.starts_with("HEADER_ROWS\t1\nREGIONS\t"),
+        body_text.starts_with("HEADER_ROWS\t0\nREGIONS\t"),
         "{body_text:?}"
     );
     assert!(body_text.contains("\nREGION\t"), "{body_text:?}");
@@ -7067,9 +7125,9 @@ fn attach_render_stream_sends_initial_terminal_output_frame() {
     assert!(output.contains("\x1b[?25h"), "{output:?}");
     assert!(!body_text.contains("STATUS\t"), "{body_text:?}");
     assert!(!body_text.contains("\nSNAPSHOT\t"), "{body_text:?}");
-    assert!(output.contains("pane 1"), "{output:?}");
-    assert!(output.contains("clients 0"), "{output:?}");
-    assert!(output.contains("buffers 0"), "{output:?}");
+    assert!(!output.contains("pane 1"), "{output:?}");
+    assert!(!output.contains("clients 0"), "{output:?}");
+    assert!(!output.contains("buffers 0"), "{output:?}");
     assert!(output.contains("base-ready"), "{output:?}");
     assert!(output.contains("split-ready"), "{output:?}");
 
@@ -11354,13 +11412,11 @@ fn attach_render_status_updates_for_client_count_and_messages() {
 
     let mut render = attach_render_stream(&socket, &session);
     assert_eq!(read_socket_line(&mut render), "OK\tRENDER_OUTPUT_META\n");
-    let initial = read_attach_render_frame_body_until_contains(&mut render, "clients 0");
+    let initial = read_attach_render_frame_body_until_contains(&mut render, "base-ready");
     assert!(initial.contains("base-ready") || initial.contains("split-ready"));
 
-    let mut child = spawn_attached_to_session(&socket, &session, &["clients 1"]);
-    let _updated = read_attach_render_frame_body_until_contains(&mut render, "clients 1");
+    let mut child = spawn_attached_to_session(&socket, &session, &["base-ready", "split-ready"]);
     save_buffer_text(&socket, &session, "render-buffer", "#{pane.index}\n");
-    let _buffer_update = read_attach_render_frame_body_until_contains(&mut render, "buffers 1");
 
     let message = dmux(
         &socket,
@@ -11385,7 +11441,6 @@ fn attach_render_status_updates_for_client_count_and_messages() {
         .expect("write detach input");
     let output = wait_for_child_exit(child);
     assert_success(&output);
-    let _detached = read_attach_render_frame_body_until_contains(&mut render, "clients 0");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
