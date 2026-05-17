@@ -558,6 +558,47 @@ fn run_shell_in_run_preserves_single_quoted_backslash() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "\\\n");
 }
 
+#[test]
+fn set_option_prefix_moves_and_unbinds_send_prefix_binding() {
+    let socket = unique_socket("prefix-send-binding");
+    let session = format!("prefix-send-binding-{}", std::process::id());
+
+    assert_success(&dmux(&socket, &["new", "-d", "-s", &session]));
+
+    let before = dmux(&socket, &["list-keys", "-F", "#{key}=#{command}"]);
+    assert_success(&before);
+    let before = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        before.lines().any(|line| line == "C-b=send-prefix"),
+        "{before}"
+    );
+
+    assert_success(&dmux(&socket, &["set-option", "prefix", "C-a"]));
+    let after = dmux(&socket, &["list-keys", "-F", "#{key}=#{command}"]);
+    assert_success(&after);
+    let after = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        after.lines().any(|line| line == "C-a=send-prefix"),
+        "{after}"
+    );
+    assert!(
+        !after.lines().any(|line| line == "C-b=send-prefix"),
+        "{after}"
+    );
+
+    assert_success(&dmux(&socket, &["unbind-key", "C-a"]));
+    let unbound = dmux(&socket, &["list-keys", "-F", "#{key}=#{command}"]);
+    assert_success(&unbound);
+    let unbound = String::from_utf8_lossy(&unbound.stdout);
+    assert!(
+        !unbound.lines().any(|line| line == "C-a=send-prefix"),
+        "{unbound}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
 fn read_attach_render_output_until_contains(stream: &mut UnixStream, needle: &str) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut last = String::new();
@@ -4788,6 +4829,56 @@ fn attach_prefix_percent_preserves_coalesced_input_after_raw_split() {
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_command_prompt_preserves_trailing_input_after_error() {
+    let socket = unique_socket("attach-prompt-error-tail");
+    let session = format!("attach-prompt-error-tail-{}", std::process::id());
+    let file = unique_temp_file("attach-prompt-error-tail");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["base-ready"]);
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"\x02:no-such-command\nraw-after-error\n")
+            .expect("write failed command and trailing input");
+        stdin
+            .flush()
+            .expect("flush failed command and trailing input");
+    }
+
+    assert!(poll_file_contains(&file, "raw-after-error"));
+    child.assert_running("attach after failed prompt command");
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(file);
 }
 
 #[test]

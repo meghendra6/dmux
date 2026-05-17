@@ -164,6 +164,23 @@ pub enum Command {
         session: String,
         format: String,
     },
+    ListKeys {
+        format: Option<String>,
+    },
+    BindKey {
+        key: String,
+        command: String,
+    },
+    UnbindKey {
+        key: String,
+    },
+    ShowOptions {
+        format: Option<String>,
+    },
+    SetOption {
+        name: String,
+        value: String,
+    },
     Run {
         sequence: String,
     },
@@ -259,6 +276,11 @@ where
         "zoom-pane" => parse_zoom_pane(args),
         "status-line" => parse_status_line(args),
         "display-message" => parse_display_message(args),
+        "list-keys" => parse_list_keys(args),
+        "bind-key" => parse_bind_key(args),
+        "unbind-key" => parse_unbind_key(args),
+        "show-options" => parse_show_options(args),
+        "set-option" | "set" => parse_set_option(args),
         "run" | "command" => parse_run(args),
         "source-file" => parse_source_file(args),
         "run-shell" => parse_run_shell(args),
@@ -519,6 +541,11 @@ Commands:\n\
   run <command; command...>              run dmux commands in order; stops on first error\n\
   source-file <path>                     run newline-separated dmux commands from a file\n\
   run-shell <shell-command>              run a host shell command and report its status\n\
+  list-keys [-F <format>]                list runtime prefix key bindings\n\
+  bind-key <key> <action>                bind prefix key to a supported live action\n\
+  unbind-key <key>                       remove a prefix binding\n\
+  show-options [-F <format>]             list runtime server options\n\
+  set-option <name> <value>              set runtime server option\n\
   kill-session -t <name>\n\
   kill-server\n\
 \n\
@@ -551,6 +578,7 @@ Copy:\n\
 Prompt:\n\
   C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
   Prompt accepts semicolon-separated commands; source-file reads prompt commands.\n\
+  Key bindings and options are runtime/server-scoped; use list-keys/show-options to inspect.\n\
 Prompt examples:\n\
   :split -h               :split -v               :rename-window api\n\
   :layout tiled           :swap-pane 1            :break-pane\n\
@@ -576,6 +604,7 @@ Copy:\n\
 Prompt:\n\
   C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
   Prompt accepts semicolon-separated commands; source-file reads prompt commands.\n\
+  Key bindings and options are runtime/server-scoped; use list-keys/show-options to inspect.\n\
 Prompt examples:\n\
   :split -h               :split -v               :rename-window api\n\
   :layout tiled           :swap-pane 1            :break-pane\n\
@@ -1094,6 +1123,66 @@ fn parse_run_shell(args: Vec<String>) -> Result<Command, String> {
         return Err("run-shell requires a shell command".to_string());
     }
     Ok(Command::RunShell { command })
+}
+
+fn parse_list_keys(args: Vec<String>) -> Result<Command, String> {
+    parse_optional_format(args, "list-keys").map(|format| Command::ListKeys { format })
+}
+
+fn parse_bind_key(args: Vec<String>) -> Result<Command, String> {
+    let [key, command @ ..] = args.as_slice() else {
+        return Err("bind-key requires a key and command".to_string());
+    };
+    let key = crate::config::canonical_key(key)?;
+    let command = crate::config::validate_binding_command(&command.join(" "))?;
+    Ok(Command::BindKey { key, command })
+}
+
+fn parse_unbind_key(args: Vec<String>) -> Result<Command, String> {
+    match args.as_slice() {
+        [key] => Ok(Command::UnbindKey {
+            key: crate::config::canonical_key(key)?,
+        }),
+        [] => Err("unbind-key requires a key".to_string()),
+        _ => Err("unbind-key accepts exactly one key".to_string()),
+    }
+}
+
+fn parse_show_options(args: Vec<String>) -> Result<Command, String> {
+    parse_optional_format(args, "show-options").map(|format| Command::ShowOptions { format })
+}
+
+fn parse_set_option(args: Vec<String>) -> Result<Command, String> {
+    match args.as_slice() {
+        [name, value] => Ok(Command::SetOption {
+            name: name.clone(),
+            value: crate::config::validate_option_value(name, value)?,
+        }),
+        [] | [_] => Err("set-option requires an option name and value".to_string()),
+        _ => Err("set-option accepts exactly an option name and value".to_string()),
+    }
+}
+
+fn parse_optional_format(args: Vec<String>, command_name: &str) -> Result<Option<String>, String> {
+    let mut format = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-F" | "--format" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command_name} requires a format after {}", args[i]))?;
+                format = Some(value.clone());
+                i += 2;
+            }
+            value => {
+                return Err(format!(
+                    "{command_name} does not support argument {value:?}"
+                ));
+            }
+        }
+    }
+    Ok(format)
 }
 
 fn parse_resize_pane(args: Vec<String>) -> Result<Command, String> {
@@ -2319,6 +2408,49 @@ mod tests {
                 command: "printf ok".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn parses_key_binding_and_option_commands() {
+        assert_eq!(
+            parse_args(["dmux", "list-keys", "-F", "#{key}=#{command}"]).unwrap(),
+            Command::ListKeys {
+                format: Some("#{key}=#{command}".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "bind-key", "C-a", "copy-mode"]).unwrap(),
+            Command::BindKey {
+                key: "C-a".to_string(),
+                command: "copy-mode".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "unbind-key", "x"]).unwrap(),
+            Command::UnbindKey {
+                key: "x".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "show-options"]).unwrap(),
+            Command::ShowOptions { format: None }
+        );
+        assert_eq!(
+            parse_args(["dmux", "set-option", "prefix", "C-a"]).unwrap(),
+            Command::SetOption {
+                name: "prefix".to_string(),
+                value: "C-a".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_binding_and_option_values() {
+        let err = parse_args(["dmux", "bind-key", "x", "run-shell", "date"]).unwrap_err();
+        assert!(err.contains("unsupported binding command"), "{err}");
+
+        let err = parse_args(["dmux", "set-option", "prefix", "bad-key"]).unwrap_err();
+        assert!(err.contains("invalid key"), "{err}");
     }
 
     #[test]

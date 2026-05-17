@@ -1048,12 +1048,17 @@ enum AttachInputAction {
     PaneCommand(PaneCommand),
     CommandPromptStart,
     CommandPromptUpdate(String),
-    CommandPromptDispatch(String),
+    CommandPromptDispatch {
+        command: String,
+        trailing_input: Vec<u8>,
+    },
     CommandPromptCancel,
     SelectNextPane,
     ShowPaneNumbers,
     SelectPane(usize),
-    EnterCopyMode { initial_input: Vec<u8> },
+    EnterCopyMode {
+        initial_input: Vec<u8>,
+    },
     ShowHelp,
     Detach,
 }
@@ -1065,14 +1070,19 @@ enum LiveSnapshotInputAction {
     PaneCommand(PaneCommand),
     CommandPromptStart,
     CommandPromptUpdate(String),
-    CommandPromptDispatch(String),
+    CommandPromptDispatch {
+        command: String,
+        trailing_input: Vec<u8>,
+    },
     CommandPromptCancel,
     Detach,
     SelectNextPane,
     ShowPaneNumbers,
     ShowHelp,
     SelectPane(usize),
-    EnterCopyMode { initial_input: Vec<u8> },
+    EnterCopyMode {
+        initial_input: Vec<u8>,
+    },
 }
 
 #[derive(Default)]
@@ -1091,6 +1101,88 @@ struct RawAttachInputState {
     command_prompt: Option<Vec<u8>>,
     mouse_pending: Vec<u8>,
     prompt_pending_since: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveControls {
+    prefix: u8,
+    bindings: Vec<(u8, LiveKeyAction)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveKeyAction {
+    SendPrefix,
+    Detach,
+    CopyMode,
+    SelectNextPane,
+    ShowPaneNumbers,
+    ShowHelp,
+    CommandPrompt,
+    PaneCommand(PaneCommand),
+}
+
+impl Default for LiveControls {
+    fn default() -> Self {
+        Self::from_entries(
+            crate::config::DEFAULT_PREFIX_KEY,
+            crate::config::default_key_bindings(),
+        )
+    }
+}
+
+impl LiveControls {
+    fn from_entries(prefix: &str, bindings: Vec<protocol::KeyBinding>) -> Self {
+        let prefix = crate::config::key_name_to_byte(prefix).unwrap_or(0x02);
+        let bindings = bindings
+            .into_iter()
+            .filter_map(|binding| {
+                let key = crate::config::key_name_to_byte(&binding.key).ok()?;
+                let action = live_key_action(&binding.command)?;
+                Some((key, action))
+            })
+            .collect();
+        Self { prefix, bindings }
+    }
+
+    fn action_for_key(&self, key: u8) -> Option<LiveKeyAction> {
+        self.bindings
+            .iter()
+            .find_map(|(binding_key, action)| (*binding_key == key).then_some(*action))
+    }
+
+    fn key_for_action(&self, target: LiveKeyAction) -> Option<u8> {
+        self.bindings
+            .iter()
+            .find_map(|(key, action)| (*action == target).then_some(*key))
+    }
+}
+
+fn live_key_action(command: &str) -> Option<LiveKeyAction> {
+    match command {
+        "send-prefix" => Some(LiveKeyAction::SendPrefix),
+        "detach-client" => Some(LiveKeyAction::Detach),
+        "copy-mode" => Some(LiveKeyAction::CopyMode),
+        "next-pane" => Some(LiveKeyAction::SelectNextPane),
+        "display-panes" => Some(LiveKeyAction::ShowPaneNumbers),
+        "show-help" => Some(LiveKeyAction::ShowHelp),
+        "command-prompt" => Some(LiveKeyAction::CommandPrompt),
+        "new-window" => Some(LiveKeyAction::PaneCommand(PaneCommand::NewWindow)),
+        "next-window" => Some(LiveKeyAction::PaneCommand(PaneCommand::NextWindow)),
+        "previous-window" => Some(LiveKeyAction::PaneCommand(PaneCommand::PreviousWindow)),
+        "split-window -h" => Some(LiveKeyAction::PaneCommand(PaneCommand::SplitRight)),
+        "split-window -v" => Some(LiveKeyAction::PaneCommand(PaneCommand::SplitDown)),
+        "select-pane -L" => Some(LiveKeyAction::PaneCommand(PaneCommand::FocusLeft)),
+        "select-pane -D" => Some(LiveKeyAction::PaneCommand(PaneCommand::FocusDown)),
+        "select-pane -U" => Some(LiveKeyAction::PaneCommand(PaneCommand::FocusUp)),
+        "select-pane -R" => Some(LiveKeyAction::PaneCommand(PaneCommand::FocusRight)),
+        "resize-pane -L" => Some(LiveKeyAction::PaneCommand(PaneCommand::ResizeLeft)),
+        "resize-pane -D" => Some(LiveKeyAction::PaneCommand(PaneCommand::ResizeDown)),
+        "resize-pane -U" => Some(LiveKeyAction::PaneCommand(PaneCommand::ResizeUp)),
+        "resize-pane -R" => Some(LiveKeyAction::PaneCommand(PaneCommand::ResizeRight)),
+        "kill-pane" => Some(LiveKeyAction::PaneCommand(PaneCommand::Close)),
+        "zoom-pane" => Some(LiveKeyAction::PaneCommand(PaneCommand::ToggleZoom)),
+        _ => None,
+    }
 }
 
 impl RawAttachInputState {
@@ -1154,9 +1246,18 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> Vec<AttachInpu
     actions
 }
 
+#[cfg(test)]
 fn translate_attach_input_with_state(
     input: &[u8],
     state: &mut RawAttachInputState,
+) -> Vec<AttachInputAction> {
+    translate_attach_input_with_state_with_controls(input, state, &LiveControls::default())
+}
+
+fn translate_attach_input_with_state_with_controls(
+    input: &[u8],
+    state: &mut RawAttachInputState,
+    controls: &LiveControls,
 ) -> Vec<AttachInputAction> {
     let mut bytes = Vec::new();
     if !state.mouse_pending.is_empty() {
@@ -1201,7 +1302,11 @@ fn translate_attach_input_with_state(
                     if command.is_empty() {
                         actions.push(AttachInputAction::CommandPromptCancel);
                     } else {
-                        actions.push(AttachInputAction::CommandPromptDispatch(command));
+                        actions.push(AttachInputAction::CommandPromptDispatch {
+                            command,
+                            trailing_input: bytes[offset + 1..].to_vec(),
+                        });
+                        break;
                     }
                 }
                 0x03 | 0x1b => {
@@ -1234,7 +1339,7 @@ fn translate_attach_input_with_state(
                 offset += 1;
                 continue;
             }
-            if byte == 0x02 {
+            if byte == controls.prefix {
                 state.saw_prefix = true;
                 offset += 1;
                 continue;
@@ -1246,187 +1351,49 @@ fn translate_attach_input_with_state(
 
         if state.saw_prefix {
             state.saw_prefix = false;
-            match byte {
-                b'd' | b'D' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+            if let Some(action) = controls.action_for_key(byte) {
+                if !output.is_empty() {
+                    actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                }
+                match action {
+                    LiveKeyAction::SendPrefix => output.push(controls.prefix),
+                    LiveKeyAction::Detach => {
+                        actions.push(AttachInputAction::Detach);
+                        return actions;
                     }
-                    actions.push(AttachInputAction::Detach);
-                    return actions;
-                }
-                b'[' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    LiveKeyAction::CopyMode => {
+                        actions.push(AttachInputAction::EnterCopyMode {
+                            initial_input: bytes[offset + 1..].to_vec(),
+                        });
+                        return actions;
                     }
-                    actions.push(AttachInputAction::EnterCopyMode {
-                        initial_input: bytes[offset + 1..].to_vec(),
-                    });
-                    return actions;
-                }
-                b'o' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    LiveKeyAction::SelectNextPane => {
+                        actions.push(AttachInputAction::SelectNextPane)
                     }
-                    actions.push(AttachInputAction::SelectNextPane);
-                    offset += 1;
-                    continue;
-                }
-                b'q' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    LiveKeyAction::ShowPaneNumbers => {
+                        state.selecting_pane = true;
+                        actions.push(AttachInputAction::ShowPaneNumbers);
                     }
-                    state.selecting_pane = true;
-                    actions.push(AttachInputAction::ShowPaneNumbers);
-                    offset += 1;
-                    continue;
-                }
-                b'?' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    LiveKeyAction::ShowHelp => actions.push(AttachInputAction::ShowHelp),
+                    LiveKeyAction::CommandPrompt => {
+                        state.command_prompt = Some(Vec::new());
+                        actions.push(AttachInputAction::CommandPromptStart);
                     }
-                    actions.push(AttachInputAction::ShowHelp);
-                    offset += 1;
-                    continue;
-                }
-                b':' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    LiveKeyAction::PaneCommand(command) => {
+                        actions.push(AttachInputAction::PaneCommand(command));
                     }
-                    state.command_prompt = Some(Vec::new());
-                    actions.push(AttachInputAction::CommandPromptStart);
-                    offset += 1;
-                    continue;
                 }
-                b'%' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::SplitRight));
-                    offset += 1;
-                    continue;
-                }
-                b'c' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::NewWindow));
-                    offset += 1;
-                    continue;
-                }
-                b'n' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::NextWindow));
-                    offset += 1;
-                    continue;
-                }
-                b'p' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::PreviousWindow));
-                    offset += 1;
-                    continue;
-                }
-                b'"' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::SplitDown));
-                    offset += 1;
-                    continue;
-                }
-                b'h' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusLeft));
-                    offset += 1;
-                    continue;
-                }
-                b'j' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusDown));
-                    offset += 1;
-                    continue;
-                }
-                b'k' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusUp));
-                    offset += 1;
-                    continue;
-                }
-                b'l' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusRight));
-                    offset += 1;
-                    continue;
-                }
-                b'H' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeLeft));
-                    offset += 1;
-                    continue;
-                }
-                b'J' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeDown));
-                    offset += 1;
-                    continue;
-                }
-                b'K' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeUp));
-                    offset += 1;
-                    continue;
-                }
-                b'L' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeRight));
-                    offset += 1;
-                    continue;
-                }
-                b'x' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::Close));
-                    offset += 1;
-                    continue;
-                }
-                b'z' => {
-                    if !output.is_empty() {
-                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
-                    }
-                    actions.push(AttachInputAction::PaneCommand(PaneCommand::ToggleZoom));
-                    offset += 1;
-                    continue;
-                }
-                0x02 => {
-                    output.push(0x02);
-                    offset += 1;
-                    continue;
-                }
-                _ => output.push(0x02),
+                offset += 1;
+                continue;
+            } else {
+                output.push(controls.prefix);
+                output.push(byte);
+                offset += 1;
+                continue;
             }
         }
 
-        if byte == 0x02 {
+        if byte == controls.prefix {
             state.saw_prefix = true;
         } else {
             output.push(byte);
@@ -1448,10 +1415,25 @@ fn translate_live_snapshot_input(
     translate_live_snapshot_input_with_mouse(input, state, true)
 }
 
+#[cfg(test)]
 fn translate_live_snapshot_input_with_mouse(
     input: &[u8],
     state: &mut LiveSnapshotInputState,
     mouse_focus_enabled: bool,
+) -> Vec<LiveSnapshotInputAction> {
+    translate_live_snapshot_input_with_mouse_and_controls(
+        input,
+        state,
+        mouse_focus_enabled,
+        &LiveControls::default(),
+    )
+}
+
+fn translate_live_snapshot_input_with_mouse_and_controls(
+    input: &[u8],
+    state: &mut LiveSnapshotInputState,
+    mouse_focus_enabled: bool,
+    controls: &LiveControls,
 ) -> Vec<LiveSnapshotInputAction> {
     let mut bytes = Vec::new();
     if !state.mouse_pending.is_empty() {
@@ -1495,7 +1477,11 @@ fn translate_live_snapshot_input_with_mouse(
                     if command.is_empty() {
                         actions.push(LiveSnapshotInputAction::CommandPromptCancel);
                     } else {
-                        actions.push(LiveSnapshotInputAction::CommandPromptDispatch(command));
+                        actions.push(LiveSnapshotInputAction::CommandPromptDispatch {
+                            command,
+                            trailing_input: bytes[offset + 1..].to_vec(),
+                        });
+                        break;
                     }
                 }
                 0x03 | 0x1b => {
@@ -1563,7 +1549,7 @@ fn translate_live_snapshot_input_with_mouse(
                 offset += 1;
                 continue;
             }
-            if byte == 0x02 {
+            if byte == controls.prefix {
                 state.saw_prefix = true;
                 offset += 1;
                 continue;
@@ -1575,250 +1561,51 @@ fn translate_live_snapshot_input_with_mouse(
 
         if state.saw_prefix {
             state.saw_prefix = false;
-            match byte {
-                b'd' | b'D' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
+            if let Some(action) = controls.action_for_key(byte) {
+                if !output.is_empty() {
+                    actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                        &mut output,
+                    )));
+                }
+                match action {
+                    LiveKeyAction::SendPrefix => output.push(controls.prefix),
+                    LiveKeyAction::Detach => {
+                        actions.push(LiveSnapshotInputAction::Detach);
+                        return actions;
                     }
-                    actions.push(LiveSnapshotInputAction::Detach);
-                    return actions;
-                }
-                b'o' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
+                    LiveKeyAction::CopyMode => {
+                        actions.push(LiveSnapshotInputAction::EnterCopyMode {
+                            initial_input: bytes[offset + 1..].to_vec(),
+                        });
+                        return actions;
                     }
-                    actions.push(LiveSnapshotInputAction::SelectNextPane);
-                    offset += 1;
-                    continue;
-                }
-                b'q' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
+                    LiveKeyAction::SelectNextPane => {
+                        actions.push(LiveSnapshotInputAction::SelectNextPane)
                     }
-                    state.selecting_pane = true;
-                    actions.push(LiveSnapshotInputAction::ShowPaneNumbers);
-                    offset += 1;
-                    continue;
-                }
-                b'?' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
+                    LiveKeyAction::ShowPaneNumbers => {
+                        state.selecting_pane = true;
+                        actions.push(LiveSnapshotInputAction::ShowPaneNumbers);
                     }
-                    actions.push(LiveSnapshotInputAction::ShowHelp);
-                    offset += 1;
-                    continue;
-                }
-                b':' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
+                    LiveKeyAction::ShowHelp => actions.push(LiveSnapshotInputAction::ShowHelp),
+                    LiveKeyAction::CommandPrompt => {
+                        state.command_prompt = Some(Vec::new());
+                        actions.push(LiveSnapshotInputAction::CommandPromptStart);
                     }
-                    state.command_prompt = Some(Vec::new());
-                    actions.push(LiveSnapshotInputAction::CommandPromptStart);
-                    offset += 1;
-                    continue;
-                }
-                b'[' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
+                    LiveKeyAction::PaneCommand(command) => {
+                        actions.push(LiveSnapshotInputAction::PaneCommand(command));
                     }
-                    actions.push(LiveSnapshotInputAction::EnterCopyMode {
-                        initial_input: bytes[offset + 1..].to_vec(),
-                    });
-                    return actions;
                 }
-                b'%' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(
-                        PaneCommand::SplitRight,
-                    ));
-                    offset += 1;
-                    continue;
-                }
-                b'c' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::NewWindow));
-                    offset += 1;
-                    continue;
-                }
-                b'n' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(
-                        PaneCommand::NextWindow,
-                    ));
-                    offset += 1;
-                    continue;
-                }
-                b'p' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(
-                        PaneCommand::PreviousWindow,
-                    ));
-                    offset += 1;
-                    continue;
-                }
-                b'"' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::SplitDown));
-                    offset += 1;
-                    continue;
-                }
-                b'h' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::FocusLeft));
-                    offset += 1;
-                    continue;
-                }
-                b'j' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::FocusDown));
-                    offset += 1;
-                    continue;
-                }
-                b'k' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::FocusUp));
-                    offset += 1;
-                    continue;
-                }
-                b'l' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(
-                        PaneCommand::FocusRight,
-                    ));
-                    offset += 1;
-                    continue;
-                }
-                b'H' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(
-                        PaneCommand::ResizeLeft,
-                    ));
-                    offset += 1;
-                    continue;
-                }
-                b'J' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(
-                        PaneCommand::ResizeDown,
-                    ));
-                    offset += 1;
-                    continue;
-                }
-                b'K' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::ResizeUp));
-                    offset += 1;
-                    continue;
-                }
-                b'L' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(
-                        PaneCommand::ResizeRight,
-                    ));
-                    offset += 1;
-                    continue;
-                }
-                b'x' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(PaneCommand::Close));
-                    offset += 1;
-                    continue;
-                }
-                b'z' => {
-                    if !output.is_empty() {
-                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                            &mut output,
-                        )));
-                    }
-                    actions.push(LiveSnapshotInputAction::PaneCommand(
-                        PaneCommand::ToggleZoom,
-                    ));
-                    offset += 1;
-                    continue;
-                }
-                0x02 => {
-                    output.push(0x02);
-                    offset += 1;
-                    continue;
-                }
-                _ => {
-                    output.push(0x02);
-                    output.push(byte);
-                    offset += 1;
-                    continue;
-                }
+                offset += 1;
+                continue;
+            } else {
+                output.push(controls.prefix);
+                output.push(byte);
+                offset += 1;
+                continue;
             }
         }
 
-        if byte == 0x02 {
+        if byte == controls.prefix {
             state.saw_prefix = true;
         } else {
             output.push(byte);
@@ -1838,11 +1625,19 @@ fn clear_live_snapshot_command_state(state: &mut LiveSnapshotInputState) {
     state.command_prompt = None;
 }
 
+#[cfg(test)]
 fn finish_live_snapshot_input(state: &mut LiveSnapshotInputState) -> Option<Vec<u8>> {
+    finish_live_snapshot_input_with_controls(state, &LiveControls::default())
+}
+
+fn finish_live_snapshot_input_with_controls(
+    state: &mut LiveSnapshotInputState,
+    controls: &LiveControls,
+) -> Option<Vec<u8>> {
     let mut output = Vec::new();
     if state.saw_prefix {
         state.saw_prefix = false;
-        output.push(0x02);
+        output.push(controls.prefix);
     }
     state.selecting_pane = false;
     if state.command_prompt.is_some() {
@@ -1922,7 +1717,10 @@ enum LiveSnapshotInputEvent {
     PaneCommand(PaneCommand),
     CommandPromptStart,
     CommandPromptUpdate(String),
-    CommandPromptDispatch(String),
+    CommandPromptDispatch {
+        command: String,
+        dispatch_done: mpsc::Sender<()>,
+    },
     CommandPromptCancel,
     SelectNextPane,
     ShowPaneNumbers,
@@ -1972,17 +1770,23 @@ fn spawn_live_snapshot_input_thread(
         let mut stdin = io::stdin().lock();
         let mut buf = [0_u8; 1024];
         let mut input_state = LiveSnapshotInputState::default();
+        let mut controls = load_live_controls(&socket);
         let mouse_enabled = mouse_focus_enabled.load(Ordering::SeqCst);
+        let actions = translate_live_snapshot_input_with_mouse_and_controls(
+            &initial_input,
+            &mut input_state,
+            mouse_enabled,
+            &controls,
+        );
         if !send_live_snapshot_input_actions(
             &socket,
             &session,
             &sender,
             &mut stdin,
-            translate_live_snapshot_input_with_mouse(
-                &initial_input,
-                &mut input_state,
-                mouse_enabled,
-            ),
+            &mut input_state,
+            &mouse_focus_enabled,
+            &mut controls,
+            actions,
         ) {
             return;
         }
@@ -1994,6 +1798,9 @@ fn spawn_live_snapshot_input_thread(
                     &session,
                     &sender,
                     &mut stdin,
+                    &mut input_state,
+                    &mouse_focus_enabled,
+                    &mut controls,
                     vec![action],
                 ) {
                     return;
@@ -2009,7 +1816,9 @@ fn spawn_live_snapshot_input_thread(
             };
             let n = match read_result {
                 Ok(0) => {
-                    if let Some(bytes) = finish_live_snapshot_input(&mut input_state) {
+                    if let Some(bytes) =
+                        finish_live_snapshot_input_with_controls(&mut input_state, &controls)
+                    {
                         let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
                     }
                     let _ = sender.send(LiveSnapshotInputEvent::Eof);
@@ -2026,17 +1835,23 @@ fn spawn_live_snapshot_input_thread(
                 }
             };
 
+            controls = load_live_controls(&socket);
             let mouse_enabled = mouse_focus_enabled.load(Ordering::SeqCst);
+            let actions = translate_live_snapshot_input_with_mouse_and_controls(
+                &buf[..n],
+                &mut input_state,
+                mouse_enabled,
+                &controls,
+            );
             if !send_live_snapshot_input_actions(
                 &socket,
                 &session,
                 &sender,
                 &mut stdin,
-                translate_live_snapshot_input_with_mouse(
-                    &buf[..n],
-                    &mut input_state,
-                    mouse_enabled,
-                ),
+                &mut input_state,
+                &mouse_focus_enabled,
+                &mut controls,
+                actions,
             ) {
                 return;
             }
@@ -2049,6 +1864,9 @@ fn send_live_snapshot_input_actions<R: Read>(
     session: &str,
     sender: &mpsc::Sender<LiveSnapshotInputEvent>,
     stdin: &mut R,
+    input_state: &mut LiveSnapshotInputState,
+    mouse_focus_enabled: &Arc<AtomicBool>,
+    controls: &mut LiveControls,
     actions: Vec<LiveSnapshotInputAction>,
 ) -> bool {
     for action in actions {
@@ -2065,8 +1883,45 @@ fn send_live_snapshot_input_actions<R: Read>(
             LiveSnapshotInputAction::CommandPromptUpdate(command) => {
                 let _ = sender.send(LiveSnapshotInputEvent::CommandPromptUpdate(command));
             }
-            LiveSnapshotInputAction::CommandPromptDispatch(command) => {
-                let _ = sender.send(LiveSnapshotInputEvent::CommandPromptDispatch(command));
+            LiveSnapshotInputAction::CommandPromptDispatch {
+                command,
+                trailing_input,
+            } => {
+                let (dispatch_done, dispatch_wait) = mpsc::channel();
+                if sender
+                    .send(LiveSnapshotInputEvent::CommandPromptDispatch {
+                        command,
+                        dispatch_done,
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
+                if dispatch_wait.recv().is_err() {
+                    return false;
+                }
+                *controls = load_live_controls(socket);
+                if !trailing_input.is_empty() {
+                    let mouse_enabled = mouse_focus_enabled.load(Ordering::SeqCst);
+                    let actions = translate_live_snapshot_input_with_mouse_and_controls(
+                        &trailing_input,
+                        input_state,
+                        mouse_enabled,
+                        controls,
+                    );
+                    if !send_live_snapshot_input_actions(
+                        socket,
+                        session,
+                        sender,
+                        stdin,
+                        input_state,
+                        mouse_focus_enabled,
+                        controls,
+                        actions,
+                    ) {
+                        return false;
+                    }
+                }
             }
             LiveSnapshotInputAction::CommandPromptCancel => {
                 let _ = sender.send(LiveSnapshotInputEvent::CommandPromptCancel);
@@ -2445,14 +2300,20 @@ fn run_live_snapshot_attach(
                 }
                 last_redraw = Instant::now();
             }
-            Ok(LiveSnapshotInputEvent::CommandPromptDispatch(command)) => {
+            Ok(LiveSnapshotInputEvent::CommandPromptDispatch {
+                command,
+                dispatch_done,
+            }) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 command_prompt_message = None;
                 let command_result = dispatch_attach_command(socket, session, &command);
                 pane_number_message = match command_result {
                     Ok(AttachCommandResult {
                         exit_attach: true, ..
-                    }) => break,
+                    }) => {
+                        let _ = dispatch_done.send(());
+                        break;
+                    }
                     Ok(AttachCommandResult {
                         message: Some(message),
                         ..
@@ -2463,6 +2324,7 @@ fn run_live_snapshot_attach(
                         Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
                     )),
                 };
+                let _ = dispatch_done.send(());
                 if !redraw_paused {
                     frame = write_live_snapshot_frame_with_active_message(
                         socket,
@@ -2955,6 +2817,7 @@ fn raw_pending_input(
     actions: &[AttachInputAction],
     saw_prefix: bool,
     focus: RawPendingFocus,
+    controls: &LiveControls,
 ) -> Vec<u8> {
     let mut pending = Vec::new();
     for action in actions {
@@ -2966,50 +2829,65 @@ fn raw_pending_input(
             | AttachInputAction::PaneCommand(PaneCommand::FocusRight)
                 if focus == RawPendingFocus::Drop => {}
             AttachInputAction::PaneCommand(command) => {
-                pending.push(0x02);
-                pending.push(match command {
-                    PaneCommand::NewWindow => b'c',
-                    PaneCommand::NextWindow => b'n',
-                    PaneCommand::PreviousWindow => b'p',
-                    PaneCommand::SplitRight => b'%',
-                    PaneCommand::SplitDown => b'"',
-                    PaneCommand::FocusLeft => b'h',
-                    PaneCommand::FocusDown => b'j',
-                    PaneCommand::FocusUp => b'k',
-                    PaneCommand::FocusRight => b'l',
-                    PaneCommand::ResizeLeft => b'H',
-                    PaneCommand::ResizeDown => b'J',
-                    PaneCommand::ResizeUp => b'K',
-                    PaneCommand::ResizeRight => b'L',
-                    PaneCommand::Close => b'x',
-                    PaneCommand::ToggleZoom => b'z',
-                });
+                push_pending_bound_action(
+                    &mut pending,
+                    controls,
+                    LiveKeyAction::PaneCommand(*command),
+                );
             }
             AttachInputAction::EnterCopyMode { initial_input } => {
-                pending.extend_from_slice(b"\x02[");
-                pending.extend_from_slice(initial_input);
+                if push_pending_bound_action(&mut pending, controls, LiveKeyAction::CopyMode) {
+                    pending.extend_from_slice(initial_input);
+                }
             }
-            AttachInputAction::SelectNextPane => pending.extend_from_slice(b"\x02o"),
-            AttachInputAction::ShowPaneNumbers => pending.extend_from_slice(b"\x02q"),
+            AttachInputAction::SelectNextPane => {
+                push_pending_bound_action(&mut pending, controls, LiveKeyAction::SelectNextPane);
+            }
+            AttachInputAction::ShowPaneNumbers => {
+                push_pending_bound_action(&mut pending, controls, LiveKeyAction::ShowPaneNumbers);
+            }
             AttachInputAction::SelectPane(index) => {
                 if *index < 10 {
                     pending.push(b'0' + *index as u8);
                 }
             }
-            AttachInputAction::ShowHelp => pending.extend_from_slice(b"\x02?"),
-            AttachInputAction::Detach => pending.extend_from_slice(b"\x02d"),
-            AttachInputAction::CommandPromptStart => pending.extend_from_slice(b"\x02:"),
-            AttachInputAction::CommandPromptDispatch(command) => {
+            AttachInputAction::ShowHelp => {
+                push_pending_bound_action(&mut pending, controls, LiveKeyAction::ShowHelp);
+            }
+            AttachInputAction::Detach => {
+                push_pending_bound_action(&mut pending, controls, LiveKeyAction::Detach);
+            }
+            AttachInputAction::CommandPromptStart => {
+                push_pending_bound_action(&mut pending, controls, LiveKeyAction::CommandPrompt);
+            }
+            AttachInputAction::CommandPromptDispatch {
+                command,
+                trailing_input,
+            } => {
                 pending.extend_from_slice(command.as_bytes());
                 pending.push(b'\n');
+                pending.extend_from_slice(trailing_input);
             }
             AttachInputAction::CommandPromptUpdate(_) | AttachInputAction::CommandPromptCancel => {}
         }
     }
     if saw_prefix {
-        pending.push(0x02);
+        pending.push(controls.prefix);
     }
     pending
+}
+
+fn push_pending_bound_action(
+    pending: &mut Vec<u8>,
+    controls: &LiveControls,
+    action: LiveKeyAction,
+) -> bool {
+    let Some(key) = controls.key_for_action(action) else {
+        return false;
+    };
+    pending.push(controls.prefix);
+    pending.push(key);
+    true
 }
 
 fn forward_stdin_until_detach<F, C>(
@@ -3029,6 +2907,7 @@ where
     let mut buf = [0_u8; 1024];
     let mut input_state = RawAttachInputState::default();
     let mut initial_input = Some(initial_input);
+    let mut controls = load_live_controls(socket);
 
     loop {
         tick()?;
@@ -3038,6 +2917,7 @@ where
                     &[],
                     input_state.saw_prefix,
                     RawPendingFocus::Preserve,
+                    &controls,
                 ),
             });
         }
@@ -3048,7 +2928,7 @@ where
             write_attach_transient_message("cancelled")?;
         }
         let actions = if let Some(input) = initial_input.take() {
-            translate_attach_input_with_state(&input, &mut input_state)
+            translate_attach_input_with_state_with_controls(&input, &mut input_state, &controls)
         } else {
             let read_result = {
                 let _nonblocking_stdin = NonBlockingFdGuard::enable(STDIN_FILENO)?;
@@ -3064,7 +2944,8 @@ where
                 }
                 Err(error) => return Err(error),
             };
-            translate_attach_input_with_state(&buf[..n], &mut input_state)
+            controls = load_live_controls(socket);
+            translate_attach_input_with_state_with_controls(&buf[..n], &mut input_state, &controls)
         };
 
         for (index, action) in actions.iter().enumerate() {
@@ -3077,28 +2958,42 @@ where
                 AttachInputAction::CommandPromptCancel => {
                     write_attach_transient_message("cancelled")?
                 }
-                AttachInputAction::CommandPromptDispatch(command) => {
-                    match dispatch_attach_command(socket, session, command) {
-                        Ok(result) => {
-                            if let Some(message) = result.message {
-                                write_attach_transient_message(&message)?;
-                            }
-                            if result.exit_attach {
-                                return Ok(RawAttachExit::Detach);
-                            }
-                            if result.reconnect {
-                                return Ok(RawAttachExit::Reconnect {
-                                    pending_input: raw_pending_input(
-                                        &actions[index + 1..],
-                                        input_state.saw_prefix,
-                                        RawPendingFocus::Preserve,
-                                    ),
-                                });
-                            }
+                AttachInputAction::CommandPromptDispatch {
+                    command,
+                    trailing_input,
+                } => match dispatch_attach_command(socket, session, command) {
+                    Ok(result) => {
+                        if let Some(message) = result.message {
+                            write_attach_transient_message(&message)?;
                         }
-                        Err(error) => write_attach_transient_message(&error.to_string())?,
+                        if result.exit_attach {
+                            return Ok(RawAttachExit::Detach);
+                        }
+                        controls = load_live_controls(socket);
+                        if result.reconnect {
+                            let mut pending_input = trailing_input.clone();
+                            pending_input.extend(raw_pending_input(
+                                &actions[index + 1..],
+                                input_state.saw_prefix,
+                                RawPendingFocus::Preserve,
+                                &controls,
+                            ));
+                            return Ok(RawAttachExit::Reconnect { pending_input });
+                        }
+                        if !trailing_input.is_empty() {
+                            initial_input = Some(trailing_input.clone());
+                            break;
+                        }
                     }
-                }
+                    Err(error) => {
+                        write_attach_transient_message(&error.to_string())?;
+                        controls = load_live_controls(socket);
+                        if !trailing_input.is_empty() {
+                            initial_input = Some(trailing_input.clone());
+                            break;
+                        }
+                    }
+                },
                 AttachInputAction::PaneCommand(PaneCommand::NewWindow) => {
                     if let Err(error) =
                         send_control_request(socket, &protocol::encode_new_window(session, &[]))
@@ -3110,6 +3005,7 @@ where
                                 &actions[index + 1..],
                                 input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
+                                &controls,
                             ),
                         });
                     }
@@ -3125,6 +3021,7 @@ where
                                 &actions[index + 1..],
                                 input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
+                                &controls,
                             ),
                         });
                     }
@@ -3140,6 +3037,7 @@ where
                                 &actions[index + 1..],
                                 input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
+                                &controls,
                             ),
                         });
                     }
@@ -3155,6 +3053,7 @@ where
                                 &actions[index + 1..],
                                 input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
+                                &controls,
                             ),
                         });
                     }
@@ -3170,6 +3069,7 @@ where
                                 &actions[index + 1..],
                                 input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
+                                &controls,
                             ),
                         });
                     }
@@ -3185,6 +3085,7 @@ where
                                 &actions[index + 1..],
                                 input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
+                                &controls,
                             ),
                         });
                     }
@@ -3200,6 +3101,7 @@ where
                                 &actions[index + 1..],
                                 input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
+                                &controls,
                             ),
                         });
                     }
@@ -3231,6 +3133,7 @@ where
                                 &actions[index + 1..],
                                 input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
+                                &controls,
                             ),
                         });
                     }
@@ -3250,6 +3153,7 @@ where
                                 &actions[index + 1..],
                                 input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
+                                &controls,
                             ),
                         });
                     }
@@ -3263,6 +3167,7 @@ where
                                 &actions[index + 1..],
                                 input_state.saw_prefix,
                                 RawPendingFocus::Preserve,
+                                &controls,
                             ),
                         });
                     }
@@ -3281,6 +3186,7 @@ where
                                     &actions[index + 1..],
                                     input_state.saw_prefix,
                                     RawPendingFocus::Preserve,
+                                    &controls,
                                 ),
                             });
                         }
@@ -3668,6 +3574,64 @@ fn dispatch_attach_command_with_context(
             false,
             false,
         ),
+        "list-keys" => (
+            send_control_request(
+                socket,
+                &protocol::encode_list_keys(
+                    parse_attach_optional_format(args, "list-keys")?.as_deref(),
+                ),
+            )?,
+            false,
+            false,
+        ),
+        "bind-key" => {
+            let [key, command @ ..] = args else {
+                return Err(io::Error::other("bind-key requires a key and command"));
+            };
+            let key = crate::config::canonical_key(key).map_err(io::Error::other)?;
+            let command = crate::config::validate_binding_command(&command.join(" "))
+                .map_err(io::Error::other)?;
+            (
+                send_control_request(socket, &protocol::encode_bind_key(&key, &command))?,
+                false,
+                false,
+            )
+        }
+        "unbind-key" => {
+            let [key] = args else {
+                return Err(io::Error::other("unbind-key accepts exactly one key"));
+            };
+            let key = crate::config::canonical_key(key).map_err(io::Error::other)?;
+            (
+                send_control_request(socket, &protocol::encode_unbind_key(&key))?,
+                false,
+                false,
+            )
+        }
+        "show-options" => (
+            send_control_request(
+                socket,
+                &protocol::encode_show_options(
+                    parse_attach_optional_format(args, "show-options")?.as_deref(),
+                ),
+            )?,
+            false,
+            false,
+        ),
+        "set-option" | "set" => {
+            let [name, value] = args else {
+                return Err(io::Error::other(
+                    "set-option requires an option name and value",
+                ));
+            };
+            let value =
+                crate::config::validate_option_value(name, value).map_err(io::Error::other)?;
+            (
+                send_control_request(socket, &protocol::encode_set_option(name, &value))?,
+                false,
+                false,
+            )
+        }
         "split-window" | "split" => {
             let direction = if args.contains(&"-v") {
                 protocol::SplitDirection::Vertical
@@ -3946,6 +3910,31 @@ fn parse_attach_pane_transfer(
     Ok((source, destination, direction))
 }
 
+fn parse_attach_optional_format(args: &[&str], command_name: &str) -> io::Result<Option<String>> {
+    let mut format = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "-F" | "--format" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    io::Error::other(format!(
+                        "{command_name} requires a format after {}",
+                        args[index]
+                    ))
+                })?;
+                format = Some((*value).to_string());
+                index += 2;
+            }
+            value => {
+                return Err(io::Error::other(format!(
+                    "{command_name} does not support argument {value:?}"
+                )));
+            }
+        }
+    }
+    Ok(format)
+}
+
 fn parse_attach_pane_target(
     session: &str,
     value: &str,
@@ -4032,6 +4021,37 @@ fn send_control_request(socket: &Path, line: &str) -> io::Result<Vec<u8>> {
     let mut body = Vec::new();
     stream.read_to_end(&mut body)?;
     Ok(body)
+}
+
+fn load_live_controls(socket: &Path) -> LiveControls {
+    let prefix = send_control_request(socket, &protocol::encode_show_options(None))
+        .ok()
+        .and_then(|body| {
+            String::from_utf8(body).ok().and_then(|text| {
+                text.lines().find_map(|line| {
+                    let (name, value) = line.split_once('\t')?;
+                    (name == crate::config::OPTION_PREFIX).then_some(value.to_string())
+                })
+            })
+        })
+        .unwrap_or_else(|| crate::config::DEFAULT_PREFIX_KEY.to_string());
+    let bindings = send_control_request(socket, &protocol::encode_list_keys(None))
+        .ok()
+        .and_then(|body| {
+            String::from_utf8(body).ok().map(|text| {
+                text.lines()
+                    .filter_map(|line| {
+                        let (key, command) = line.split_once('\t')?;
+                        Some(protocol::KeyBinding {
+                            key: key.to_string(),
+                            command: command.to_string(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_else(crate::config::default_key_bindings);
+    LiveControls::from_entries(&prefix, bindings)
 }
 
 fn parse_sgr_mouse_event(input: &[u8]) -> Option<(SgrMouseEvent, usize)> {
@@ -5368,6 +5388,77 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_input_uses_custom_prefix_and_rebound_keys() {
+        let mut state = LiveSnapshotInputState::default();
+        let controls = LiveControls::from_entries(
+            "C-a",
+            vec![protocol::KeyBinding {
+                key: "m".to_string(),
+                command: "copy-mode".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            translate_live_snapshot_input_with_mouse_and_controls(
+                b"\x02m", &mut state, true, &controls
+            ),
+            vec![LiveSnapshotInputAction::Forward(b"\x02m".to_vec())]
+        );
+        assert_eq!(
+            translate_live_snapshot_input_with_mouse_and_controls(
+                b"\x01mrest",
+                &mut state,
+                true,
+                &controls
+            ),
+            vec![LiveSnapshotInputAction::EnterCopyMode {
+                initial_input: b"rest".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn live_snapshot_input_uses_bound_send_prefix_action() {
+        let mut state = LiveSnapshotInputState::default();
+        let controls = LiveControls::from_entries(
+            "C-a",
+            vec![protocol::KeyBinding {
+                key: "x".to_string(),
+                command: "send-prefix".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            translate_live_snapshot_input_with_mouse_and_controls(
+                b"\x01x", &mut state, true, &controls
+            ),
+            vec![LiveSnapshotInputAction::Forward(vec![0x01])]
+        );
+    }
+
+    #[test]
+    fn live_snapshot_input_unbound_key_no_longer_triggers_action() {
+        let mut state = LiveSnapshotInputState::default();
+        let controls = LiveControls::from_entries("C-b", Vec::new());
+
+        assert_eq!(
+            translate_live_snapshot_input_with_mouse_and_controls(
+                b"\x02d", &mut state, true, &controls
+            ),
+            vec![LiveSnapshotInputAction::Forward(b"\x02d".to_vec())]
+        );
+        assert_eq!(
+            translate_live_snapshot_input_with_mouse_and_controls(
+                b"\x02\x02",
+                &mut state,
+                true,
+                &controls
+            ),
+            vec![LiveSnapshotInputAction::Forward(b"\x02\x02".to_vec())]
+        );
+    }
+
+    #[test]
     fn live_snapshot_input_selects_next_pane_on_prefix_o() {
         let mut state = LiveSnapshotInputState::default();
 
@@ -5468,11 +5559,64 @@ mod tests {
         );
         assert_eq!(
             actions.last(),
-            Some(&LiveSnapshotInputAction::CommandPromptDispatch(
-                "rename-window work".to_string()
-            ))
+            Some(&LiveSnapshotInputAction::CommandPromptDispatch {
+                command: "rename-window work".to_string(),
+                trailing_input: Vec::new(),
+            })
         );
         assert!(state.command_prompt.is_none());
+    }
+
+    #[test]
+    fn live_snapshot_command_prompt_dispatch_preserves_trailing_input_for_reparse() {
+        let mut state = LiveSnapshotInputState::default();
+        let controls = LiveControls::from_entries(
+            "C-b",
+            vec![
+                protocol::KeyBinding {
+                    key: ":".to_string(),
+                    command: "command-prompt".to_string(),
+                },
+                protocol::KeyBinding {
+                    key: "%".to_string(),
+                    command: "split-window -h".to_string(),
+                },
+            ],
+        );
+
+        let actions = translate_live_snapshot_input_with_mouse_and_controls(
+            b"\x02:set-option prefix C-a\n\x01%",
+            &mut state,
+            true,
+            &controls,
+        );
+
+        assert_eq!(
+            actions.last(),
+            Some(&LiveSnapshotInputAction::CommandPromptDispatch {
+                command: "set-option prefix C-a".to_string(),
+                trailing_input: b"\x01%".to_vec(),
+            })
+        );
+
+        let updated_controls = LiveControls::from_entries(
+            "C-a",
+            vec![protocol::KeyBinding {
+                key: "%".to_string(),
+                command: "split-window -h".to_string(),
+            }],
+        );
+        assert_eq!(
+            translate_live_snapshot_input_with_mouse_and_controls(
+                b"\x01%",
+                &mut state,
+                true,
+                &updated_controls,
+            ),
+            vec![LiveSnapshotInputAction::PaneCommand(
+                PaneCommand::SplitRight
+            )]
+        );
     }
 
     #[test]
@@ -5568,7 +5712,6 @@ mod tests {
     #[test]
     fn attach_input_dispatches_prefix_colon_command_prompt() {
         let mut state = RawAttachInputState::default();
-
         let actions = translate_attach_input_with_state(b"\x02:select-window 1\n", &mut state);
 
         assert_eq!(
@@ -5580,11 +5723,44 @@ mod tests {
         )));
         assert_eq!(
             actions.last(),
-            Some(&AttachInputAction::CommandPromptDispatch(
-                "select-window 1".to_string()
-            ))
+            Some(&AttachInputAction::CommandPromptDispatch {
+                command: "select-window 1".to_string(),
+                trailing_input: Vec::new(),
+            })
         );
         assert!(state.command_prompt.is_none());
+    }
+
+    #[test]
+    fn attach_command_prompt_dispatch_preserves_trailing_input_for_reparse() {
+        let mut state = RawAttachInputState::default();
+        let controls = LiveControls::from_entries(
+            "C-b",
+            vec![
+                protocol::KeyBinding {
+                    key: ":".to_string(),
+                    command: "command-prompt".to_string(),
+                },
+                protocol::KeyBinding {
+                    key: "%".to_string(),
+                    command: "split-window -h".to_string(),
+                },
+            ],
+        );
+
+        let actions = translate_attach_input_with_state_with_controls(
+            b"\x02:set-option prefix C-a\n\x01%",
+            &mut state,
+            &controls,
+        );
+
+        assert_eq!(
+            actions.last(),
+            Some(&AttachInputAction::CommandPromptDispatch {
+                command: "set-option prefix C-a".to_string(),
+                trailing_input: b"\x01%".to_vec(),
+            })
+        );
     }
 
     #[test]
@@ -5809,6 +5985,65 @@ mod tests {
     }
 
     #[test]
+    fn attach_prompt_list_keys_and_show_options_parse_format_args() {
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/dmux-list-keys-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn({
+            let socket = socket.clone();
+            move || {
+                {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    assert_eq!(
+                        read_line(&mut stream).unwrap(),
+                        protocol::encode_list_keys(Some("#{key}=#{command}"))
+                    );
+                    stream.write_all(b"OK\nC-b=send-prefix\n").unwrap();
+                }
+
+                {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    assert_eq!(
+                        read_line(&mut stream).unwrap(),
+                        protocol::encode_show_options(Some("#{option.name}=#{option.value}"))
+                    );
+                    stream.write_all(b"OK\nprefix=C-b\n").unwrap();
+                }
+                let _ = std::fs::remove_file(socket);
+            }
+        });
+
+        let keys =
+            dispatch_attach_command(&socket, "dev", "list-keys -F '#{key}=#{command}'").unwrap();
+        assert_eq!(keys.message.as_deref(), Some("C-b=send-prefix"));
+        let options = dispatch_attach_command(
+            &socket,
+            "dev",
+            "show-options -F '#{option.name}=#{option.value}'",
+        )
+        .unwrap();
+        assert_eq!(options.message.as_deref(), Some("prefix=C-b"));
+        server.join().unwrap();
+
+        let err = match dispatch_attach_command(Path::new("unused.sock"), "dev", "list-keys bad") {
+            Ok(_) => panic!("list-keys with invalid args should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("does not support argument"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
     fn attach_prompt_layout_requires_preset_before_contacting_server() {
         let err = match dispatch_attach_command(Path::new("unused.sock"), "dev", "layout") {
             Ok(_) => panic!("layout without preset should fail"),
@@ -5869,6 +6104,38 @@ mod tests {
     }
 
     #[test]
+    fn attach_input_uses_bound_send_prefix_action() {
+        let mut state = RawAttachInputState::default();
+        let controls = LiveControls::from_entries(
+            "C-a",
+            vec![protocol::KeyBinding {
+                key: "x".to_string(),
+                command: "send-prefix".to_string(),
+            }],
+        );
+
+        let actions =
+            translate_attach_input_with_state_with_controls(b"\x01x", &mut state, &controls);
+
+        assert_eq!(actions, vec![AttachInputAction::Forward(vec![0x01])]);
+    }
+
+    #[test]
+    fn attach_input_unbound_prefix_key_forwards_prefix_and_key() {
+        let mut state = RawAttachInputState::default();
+        let controls = LiveControls::from_entries("C-b", Vec::new());
+
+        let actions =
+            translate_attach_input_with_state_with_controls(b"\x02\x02", &mut state, &controls);
+
+        assert_eq!(
+            actions,
+            vec![AttachInputAction::Forward(b"\x02\x02".to_vec())]
+        );
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
     fn attach_input_consumes_select_next_prefix_without_forwarding() {
         let actions = translate_attach_input(b"\x02o", &mut false);
 
@@ -5912,6 +6179,7 @@ mod tests {
             ],
             false,
             RawPendingFocus::Preserve,
+            &LiveControls::default(),
         );
 
         assert_eq!(pending, b"\x02h\x02ltail");
@@ -5926,14 +6194,48 @@ mod tests {
             ],
             false,
             RawPendingFocus::Preserve,
+            &LiveControls::default(),
         );
 
         assert_eq!(pending, b"\x02htail");
     }
 
     #[test]
+    fn raw_pending_input_uses_custom_prefix_and_rebound_keys() {
+        let controls = LiveControls::from_entries(
+            "C-a",
+            vec![
+                protocol::KeyBinding {
+                    key: "m".to_string(),
+                    command: "new-window".to_string(),
+                },
+                protocol::KeyBinding {
+                    key: "s".to_string(),
+                    command: "split-window -h".to_string(),
+                },
+            ],
+        );
+        let actions = translate_attach_input_with_state_with_controls(
+            b"\x01m\x01s",
+            &mut RawAttachInputState::default(),
+            &controls,
+        );
+        assert_eq!(
+            actions,
+            vec![
+                AttachInputAction::PaneCommand(PaneCommand::NewWindow),
+                AttachInputAction::PaneCommand(PaneCommand::SplitRight),
+            ]
+        );
+
+        let pending = raw_pending_input(&actions[1..], false, RawPendingFocus::Preserve, &controls);
+
+        assert_eq!(pending, b"\x01s");
+    }
+
+    #[test]
     fn raw_pending_input_preserves_trailing_prefix_after_layout_transition() {
-        let pending = raw_pending_input(&[], true, RawPendingFocus::Drop);
+        let pending = raw_pending_input(&[], true, RawPendingFocus::Drop, &LiveControls::default());
 
         assert_eq!(pending, b"\x02");
     }
