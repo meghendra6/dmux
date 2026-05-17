@@ -98,7 +98,9 @@ Attached clients show a top tab line for windows and a bottom info line with
 the active session, pane, client/buffer counts, alerts, and quick affordances
 such as `C-b ? help`, `C-b : command`, and Alt-arrow focus. Press `C-b ?` to
 toggle a boxed attach help popup covering session, window, pane, copy-mode, and
-command-prompt workflows; the popup stays visible until closed. Press `C-b :`
+command-prompt workflows; the popup stays visible until closed. Press `C-b !`
+to open an on-demand attention popup for mux-level pane alerts such as bell,
+activity, exited panes, and blocked clipboard attempts. Press `C-b :`
 for an attached command prompt that
 shows the typed command and controls (`Enter` run, Escape/`C-c` cancel,
 Backspace edit), with examples such as `:split -h`, `:split -v`,
@@ -113,9 +115,10 @@ server exits. Use `dmux list-keys` to inspect bindings and
 `dmux bind-key <key> <action>`/`dmux unbind-key <key>` to customize supported
 live actions such as `copy-mode`, `detach-client`, `command-prompt`,
 `split-window -h|-v`, `select-pane -L|-D|-U|-R`, `resize-pane -L|-D|-U|-R [amount]`,
-`next-pane`, `new-window`, `next-window`, `previous-window`, `kill-pane`, and
-`zoom-pane`. Keys can be printable characters, `Space`, `Tab`, `Enter`,
-`Escape`, arrows, `C-<letter>`, `C-<arrow>`, or `M-<key>`/`Alt-<key>`. Ordinary
+`next-pane`, `display-panes`, `show-attention`, `new-window`, `next-window`,
+`previous-window`, `kill-pane`, and `zoom-pane`. Keys can be printable
+characters, `Space`, `Tab`, `Enter`, `Escape`, arrows, `C-<letter>`,
+`C-<arrow>`, or `M-<key>`/`Alt-<key>`. Ordinary
 bindings are prefix chords; `M-`/`Alt-` bindings are no-prefix attach shortcuts.
 Use `dmux show-options` and `dmux set-option prefix C-a` to inspect or change
 validated runtime options; `status-hints` accepts `on` or `off`.
@@ -128,8 +131,11 @@ rendered line; mouse drag saves an inclusive line range. Mouse selection is
 currently basic line-level selection. In unzoomed multi-pane attach, copy-mode
 copies lines from the rendered composed layout, including pane separators and
 visible content from multiple panes, while input is routed to the server active
-pane. Unzoomed multi-pane attach handles `C-b d` to detach (`C-b D` also detaches), `C-b ?` to toggle
-attach help, `C-b :` to run attached commands such as rename/select/kill/list/paste/split/layout, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
+pane. Unzoomed multi-pane attach handles `C-b d` to detach (`C-b D` also
+detaches), `C-b ?` to toggle attach help, `C-b !` to toggle the attention
+popup, `C-b :` to run attached commands such as
+rename/select/kill/list/paste/split/layout, `C-b c` to create a new window,
+`C-b n`/`C-b p` to cycle windows,
 `C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` or `C-b` arrows to focus by
 direction, `Alt-h/j/k/l` or `Alt` arrows to focus without prefix, `C-b H/J/K/L`
 to resize the active pane left/down/up/right by 5 cells, `C-b Ctrl-arrows` to
@@ -222,8 +228,8 @@ Implemented Phase 2 groundwork:
 - formatted buffer listing with latest marker, byte/line counts, and previews
 - latest-buffer status/display-message format fields with token-like data safety
 - bounded transient display messages in attach render output
-- top tab line, bottom info line, persistent attach help popup, and visible
-  command-prompt input and controls
+- top tab line, bottom info line, persistent attach help/attention popups, and
+  visible command-prompt input and controls
 - attach-time basic copy-mode key handling for line copy
 - attach-time basic copy-mode mouse selection for line ranges
 - attach-time TUI chrome with tabs, footer info, and prefix/help/command affordances
