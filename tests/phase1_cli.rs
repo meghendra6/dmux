@@ -10123,6 +10123,80 @@ fn list_clients_and_detach_client_close_attach_without_killing_session() {
 }
 
 #[test]
+fn list_clients_reports_and_detaches_event_and_render_streams() {
+    let socket = unique_socket("client-stream-types");
+    let session = format!("client-stream-types-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let mut events = attach_events_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut events), "OK\n");
+    assert_eq!(read_socket_line(&mut events), "REDRAW\n");
+    let mut render = attach_render_stream(&socket, &session);
+    assert_eq!(read_socket_line(&mut render), "OK\tRENDER_OUTPUT_META\n");
+    let _initial_render = read_attach_render_frame_body(&mut render);
+
+    let clients = dmux(
+        &socket,
+        &[
+            "list-clients",
+            "-t",
+            &session,
+            "-F",
+            "#{client.id} #{client.type} #{client.width}x#{client.height} #{client.attached}",
+        ],
+    );
+    assert_success(&clients);
+    let clients_text = String::from_utf8_lossy(&clients.stdout);
+    assert!(
+        clients_text.lines().any(|line| line.contains(" event ")),
+        "{clients_text}"
+    );
+    assert!(
+        clients_text.lines().any(|line| line.contains(" render ")),
+        "{clients_text}"
+    );
+    assert!(
+        clients_text.lines().all(|line| line.ends_with(" 1")),
+        "{clients_text}"
+    );
+
+    let event_id = clients_text
+        .lines()
+        .find(|line| line.contains(" event "))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("event client id")
+        .to_string();
+    assert_success(&dmux(&socket, &["detach-client", "-c", &event_id]));
+
+    let clients = dmux(
+        &socket,
+        &["list-clients", "-t", &session, "-F", "#{client.type}"],
+    );
+    assert_success(&clients);
+    let clients_text = String::from_utf8_lossy(&clients.stdout);
+    assert!(
+        !clients_text.lines().any(|line| line == "event"),
+        "{clients_text}"
+    );
+    assert!(
+        clients_text.lines().any(|line| line == "render"),
+        "{clients_text}"
+    );
+
+    assert_success(&dmux(&socket, &["detach-client", "-t", &session]));
+    let clients = dmux(&socket, &["list-clients", "-t", &session]);
+    assert_success(&clients);
+    assert_eq!(String::from_utf8_lossy(&clients.stdout), "");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn rename_alias_expires_when_layout_reconnect_is_abandoned() {
     let socket = unique_socket("rename-alias-abandoned-reconnect");
     let session = format!("rename-alias-abandoned-reconnect-{}", std::process::id());

@@ -328,6 +328,7 @@ Attach keys:\n\
   C-b %       split right\n\
   C-b \"       split down\n\
   C-b ?       show this help\n\
+  C-b :       enter an attached command (rename/select/kill/list/paste basics)\n\
   C-b [       copy-mode for the active pane\n\
   C-b o       cycle panes in multi-pane attach\n\
   C-b h/j/k/l focus left/down/up/right\n\
@@ -346,7 +347,7 @@ Pane commands:\n\
 }
 
 pub fn attach_help_summary() -> &'static str {
-    "C-b d detach / C-b D detach | C-b ? help | C-b c new window | C-b n/p next/previous window | C-b % split right | C-b \" split down | C-b h/j/k/l focus | C-b H/J/K/L resize by 5 | C-b x close | C-b z zoom | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | resize: dmux resize-pane -t <name> -L|-R|-U|-D [amount] | select: dmux select-pane -t <name> -p <index>"
+    "C-b d detach / C-b D detach | C-b ? help | C-b : command prompt | C-b c new window | C-b n/p next/previous window | C-b % split right | C-b \" split down | C-b h/j/k/l focus | C-b H/J/K/L resize by 5 | C-b x close | C-b z zoom | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | resize: dmux resize-pane -t <name> -L|-R|-U|-D [amount] | select: dmux select-pane -t <name> -p <index>"
 }
 
 fn parse_list_sessions(args: Vec<String>, command_name: &str) -> Result<Command, String> {

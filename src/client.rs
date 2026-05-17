@@ -21,6 +21,7 @@ const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const LIVE_SNAPSHOT_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 const LIVE_SNAPSHOT_EVENT_SAFETY_REDRAW_INTERVAL: Duration = Duration::from_millis(1000);
 const PANE_NUMBER_DISPLAY_DURATION: Duration = Duration::from_millis(1000);
+const COPY_MODE_ESCAPE_DISAMBIGUATION: Duration = Duration::from_millis(30);
 const ATTACH_RESIZE_AMOUNT: usize = 5;
 const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 const CURSOR_HOME: &[u8] = b"\x1b[H";
@@ -966,6 +967,9 @@ enum PaneCommand {
 enum AttachInputAction {
     Forward(Vec<u8>),
     PaneCommand(PaneCommand),
+    CommandPromptStart,
+    CommandPromptDispatch(String),
+    CommandPromptCancel,
     SelectNextPane,
     ShowPaneNumbers,
     SelectPane(usize),
@@ -979,6 +983,9 @@ enum LiveSnapshotInputAction {
     Forward(Vec<u8>),
     MousePress(MousePosition),
     PaneCommand(PaneCommand),
+    CommandPromptStart,
+    CommandPromptDispatch(String),
+    CommandPromptCancel,
     Detach,
     SelectNextPane,
     ShowPaneNumbers,
@@ -991,13 +998,65 @@ enum LiveSnapshotInputAction {
 struct LiveSnapshotInputState {
     saw_prefix: bool,
     selecting_pane: bool,
+    command_prompt: Option<Vec<u8>>,
     mouse_pending: Vec<u8>,
+    prompt_pending_since: Option<Instant>,
 }
 
 #[derive(Default)]
 struct RawAttachInputState {
     saw_prefix: bool,
     selecting_pane: bool,
+    command_prompt: Option<Vec<u8>>,
+    mouse_pending: Vec<u8>,
+    prompt_pending_since: Option<Instant>,
+}
+
+impl RawAttachInputState {
+    fn prompt_pending_timeout_action(&mut self, now: Instant) -> Option<AttachInputAction> {
+        if prompt_pending_timeout(
+            &mut self.command_prompt,
+            &mut self.mouse_pending,
+            &mut self.prompt_pending_since,
+            now,
+        ) {
+            return Some(AttachInputAction::CommandPromptCancel);
+        }
+        None
+    }
+}
+
+impl LiveSnapshotInputState {
+    fn prompt_pending_timeout_action(&mut self, now: Instant) -> Option<LiveSnapshotInputAction> {
+        if prompt_pending_timeout(
+            &mut self.command_prompt,
+            &mut self.mouse_pending,
+            &mut self.prompt_pending_since,
+            now,
+        ) {
+            return Some(LiveSnapshotInputAction::CommandPromptCancel);
+        }
+        None
+    }
+}
+
+fn prompt_pending_timeout(
+    command_prompt: &mut Option<Vec<u8>>,
+    pending: &mut Vec<u8>,
+    pending_since: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    if command_prompt.is_some()
+        && !pending.is_empty()
+        && pending_since
+            .is_some_and(|since| now.duration_since(since) >= COPY_MODE_ESCAPE_DISAMBIGUATION)
+    {
+        *command_prompt = None;
+        pending.clear();
+        *pending_since = None;
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1005,6 +1064,9 @@ fn translate_attach_input(input: &[u8], saw_prefix: &mut bool) -> Vec<AttachInpu
     let mut state = RawAttachInputState {
         saw_prefix: *saw_prefix,
         selecting_pane: false,
+        command_prompt: None,
+        mouse_pending: Vec::new(),
+        prompt_pending_since: None,
     };
     let actions = translate_attach_input_with_state(input, &mut state);
     *saw_prefix = state.saw_prefix;
@@ -1015,27 +1077,87 @@ fn translate_attach_input_with_state(
     input: &[u8],
     state: &mut RawAttachInputState,
 ) -> Vec<AttachInputAction> {
-    let mut output = Vec::with_capacity(input.len());
-    let mut actions = Vec::new();
+    let mut bytes = Vec::new();
+    if !state.mouse_pending.is_empty() {
+        bytes.extend_from_slice(&state.mouse_pending);
+        state.mouse_pending.clear();
+        state.prompt_pending_since = None;
+    }
+    bytes.extend_from_slice(input);
 
-    for (index, byte) in input.iter().enumerate() {
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut actions = Vec::new();
+    let mut offset = 0;
+
+    while offset < bytes.len() {
+        if let Some(command) = state.command_prompt.as_mut() {
+            if bytes[offset] == 0x1b {
+                let remaining = &bytes[offset..];
+                if let Some(consumed) = complete_sgr_mouse_event_len(remaining) {
+                    state.command_prompt = None;
+                    actions.push(AttachInputAction::CommandPromptCancel);
+                    offset += consumed;
+                    continue;
+                }
+                if let Some(consumed) = complete_csi_sequence_len(remaining) {
+                    state.command_prompt = None;
+                    actions.push(AttachInputAction::CommandPromptCancel);
+                    offset += consumed;
+                    continue;
+                }
+                if is_incomplete_prompt_escape_sequence(remaining) {
+                    state.mouse_pending.extend_from_slice(remaining);
+                    state.prompt_pending_since = Some(Instant::now());
+                    break;
+                }
+            }
+
+            let byte = bytes[offset];
+            match byte {
+                b'\r' | b'\n' => {
+                    let command = String::from_utf8_lossy(command).trim().to_string();
+                    state.command_prompt = None;
+                    if command.is_empty() {
+                        actions.push(AttachInputAction::CommandPromptCancel);
+                    } else {
+                        actions.push(AttachInputAction::CommandPromptDispatch(command));
+                    }
+                }
+                0x03 | 0x1b => {
+                    state.command_prompt = None;
+                    actions.push(AttachInputAction::CommandPromptCancel);
+                }
+                0x7f | 0x08 => {
+                    command.pop();
+                }
+                byte if !byte.is_ascii_control() => command.push(byte),
+                _ => {}
+            }
+            offset += 1;
+            continue;
+        }
+
+        let byte = bytes[offset];
         if state.selecting_pane {
             state.selecting_pane = false;
             if byte.is_ascii_digit() {
-                actions.push(AttachInputAction::SelectPane(usize::from(*byte - b'0')));
+                actions.push(AttachInputAction::SelectPane(usize::from(byte - b'0')));
+                offset += 1;
                 continue;
             }
-            if *byte == 0x02 {
+            if byte == 0x02 {
                 state.saw_prefix = true;
+                offset += 1;
                 continue;
             }
-            output.push(*byte);
+            output.push(byte);
+            offset += 1;
             continue;
         }
 
         if state.saw_prefix {
             state.saw_prefix = false;
-            match *byte {
+            match byte {
                 b'd' | b'D' => {
                     if !output.is_empty() {
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
@@ -1048,7 +1170,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::EnterCopyMode {
-                        initial_input: input[index + 1..].to_vec(),
+                        initial_input: bytes[offset + 1..].to_vec(),
                     });
                     return actions;
                 }
@@ -1057,6 +1179,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::SelectNextPane);
+                    offset += 1;
                     continue;
                 }
                 b'q' => {
@@ -1065,6 +1188,7 @@ fn translate_attach_input_with_state(
                     }
                     state.selecting_pane = true;
                     actions.push(AttachInputAction::ShowPaneNumbers);
+                    offset += 1;
                     continue;
                 }
                 b'?' => {
@@ -1072,6 +1196,16 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::ShowHelp);
+                    offset += 1;
+                    continue;
+                }
+                b':' => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    state.command_prompt = Some(Vec::new());
+                    actions.push(AttachInputAction::CommandPromptStart);
+                    offset += 1;
                     continue;
                 }
                 b'%' => {
@@ -1079,6 +1213,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::SplitRight));
+                    offset += 1;
                     continue;
                 }
                 b'c' => {
@@ -1086,6 +1221,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::NewWindow));
+                    offset += 1;
                     continue;
                 }
                 b'n' => {
@@ -1093,6 +1229,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::NextWindow));
+                    offset += 1;
                     continue;
                 }
                 b'p' => {
@@ -1100,6 +1237,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::PreviousWindow));
+                    offset += 1;
                     continue;
                 }
                 b'"' => {
@@ -1107,6 +1245,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::SplitDown));
+                    offset += 1;
                     continue;
                 }
                 b'h' => {
@@ -1114,6 +1253,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusLeft));
+                    offset += 1;
                     continue;
                 }
                 b'j' => {
@@ -1121,6 +1261,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusDown));
+                    offset += 1;
                     continue;
                 }
                 b'k' => {
@@ -1128,6 +1269,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusUp));
+                    offset += 1;
                     continue;
                 }
                 b'l' => {
@@ -1135,6 +1277,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::FocusRight));
+                    offset += 1;
                     continue;
                 }
                 b'H' => {
@@ -1142,6 +1285,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeLeft));
+                    offset += 1;
                     continue;
                 }
                 b'J' => {
@@ -1149,6 +1293,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeDown));
+                    offset += 1;
                     continue;
                 }
                 b'K' => {
@@ -1156,6 +1301,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeUp));
+                    offset += 1;
                     continue;
                 }
                 b'L' => {
@@ -1163,6 +1309,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::ResizeRight));
+                    offset += 1;
                     continue;
                 }
                 b'x' => {
@@ -1170,6 +1317,7 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::Close));
+                    offset += 1;
                     continue;
                 }
                 b'z' => {
@@ -1177,21 +1325,24 @@ fn translate_attach_input_with_state(
                         actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
                     }
                     actions.push(AttachInputAction::PaneCommand(PaneCommand::ToggleZoom));
+                    offset += 1;
                     continue;
                 }
                 0x02 => {
                     output.push(0x02);
+                    offset += 1;
                     continue;
                 }
                 _ => output.push(0x02),
             }
         }
 
-        if *byte == 0x02 {
+        if byte == 0x02 {
             state.saw_prefix = true;
         } else {
-            output.push(*byte);
+            output.push(byte);
         }
+        offset += 1;
     }
 
     if !output.is_empty() {
@@ -1217,6 +1368,7 @@ fn translate_live_snapshot_input_with_mouse(
     if !state.mouse_pending.is_empty() {
         bytes.extend_from_slice(&state.mouse_pending);
         state.mouse_pending.clear();
+        state.prompt_pending_since = None;
     }
     bytes.extend_from_slice(input);
 
@@ -1225,17 +1377,65 @@ fn translate_live_snapshot_input_with_mouse(
     let mut offset = 0;
 
     while offset < bytes.len() {
+        if let Some(command) = state.command_prompt.as_mut() {
+            if bytes[offset] == 0x1b {
+                let remaining = &bytes[offset..];
+                if let Some(consumed) = complete_sgr_mouse_event_len(remaining) {
+                    state.command_prompt = None;
+                    actions.push(LiveSnapshotInputAction::CommandPromptCancel);
+                    offset += consumed;
+                    continue;
+                }
+                if let Some(consumed) = complete_csi_sequence_len(remaining) {
+                    state.command_prompt = None;
+                    actions.push(LiveSnapshotInputAction::CommandPromptCancel);
+                    offset += consumed;
+                    continue;
+                }
+                if is_incomplete_prompt_escape_sequence(remaining) {
+                    state.mouse_pending.extend_from_slice(remaining);
+                    state.prompt_pending_since = Some(Instant::now());
+                    break;
+                }
+            }
+            let byte = bytes[offset];
+            match byte {
+                b'\r' | b'\n' => {
+                    let command = String::from_utf8_lossy(command).trim().to_string();
+                    state.command_prompt = None;
+                    if command.is_empty() {
+                        actions.push(LiveSnapshotInputAction::CommandPromptCancel);
+                    } else {
+                        actions.push(LiveSnapshotInputAction::CommandPromptDispatch(command));
+                    }
+                }
+                0x03 | 0x1b => {
+                    state.command_prompt = None;
+                    actions.push(LiveSnapshotInputAction::CommandPromptCancel);
+                }
+                0x7f | 0x08 => {
+                    command.pop();
+                }
+                byte if !byte.is_ascii_control() => command.push(byte),
+                _ => {}
+            }
+            offset += 1;
+            continue;
+        }
+
         if mouse_focus_enabled && bytes[offset] == 0x1b {
             let remaining = &bytes[offset..];
             if let Some((event, consumed)) = parse_sgr_mouse_event(remaining) {
-                if !output.is_empty() {
-                    actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                        &mut output,
-                    )));
-                }
-                clear_live_snapshot_command_state(state);
                 if let Some(position) = live_mouse_press_position(event) {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    clear_live_snapshot_command_state(state);
                     actions.push(LiveSnapshotInputAction::MousePress(position));
+                } else {
+                    output.extend_from_slice(&remaining[..consumed]);
                 }
                 offset += consumed;
                 continue;
@@ -1250,12 +1450,7 @@ fn translate_live_snapshot_input_with_mouse(
                 break;
             }
             if let Some(consumed) = complete_sgr_mouse_event_len(remaining) {
-                if !output.is_empty() {
-                    actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                        &mut output,
-                    )));
-                }
-                clear_live_snapshot_command_state(state);
+                output.extend_from_slice(&remaining[..consumed]);
                 offset += consumed;
                 continue;
             }
@@ -1321,6 +1516,17 @@ fn translate_live_snapshot_input_with_mouse(
                         )));
                     }
                     actions.push(LiveSnapshotInputAction::ShowHelp);
+                    offset += 1;
+                    continue;
+                }
+                b':' => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    state.command_prompt = Some(Vec::new());
+                    actions.push(LiveSnapshotInputAction::CommandPromptStart);
                     offset += 1;
                     continue;
                 }
@@ -1532,6 +1738,7 @@ fn translate_live_snapshot_input_with_mouse(
 fn clear_live_snapshot_command_state(state: &mut LiveSnapshotInputState) {
     state.saw_prefix = false;
     state.selecting_pane = false;
+    state.command_prompt = None;
 }
 
 fn finish_live_snapshot_input(state: &mut LiveSnapshotInputState) -> Option<Vec<u8>> {
@@ -1541,7 +1748,11 @@ fn finish_live_snapshot_input(state: &mut LiveSnapshotInputState) -> Option<Vec<
         output.push(0x02);
     }
     state.selecting_pane = false;
-    if !state.mouse_pending.is_empty() {
+    if state.command_prompt.is_some() {
+        state.command_prompt = None;
+        state.mouse_pending.clear();
+        state.prompt_pending_since = None;
+    } else if !state.mouse_pending.is_empty() {
         output.extend(std::mem::take(&mut state.mouse_pending));
     }
 
@@ -1612,6 +1823,9 @@ enum LiveSnapshotInputEvent {
     Forward(Vec<u8>),
     MousePress(MousePosition),
     PaneCommand(PaneCommand),
+    CommandPromptStart,
+    CommandPromptDispatch(String),
+    CommandPromptCancel,
     SelectNextPane,
     ShowPaneNumbers,
     ShowHelp,
@@ -1676,7 +1890,26 @@ fn spawn_live_snapshot_input_thread(
         }
 
         loop {
-            let n = match stdin.read(&mut buf) {
+            if let Some(action) = input_state.prompt_pending_timeout_action(Instant::now()) {
+                if !send_live_snapshot_input_actions(
+                    &socket,
+                    &session,
+                    &sender,
+                    &mut stdin,
+                    vec![action],
+                ) {
+                    return;
+                }
+            }
+            let read_result = if input_state.prompt_pending_since.is_some() && stdin_is_tty() {
+                match NonBlockingFdGuard::enable(STDIN_FILENO) {
+                    Ok(_guard) => stdin.read(&mut buf),
+                    Err(error) => Err(error),
+                }
+            } else {
+                stdin.read(&mut buf)
+            };
+            let n = match read_result {
                 Ok(0) => {
                     if let Some(bytes) = finish_live_snapshot_input(&mut input_state) {
                         let _ = sender.send(LiveSnapshotInputEvent::Forward(bytes));
@@ -1685,6 +1918,10 @@ fn spawn_live_snapshot_input_thread(
                     break;
                 }
                 Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 Err(_) => {
                     let _ = sender.send(LiveSnapshotInputEvent::Eof);
                     break;
@@ -1723,6 +1960,15 @@ fn send_live_snapshot_input_actions<R: Read>(
             }
             LiveSnapshotInputAction::PaneCommand(command) => {
                 let _ = sender.send(LiveSnapshotInputEvent::PaneCommand(command));
+            }
+            LiveSnapshotInputAction::CommandPromptStart => {
+                let _ = sender.send(LiveSnapshotInputEvent::CommandPromptStart);
+            }
+            LiveSnapshotInputAction::CommandPromptDispatch(command) => {
+                let _ = sender.send(LiveSnapshotInputEvent::CommandPromptDispatch(command));
+            }
+            LiveSnapshotInputAction::CommandPromptCancel => {
+                let _ = sender.send(LiveSnapshotInputEvent::CommandPromptCancel);
             }
             LiveSnapshotInputAction::Detach => {
                 let _ = sender.send(LiveSnapshotInputEvent::Detach);
@@ -2031,6 +2277,66 @@ fn run_live_snapshot_attach(
                 let result = apply_live_pane_command(socket, session, command, &frame);
                 pane_number_message = match result {
                     Ok(()) => None,
+                    Err(error) => Some((
+                        error.to_string(),
+                        Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
+                    )),
+                };
+                if !redraw_paused {
+                    frame = write_live_snapshot_frame_with_pane_number_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                    )?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
+                }
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::CommandPromptStart) => {
+                pane_number_message = Some((
+                    ":".to_string(),
+                    Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
+                ));
+                if !redraw_paused {
+                    frame = write_live_snapshot_frame_with_pane_number_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                    )?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
+                }
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::CommandPromptCancel) => {
+                pane_number_message = Some((
+                    "cancelled".to_string(),
+                    Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
+                ));
+                if !redraw_paused {
+                    frame = write_live_snapshot_frame_with_pane_number_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                    )?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
+                }
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::CommandPromptDispatch(command)) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                let command_result = dispatch_attach_command(socket, session, &command);
+                pane_number_message = match command_result {
+                    Ok(AttachCommandResult {
+                        exit_attach: true, ..
+                    }) => break,
+                    Ok(AttachCommandResult {
+                        message: Some(message),
+                        ..
+                    }) => Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION)),
+                    Ok(AttachCommandResult { .. }) => None,
                     Err(error) => Some((
                         error.to_string(),
                         Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
@@ -2520,6 +2826,12 @@ fn raw_pending_input(
             }
             AttachInputAction::ShowHelp => pending.extend_from_slice(b"\x02?"),
             AttachInputAction::Detach => pending.extend_from_slice(b"\x02d"),
+            AttachInputAction::CommandPromptStart => pending.extend_from_slice(b"\x02:"),
+            AttachInputAction::CommandPromptDispatch(command) => {
+                pending.extend_from_slice(command.as_bytes());
+                pending.push(b'\n');
+            }
+            AttachInputAction::CommandPromptCancel => {}
         }
     }
     if saw_prefix {
@@ -2557,6 +2869,12 @@ where
                 ),
             });
         }
+        if input_state
+            .prompt_pending_timeout_action(Instant::now())
+            .is_some()
+        {
+            write_attach_transient_message("cancelled")?;
+        }
         let actions = if let Some(input) = initial_input.take() {
             translate_attach_input_with_state(&input, &mut input_state)
         } else {
@@ -2580,6 +2898,32 @@ where
         for (index, action) in actions.iter().enumerate() {
             match action {
                 AttachInputAction::Forward(output) => stream.write_all(&output)?,
+                AttachInputAction::CommandPromptStart => write_attach_command_prompt()?,
+                AttachInputAction::CommandPromptCancel => {
+                    write_attach_transient_message("cancelled")?
+                }
+                AttachInputAction::CommandPromptDispatch(command) => {
+                    match dispatch_attach_command(socket, session, command) {
+                        Ok(result) => {
+                            if let Some(message) = result.message {
+                                write_attach_transient_message(&message)?;
+                            }
+                            if result.exit_attach {
+                                return Ok(RawAttachExit::Detach);
+                            }
+                            if result.reconnect {
+                                return Ok(RawAttachExit::Reconnect {
+                                    pending_input: raw_pending_input(
+                                        &actions[index + 1..],
+                                        input_state.saw_prefix,
+                                        RawPendingFocus::Preserve,
+                                    ),
+                                });
+                            }
+                        }
+                        Err(error) => write_attach_transient_message(&error.to_string())?,
+                    }
+                }
                 AttachInputAction::PaneCommand(PaneCommand::NewWindow) => {
                     if let Err(error) =
                         send_control_request(socket, &protocol::encode_new_window(session, &[]))
@@ -2626,24 +2970,34 @@ where
                     }
                 }
                 AttachInputAction::PaneCommand(PaneCommand::SplitRight) => {
-                    split_pane(socket, session, protocol::SplitDirection::Horizontal)?;
-                    return Ok(RawAttachExit::Reconnect {
-                        pending_input: raw_pending_input(
-                            &actions[index + 1..],
-                            input_state.saw_prefix,
-                            RawPendingFocus::Preserve,
-                        ),
-                    });
+                    if let Err(error) =
+                        split_pane(socket, session, protocol::SplitDirection::Horizontal)
+                    {
+                        write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                input_state.saw_prefix,
+                                RawPendingFocus::Preserve,
+                            ),
+                        });
+                    }
                 }
                 AttachInputAction::PaneCommand(PaneCommand::SplitDown) => {
-                    split_pane(socket, session, protocol::SplitDirection::Vertical)?;
-                    return Ok(RawAttachExit::Reconnect {
-                        pending_input: raw_pending_input(
-                            &actions[index + 1..],
-                            input_state.saw_prefix,
-                            RawPendingFocus::Preserve,
-                        ),
-                    });
+                    if let Err(error) =
+                        split_pane(socket, session, protocol::SplitDirection::Vertical)
+                    {
+                        write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                input_state.saw_prefix,
+                                RawPendingFocus::Preserve,
+                            ),
+                        });
+                    }
                 }
                 AttachInputAction::PaneCommand(PaneCommand::Close) => {
                     if let Err(error) =
@@ -2761,7 +3115,7 @@ where
                 }
                 AttachInputAction::EnterCopyMode { initial_input } => {
                     copy_mode_active.store(true, Ordering::SeqCst);
-                    let result = enter_copy_mode(&initial_input);
+                    let result = enter_copy_mode(initial_input);
                     copy_mode_active.store(false, Ordering::SeqCst);
                     result?;
                 }
@@ -2834,9 +3188,27 @@ fn run_copy_mode_view_with_reader<R: Read>(
         return Ok(());
     }
 
+    let _nonblocking_stdin = if stdin_is_tty() {
+        Some(NonBlockingFdGuard::enable(STDIN_FILENO)?)
+    } else {
+        None
+    };
     let mut buf = [0_u8; 1024];
     loop {
-        let n = stdin.read(&mut buf)?;
+        if let Some(action) = input_state.pending_timeout_action(Instant::now()) {
+            if apply_copy_mode_action(socket, session, view, action)? {
+                break;
+            }
+        }
+
+        let n = match stdin.read(&mut buf) {
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if n == 0 {
             break;
         }
@@ -2929,7 +3301,10 @@ fn map_copy_mode_save_text_error(error: io::Error) -> io::Error {
     }
 }
 
-fn write_copy_mode_view(view: &CopyModeView) -> io::Result<()> {
+fn write_copy_mode_view(view: &mut CopyModeView) -> io::Result<()> {
+    if let Some(size) = detect_attach_size() {
+        view.set_height(usize::from(size.rows));
+    }
     let mut stdout = io::stdout().lock();
     stdout.write_all(view.render().as_bytes())?;
     stdout.flush()
@@ -2951,10 +3326,153 @@ fn write_attach_help_message() -> io::Result<()> {
     stdout.flush()
 }
 
+fn write_attach_command_prompt() -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(b"\r\n:")?;
+    stdout.flush()
+}
+
 fn write_attach_transient_message(message: &str) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(format!("\r\n-- dmux: {message} --\r\n").as_bytes())?;
     stdout.flush()
+}
+
+struct AttachCommandResult {
+    message: Option<String>,
+    reconnect: bool,
+    exit_attach: bool,
+}
+
+fn dispatch_attach_command(
+    socket: &Path,
+    session: &str,
+    command: &str,
+) -> io::Result<AttachCommandResult> {
+    let parts = command.split_whitespace().collect::<Vec<_>>();
+    let Some((name, args)) = parts.split_first() else {
+        return Ok(AttachCommandResult {
+            message: None,
+            reconnect: false,
+            exit_attach: false,
+        });
+    };
+
+    let (body, reconnect, exit_attach) = match *name {
+        "rename-window" | "renamew" => {
+            let name = args.join(" ");
+            if name.is_empty() {
+                return Err(io::Error::other("rename-window requires a name"));
+            }
+            (
+                send_control_request(
+                    socket,
+                    &protocol::encode_rename_window(session, protocol::WindowTarget::Active, &name),
+                )?,
+                false,
+                false,
+            )
+        }
+        "rename-session" | "rename" => {
+            let new_name = args.join(" ");
+            if new_name.is_empty() {
+                return Err(io::Error::other("rename-session requires a name"));
+            }
+            (
+                send_control_request(socket, &protocol::encode_rename_session(session, &new_name))?,
+                false,
+                false,
+            )
+        }
+        "select-window" | "selectw" => {
+            let target = parse_attach_window_target(args)?;
+            (
+                send_control_request(
+                    socket,
+                    &protocol::encode_select_window_target(session, target),
+                )?,
+                true,
+                false,
+            )
+        }
+        "kill-window" | "killw" => {
+            let target = if args.is_empty() {
+                protocol::WindowTarget::Active
+            } else {
+                parse_attach_window_target(args)?
+            };
+            (
+                send_control_request(
+                    socket,
+                    &protocol::encode_kill_window_target(session, target),
+                )?,
+                true,
+                false,
+            )
+        }
+        "kill-session" | "kill" => (
+            send_control_request(socket, &protocol::encode_kill(session))?,
+            false,
+            true,
+        ),
+        "paste-buffer" | "pasteb" | "paste" => {
+            let buffer = args.first().copied();
+            (
+                send_control_request(socket, &protocol::encode_paste_buffer(session, buffer))?,
+                false,
+                false,
+            )
+        }
+        "list-windows" | "lsw" => (
+            send_control_request(socket, &protocol::encode_list_windows(session, None))?,
+            false,
+            false,
+        ),
+        "list-buffers" | "lsb" => (
+            send_control_request(socket, &protocol::encode_list_buffers(None))?,
+            false,
+            false,
+        ),
+        "split-window" | "split" => {
+            let direction = if args.contains(&"-v") {
+                protocol::SplitDirection::Vertical
+            } else {
+                protocol::SplitDirection::Horizontal
+            };
+            (
+                send_control_request(socket, &protocol::encode_split(session, direction, &[]))?,
+                true,
+                false,
+            )
+        }
+        other => {
+            return Err(io::Error::other(format!(
+                "unknown attach command {other:?}"
+            )));
+        }
+    };
+    let message = String::from_utf8_lossy(&body).trim_end().to_string();
+    Ok(AttachCommandResult {
+        message: (!message.is_empty()).then_some(message),
+        reconnect,
+        exit_attach,
+    })
+}
+
+fn parse_attach_window_target(args: &[&str]) -> io::Result<protocol::WindowTarget> {
+    let value = args
+        .first()
+        .ok_or_else(|| io::Error::other("select-window requires a target"))?;
+    if let Some(id) = value.strip_prefix('@') {
+        return id
+            .parse::<usize>()
+            .map(protocol::WindowTarget::Id)
+            .map_err(|_| io::Error::other("invalid window id"));
+    }
+    if let Ok(index) = value.parse::<usize>() {
+        return Ok(protocol::WindowTarget::Index(index));
+    }
+    Ok(protocol::WindowTarget::Name((*value).to_string()))
 }
 
 fn send_control_request(socket: &Path, line: &str) -> io::Result<Vec<u8>> {
@@ -3009,6 +3527,7 @@ fn parse_sgr_mouse_event(input: &[u8]) -> Option<(SgrMouseEvent, usize)> {
 #[derive(Default)]
 struct CopyModeInputState {
     pending: Vec<u8>,
+    pending_since: Option<Instant>,
 }
 
 impl CopyModeInputState {
@@ -3017,6 +3536,7 @@ impl CopyModeInputState {
         if !self.pending.is_empty() {
             bytes.extend_from_slice(&self.pending);
             self.pending.clear();
+            self.pending_since = None;
         }
         bytes.extend_from_slice(input);
 
@@ -3028,9 +3548,20 @@ impl CopyModeInputState {
                 if let Some((event, consumed)) = parse_sgr_mouse_event(remaining) {
                     offset += consumed;
                     actions.push(view.apply_mouse_event(event));
+                } else if let Some((key, consumed)) = parse_copy_mode_csi_key(remaining) {
+                    offset += consumed;
+                    actions.push(view.apply_key(key));
+                } else if is_incomplete_copy_mode_csi_key(remaining) {
+                    self.pending.extend_from_slice(remaining);
+                    self.pending_since = Some(Instant::now());
+                    break;
                 } else if is_incomplete_sgr_mouse_event(remaining) {
                     self.pending.extend_from_slice(remaining);
+                    self.pending_since = Some(Instant::now());
                     break;
+                } else if let Some(consumed) = complete_csi_sequence_len(remaining) {
+                    offset += consumed;
+                    actions.push(CopyModeAction::Ignore);
                 } else {
                     offset += 1;
                     actions.push(CopyModeAction::Exit);
@@ -3044,6 +3575,54 @@ impl CopyModeInputState {
 
         actions
     }
+
+    fn pending_timeout_action(&mut self, now: Instant) -> Option<CopyModeAction> {
+        if self.pending.as_slice() == [0x1b]
+            && self
+                .pending_since
+                .is_some_and(|since| now.duration_since(since) >= COPY_MODE_ESCAPE_DISAMBIGUATION)
+        {
+            self.pending.clear();
+            self.pending_since = None;
+            return Some(CopyModeAction::Exit);
+        }
+        None
+    }
+}
+
+fn parse_copy_mode_csi_key(input: &[u8]) -> Option<(u8, usize)> {
+    match input {
+        [0x1b, b'[', b'A', ..] => Some((b'k', 3)),
+        [0x1b, b'[', b'B', ..] => Some((b'j', 3)),
+        [0x1b, b'[', b'H', ..] => Some((b'g', 3)),
+        [0x1b, b'[', b'F', ..] => Some((b'G', 3)),
+        [0x1b, b'[', b'5', b'~', ..] => Some((0x02, 4)),
+        [0x1b, b'[', b'6', b'~', ..] => Some((0x06, 4)),
+        _ => None,
+    }
+}
+
+fn is_incomplete_copy_mode_csi_key(input: &[u8]) -> bool {
+    input == [0x1b] || is_incomplete_csi_sequence(input)
+}
+
+fn is_incomplete_prompt_escape_sequence(input: &[u8]) -> bool {
+    input == [0x1b] || is_incomplete_sgr_mouse_event(input) || is_incomplete_csi_sequence(input)
+}
+
+fn is_incomplete_csi_sequence(input: &[u8]) -> bool {
+    input.starts_with(b"\x1b[") && input.len() < 64 && complete_csi_sequence_len(input).is_none()
+}
+
+fn complete_csi_sequence_len(input: &[u8]) -> Option<usize> {
+    if !input.starts_with(b"\x1b[") {
+        return None;
+    }
+
+    input[2..]
+        .iter()
+        .position(|byte| (0x40..=0x7e).contains(byte))
+        .map(|end| 2 + end + 1)
 }
 
 fn is_incomplete_sgr_mouse_event(input: &[u8]) -> bool {
@@ -3102,6 +3681,8 @@ struct CopyModeLine {
 struct CopyModeView {
     lines: Vec<CopyModeLine>,
     cursor: usize,
+    viewport: usize,
+    height: usize,
     selection_anchor: Option<usize>,
 }
 
@@ -3124,6 +3705,8 @@ impl CopyModeView {
         Ok(Self {
             lines,
             cursor: 0,
+            viewport: 0,
+            height: 24,
             selection_anchor: None,
         })
     }
@@ -3142,6 +3725,8 @@ impl CopyModeView {
         Ok(Self {
             lines,
             cursor: 0,
+            viewport: 0,
+            height: 24,
             selection_anchor: None,
         })
     }
@@ -3152,6 +3737,52 @@ impl CopyModeView {
 
     fn is_empty(&self) -> bool {
         self.lines.is_empty()
+    }
+
+    fn set_height(&mut self, height: usize) {
+        self.height = height.max(2);
+        self.ensure_cursor_visible();
+    }
+
+    #[cfg(test)]
+    fn set_height_for_test(&mut self, height: usize) {
+        self.set_height(height);
+    }
+
+    fn visible_line_count(&self) -> usize {
+        self.height.saturating_sub(1).max(1)
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        let visible = self.visible_line_count();
+        if self.cursor < self.viewport {
+            self.viewport = self.cursor;
+        } else if self.cursor >= self.viewport + visible {
+            self.viewport = self.cursor + 1 - visible;
+        }
+        self.clamp_viewport();
+    }
+
+    fn clamp_viewport(&mut self) {
+        let visible = self.visible_line_count();
+        self.viewport = self.viewport.min(self.lines.len().saturating_sub(visible));
+    }
+
+    fn move_cursor_to(&mut self, cursor: usize) -> CopyModeAction {
+        if self.lines.is_empty() {
+            return CopyModeAction::Ignore;
+        }
+        let cursor = cursor.min(self.lines.len() - 1);
+        if cursor == self.cursor {
+            return CopyModeAction::Ignore;
+        }
+        self.cursor = cursor;
+        self.ensure_cursor_visible();
+        CopyModeAction::Redraw
+    }
+
+    fn page_amount(&self) -> usize {
+        self.visible_line_count().max(1)
     }
 
     fn selected_text_for_line_range(&self, start: usize, end: usize) -> io::Result<String> {
@@ -3178,22 +3809,12 @@ impl CopyModeView {
 
     fn apply_key(&mut self, byte: u8) -> CopyModeAction {
         match byte {
-            b'j' | 0x0e => {
-                if self.cursor + 1 < self.lines.len() {
-                    self.cursor += 1;
-                    CopyModeAction::Redraw
-                } else {
-                    CopyModeAction::Ignore
-                }
-            }
-            b'k' | 0x10 => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                    CopyModeAction::Redraw
-                } else {
-                    CopyModeAction::Ignore
-                }
-            }
+            b'j' | 0x0e => self.move_cursor_to(self.cursor + 1),
+            b'k' | 0x10 => self.move_cursor_to(self.cursor.saturating_sub(1)),
+            0x06 => self.move_cursor_to(self.cursor.saturating_add(self.page_amount())),
+            0x02 => self.move_cursor_to(self.cursor.saturating_sub(self.page_amount())),
+            b'g' => self.move_cursor_to(0),
+            b'G' => self.move_cursor_to(self.lines.len().saturating_sub(1)),
             b'y' | b'\r' | b'\n' => self
                 .cursor_line_number()
                 .map(CopyModeAction::CopyLine)
@@ -3216,6 +3837,7 @@ impl CopyModeView {
             };
 
             self.cursor = index;
+            self.ensure_cursor_visible();
             let (start_index, end_index) = normalized_indexes(anchor, index);
             return CopyModeAction::CopyLineRange {
                 start: self.lines[start_index].number,
@@ -3233,6 +3855,7 @@ impl CopyModeView {
         if event.code & 32 != 0 {
             if self.selection_anchor.is_some() {
                 self.cursor = index;
+                self.ensure_cursor_visible();
                 return CopyModeAction::Redraw;
             }
             return CopyModeAction::Ignore;
@@ -3241,6 +3864,7 @@ impl CopyModeView {
         if event.code & 3 == 0 {
             self.selection_anchor = Some(index);
             self.cursor = index;
+            self.ensure_cursor_visible();
             return CopyModeAction::Redraw;
         }
 
@@ -3251,7 +3875,7 @@ impl CopyModeView {
         if row < 2 {
             return None;
         }
-        let index = usize::from(row) - 2;
+        let index = self.viewport + usize::from(row) - 2;
         self.lines.get(index).map(|_| index)
     }
 
@@ -3263,7 +3887,9 @@ impl CopyModeView {
     fn render(&self) -> String {
         let mut output = String::from("\x1b[2J\x1b[H-- copy mode --\r\n");
         let selected = self.selected_bounds();
-        for (index, line) in self.lines.iter().enumerate() {
+        let end = (self.viewport + self.visible_line_count()).min(self.lines.len());
+        for (index, line) in self.lines[self.viewport..end].iter().enumerate() {
+            let index = self.viewport + index;
             if index == self.cursor {
                 output.push('>');
             } else if selected
@@ -3748,7 +4374,8 @@ mod tests {
 
     #[test]
     fn read_attach_layout_snapshot_falls_back_to_plain_snapshot_for_unknown_request() {
-        let socket = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir();
+        let socket = dir.join(format!(
             "dmux-layout-fallback-{}-{}.sock",
             std::process::id(),
             std::time::SystemTime::now()
@@ -4085,21 +4712,39 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_input_consumes_non_press_mouse_events() {
+    fn live_snapshot_input_forwards_non_press_mouse_events() {
         let mut state = LiveSnapshotInputState::default();
 
-        assert!(translate_live_snapshot_input(b"\x1b[<0;1;2m", &mut state).is_empty());
-        assert!(translate_live_snapshot_input(b"\x1b[<32;1;2M", &mut state).is_empty());
-        assert!(translate_live_snapshot_input(b"\x1b[<64;1;2M", &mut state).is_empty());
+        assert_eq!(
+            translate_live_snapshot_input(b"\x1b[<0;1;2m", &mut state),
+            vec![LiveSnapshotInputAction::Forward(b"\x1b[<0;1;2m".to_vec())]
+        );
+        assert_eq!(
+            translate_live_snapshot_input(b"\x1b[<32;1;2M", &mut state),
+            vec![LiveSnapshotInputAction::Forward(b"\x1b[<32;1;2M".to_vec())]
+        );
+        assert_eq!(
+            translate_live_snapshot_input(b"\x1b[<64;1;2M", &mut state),
+            vec![LiveSnapshotInputAction::Forward(b"\x1b[<64;1;2M".to_vec())]
+        );
     }
 
     #[test]
-    fn live_snapshot_input_consumes_modified_left_clicks() {
+    fn live_snapshot_input_forwards_modified_left_clicks() {
         let mut state = LiveSnapshotInputState::default();
 
-        assert!(translate_live_snapshot_input(b"\x1b[<4;1;2M", &mut state).is_empty());
-        assert!(translate_live_snapshot_input(b"\x1b[<8;1;2M", &mut state).is_empty());
-        assert!(translate_live_snapshot_input(b"\x1b[<16;1;2M", &mut state).is_empty());
+        assert_eq!(
+            translate_live_snapshot_input(b"\x1b[<4;1;2M", &mut state),
+            vec![LiveSnapshotInputAction::Forward(b"\x1b[<4;1;2M".to_vec())]
+        );
+        assert_eq!(
+            translate_live_snapshot_input(b"\x1b[<8;1;2M", &mut state),
+            vec![LiveSnapshotInputAction::Forward(b"\x1b[<8;1;2M".to_vec())]
+        );
+        assert_eq!(
+            translate_live_snapshot_input(b"\x1b[<16;1;2M", &mut state),
+            vec![LiveSnapshotInputAction::Forward(b"\x1b[<16;1;2M".to_vec())]
+        );
     }
 
     #[test]
@@ -4267,6 +4912,36 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_input_dispatches_prefix_colon_command_prompt() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02:rename-window work\r", &mut state),
+            vec![
+                LiveSnapshotInputAction::CommandPromptStart,
+                LiveSnapshotInputAction::CommandPromptDispatch("rename-window work".to_string()),
+            ]
+        );
+        assert!(state.command_prompt.is_none());
+    }
+
+    #[test]
+    fn live_snapshot_input_forwards_drag_release_and_wheel_mouse_events() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input_with_mouse(
+                b"\x1b[<32;2;3M\x1b[<0;2;3m\x1b[<64;2;3M",
+                &mut state,
+                true,
+            ),
+            vec![LiveSnapshotInputAction::Forward(
+                b"\x1b[<32;2;3M\x1b[<0;2;3m\x1b[<64;2;3M".to_vec()
+            )]
+        );
+    }
+
+    #[test]
     fn live_snapshot_input_passes_coalesced_copy_mode_keys_as_initial_input() {
         let mut state = LiveSnapshotInputState::default();
 
@@ -4341,9 +5016,149 @@ mod tests {
     }
 
     #[test]
+    fn attach_input_dispatches_prefix_colon_command_prompt() {
+        let mut state = RawAttachInputState::default();
+
+        assert_eq!(
+            translate_attach_input_with_state(b"\x02:select-window 1\n", &mut state),
+            vec![
+                AttachInputAction::CommandPromptStart,
+                AttachInputAction::CommandPromptDispatch("select-window 1".to_string()),
+            ]
+        );
+        assert!(state.command_prompt.is_none());
+    }
+
+    #[test]
+    fn attach_command_prompt_drops_mouse_sequence_on_cancel() {
+        let mut state = RawAttachInputState::default();
+
+        assert_eq!(
+            translate_attach_input_with_state(b"\x02:", &mut state),
+            vec![AttachInputAction::CommandPromptStart]
+        );
+        assert_eq!(
+            translate_attach_input_with_state(b"\x1b[<0;12;3M", &mut state),
+            vec![AttachInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn attach_command_prompt_buffers_split_mouse_sequence_before_cancel() {
+        let mut state = RawAttachInputState::default();
+
+        assert_eq!(
+            translate_attach_input_with_state(b"\x02:", &mut state),
+            vec![AttachInputAction::CommandPromptStart]
+        );
+        assert!(translate_attach_input_with_state(b"\x1b[<0;12", &mut state).is_empty());
+        assert!(state.command_prompt.is_some());
+        assert!(!state.mouse_pending.is_empty());
+        assert_eq!(
+            translate_attach_input_with_state(b";3M", &mut state),
+            vec![AttachInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn attach_command_prompt_buffers_mouse_sequence_split_after_escape() {
+        let mut state = RawAttachInputState::default();
+
+        assert_eq!(
+            translate_attach_input_with_state(b"\x02:", &mut state),
+            vec![AttachInputAction::CommandPromptStart]
+        );
+        assert!(translate_attach_input_with_state(b"\x1b", &mut state).is_empty());
+        assert!(state.command_prompt.is_some());
+        assert_eq!(
+            translate_attach_input_with_state(b"[<0;12;3M", &mut state),
+            vec![AttachInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn attach_command_prompt_drops_csi_sequence_on_cancel() {
+        let mut state = RawAttachInputState::default();
+
+        assert_eq!(
+            translate_attach_input_with_state(b"\x02:", &mut state),
+            vec![AttachInputAction::CommandPromptStart]
+        );
+        assert_eq!(
+            translate_attach_input_with_state(b"\x1b[D", &mut state),
+            vec![AttachInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn attach_command_prompt_buffers_split_csi_sequence_before_cancel() {
+        let mut state = RawAttachInputState::default();
+
+        assert_eq!(
+            translate_attach_input_with_state(b"\x02:", &mut state),
+            vec![AttachInputAction::CommandPromptStart]
+        );
+        assert!(translate_attach_input_with_state(b"\x1b[1", &mut state).is_empty());
+        assert!(state.command_prompt.is_some());
+        assert!(!state.mouse_pending.is_empty());
+        assert_eq!(
+            translate_attach_input_with_state(b";5D", &mut state),
+            vec![AttachInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn attach_command_prompt_buffers_csi_sequence_split_after_escape() {
+        let mut state = RawAttachInputState::default();
+
+        assert_eq!(
+            translate_attach_input_with_state(b"\x02:", &mut state),
+            vec![AttachInputAction::CommandPromptStart]
+        );
+        assert!(translate_attach_input_with_state(b"\x1b", &mut state).is_empty());
+        assert!(state.command_prompt.is_some());
+        assert_eq!(
+            translate_attach_input_with_state(b"[D", &mut state),
+            vec![AttachInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn attach_command_prompt_cancels_pending_escape_after_timeout() {
+        let mut state = RawAttachInputState::default();
+
+        assert_eq!(
+            translate_attach_input_with_state(b"\x02:", &mut state),
+            vec![AttachInputAction::CommandPromptStart]
+        );
+        assert!(translate_attach_input_with_state(b"\x1b", &mut state).is_empty());
+        let pending_since = state
+            .prompt_pending_since
+            .expect("pending escape timestamp");
+        assert_eq!(
+            state.prompt_pending_timeout_action(pending_since + COPY_MODE_ESCAPE_DISAMBIGUATION),
+            Some(AttachInputAction::CommandPromptCancel)
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
     fn directional_focus_uses_server_select_request() {
-        let socket = std::env::current_dir().unwrap().join(format!(
-            ".dmux-focus-direction-{}-{}.sock",
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/dmux-focus-{}-{}.sock",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4367,6 +5182,71 @@ mod tests {
 
         select_directional_pane(&socket, "dev", PaneCommand::FocusLeft).unwrap();
 
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn attach_prompt_rename_session_does_not_force_raw_reconnect() {
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/dmux-rename-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn({
+            let socket = socket.clone();
+            move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert_eq!(
+                    read_line(&mut stream).unwrap(),
+                    protocol::encode_rename_session("dev", "work")
+                );
+                stream.write_all(b"OK\n").unwrap();
+                let _ = std::fs::remove_file(socket);
+            }
+        });
+
+        let result = dispatch_attach_command(&socket, "dev", "rename-session work").unwrap();
+
+        assert!(result.message.is_none());
+        assert!(!result.reconnect);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn attach_prompt_kill_session_marks_attach_exit() {
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/dmux-kill-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn({
+            let socket = socket.clone();
+            move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert_eq!(
+                    read_line(&mut stream).unwrap(),
+                    protocol::encode_kill("dev")
+                );
+                stream.write_all(b"OK\n").unwrap();
+                let _ = std::fs::remove_file(socket);
+            }
+        });
+
+        let result = dispatch_attach_command(&socket, "dev", "kill-session").unwrap();
+
+        assert!(result.message.is_none());
+        assert!(!result.reconnect);
+        assert!(result.exit_attach);
         server.join().unwrap();
     }
 
@@ -4501,6 +5381,132 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_command_prompt_drops_mouse_sequence_on_cancel() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02:", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptStart]
+        );
+        assert_eq!(
+            translate_live_snapshot_input(b"\x1b[<0;12;3M", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn live_snapshot_command_prompt_buffers_split_mouse_sequence_before_cancel() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02:", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptStart]
+        );
+        assert!(translate_live_snapshot_input(b"\x1b[<0;12", &mut state).is_empty());
+        assert!(state.command_prompt.is_some());
+        assert!(!state.mouse_pending.is_empty());
+        assert_eq!(
+            translate_live_snapshot_input(b";3M", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn live_snapshot_command_prompt_buffers_mouse_sequence_split_after_escape() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02:", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptStart]
+        );
+        assert!(translate_live_snapshot_input(b"\x1b", &mut state).is_empty());
+        assert!(state.command_prompt.is_some());
+        assert_eq!(
+            translate_live_snapshot_input(b"[<0;12;3M", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn live_snapshot_command_prompt_drops_csi_sequence_on_cancel() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02:", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptStart]
+        );
+        assert_eq!(
+            translate_live_snapshot_input(b"\x1b[D", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn live_snapshot_command_prompt_buffers_split_csi_sequence_before_cancel() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02:", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptStart]
+        );
+        assert!(translate_live_snapshot_input(b"\x1b[1", &mut state).is_empty());
+        assert!(state.command_prompt.is_some());
+        assert!(!state.mouse_pending.is_empty());
+        assert_eq!(
+            translate_live_snapshot_input(b";5D", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn live_snapshot_command_prompt_buffers_csi_sequence_split_after_escape() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02:", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptStart]
+        );
+        assert!(translate_live_snapshot_input(b"\x1b", &mut state).is_empty());
+        assert!(state.command_prompt.is_some());
+        assert_eq!(
+            translate_live_snapshot_input(b"[D", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptCancel]
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
+    fn live_snapshot_command_prompt_cancels_pending_escape_after_timeout() {
+        let mut state = LiveSnapshotInputState::default();
+
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02:", &mut state),
+            vec![LiveSnapshotInputAction::CommandPromptStart]
+        );
+        assert!(translate_live_snapshot_input(b"\x1b", &mut state).is_empty());
+        let pending_since = state
+            .prompt_pending_since
+            .expect("pending escape timestamp");
+        assert_eq!(
+            state.prompt_pending_timeout_action(pending_since + COPY_MODE_ESCAPE_DISAMBIGUATION),
+            Some(LiveSnapshotInputAction::CommandPromptCancel)
+        );
+        assert!(state.command_prompt.is_none());
+        assert!(state.mouse_pending.is_empty());
+    }
+
+    #[test]
     fn next_pane_index_wraps_after_active_pane() {
         assert_eq!(
             next_pane_index_from_listing("0\t0\n1\t1\n2\t0\n").unwrap(),
@@ -4537,7 +5543,9 @@ mod tests {
         let mut state = LiveSnapshotInputState {
             saw_prefix: true,
             selecting_pane: false,
+            command_prompt: None,
             mouse_pending: Vec::new(),
+            prompt_pending_since: None,
         };
 
         let pending = finish_live_snapshot_input(&mut state);
@@ -4555,6 +5563,117 @@ mod tests {
         assert_eq!(view.cursor_line_number(), Some(2));
         assert_eq!(view.apply_key(0x10), CopyModeAction::Redraw);
         assert_eq!(view.cursor_line_number(), Some(1));
+    }
+
+    #[test]
+    fn copy_mode_view_pages_and_clips_to_terminal_height() {
+        let mut view = CopyModeView::from_numbered_output(
+            "1\tone\n2\ttwo\n3\tthree\n4\tfour\n5\tfive\n6\tsix\n",
+        )
+        .unwrap();
+        view.set_height_for_test(4);
+
+        assert!(!view.render().contains("4\tfour"));
+        assert_eq!(view.apply_key(b'\x06'), CopyModeAction::Redraw);
+        assert_eq!(view.cursor_line_number(), Some(4));
+        assert!(view.render().contains("4\tfour"));
+        assert!(!view.render().contains("1\tone"));
+    }
+
+    #[test]
+    fn copy_mode_view_home_end_jump_viewport() {
+        let mut view =
+            CopyModeView::from_numbered_output("1\tone\n2\ttwo\n3\tthree\n4\tfour\n").unwrap();
+        view.set_height_for_test(3);
+
+        assert_eq!(view.apply_key(b'G'), CopyModeAction::Redraw);
+        assert_eq!(view.cursor_line_number(), Some(4));
+        assert!(view.render().contains("4\tfour"));
+        assert!(!view.render().contains("1\tone"));
+        assert_eq!(view.apply_key(b'g'), CopyModeAction::Redraw);
+        assert_eq!(view.cursor_line_number(), Some(1));
+    }
+
+    #[test]
+    fn copy_mode_input_parses_arrow_and_page_keys() {
+        let mut view =
+            CopyModeView::from_numbered_output("1\tone\n2\ttwo\n3\tthree\n4\tfour\n").unwrap();
+        let mut input = CopyModeInputState::default();
+
+        assert_eq!(
+            input.apply(&mut view, b"\x1b[B"),
+            vec![CopyModeAction::Redraw]
+        );
+        assert_eq!(view.cursor_line_number(), Some(2));
+        assert_eq!(
+            input.apply(&mut view, b"\x1b[5~"),
+            vec![CopyModeAction::Redraw]
+        );
+        assert_eq!(view.cursor_line_number(), Some(1));
+    }
+
+    #[test]
+    fn copy_mode_input_ignores_left_and_right_arrows() {
+        let mut view = CopyModeView::from_numbered_output("1\tone\n2\ttwo\n").unwrap();
+        let mut input = CopyModeInputState::default();
+
+        assert_eq!(
+            input.apply(&mut view, b"\x1b[D"),
+            vec![CopyModeAction::Ignore]
+        );
+        assert_eq!(
+            input.apply(&mut view, b"\x1b[C"),
+            vec![CopyModeAction::Ignore]
+        );
+        assert_eq!(view.cursor_line_number(), Some(1));
+    }
+
+    #[test]
+    fn copy_mode_input_buffers_csi_keys_split_after_escape() {
+        let mut view =
+            CopyModeView::from_numbered_output("1\tone\n2\ttwo\n3\tthree\n4\tfour\n").unwrap();
+        let mut input = CopyModeInputState::default();
+
+        assert_eq!(input.apply(&mut view, b"\x1b"), Vec::new());
+        assert_eq!(input.apply(&mut view, b"[B"), vec![CopyModeAction::Redraw]);
+        assert_eq!(view.cursor_line_number(), Some(2));
+
+        assert_eq!(input.apply(&mut view, b"\x1b"), Vec::new());
+        assert_eq!(input.apply(&mut view, b"[5~"), vec![CopyModeAction::Redraw]);
+        assert_eq!(view.cursor_line_number(), Some(1));
+    }
+
+    #[test]
+    fn copy_mode_input_ignores_split_left_arrow_after_escape() {
+        let mut view = CopyModeView::from_numbered_output("1\tone\n2\ttwo\n").unwrap();
+        let mut input = CopyModeInputState::default();
+
+        assert_eq!(input.apply(&mut view, b"\x1b"), Vec::new());
+        assert_eq!(input.apply(&mut view, b"[D"), vec![CopyModeAction::Ignore]);
+        assert_eq!(view.cursor_line_number(), Some(1));
+    }
+
+    #[test]
+    fn copy_mode_input_buffers_split_unsupported_csi_parameters() {
+        let mut view = CopyModeView::from_numbered_output("1\tone\n2\ttwo\n").unwrap();
+        let mut input = CopyModeInputState::default();
+
+        assert_eq!(input.apply(&mut view, b"\x1b[1"), Vec::new());
+        assert_eq!(input.apply(&mut view, b";5D"), vec![CopyModeAction::Ignore]);
+        assert_eq!(view.cursor_line_number(), Some(1));
+    }
+
+    #[test]
+    fn copy_mode_input_exits_on_lone_escape_after_disambiguation_timeout() {
+        let mut view = CopyModeView::from_numbered_output("1\tone\n").unwrap();
+        let mut input = CopyModeInputState::default();
+
+        assert_eq!(input.apply(&mut view, b"\x1b"), Vec::new());
+        let pending_since = input.pending_since.expect("pending escape timestamp");
+        assert_eq!(
+            input.pending_timeout_action(pending_since + COPY_MODE_ESCAPE_DISAMBIGUATION),
+            Some(CopyModeAction::Exit)
+        );
     }
 
     #[test]
