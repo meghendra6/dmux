@@ -28,6 +28,8 @@ const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
 const RESET_STYLE: &[u8] = b"\x1b[0m";
+const SAVE_CURSOR: &[u8] = b"\x1b7";
+const RESTORE_CURSOR: &[u8] = b"\x1b8";
 const ATTACH_RENDER_RESPONSE: &str = "OK\tRENDER_OUTPUT_META\n";
 const STDIN_FILENO: c_int = 0;
 const F_GETFL: c_int = 3;
@@ -550,29 +552,38 @@ fn write_initial_live_snapshot_frame(
     socket: &Path,
     session: &str,
 ) -> io::Result<LiveSnapshotFrame> {
-    write_live_snapshot_frame_with_message_and_clear(socket, session, None, true, false)
+    write_live_snapshot_frame_with_message_and_clear(socket, session, None, None, true, false)
 }
 
 fn write_live_snapshot_frame_with_message_and_clear(
     socket: &Path,
     session: &str,
     message: Option<&str>,
+    overlay: Option<&str>,
     clear: bool,
     prioritize_message: bool,
 ) -> io::Result<LiveSnapshotFrame> {
     let status = read_attach_status_line(socket, session)?;
     let snapshot = read_attach_layout_frame(socket, session)?;
-    write_live_frame_to_stdout(&status, message, &snapshot, clear, prioritize_message)
+    write_live_frame_to_stdout(
+        &status,
+        message,
+        overlay,
+        &snapshot,
+        clear,
+        prioritize_message,
+    )
 }
 
 fn write_live_frame_to_stdout(
     status: &str,
     message: Option<&str>,
+    overlay: Option<&str>,
     snapshot: &AttachLayoutSnapshotResponse,
     clear: bool,
     prioritize_message: bool,
 ) -> io::Result<LiveSnapshotFrame> {
-    let attach_size = detect_attach_size();
+    let attach_size = detect_attach_size().or_else(|| overlay.map(|_| default_attach_size()));
     let width = attach_size.map(|size| usize::from(size.cols));
     let max_header_rows = attach_size.map(|size| {
         let rows = usize::from(size.rows);
@@ -602,6 +613,9 @@ fn write_live_frame_to_stdout(
         write_snapshot_rows(&mut stdout, &snapshot.snapshot, snapshot_rows)?;
     } else {
         write_snapshot_rows_for_repaint(&mut stdout, &snapshot.snapshot, snapshot_rows)?;
+    }
+    if let (Some(overlay), Some(size)) = (overlay, attach_size) {
+        append_help_popup_overlay(&mut stdout, overlay, size, header_rows)?;
     }
     stdout.flush()?;
 
@@ -740,11 +754,159 @@ fn write_snapshot_rows(
 fn write_live_render_output(
     frame: &AttachRenderFrame,
     state: &mut LiveRenderOutputState,
+    overlay: Option<&str>,
 ) -> io::Result<()> {
-    let output = diff_live_render_output(frame, state);
+    let mut output = diff_live_render_output(frame, state);
+    if let Some(overlay) = overlay {
+        let size = detect_attach_size().unwrap_or_else(default_attach_size);
+        append_centered_popup_overlay(
+            &mut output,
+            "dmux help",
+            &popup_content_lines(overlay),
+            size,
+            frame.header_rows,
+        );
+    }
     let mut stdout = io::stdout().lock();
     stdout.write_all(&output)?;
     stdout.flush()
+}
+
+fn default_attach_size() -> PtySize {
+    PtySize { cols: 80, rows: 24 }
+}
+
+fn append_help_popup_overlay(
+    stdout: &mut impl Write,
+    overlay: &str,
+    size: PtySize,
+    header_rows: usize,
+) -> io::Result<()> {
+    let mut output = Vec::new();
+    append_centered_popup_overlay(
+        &mut output,
+        "dmux help",
+        &popup_content_lines(overlay),
+        size,
+        header_rows,
+    );
+    stdout.write_all(&output)
+}
+
+fn append_centered_popup_overlay(
+    output: &mut Vec<u8>,
+    title: &str,
+    content: &[String],
+    size: PtySize,
+    header_rows: usize,
+) {
+    let rows = usize::from(size.rows);
+    let cols = usize::from(size.cols);
+    if rows <= header_rows || cols < 4 {
+        return;
+    }
+
+    let available_rows = rows.saturating_sub(header_rows);
+    if available_rows < 3 {
+        return;
+    }
+
+    let popup_lines = boxed_popup_lines(title, content, Some(cols), Some(available_rows));
+    if popup_lines.is_empty() {
+        return;
+    }
+
+    let popup_height = popup_lines.len();
+    let popup_width = popup_lines
+        .iter()
+        .map(|line| display_cell_width(line))
+        .max()
+        .unwrap_or(0);
+    if popup_height > available_rows || popup_width > cols {
+        return;
+    }
+
+    let top = header_rows + ((available_rows.saturating_sub(popup_height) + 1) / 2) + 1;
+    let left = ((cols.saturating_sub(popup_width) + 1) / 2) + 1;
+
+    output.extend_from_slice(SAVE_CURSOR);
+    for (index, line) in popup_lines.iter().enumerate() {
+        write_absolute_cursor_position(output, top + index, left);
+        output.extend_from_slice(RESET_STYLE);
+        output.extend_from_slice(line.as_bytes());
+    }
+    output.extend_from_slice(RESTORE_CURSOR);
+}
+
+fn popup_content_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn boxed_popup_lines(
+    title: &str,
+    content: &[String],
+    max_total_width: Option<usize>,
+    max_rows: Option<usize>,
+) -> Vec<String> {
+    if max_total_width.is_some_and(|width| width < 4) {
+        return Vec::new();
+    }
+
+    let max_content_rows = max_rows
+        .map(|rows| rows.saturating_sub(2))
+        .unwrap_or(usize::MAX);
+    if max_content_rows == 0 {
+        return Vec::new();
+    }
+
+    let mut visible_content = content
+        .iter()
+        .take(max_content_rows)
+        .cloned()
+        .collect::<Vec<_>>();
+    if content.len() > max_content_rows {
+        let replacement = if max_content_rows == 1 {
+            "...".to_string()
+        } else {
+            "... more".to_string()
+        };
+        if let Some(last) = visible_content.last_mut() {
+            *last = replacement;
+        }
+    }
+
+    let max_inner_width = max_total_width
+        .map(|width| width.saturating_sub(2))
+        .unwrap_or(usize::MAX);
+    let max_content_width = max_inner_width.saturating_sub(2);
+    let content_width = visible_content
+        .iter()
+        .map(|line| display_cell_width(line))
+        .max()
+        .unwrap_or(0)
+        .min(max_content_width);
+    let title_text = format!(" {title} ");
+    let mut border_width = (content_width + 2).max(display_cell_width(&title_text));
+    border_width = border_width.min(max_inner_width);
+    if border_width == 0 {
+        return Vec::new();
+    }
+
+    let title_segment = truncate_header_line(&title_text, Some(border_width));
+    let trailing = border_width.saturating_sub(display_cell_width(&title_segment));
+    let inner_width = border_width.saturating_sub(2);
+    let mut lines = Vec::with_capacity(visible_content.len() + 2);
+    lines.push(format!("┌{title_segment}{}┐", "─".repeat(trailing)));
+    for line in visible_content {
+        let line = truncate_header_line(&line, Some(inner_width));
+        lines.push(format!("│ {line}{} │", cell_padding(&line, inner_width)));
+    }
+    lines.push(format!("└{}┘", "─".repeat(border_width)));
+    lines
 }
 
 fn reset_live_render_output_state(state: &mut LiveRenderOutputState) {
@@ -2848,7 +3010,6 @@ fn run_live_snapshot_attach(
                     };
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     if command_prompt_message.is_some()
-                        || help_popup_visible
                         || pane_number_message
                             .as_ref()
                             .is_some_and(|(_, until)| Instant::now() < *until)
@@ -2866,7 +3027,12 @@ fn run_live_snapshot_attach(
                         if command_prompt_message.is_none() && !help_popup_visible {
                             pane_number_message = None;
                         }
-                        write_live_render_output(&render_frame, &mut render_output_state)?;
+                        let help_popup_message = help_popup_visible.then(attach_help_overlay_text);
+                        write_live_render_output(
+                            &render_frame,
+                            &mut render_output_state,
+                            help_popup_message.as_deref(),
+                        )?;
                     }
                     last_redraw = Instant::now();
                     pending_input_repaint_deadline = None;
@@ -2970,26 +3136,21 @@ fn write_live_snapshot_frame_with_active_message(
     command_prompt_message: Option<&str>,
     help_popup_visible: bool,
 ) -> io::Result<LiveSnapshotFrame> {
-    let help_popup_message = help_popup_visible.then(attach_help_popup_message);
-    let message = active_live_message(
-        pane_number_message,
-        command_prompt_message,
-        help_popup_message.as_deref(),
-        Instant::now(),
-    );
+    let help_popup_message = help_popup_visible.then(attach_help_overlay_text);
+    let message = active_live_message(pane_number_message, command_prompt_message, Instant::now());
     write_live_snapshot_frame_with_message_and_clear(
         socket,
         session,
         message,
+        help_popup_message.as_deref(),
         false,
-        command_prompt_message.is_some() || help_popup_visible,
+        command_prompt_message.is_some(),
     )
 }
 
 fn active_live_message<'a>(
     pane_number_message: &'a mut Option<(String, Instant)>,
     command_prompt_message: Option<&'a str>,
-    help_popup_message: Option<&'a str>,
     now: Instant,
 ) -> Option<&'a str> {
     if pane_number_message
@@ -2999,7 +3160,7 @@ fn active_live_message<'a>(
         *pane_number_message = None;
     }
 
-    command_prompt_message.or(help_popup_message).or_else(|| {
+    command_prompt_message.or_else(|| {
         pane_number_message
             .as_ref()
             .map(|(message, _)| message.as_str())
@@ -3271,6 +3432,7 @@ where
     let mut input_state = RawAttachInputState::default();
     let mut initial_input = Some(initial_input);
     let mut controls = load_live_controls(socket);
+    let mut help_popup_visible = false;
 
     loop {
         tick()?;
@@ -3540,15 +3702,30 @@ where
                     }
                 }
                 AttachInputAction::EnterCopyMode { initial_input } => {
+                    help_popup_visible = false;
                     copy_mode_active.store(true, Ordering::SeqCst);
                     let result = enter_copy_mode(initial_input);
                     copy_mode_active.store(false, Ordering::SeqCst);
                     result?;
                 }
                 AttachInputAction::ShowHelp => {
-                    write_attach_help_message()?;
+                    help_popup_visible = !help_popup_visible;
+                    if help_popup_visible {
+                        write_attach_help_message()?;
+                    } else {
+                        let _ = write_live_snapshot_frame_with_message_and_clear(
+                            socket, session, None, None, false, false,
+                        )?;
+                    }
                 }
-                AttachInputAction::Detach => return Ok(RawAttachExit::Detach),
+                AttachInputAction::Detach => {
+                    if help_popup_visible {
+                        let _ = write_live_snapshot_frame_with_message_and_clear(
+                            socket, session, None, None, false, false,
+                        )?;
+                    }
+                    return Ok(RawAttachExit::Detach);
+                }
             }
         }
     }
@@ -3746,33 +3923,34 @@ fn attach_help_message() -> &'static str {
     cli::attach_help_overlay()
 }
 
-fn attach_help_popup_message() -> String {
-    let mut content = attach_help_message()
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    content.push("C-b ? close".to_string());
-    let content_width = content
-        .iter()
-        .map(|line| display_cell_width(line))
-        .max()
-        .unwrap_or(0);
-    let title = " dmux help ";
-    let border_width = (content_width + 2).max(display_cell_width(title));
-    let trailing = border_width.saturating_sub(display_cell_width(title));
-    let mut output = Vec::with_capacity(content.len() + 2);
-    output.push(format!("┌{title}{}┐", "─".repeat(trailing)));
-    for line in content {
-        output.push(format!(
-            "│ {}{} │",
-            line,
-            cell_padding(&line, content_width)
-        ));
+fn attach_help_popup_content() -> Vec<String> {
+    let mut saw_close_hint = false;
+    let mut content = Vec::new();
+    for line in attach_help_message().lines().map(str::trim_end) {
+        if line.is_empty()
+            || line.starts_with("Prompt accepts ")
+            || line.starts_with("Key bindings and options ")
+            || line.starts_with("Use list-keys/")
+        {
+            continue;
+        }
+        let line = line.replace("C-b ? toggle help", "C-b ? close");
+        saw_close_hint |= line.contains("C-b ? close");
+        content.push(line);
     }
-    output.push(format!("└{}┘", "─".repeat(border_width)));
-    output.join("\n")
+    if !saw_close_hint {
+        content.insert(0, "C-b ? close".to_string());
+    }
+    content
+}
+
+fn attach_help_overlay_text() -> String {
+    attach_help_popup_content().join("\n")
+}
+
+#[cfg(test)]
+fn attach_help_popup_message() -> String {
+    boxed_popup_lines("dmux help", &attach_help_popup_content(), None, None).join("\n")
 }
 
 fn cell_padding(line: &str, target_width: usize) -> String {
@@ -3781,7 +3959,16 @@ fn cell_padding(line: &str, target_width: usize) -> String {
 
 fn write_attach_help_message() -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    stdout.write_all(format!("\r\n{}\r\n", attach_help_popup_message()).as_bytes())?;
+    let size = detect_attach_size().unwrap_or_else(default_attach_size);
+    let mut output = Vec::new();
+    append_centered_popup_overlay(
+        &mut output,
+        "dmux help",
+        &attach_help_popup_content(),
+        size,
+        0,
+    );
+    stdout.write_all(&output)?;
     stdout.flush()
 }
 
@@ -7422,20 +7609,57 @@ mod tests {
         let now = Instant::now();
         let mut transient = Some(("old".to_string(), now));
 
-        let message = active_live_message(&mut transient, Some(":rename-window api"), None, now);
+        let message = active_live_message(&mut transient, Some(":rename-window api"), now);
 
         assert_eq!(message, Some(":rename-window api"));
         assert!(transient.is_none());
     }
 
     #[test]
-    fn active_live_message_keeps_help_popup_visible_without_transient_expiry() {
+    fn help_popup_overlay_does_not_become_a_header_message() {
         let now = Instant::now();
         let mut transient = None;
 
-        let message = active_live_message(&mut transient, None, Some("help"), now);
+        let message = active_live_message(&mut transient, None, now);
+        let header_lines = live_header_lines("tabs: [0:0*]\npane 0", message, Some(80));
 
-        assert_eq!(message, Some("help"));
+        assert_eq!(message, None);
+        assert_eq!(header_lines, vec!["tabs: [0:0*]", "pane 0"]);
+    }
+
+    #[test]
+    fn popup_overlay_uses_absolute_position_and_restores_cursor() {
+        let mut output = b"\x1b[0m\x1b[H\x1b[2Ktabs\r\n\x1b[2Kpane\x1b[?25h\x1b[2;5H".to_vec();
+
+        append_centered_popup_overlay(
+            &mut output,
+            "dmux help",
+            &["C-b ? close".to_string(), "Prompt examples:".to_string()],
+            PtySize { cols: 40, rows: 10 },
+            1,
+        );
+
+        assert!(
+            output
+                .windows(b"\x1b7".len())
+                .any(|window| window == b"\x1b7")
+        );
+        assert!(
+            output
+                .windows(b"\x1b8".len())
+                .any(|window| window == b"\x1b8")
+        );
+        assert!(
+            output
+                .windows(b"\x1b[5;".len())
+                .any(|window| window == b"\x1b[5;")
+        );
+        assert!(
+            output
+                .windows("┌ dmux help ".as_bytes().len())
+                .any(|window| { window == "┌ dmux help ".as_bytes() })
+        );
+        assert!(output.ends_with(b"\x1b8"), "{output:?}");
     }
 
     #[test]
