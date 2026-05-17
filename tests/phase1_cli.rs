@@ -2567,6 +2567,8 @@ fn cli_help_lists_attach_and_attach_help() {
     assert!(stdout.contains("C-b %"), "{stdout:?}");
     assert!(stdout.contains("C-b \""), "{stdout:?}");
     assert!(stdout.contains("C-b h/j/k/l"), "{stdout:?}");
+    assert!(stdout.contains("Alt-h/j/k/l"), "{stdout:?}");
+    assert!(stdout.contains("Ctrl-arrows"), "{stdout:?}");
     assert!(stdout.contains("C-b x"), "{stdout:?}");
     assert!(stdout.contains("C-b z"), "{stdout:?}");
     assert!(stdout.contains("C-b ?"), "{stdout:?}");
@@ -5189,6 +5191,81 @@ fn attach_prefix_h_l_focuses_horizontal_panes_for_live_input() {
     }
     let split = poll_capture(&socket, &session, "split-focus:split-right");
     assert!(split.contains("split-focus:split-right"), "{split:?}");
+    let active = poll_active_pane(&socket, &session, 1);
+    assert!(active.lines().any(|line| line == "1\t1"), "{active:?}");
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach input");
+        stdin.flush().expect("flush detach input");
+    }
+    let output = wait_for_child_exit(child);
+    assert_success(&output);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_arrow_and_alt_focus_shortcuts_route_live_input() {
+    let socket = unique_socket("attach-arrow-alt-focus");
+    let session = format!("attach-arrow-alt-focus-{}", std::process::id());
+    let base_file = unique_temp_file("attach-arrow-alt-focus-base");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!("printf base-ready; cat > {}; sleep 30", base_file.display()),
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; read line; echo split-alt:$line; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["base-ready", "split-ready"]);
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"\x02\x1b[Dbase-arrow\n")
+            .expect("write prefix-left arrow and input");
+        stdin.flush().expect("flush prefix-left arrow");
+    }
+    assert!(poll_file_contains(&base_file, "base-arrow"));
+    let active = poll_active_pane(&socket, &session, 0);
+    assert!(active.lines().any(|line| line == "0\t1"), "{active:?}");
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"\x1b[1;3Csplit-right\r")
+            .expect("write alt-right arrow and input");
+        stdin.flush().expect("flush alt-right arrow");
+    }
+    let split = poll_capture(&socket, &session, "split-alt:split-right");
+    assert!(split.contains("split-alt:split-right"), "{split:?}");
     let active = poll_active_pane(&socket, &session, 1);
     assert!(active.lines().any(|line| line == "1\t1"), "{active:?}");
 
