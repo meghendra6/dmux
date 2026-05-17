@@ -679,17 +679,18 @@ impl Session {
         target: &Target,
         command: Vec<String>,
         force: bool,
+        cwd: Option<PathBuf>,
     ) -> Result<Option<i32>, String> {
-        let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
         let session_name = self.name();
         let attach_events = self.attach_event_clients();
         let reconnect_live_raw =
             self.target_is_active_window(target)? && !has_attach_pane_snapshot(self);
-        let (id, size, old_pid) = self.windows.lock().unwrap().prepare_respawn_pane(
+        let (id, size, old_pid, existing_cwd) = self.windows.lock().unwrap().prepare_respawn_pane(
             target.window.clone(),
             target.pane.clone(),
             force,
         )?;
+        let cwd = cwd.unwrap_or(existing_cwd);
         let pane = spawn_pane(
             id,
             session_name,
@@ -1273,7 +1274,7 @@ impl Window {
         &self,
         target: PaneTarget,
         force: bool,
-    ) -> Result<(PaneId, PtySize, Option<i32>), String> {
+    ) -> Result<(PaneId, PtySize, Option<i32>, PathBuf), String> {
         let index = self.resolve_pane_target(target)?;
         let pane = self
             .panes
@@ -1287,7 +1288,7 @@ impl Window {
         } else {
             None
         };
-        Ok((pane.id, *pane.size.lock().unwrap(), old_pid))
+        Ok((pane.id, *pane.size.lock().unwrap(), old_pid, pane.cwd()))
     }
 
     fn replace_pane(&mut self, id: PaneId, pane: Arc<Pane>) -> Result<(), String> {
@@ -1808,7 +1809,7 @@ impl WindowSet {
         window: WindowTarget,
         target: PaneTarget,
         force: bool,
-    ) -> Result<(PaneId, PtySize, Option<i32>), String> {
+    ) -> Result<(PaneId, PtySize, Option<i32>, PathBuf), String> {
         let window_index = self.resolve_target(window)?;
         self.windows[window_index].prepare_respawn_pane(target, force)
     }
@@ -2247,6 +2248,7 @@ struct Pane {
     child_pid: i32,
     writer: Arc<Mutex<File>>,
     process: Mutex<PaneProcessStatus>,
+    cwd: Mutex<PathBuf>,
     size: Mutex<PtySize>,
     raw_history: Arc<Mutex<Vec<u8>>>,
     terminal: Arc<Mutex<TerminalState>>,
@@ -2307,6 +2309,10 @@ impl Pane {
             .and_then(Weak::upgrade)
     }
 
+    fn cwd(&self) -> PathBuf {
+        self.cwd.lock().unwrap().clone()
+    }
+
     fn is_running(&self) -> bool {
         matches!(
             *self.process.lock().unwrap(),
@@ -2355,7 +2361,11 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
     };
 
     match request {
-        Request::New { session, command } => handle_new(&state, &mut stream, session, command),
+        Request::New {
+            session,
+            command,
+            cwd,
+        } => handle_new(&state, &mut stream, session, command, cwd),
         Request::List => handle_list(&state, &mut stream),
         Request::ListSessions { format } => {
             handle_list_sessions(&state, &mut stream, format.as_deref())
@@ -2432,7 +2442,8 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             target,
             direction,
             command,
-        } => handle_split(&state, &mut stream, &target, direction, command),
+            cwd,
+        } => handle_split(&state, &mut stream, &target, direction, command, cwd),
         Request::ListPanes {
             session,
             window,
@@ -2463,10 +2474,13 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             target,
             force,
             command,
-        } => handle_respawn_pane(&state, &mut stream, &target, force, command),
-        Request::NewWindow { session, command } => {
-            handle_new_window(&state, &mut stream, &session, command)
-        }
+            cwd,
+        } => handle_respawn_pane(&state, &mut stream, &target, force, command, cwd),
+        Request::NewWindow {
+            session,
+            command,
+            cwd,
+        } => handle_new_window(&state, &mut stream, &session, command, cwd),
         Request::ListWindows { session, format } => {
             handle_list_windows(&state, &mut stream, &session, format.as_deref())
         }
@@ -2559,6 +2573,7 @@ fn handle_new(
     stream: &mut UnixStream,
     name: String,
     command: Vec<String>,
+    cwd: Option<PathBuf>,
 ) -> io::Result<()> {
     if let Err(message) = validate_session_name(&name) {
         write_err(stream, &message)?;
@@ -2572,7 +2587,7 @@ fn handle_new(
         return Ok(());
     }
 
-    let cwd = std::env::current_dir()?;
+    let cwd = cwd.unwrap_or(std::env::current_dir()?);
     let attach_events = Arc::new(Mutex::new(Vec::new()));
     let pane = spawn_pane(
         PaneId::new(0),
@@ -2625,6 +2640,7 @@ fn spawn_pane(
         process: Mutex::new(PaneProcessStatus::Running {
             pid: process.child_pid,
         }),
+        cwd: Mutex::new(spec.cwd.clone()),
         size: Mutex::new(spec.size),
         raw_history: Arc::new(Mutex::new(Vec::new())),
         terminal: Arc::new(Mutex::new(TerminalState::new(
@@ -3353,6 +3369,7 @@ fn handle_split(
     target: &Target,
     direction: SplitDirection,
     command: Vec<String>,
+    cwd: Option<PathBuf>,
 ) -> io::Result<()> {
     let session = resolve_session(state, &target.session);
 
@@ -3375,7 +3392,16 @@ fn handle_split(
             return Ok(());
         }
     };
-    let cwd = std::env::current_dir()?;
+    let cwd = match cwd {
+        Some(cwd) => cwd,
+        None => match session.target_pane(target) {
+            Ok(pane) => pane.cwd(),
+            Err(message) => {
+                write_err(stream, &message)?;
+                return Ok(());
+            }
+        },
+    };
     let pane = spawn_pane(
         session.next_pane_id(),
         session.name(),
@@ -4066,6 +4092,7 @@ fn handle_respawn_pane(
     target: &Target,
     force: bool,
     command: Vec<String>,
+    cwd: Option<PathBuf>,
 ) -> io::Result<()> {
     let session = resolve_session(state, &target.session);
 
@@ -4074,7 +4101,7 @@ fn handle_respawn_pane(
         return Ok(());
     };
 
-    let old_pid = match session.respawn_pane(target, command, force) {
+    let old_pid = match session.respawn_pane(target, command, force, cwd) {
         Ok(old_pid) => old_pid,
         Err(message) => {
             write_err(stream, &message)?;
@@ -4092,6 +4119,7 @@ fn handle_new_window(
     stream: &mut UnixStream,
     name: &str,
     command: Vec<String>,
+    cwd: Option<PathBuf>,
 ) -> io::Result<()> {
     let session = resolve_session(state, name);
 
@@ -4104,7 +4132,16 @@ fn handle_new_window(
         return Ok(());
     };
 
-    let cwd = std::env::current_dir()?;
+    let cwd = match cwd {
+        Some(cwd) => cwd,
+        None => match session.active_pane() {
+            Some(pane) => pane.cwd(),
+            None => {
+                write_err(stream, "missing pane")?;
+                return Ok(());
+            }
+        },
+    };
     let pane = spawn_pane(
         session.next_pane_id(),
         session.name(),
@@ -5908,6 +5945,7 @@ mod tests {
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
             process: Mutex::new(PaneProcessStatus::Running { pid: 0 }),
+            cwd: Mutex::new(std::env::current_dir().unwrap()),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
@@ -6340,6 +6378,7 @@ mod tests {
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
             process: Mutex::new(PaneProcessStatus::Running { pid: 0 }),
+            cwd: Mutex::new(dir.clone()),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
@@ -6391,6 +6430,7 @@ mod tests {
             child_pid: 0,
             writer: Arc::new(Mutex::new(writer)),
             process: Mutex::new(PaneProcessStatus::Running { pid: 0 }),
+            cwd: Mutex::new(dir.clone()),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),

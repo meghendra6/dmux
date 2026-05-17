@@ -1,3 +1,7 @@
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+
 pub const ARG_SEPARATOR: char = '\u{1f}';
 pub const MAX_SAVE_BUFFER_TEXT_BYTES: usize = 1024 * 1024;
 
@@ -102,6 +106,7 @@ pub enum Request {
     New {
         session: String,
         command: Vec<String>,
+        cwd: Option<PathBuf>,
     },
     ListSessions {
         format: Option<String>,
@@ -195,6 +200,7 @@ pub enum Request {
         target: Target,
         direction: SplitDirection,
         command: Vec<String>,
+        cwd: Option<PathBuf>,
     },
     ListPanes {
         session: String,
@@ -230,10 +236,12 @@ pub enum Request {
         target: Target,
         force: bool,
         command: Vec<String>,
+        cwd: Option<PathBuf>,
     },
     NewWindow {
         session: String,
         command: Vec<String>,
+        cwd: Option<PathBuf>,
     },
     ListWindows {
         session: String,
@@ -292,9 +300,19 @@ pub enum Request {
     KillServer,
 }
 
+#[allow(dead_code)]
 pub fn encode_new(session: &str, command: &[String]) -> String {
     let joined = command.join(&ARG_SEPARATOR.to_string());
     format!("NEW\t{session}\t{}\t{joined}\n", command.len())
+}
+
+pub fn encode_new_in_cwd(session: &str, command: &[String], cwd: &Path) -> String {
+    let joined = command.join(&ARG_SEPARATOR.to_string());
+    format!(
+        "NEW_CWD\t{session}\t{}\t{}\t{joined}\n",
+        encode_path(cwd),
+        command.len()
+    )
 }
 
 pub fn encode_attach(session: &str) -> String {
@@ -546,6 +564,7 @@ pub fn encode_split(session: &str, direction: SplitDirection, command: &[String]
     )
 }
 
+#[allow(dead_code)]
 pub fn encode_split_target(
     target: &Target,
     direction: SplitDirection,
@@ -556,6 +575,22 @@ pub fn encode_split_target(
         "SPLIT_TARGET\t{}\t{}\t{}\t{joined}\n",
         encode_target(target),
         encode_split_direction(direction),
+        command.len()
+    )
+}
+
+pub fn encode_split_target_in_cwd(
+    target: &Target,
+    direction: SplitDirection,
+    command: &[String],
+    cwd: &Path,
+) -> String {
+    let joined = command.join(&ARG_SEPARATOR.to_string());
+    format!(
+        "SPLIT_TARGET_CWD\t{}\t{}\t{}\t{}\t{joined}\n",
+        encode_target(target),
+        encode_split_direction(direction),
+        encode_path(cwd),
         command.len()
     )
 }
@@ -686,9 +721,34 @@ pub fn encode_respawn_pane_target(target: &Target, force: bool, command: &[Strin
     )
 }
 
+pub fn encode_respawn_pane_target_in_cwd(
+    target: &Target,
+    force: bool,
+    command: &[String],
+    cwd: &Path,
+) -> String {
+    let joined = command.join(&ARG_SEPARATOR.to_string());
+    format!(
+        "RESPAWN_PANE_TARGET_CWD\t{}\t{}\t{}\t{}\t{joined}\n",
+        encode_target(target),
+        usize::from(force),
+        encode_path(cwd),
+        command.len()
+    )
+}
+
 pub fn encode_new_window(session: &str, command: &[String]) -> String {
     let joined = command.join(&ARG_SEPARATOR.to_string());
     format!("NEW_WINDOW\t{session}\t{}\t{joined}\n", command.len())
+}
+
+pub fn encode_new_window_in_cwd(session: &str, command: &[String], cwd: &Path) -> String {
+    let joined = command.join(&ARG_SEPARATOR.to_string());
+    format!(
+        "NEW_WINDOW_CWD\t{session}\t{}\t{}\t{joined}\n",
+        encode_path(cwd),
+        command.len()
+    )
 }
 
 pub fn encode_list_windows(session: &str, format: Option<&str>) -> String {
@@ -929,6 +989,25 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             Ok(Request::New {
                 session: (*session).to_string(),
                 command,
+                cwd: None,
+            })
+        }
+        ["NEW_CWD", session, cwd, argc, joined] => {
+            let argc = argc
+                .parse::<usize>()
+                .map_err(|_| "NEW_CWD has invalid argc".to_string())?;
+            let command = if *joined == "" {
+                Vec::new()
+            } else {
+                joined.split(ARG_SEPARATOR).map(str::to_string).collect()
+            };
+            if command.len() != argc {
+                return Err("NEW_CWD argc does not match command".to_string());
+            }
+            Ok(Request::New {
+                session: (*session).to_string(),
+                command,
+                cwd: Some(decode_path(cwd)?),
             })
         }
         ["ATTACH", session] => Ok(Request::Attach {
@@ -1223,6 +1302,7 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 target: Target::active((*session).to_string()),
                 direction: decode_split_direction(direction)?,
                 command,
+                cwd: None,
             })
         }
         ["SPLIT_TARGET", target, direction, argc, joined] => {
@@ -1241,6 +1321,26 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 target: decode_target(target, "SPLIT_TARGET")?,
                 direction: decode_split_direction(direction)?,
                 command,
+                cwd: None,
+            })
+        }
+        ["SPLIT_TARGET_CWD", target, direction, cwd, argc, joined] => {
+            let argc = argc
+                .parse::<usize>()
+                .map_err(|_| "SPLIT_TARGET_CWD has invalid argc".to_string())?;
+            let command = if *joined == "" {
+                Vec::new()
+            } else {
+                joined.split(ARG_SEPARATOR).map(str::to_string).collect()
+            };
+            if command.len() != argc {
+                return Err("SPLIT_TARGET_CWD argc does not match command".to_string());
+            }
+            Ok(Request::Split {
+                target: decode_target(target, "SPLIT_TARGET_CWD")?,
+                direction: decode_split_direction(direction)?,
+                command,
+                cwd: Some(decode_path(cwd)?),
             })
         }
         ["LIST_PANES", session] => Ok(Request::ListPanes {
@@ -1362,6 +1462,7 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                     _ => return Err("RESPAWN_PANE has invalid force flag".to_string()),
                 },
                 command,
+                cwd: None,
             })
         }
         ["RESPAWN_PANE_TARGET", target, force, argc, joined] => {
@@ -1384,6 +1485,30 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                     _ => return Err("RESPAWN_PANE_TARGET has invalid force flag".to_string()),
                 },
                 command,
+                cwd: None,
+            })
+        }
+        ["RESPAWN_PANE_TARGET_CWD", target, force, cwd, argc, joined] => {
+            let argc = argc
+                .parse::<usize>()
+                .map_err(|_| "RESPAWN_PANE_TARGET_CWD has invalid argc".to_string())?;
+            let command = if *joined == "" {
+                Vec::new()
+            } else {
+                joined.split(ARG_SEPARATOR).map(str::to_string).collect()
+            };
+            if command.len() != argc {
+                return Err("RESPAWN_PANE_TARGET_CWD argc does not match command".to_string());
+            }
+            Ok(Request::RespawnPane {
+                target: decode_target(target, "RESPAWN_PANE_TARGET_CWD")?,
+                force: match *force {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err("RESPAWN_PANE_TARGET_CWD has invalid force flag".to_string()),
+                },
+                command,
+                cwd: Some(decode_path(cwd)?),
             })
         }
         ["NEW_WINDOW", session, argc, joined] => {
@@ -1401,6 +1526,25 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             Ok(Request::NewWindow {
                 session: (*session).to_string(),
                 command,
+                cwd: None,
+            })
+        }
+        ["NEW_WINDOW_CWD", session, cwd, argc, joined] => {
+            let argc = argc
+                .parse::<usize>()
+                .map_err(|_| "NEW_WINDOW_CWD has invalid argc".to_string())?;
+            let command = if *joined == "" {
+                Vec::new()
+            } else {
+                joined.split(ARG_SEPARATOR).map(str::to_string).collect()
+            };
+            if command.len() != argc {
+                return Err("NEW_WINDOW_CWD argc does not match command".to_string());
+            }
+            Ok(Request::NewWindow {
+                session: (*session).to_string(),
+                command,
+                cwd: Some(decode_path(cwd)?),
             })
         }
         ["LIST_WINDOWS", session] => Ok(Request::ListWindows {
@@ -1710,6 +1854,14 @@ fn decode_optional_text(value: &str, command: &str) -> Result<Option<String>, St
     }
 }
 
+fn encode_path(path: &Path) -> String {
+    encode_hex(path.as_os_str().as_bytes())
+}
+
+fn decode_path(hex: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from(OsString::from_vec(decode_hex(hex)?)))
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1761,7 +1913,24 @@ mod tests {
             decode_request(&line).unwrap(),
             Request::New {
                 session: "dev".to_string(),
-                command
+                command,
+                cwd: None,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_new_request_with_cwd() {
+        let command = vec!["pwd".to_string()];
+        let cwd = PathBuf::from("/tmp/dmux cwd");
+        let line = encode_new_in_cwd("dev", &command, &cwd);
+
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::New {
+                session: "dev".to_string(),
+                command,
+                cwd: Some(cwd),
             }
         );
     }
@@ -2126,6 +2295,7 @@ mod tests {
                 target: Target::active("dev".to_string()),
                 direction: SplitDirection::Horizontal,
                 command,
+                cwd: None,
             }
         );
     }
@@ -2146,6 +2316,29 @@ mod tests {
                 target,
                 direction: SplitDirection::Vertical,
                 command,
+                cwd: None,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_targeted_split_request_with_cwd() {
+        let command = vec!["pwd".to_string()];
+        let cwd = PathBuf::from("/tmp/dmux split cwd");
+        let target = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Active,
+            pane: PaneTarget::Index(0),
+        };
+        let line = encode_split_target_in_cwd(&target, SplitDirection::Horizontal, &command, &cwd);
+
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::Split {
+                target,
+                direction: SplitDirection::Horizontal,
+                command,
+                cwd: Some(cwd),
             }
         );
     }
@@ -2236,6 +2429,28 @@ mod tests {
                 },
                 force: true,
                 command,
+                cwd: None,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_respawn_pane_request_with_cwd() {
+        let command = vec!["pwd".to_string()];
+        let cwd = PathBuf::from("/tmp/dmux respawn cwd");
+        let target = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Active,
+            pane: PaneTarget::Index(1),
+        };
+        let line = encode_respawn_pane_target_in_cwd(&target, true, &command, &cwd);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::RespawnPane {
+                target,
+                force: true,
+                command,
+                cwd: Some(cwd),
             }
         );
     }
@@ -2253,6 +2468,22 @@ mod tests {
             Request::NewWindow {
                 session: "dev".to_string(),
                 command,
+                cwd: None,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_new_window_request_with_cwd() {
+        let command = vec!["pwd".to_string()];
+        let cwd = PathBuf::from("/tmp/dmux window cwd");
+        let line = encode_new_window_in_cwd("dev", &command, &cwd);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::NewWindow {
+                session: "dev".to_string(),
+                command,
+                cwd: Some(cwd),
             }
         );
     }
