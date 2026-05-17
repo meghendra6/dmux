@@ -7,7 +7,7 @@ use crate::protocol::{
 };
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::{TerminalChanges, TerminalState};
-use crate::terminal_query::PtyOutputFilter;
+use crate::terminal_query::{FilteredPtyOutput, PtyOutputFilter};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
@@ -1378,6 +1378,7 @@ impl Window {
                     title: pane.title(),
                     bell: pane.bell(),
                     activity: pane.activity(),
+                    clipboard_blocked: pane.clipboard_blocked(),
                 })
             })
             .collect()
@@ -1946,6 +1947,7 @@ impl WindowSet {
             pane_title: pane.title(),
             pane_bell: pane.bell(),
             pane_activity: pane.activity(),
+            pane_clipboard_blocked: pane.clipboard_blocked(),
             buffer_summary: BufferStatusSummary::default(),
             transient_message: None,
             session_attached_count: 0,
@@ -1997,6 +1999,7 @@ struct PaneDescription {
     title: String,
     bell: bool,
     activity: bool,
+    clipboard_blocked: usize,
 }
 
 struct IndexedPane {
@@ -2186,6 +2189,7 @@ struct StatusContext {
     pane_title: String,
     pane_bell: bool,
     pane_activity: bool,
+    pane_clipboard_blocked: usize,
     buffer_summary: BufferStatusSummary,
     transient_message: Option<String>,
     status_hints: bool,
@@ -2290,6 +2294,7 @@ struct Pane {
     title: Mutex<String>,
     bell: AtomicBool,
     activity: AtomicBool,
+    clipboard_blocked: AtomicUsize,
     synchronized_output_redraw_pending: AtomicBool,
     size: Mutex<PtySize>,
     raw_history: Arc<Mutex<Vec<u8>>>,
@@ -2381,6 +2386,16 @@ impl Pane {
 
     fn activity(&self) -> bool {
         self.activity.load(Ordering::SeqCst)
+    }
+
+    fn record_blocked_clipboard_writes(&self, count: usize) {
+        if count > 0 {
+            self.clipboard_blocked.fetch_add(count, Ordering::SeqCst);
+        }
+    }
+
+    fn clipboard_blocked(&self) -> usize {
+        self.clipboard_blocked.load(Ordering::SeqCst)
     }
 
     fn clear_alerts(&self) {
@@ -2735,6 +2750,7 @@ fn spawn_pane(
         title: Mutex::new(String::new()),
         bell: AtomicBool::new(false),
         activity: AtomicBool::new(false),
+        clipboard_blocked: AtomicUsize::new(0),
         synchronized_output_redraw_pending: AtomicBool::new(false),
         size: Mutex::new(spec.size),
         raw_history: Arc::new(Mutex::new(Vec::new())),
@@ -3579,6 +3595,7 @@ fn format_pane_line(format: &str, pane: &PaneDescription) -> String {
         _ => String::new(),
     };
     let pane_cwd = pane.cwd.to_string_lossy();
+    let clipboard_blocked = pane.clipboard_blocked.to_string();
     format
         .replace("#{pane.id}", &pane.id.as_usize().to_string())
         .replace("#{pane.index}", &pane.index.to_string())
@@ -3592,6 +3609,7 @@ fn format_pane_line(format: &str, pane: &PaneDescription) -> String {
         .replace("#{pane.title}", &pane.title)
         .replace("#{pane.bell}", if pane.bell { "1" } else { "0" })
         .replace("#{pane.activity}", if pane.activity { "1" } else { "0" })
+        .replace("#{pane.clipboard_blocked}", &clipboard_blocked)
         .replace(
             "#{window.zoomed_flag}",
             if pane.window_zoomed { "1" } else { "0" },
@@ -3894,6 +3912,7 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
     let pane_pid = context.pane_process.pid().to_string();
     let pane_bell = if context.pane_bell { "1" } else { "0" };
     let pane_activity = if context.pane_activity { "1" } else { "0" };
+    let pane_clipboard_blocked = context.pane_clipboard_blocked.to_string();
     let pane_exit_status = match context.pane_process {
         PaneProcessStatus::Exited {
             exit_status: Some(status),
@@ -3959,6 +3978,7 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{pane.title}", context.pane_title.as_str()),
         ("#{pane.bell}", pane_bell),
         ("#{pane.activity}", pane_activity),
+        ("#{pane.clipboard_blocked}", pane_clipboard_blocked.as_str()),
         ("#{buffer.count}", buffer_count.as_str()),
         ("#{buffer.index}", buffer_index.as_str()),
         ("#{buffer.name}", buffer_name),
@@ -5708,15 +5728,37 @@ fn start_output_pump(mut reader: File, pane: Arc<Pane>) {
 
 fn handle_pane_output(pane: &Arc<Pane>, bytes: &[u8]) {
     let filtered = pane.output_filter.lock().unwrap().filter(bytes);
-    if !filtered.reply_bytes.is_empty() {
-        let _ = pane.writer.lock().unwrap().write_all(&filtered.reply_bytes);
-    }
-    publish_pane_output(pane, &filtered.display_bytes);
+    publish_filtered_pane_output(pane, filtered);
 }
 
 fn flush_pane_output_filter(pane: &Arc<Pane>) {
-    let pending = pane.output_filter.lock().unwrap().finish();
-    publish_pane_output(pane, &pending);
+    let filtered = pane.output_filter.lock().unwrap().finish();
+    publish_filtered_pane_output(pane, filtered);
+}
+
+fn publish_filtered_pane_output(pane: &Arc<Pane>, filtered: FilteredPtyOutput) {
+    if !filtered.reply_bytes.is_empty() {
+        let _ = pane.writer.lock().unwrap().write_all(&filtered.reply_bytes);
+    }
+    if filtered.blocked_clipboard_writes > 0 {
+        pane.record_blocked_clipboard_writes(filtered.blocked_clipboard_writes);
+    }
+    if !filtered.display_bytes.is_empty() {
+        publish_pane_output(pane, &filtered.display_bytes);
+    } else if filtered.blocked_clipboard_writes > 0 {
+        notify_pane_metadata_changed(pane);
+    }
+}
+
+fn notify_pane_metadata_changed(pane: &Arc<Pane>) {
+    if let Some(session) = pane.session() {
+        if !session.is_active_pane(pane) {
+            pane.mark_activity();
+        }
+        session.notify_attach_redraw_immediate();
+    } else {
+        notify_attach_redraw(&pane.attach_events);
+    }
 }
 
 fn publish_pane_output(pane: &Arc<Pane>, bytes: &[u8]) {
@@ -6107,6 +6149,7 @@ mod tests {
             title: Mutex::new(String::new()),
             bell: AtomicBool::new(false),
             activity: AtomicBool::new(false),
+            clipboard_blocked: AtomicUsize::new(0),
             synchronized_output_redraw_pending: AtomicBool::new(false),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
@@ -6612,6 +6655,7 @@ mod tests {
             title: Mutex::new(String::new()),
             bell: AtomicBool::new(false),
             activity: AtomicBool::new(false),
+            clipboard_blocked: AtomicUsize::new(0),
             synchronized_output_redraw_pending: AtomicBool::new(false),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
@@ -6668,6 +6712,7 @@ mod tests {
             title: Mutex::new(String::new()),
             bell: AtomicBool::new(false),
             activity: AtomicBool::new(false),
+            clipboard_blocked: AtomicUsize::new(0),
             synchronized_output_redraw_pending: AtomicBool::new(false),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),

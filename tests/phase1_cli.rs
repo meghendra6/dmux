@@ -8476,6 +8476,63 @@ fn active_pane_bell_is_exposed_in_status_format() {
 }
 
 #[test]
+fn osc52_clipboard_writes_are_blocked_and_reported() {
+    let socket = unique_socket("osc52-clipboard-policy");
+    let session = format!("osc52-clipboard-policy-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf 'before\\033]52;c;SGVsbG8=\\007after'; sleep 30",
+        ],
+    ));
+
+    let captured = poll_capture(&socket, &session, "beforeafter");
+    assert!(captured.contains("beforeafter"), "{captured:?}");
+    assert!(!captured.contains("SGVsbG8="), "{captured:?}");
+
+    let blocked = poll_pane_format(&socket, &session, "#{pane.clipboard_blocked}", "1");
+    assert!(blocked.lines().any(|line| line == "1"), "{blocked:?}");
+
+    let status = dmux(
+        &socket,
+        &[
+            "status-line",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.clipboard_blocked}",
+        ],
+    );
+    assert_success(&status);
+    assert_eq!(String::from_utf8_lossy(&status.stdout).trim_end(), "1");
+
+    let mut raw_attach = UnixStream::connect(&socket).expect("connect raw attach stream");
+    raw_attach
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set raw attach read timeout");
+    raw_attach
+        .write_all(format!("ATTACH\t{session}\n").as_bytes())
+        .expect("write raw attach request");
+    assert_eq!(read_socket_line(&mut raw_attach), "OK\tLIVE\t0\n");
+    let mut raw = vec![0_u8; "beforeafter".len()];
+    raw_attach
+        .read_exact(&mut raw)
+        .expect("read raw attach history");
+    assert_eq!(String::from_utf8_lossy(&raw), "beforeafter");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn select_pane_switches_active_capture_target() {
     let socket = unique_socket("select-pane");
     let session = format!("select-pane-{}", std::process::id());
