@@ -26,6 +26,7 @@ const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
 const ATTACH_RENDER_STATUS_FORMAT: &str = "#{session.name} #{window.list} pane #{pane.index} clients #{client.count} buffers #{buffer.count} | #{status.help}";
 const ATTACH_RENDER_RESPONSE: &[u8] = b"OK\tRENDER_OUTPUT_META\n";
 const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(16);
+const SYNCHRONIZED_OUTPUT_REDRAW_TIMEOUT: Duration = Duration::from_millis(100);
 const TRANSIENT_MESSAGE_DURATION: Duration = Duration::from_millis(1500);
 const RAW_ATTACH_RECONNECT_ALIAS_GRACE: Duration = Duration::from_millis(500);
 const CURSOR_HOME: &[u8] = b"\x1b[H";
@@ -521,6 +522,20 @@ impl Session {
         self.windows.lock().unwrap().active_live_pane()
     }
 
+    fn is_active_pane(&self, pane: &Arc<Pane>) -> bool {
+        self.windows
+            .lock()
+            .unwrap()
+            .active_pane()
+            .is_some_and(|active| Arc::ptr_eq(&active, pane))
+    }
+
+    fn clear_active_pane_alerts(&self) {
+        if let Some(pane) = self.windows.lock().unwrap().active_pane() {
+            pane.clear_alerts();
+        }
+    }
+
     fn target_pane(&self, target: &Target) -> Result<Arc<Pane>, String> {
         self.windows
             .lock()
@@ -627,7 +642,9 @@ impl Session {
     }
 
     fn select_pane(&self, window: WindowTarget, target: PaneSelectTarget) -> Result<bool, String> {
-        self.windows.lock().unwrap().select_pane(window, target)
+        let changed = self.windows.lock().unwrap().select_pane(window, target)?;
+        self.clear_active_pane_alerts();
+        Ok(changed)
     }
 
     fn kill_pane(&self, target: &Target) -> Result<Arc<Pane>, String> {
@@ -772,7 +789,9 @@ impl Session {
     }
 
     fn select_window(&self, target: WindowTarget) -> Result<(), String> {
-        self.windows.lock().unwrap().select(target)
+        self.windows.lock().unwrap().select(target)?;
+        self.clear_active_pane_alerts();
+        Ok(())
     }
 
     fn rename_window(&self, target: WindowTarget, name: String) -> Result<(), String> {
@@ -780,11 +799,15 @@ impl Session {
     }
 
     fn select_next_window(&self) -> Result<(), String> {
-        self.windows.lock().unwrap().select_next()
+        self.windows.lock().unwrap().select_next()?;
+        self.clear_active_pane_alerts();
+        Ok(())
     }
 
     fn select_previous_window(&self) -> Result<(), String> {
-        self.windows.lock().unwrap().select_previous()
+        self.windows.lock().unwrap().select_previous()?;
+        self.clear_active_pane_alerts();
+        Ok(())
     }
 
     fn window_descriptions(&self) -> Vec<WindowDescription> {
@@ -796,10 +819,13 @@ impl Session {
     }
 
     fn zoom_pane(&self, target: &Target) -> Result<bool, String> {
-        self.windows
+        let changed = self
+            .windows
             .lock()
             .unwrap()
-            .zoom_pane(target.window.clone(), target.pane.clone())
+            .zoom_pane(target.window.clone(), target.pane.clone())?;
+        self.clear_active_pane_alerts();
+        Ok(changed)
     }
 
     fn status_context(&self) -> Option<StatusContext> {
@@ -1348,6 +1374,10 @@ impl Window {
                     zoomed: self.zoomed == Some(index),
                     window_zoomed,
                     process: pane.process_status(),
+                    cwd: pane.cwd(),
+                    title: pane.title(),
+                    bell: pane.bell(),
+                    activity: pane.activity(),
                 })
             })
             .collect()
@@ -1456,6 +1486,7 @@ impl Window {
         self.panes.active_index()
     }
 
+    #[cfg(test)]
     fn active_pane_id(&self) -> Option<PaneId> {
         self.panes
             .get(self.panes.active_index())
@@ -1464,12 +1495,6 @@ impl Window {
 
     fn active_pane_zoomed(&self) -> bool {
         self.zoomed == Some(self.panes.active_index())
-    }
-
-    fn active_pane_process(&self) -> Option<PaneProcessStatus> {
-        self.panes
-            .get(self.panes.active_index())
-            .map(|pane| pane.process_status())
     }
 
     fn is_zoomed(&self) -> bool {
@@ -1905,6 +1930,7 @@ impl WindowSet {
 
     fn status_context(&self, session_name: &str) -> Option<StatusContext> {
         let window = self.active_window()?;
+        let pane = window.active_pane()?;
         Some(StatusContext {
             session_name: session_name.to_string(),
             window_index: self.active,
@@ -1912,10 +1938,14 @@ impl WindowSet {
             window_name: window.name.clone(),
             window_count: self.windows.len(),
             pane_index: window.active_pane_index(),
-            pane_id: window.active_pane_id()?,
+            pane_id: pane.id,
             pane_zoomed: window.active_pane_zoomed(),
             window_zoomed: window.is_zoomed(),
-            pane_process: window.active_pane_process()?,
+            pane_process: pane.process_status(),
+            pane_cwd: pane.cwd(),
+            pane_title: pane.title(),
+            pane_bell: pane.bell(),
+            pane_activity: pane.activity(),
             buffer_summary: BufferStatusSummary::default(),
             transient_message: None,
             session_attached_count: 0,
@@ -1963,6 +1993,10 @@ struct PaneDescription {
     zoomed: bool,
     window_zoomed: bool,
     process: PaneProcessStatus,
+    cwd: PathBuf,
+    title: String,
+    bell: bool,
+    activity: bool,
 }
 
 struct IndexedPane {
@@ -2148,6 +2182,10 @@ struct StatusContext {
     pane_zoomed: bool,
     window_zoomed: bool,
     pane_process: PaneProcessStatus,
+    pane_cwd: PathBuf,
+    pane_title: String,
+    pane_bell: bool,
+    pane_activity: bool,
     buffer_summary: BufferStatusSummary,
     transient_message: Option<String>,
     status_hints: bool,
@@ -2249,6 +2287,10 @@ struct Pane {
     writer: Arc<Mutex<File>>,
     process: Mutex<PaneProcessStatus>,
     cwd: Mutex<PathBuf>,
+    title: Mutex<String>,
+    bell: AtomicBool,
+    activity: AtomicBool,
+    synchronized_output_redraw_pending: AtomicBool,
     size: Mutex<PtySize>,
     raw_history: Arc<Mutex<Vec<u8>>>,
     terminal: Arc<Mutex<TerminalState>>,
@@ -2311,6 +2353,55 @@ impl Pane {
 
     fn cwd(&self) -> PathBuf {
         self.cwd.lock().unwrap().clone()
+    }
+
+    fn set_cwd(&self, cwd: PathBuf) {
+        *self.cwd.lock().unwrap() = cwd;
+    }
+
+    fn title(&self) -> String {
+        self.title.lock().unwrap().clone()
+    }
+
+    fn set_title(&self, title: String) {
+        *self.title.lock().unwrap() = title;
+    }
+
+    fn mark_bell(&self) {
+        self.bell.store(true, Ordering::SeqCst);
+    }
+
+    fn bell(&self) -> bool {
+        self.bell.load(Ordering::SeqCst)
+    }
+
+    fn mark_activity(&self) {
+        self.activity.store(true, Ordering::SeqCst);
+    }
+
+    fn activity(&self) -> bool {
+        self.activity.load(Ordering::SeqCst)
+    }
+
+    fn clear_alerts(&self) {
+        self.bell.store(false, Ordering::SeqCst);
+        self.activity.store(false, Ordering::SeqCst);
+    }
+
+    fn mark_synchronized_output_redraw_pending(&self) -> bool {
+        self.synchronized_output_redraw_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    fn clear_synchronized_output_redraw_pending(&self) {
+        self.synchronized_output_redraw_pending
+            .store(false, Ordering::SeqCst);
+    }
+
+    fn take_synchronized_output_redraw_pending(&self) -> bool {
+        self.synchronized_output_redraw_pending
+            .swap(false, Ordering::SeqCst)
     }
 
     fn is_running(&self) -> bool {
@@ -2641,6 +2732,10 @@ fn spawn_pane(
             pid: process.child_pid,
         }),
         cwd: Mutex::new(spec.cwd.clone()),
+        title: Mutex::new(String::new()),
+        bell: AtomicBool::new(false),
+        activity: AtomicBool::new(false),
+        synchronized_output_redraw_pending: AtomicBool::new(false),
         size: Mutex::new(spec.size),
         raw_history: Arc::new(Mutex::new(Vec::new())),
         terminal: Arc::new(Mutex::new(TerminalState::new(
@@ -3483,6 +3578,7 @@ fn format_pane_line(format: &str, pane: &PaneDescription) -> String {
         } => signal.to_string(),
         _ => String::new(),
     };
+    let pane_cwd = pane.cwd.to_string_lossy();
     format
         .replace("#{pane.id}", &pane.id.as_usize().to_string())
         .replace("#{pane.index}", &pane.index.to_string())
@@ -3492,6 +3588,10 @@ fn format_pane_line(format: &str, pane: &PaneDescription) -> String {
         .replace("#{pane.pid}", &pid)
         .replace("#{pane.exit_status}", &exit_status)
         .replace("#{pane.exit_signal}", &exit_signal)
+        .replace("#{pane.cwd}", pane_cwd.as_ref())
+        .replace("#{pane.title}", &pane.title)
+        .replace("#{pane.bell}", if pane.bell { "1" } else { "0" })
+        .replace("#{pane.activity}", if pane.activity { "1" } else { "0" })
         .replace(
             "#{window.zoomed_flag}",
             if pane.window_zoomed { "1" } else { "0" },
@@ -3790,7 +3890,10 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
     let pane_id = context.pane_id.as_usize().to_string();
     let pane_zoomed = if context.pane_zoomed { "1" } else { "0" };
     let window_zoomed = if context.window_zoomed { "1" } else { "0" };
+    let pane_cwd = context.pane_cwd.to_string_lossy();
     let pane_pid = context.pane_process.pid().to_string();
+    let pane_bell = if context.pane_bell { "1" } else { "0" };
+    let pane_activity = if context.pane_activity { "1" } else { "0" };
     let pane_exit_status = match context.pane_process {
         PaneProcessStatus::Exited {
             exit_status: Some(status),
@@ -3852,6 +3955,10 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{pane.pid}", pane_pid.as_str()),
         ("#{pane.exit_status}", pane_exit_status.as_str()),
         ("#{pane.exit_signal}", pane_exit_signal.as_str()),
+        ("#{pane.cwd}", pane_cwd.as_ref()),
+        ("#{pane.title}", context.pane_title.as_str()),
+        ("#{pane.bell}", pane_bell),
+        ("#{pane.activity}", pane_activity),
         ("#{buffer.count}", buffer_count.as_str()),
         ("#{buffer.index}", buffer_index.as_str()),
         ("#{buffer.name}", buffer_name),
@@ -5618,12 +5725,49 @@ fn publish_pane_output(pane: &Arc<Pane>, bytes: &[u8]) {
     }
     append_history(&pane.raw_history, bytes);
     let terminal_changes = pane.terminal.lock().unwrap().apply_bytes(bytes);
+    if let Some(cwd) = terminal_changes.cwd.as_ref().filter(|cwd| cwd.is_dir()) {
+        pane.set_cwd(cwd.clone());
+    }
+    if let Some(title) = terminal_changes.title.as_ref() {
+        pane.set_title(title.clone());
+    }
+    if terminal_changes.bell {
+        pane.mark_bell();
+    }
     if let Some(session) = pane.session() {
-        session.notify_attach_redraw_for_pane_output(terminal_changes);
+        if !session.is_active_pane(pane) {
+            pane.mark_activity();
+        }
+        if terminal_changes.synchronized_output_active
+            && !terminal_changes.synchronized_output_finished
+        {
+            schedule_synchronized_output_redraw_timeout(pane, &session);
+        } else {
+            pane.clear_synchronized_output_redraw_pending();
+            session.notify_attach_redraw_for_pane_output(terminal_changes);
+        }
     } else {
         notify_attach_redraw(&pane.attach_events);
     }
     broadcast(&pane.clients, bytes);
+}
+
+fn schedule_synchronized_output_redraw_timeout(pane: &Arc<Pane>, session: &Arc<Session>) {
+    if !pane.mark_synchronized_output_redraw_pending() {
+        return;
+    }
+
+    let pane = Arc::downgrade(pane);
+    let session = Arc::downgrade(session);
+    std::thread::spawn(move || {
+        std::thread::sleep(SYNCHRONIZED_OUTPUT_REDRAW_TIMEOUT);
+        let (Some(pane), Some(session)) = (pane.upgrade(), session.upgrade()) else {
+            return;
+        };
+        if pane.take_synchronized_output_redraw_pending() {
+            session.notify_attach_redraw_immediate();
+        }
+    });
 }
 
 fn mark_exited_pane_in_session(pane: &Arc<Pane>) {
@@ -5926,6 +6070,20 @@ mod tests {
         body
     }
 
+    fn assert_no_attach_render_frame(stream: &mut UnixStream) {
+        let mut byte = [0_u8; 1];
+        match stream.read(&mut byte) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Ok(0) => panic!("attach render stream closed while waiting for no frame"),
+            Ok(n) => panic!("unexpected attach render frame byte count: {n}"),
+            Err(error) => panic!("unexpected attach render read error: {error}"),
+        }
+    }
+
     fn test_pane() -> (Arc<Pane>, PathBuf) {
         test_pane_with_id(0)
     }
@@ -5946,6 +6104,10 @@ mod tests {
             writer: Arc::new(Mutex::new(writer)),
             process: Mutex::new(PaneProcessStatus::Running { pid: 0 }),
             cwd: Mutex::new(std::env::current_dir().unwrap()),
+            title: Mutex::new(String::new()),
+            bell: AtomicBool::new(false),
+            activity: AtomicBool::new(false),
+            synchronized_output_redraw_pending: AtomicBool::new(false),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
@@ -6236,6 +6398,74 @@ mod tests {
     }
 
     #[test]
+    fn synchronized_output_suppresses_attach_render_until_finish() {
+        let (pane, writer_path) = test_pane();
+        let session = Arc::new(Session::new(
+            "test".to_string(),
+            1,
+            Arc::clone(&pane),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        pane.set_session(&session);
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let _registration = session
+            .register_attach_render_stream(&server, 1)
+            .unwrap()
+            .unwrap();
+        let _initial = read_attach_render_frame_body(&mut client);
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        publish_pane_output(&pane, b"\x1b[?2026hfirst");
+
+        assert_no_attach_render_frame(&mut client);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        publish_pane_output(&pane, b"second\x1b[?2026l");
+
+        let body = String::from_utf8(read_attach_render_frame_body(&mut client))
+            .expect("render frame utf8");
+        assert!(body.contains("OUTPUT\t"), "{body:?}");
+        let _ = std::fs::remove_file(writer_path);
+    }
+
+    #[test]
+    fn synchronized_output_timeout_flushes_unterminated_block() {
+        let (pane, writer_path) = test_pane();
+        let session = Arc::new(Session::new(
+            "test".to_string(),
+            1,
+            Arc::clone(&pane),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        pane.set_session(&session);
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let _registration = session
+            .register_attach_render_stream(&server, 1)
+            .unwrap()
+            .unwrap();
+        let _initial = read_attach_render_frame_body(&mut client);
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        publish_pane_output(&pane, b"\x1b[?2026hunterminated");
+
+        assert_no_attach_render_frame(&mut client);
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let body = String::from_utf8(read_attach_render_frame_body(&mut client))
+            .expect("render frame utf8");
+        assert!(body.contains("OUTPUT\t"), "{body:?}");
+        let _ = std::fs::remove_file(writer_path);
+    }
+
+    #[test]
     fn immediate_scheduler_does_not_drain_later_debounced_epoch() {
         let (pane, writer_path) = test_pane();
         let session = Arc::new(Session::new(
@@ -6379,6 +6609,10 @@ mod tests {
             writer: Arc::new(Mutex::new(writer)),
             process: Mutex::new(PaneProcessStatus::Running { pid: 0 }),
             cwd: Mutex::new(dir.clone()),
+            title: Mutex::new(String::new()),
+            bell: AtomicBool::new(false),
+            activity: AtomicBool::new(false),
+            synchronized_output_redraw_pending: AtomicBool::new(false),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),
@@ -6431,6 +6665,10 @@ mod tests {
             writer: Arc::new(Mutex::new(writer)),
             process: Mutex::new(PaneProcessStatus::Running { pid: 0 }),
             cwd: Mutex::new(dir.clone()),
+            title: Mutex::new(String::new()),
+            bell: AtomicBool::new(false),
+            activity: AtomicBool::new(false),
+            synchronized_output_redraw_pending: AtomicBool::new(false),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
             terminal: Arc::new(Mutex::new(TerminalState::new(80, 24, 100))),

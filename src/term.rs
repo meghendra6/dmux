@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use unicode_width::UnicodeWidthChar;
 
@@ -8,6 +9,7 @@ pub struct TerminalState {
     use_alternate_screen: bool,
     cursor_visible: bool,
     bracketed_paste: bool,
+    synchronized_output: bool,
     scrollback: Scrollback,
     parser: vte::Parser,
     style: CellStyle,
@@ -16,15 +18,23 @@ pub struct TerminalState {
     render_next_primary_output_immediately: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TerminalChanges {
     pub alternate_screen: bool,
     pub post_alternate_screen_exit: bool,
+    pub cwd: Option<PathBuf>,
+    pub title: Option<String>,
+    pub bell: bool,
+    pub synchronized_output_started: bool,
+    pub synchronized_output_finished: bool,
+    pub synchronized_output_active: bool,
 }
 
 impl TerminalChanges {
     pub fn requires_immediate_render(self) -> bool {
-        self.alternate_screen || self.post_alternate_screen_exit
+        self.alternate_screen
+            || self.post_alternate_screen_exit
+            || self.synchronized_output_finished
     }
 }
 
@@ -36,6 +46,7 @@ impl TerminalState {
             use_alternate_screen: false,
             cursor_visible: true,
             bracketed_paste: false,
+            synchronized_output: false,
             scrollback: Scrollback::new(max_scrollback_lines),
             parser: vte::Parser::new(),
             style: CellStyle::default(),
@@ -56,9 +67,8 @@ impl TerminalState {
             parser.advance(self, *byte);
         }
         self.parser = parser;
-        let changes = self.changes;
-        self.changes = TerminalChanges::default();
-        changes
+        self.changes.synchronized_output_active = self.synchronized_output;
+        std::mem::take(&mut self.changes)
     }
 
     pub fn capture_text(&self) -> String {
@@ -181,6 +191,10 @@ impl TerminalState {
         self.use_alternate_screen = false;
         self.cursor_visible = true;
         self.bracketed_paste = false;
+        if self.synchronized_output {
+            self.changes.synchronized_output_finished = true;
+        }
+        self.synchronized_output = false;
         self.scrollback.clear();
         self.style = CellStyle::default();
         self.last_printed_char = None;
@@ -259,6 +273,7 @@ impl vte::Perform for TerminalState {
             b'\n' | 0x0b | 0x0c => self.line_feed(),
             b'\t' => self.tab(),
             b'\x08' => self.active_screen_mut().backspace(),
+            b'\x07' => self.changes.bell = true,
             _ => {}
         }
     }
@@ -417,6 +432,25 @@ impl vte::Perform for TerminalState {
             _ => {}
         }
     }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        let Some(command) = params.first() else {
+            return;
+        };
+
+        match *command {
+            b"0" | b"2" => {
+                self.changes.title = Some(String::from_utf8_lossy(&osc_payload(params)).into());
+            }
+            b"7" => {
+                let payload = osc_payload(params);
+                if let Some(cwd) = parse_osc7_cwd(&payload) {
+                    self.changes.cwd = Some(cwd);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl TerminalState {
@@ -429,6 +463,18 @@ impl TerminalState {
                 (25, false) => self.cursor_visible = false,
                 (2004, true) => self.bracketed_paste = true,
                 (2004, false) => self.bracketed_paste = false,
+                (2026, true) => {
+                    if !self.synchronized_output {
+                        self.changes.synchronized_output_started = true;
+                    }
+                    self.synchronized_output = true;
+                }
+                (2026, false) => {
+                    if self.synchronized_output {
+                        self.changes.synchronized_output_finished = true;
+                    }
+                    self.synchronized_output = false;
+                }
                 (6, true) => self.active_screen_mut().set_origin_mode(true),
                 (6, false) => self.active_screen_mut().set_origin_mode(false),
                 _ => {}
@@ -1046,6 +1092,52 @@ fn is_private_mode_sequence(intermediates: &[u8]) -> bool {
     intermediates.contains(&b'?')
 }
 
+fn osc_payload(params: &[&[u8]]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for (index, param) in params.iter().skip(1).enumerate() {
+        if index > 0 {
+            payload.push(b';');
+        }
+        payload.extend_from_slice(param);
+    }
+    payload
+}
+
+fn parse_osc7_cwd(payload: &[u8]) -> Option<PathBuf> {
+    let rest = payload.strip_prefix(b"file://")?;
+    let path_start = rest.iter().position(|byte| *byte == b'/')?;
+    let path = percent_decode(&rest[path_start..])?;
+    let path = String::from_utf8(path).ok()?;
+    let path = PathBuf::from(path);
+    path.is_absolute().then_some(path)
+}
+
+fn percent_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' {
+            let high = hex_value(*input.get(index + 1)?)?;
+            let low = hex_value(*input.get(index + 2)?)?;
+            output.push((high << 4) | low);
+            index += 3;
+        } else {
+            output.push(input[index]);
+            index += 1;
+        }
+    }
+    Some(output)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn parse_sgr_color(param: &[usize], following: &[Vec<usize>]) -> Option<(Color, usize)> {
     if param.len() > 1 {
         return parse_sgr_color_components(&param[1..]).map(|color| (color, 0));
@@ -1570,6 +1662,57 @@ mod tests {
         assert!(state.bracketed_paste_enabled());
         state.apply_bytes(b"\x1b[?2004l");
         assert!(!state.bracketed_paste_enabled());
+    }
+
+    #[test]
+    fn osc7_reports_current_working_directory_change() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        let changes = state.apply_bytes(b"\x1b]7;file://localhost/tmp/dmux%20cwd\x07");
+
+        assert_eq!(changes.cwd, Some(std::path::PathBuf::from("/tmp/dmux cwd")));
+    }
+
+    #[test]
+    fn osc0_and_osc2_report_title_changes() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        assert_eq!(
+            state.apply_bytes(b"\x1b]2;editor\x07").title,
+            Some("editor".to_string())
+        );
+        assert_eq!(
+            state.apply_bytes(b"\x1b]0;shell;repo\x07").title,
+            Some("shell;repo".to_string())
+        );
+    }
+
+    #[test]
+    fn bel_reports_bell_change() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        assert!(state.apply_bytes(b"\x07").bell);
+        assert!(!state.apply_bytes(b"ordinary").bell);
+    }
+
+    #[test]
+    fn private_mode_tracks_synchronized_output() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        let start = state.apply_bytes(b"\x1b[?2026h");
+        assert!(start.synchronized_output_started);
+        assert!(start.synchronized_output_active);
+        assert!(!start.synchronized_output_finished);
+
+        let middle = state.apply_bytes(b"chunk");
+        assert!(!middle.synchronized_output_started);
+        assert!(middle.synchronized_output_active);
+        assert!(!middle.synchronized_output_finished);
+
+        let finish = state.apply_bytes(b"\x1b[?2026l");
+        assert!(!finish.synchronized_output_active);
+        assert!(finish.synchronized_output_finished);
+        assert!(finish.requires_immediate_render());
     }
 
     #[test]

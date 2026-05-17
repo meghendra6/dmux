@@ -163,7 +163,9 @@ format fields `#{buffer.index}`, `#{buffer.name}`, `#{buffer.bytes}`,
 missing matches, and pastes into exited panes are explicit errors.
 
 `status-line -F` and `display-message -p` expand session/window/tab/pane/client
-fields plus latest-buffer fields: `#{buffer.count}`, `#{buffer.index}`,
+fields, including pane metadata fields `#{pane.cwd}`, `#{pane.title}`,
+`#{pane.bell}`, and `#{pane.activity}`, plus latest-buffer fields:
+`#{buffer.count}`, `#{buffer.index}`,
 `#{buffer.name}`, `#{buffer.bytes}`, `#{buffer.lines}`, `#{buffer.latest}`, and
 `#{buffer.preview}`. Unknown `#{...}` tokens are left literal, and expanded data
 is not expanded a second time. Attached status includes client and buffer counts;
@@ -179,6 +181,9 @@ Implemented Phase 2 groundwork:
 - explicit PTY resize requests with screen-state resize
 - detached session input through `send-keys`
 - client cwd propagation for new panes, windows, and respawns
+- OSC 7 pane cwd tracking for child-reported directory changes
+- OSC 0/2 pane title tracking
+- pane bell and activity state exposed through pane/status formats
 - attach-time PTY resize to the current terminal size when available
 - session formats: `#{session.name}`, `#{session.windows}`, `#{session.window_count}`, `#{session.attached}`, `#{session.attached_count}`, `#{session.created_at}`, and `#{client.count}`
 - client formats: `#{client.id}`, `#{client.session}`, `#{client.type}`, `#{client.attached}`, `#{client.width}`, and `#{client.height}`
@@ -215,6 +220,7 @@ Implemented Phase 2 groundwork:
 - attach-time statusline snapshot rendering with prefix/help/command/copy affordances
 - attach-time split-pane layout snapshot rendering
 - event-driven live redraw for multi-pane attach with polling fallback
+- synchronized-output redraw gating with an end-marker flush and timeout guard
 - active-pane input routing for multi-pane attach
 - attach-time pane cycling for multi-pane attach
 - attach-time numbered pane selection for multi-pane attach
