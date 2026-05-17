@@ -104,6 +104,23 @@ pub enum Command {
     KillPane {
         target: Target,
     },
+    SwapPane {
+        source: Target,
+        destination: Target,
+    },
+    MovePane {
+        source: Target,
+        destination: Target,
+        direction: SplitDirection,
+    },
+    BreakPane {
+        target: Target,
+    },
+    JoinPane {
+        source: Target,
+        destination: Target,
+        direction: SplitDirection,
+    },
     RespawnPane {
         target: Target,
         force: bool,
@@ -197,6 +214,10 @@ where
         "list-panes" => parse_list_panes(args),
         "select-pane" => parse_select_pane(args),
         "kill-pane" => parse_kill_pane(args),
+        "swap-pane" => parse_swap_pane(args),
+        "move-pane" => parse_move_pane(args),
+        "break-pane" => parse_break_pane(args),
+        "join-pane" => parse_join_pane(args),
         "respawn-pane" => parse_respawn_pane(args),
         "new-window" => parse_new_window(args, "new-window"),
         "new-tab" => parse_new_window(args, "new-tab"),
@@ -297,6 +318,10 @@ Commands:\n\
   select-layout -t <name> <preset>       apply even-horizontal/even-vertical/tiled/main-*\n\
   list-panes -t <name> [-F <format>]\n\
   select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D\n\
+  swap-pane -s <target> -t <target>      swap two panes in one window\n\
+  move-pane -s <target> -t <target> [-h|-v]\n\
+  break-pane -t <target>                 move pane into a new window\n\
+  join-pane -s <target> -t <target> [-h|-v]\n\
   respawn-pane -t <name> [-p <index>] [-k] [-- command...]\n\
   new-window -t <name> [-- command...]\n\
   list-windows -t <name> [-F <format>]\n\
@@ -343,7 +368,8 @@ Prompt:\n\
   C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
 Prompt examples:\n\
   :split -h               :split -v               :rename-window api\n\
-  :layout tiled           :select-window 0        :list-windows\n\
+  :layout tiled           :swap-pane 1            :break-pane\n\
+  :join-pane -s 1.0       :select-window 0        :list-windows\n\
 CLI equivalents:\n\
   dmux split-window -t <name> -h|-v [-- command...]\n\
   dmux select-layout -t <name> tiled|even-horizontal|even-vertical|main-horizontal|main-vertical\n\
@@ -366,7 +392,8 @@ Prompt:\n\
   C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
 Prompt examples:\n\
   :split -h               :split -v               :rename-window api\n\
-  :layout tiled           :select-window 0        :list-windows\n\
+  :layout tiled           :swap-pane 1            :break-pane\n\
+  :join-pane -s 1.0       :select-window 0        :list-windows\n\
 CLI equivalents:\n\
   dmux split-window -t <name> -h|-v [-- command...]\n\
   dmux select-layout -t <name> tiled|even-horizontal|even-vertical|main-horizontal|main-vertical\n\
@@ -1226,6 +1253,134 @@ fn parse_kill_pane(args: Vec<String>) -> Result<Command, String> {
             "kill-pane",
         )?,
     })
+}
+
+fn parse_swap_pane(args: Vec<String>) -> Result<Command, String> {
+    let mut source = None;
+    let mut destination = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-s" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "swap-pane requires a source target after -s".to_string())?;
+                source = Some(parse_structured_target(value, "swap-pane")?);
+                i += 2;
+            }
+            "-t" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "swap-pane requires a destination target after -t".to_string()
+                })?;
+                destination = Some(parse_structured_target(value, "swap-pane")?);
+                i += 2;
+            }
+            value => return Err(format!("swap-pane does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::SwapPane {
+        source: source.ok_or_else(|| "swap-pane requires -s <source-target>".to_string())?,
+        destination: destination
+            .ok_or_else(|| "swap-pane requires -t <destination-target>".to_string())?,
+    })
+}
+
+fn parse_move_pane(args: Vec<String>) -> Result<Command, String> {
+    let (source, destination, direction) = parse_pane_transfer_args(args, "move-pane")?;
+    Ok(Command::MovePane {
+        source,
+        destination,
+        direction,
+    })
+}
+
+fn parse_break_pane(args: Vec<String>) -> Result<Command, String> {
+    let mut target = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "break-pane requires a target after -t".to_string())?;
+                target = Some(parse_structured_target(value, "break-pane")?);
+                i += 2;
+            }
+            value => return Err(format!("break-pane does not support argument {value:?}")),
+        }
+    }
+
+    Ok(Command::BreakPane {
+        target: target.ok_or_else(|| "break-pane requires -t <target>".to_string())?,
+    })
+}
+
+fn parse_join_pane(args: Vec<String>) -> Result<Command, String> {
+    let (source, destination, direction) = parse_pane_transfer_args(args, "join-pane")?;
+    Ok(Command::JoinPane {
+        source,
+        destination,
+        direction,
+    })
+}
+
+fn parse_pane_transfer_args(
+    args: Vec<String>,
+    command: &str,
+) -> Result<(Target, Target, SplitDirection), String> {
+    let mut source = None;
+    let mut destination = None;
+    let mut direction = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-s" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command} requires a source target after -s"))?;
+                source = Some(parse_structured_target(value, command)?);
+                i += 2;
+            }
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{command} requires a destination target after -t"))?;
+                destination = Some(parse_structured_target(value, command)?);
+                i += 2;
+            }
+            "-h" => {
+                set_pane_transfer_direction(&mut direction, SplitDirection::Horizontal, command)?;
+                i += 1;
+            }
+            "-v" => {
+                set_pane_transfer_direction(&mut direction, SplitDirection::Vertical, command)?;
+                i += 1;
+            }
+            value => return Err(format!("{command} does not support argument {value:?}")),
+        }
+    }
+
+    Ok((
+        source.ok_or_else(|| format!("{command} requires -s <source-target>"))?,
+        destination.ok_or_else(|| format!("{command} requires -t <destination-target>"))?,
+        direction.unwrap_or(SplitDirection::Horizontal),
+    ))
+}
+
+fn set_pane_transfer_direction(
+    direction: &mut Option<SplitDirection>,
+    value: SplitDirection,
+    command: &str,
+) -> Result<(), String> {
+    if direction.replace(value).is_some() {
+        Err(format!("{command} accepts only one direction"))
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_respawn_pane(args: Vec<String>) -> Result<Command, String> {
@@ -2678,6 +2833,88 @@ mod tests {
             command,
             Command::KillPane {
                 target: active_target("dev"),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_swap_pane_source_and_destination_targets() {
+        let command =
+            parse_args(["dmux", "swap-pane", "-s", "dev:0.%10", "-t", "dev:0.2"]).unwrap();
+        assert_eq!(
+            command,
+            Command::SwapPane {
+                source: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(0),
+                    pane: PaneTarget::Id(10),
+                },
+                destination: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(0),
+                    pane: PaneTarget::Index(2),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parses_move_break_and_join_pane_targets() {
+        let move_command = parse_args([
+            "dmux",
+            "move-pane",
+            "-s",
+            "dev:0.%10",
+            "-t",
+            "dev:1.0",
+            "-v",
+        ])
+        .unwrap();
+        assert_eq!(
+            move_command,
+            Command::MovePane {
+                source: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(0),
+                    pane: PaneTarget::Id(10),
+                },
+                destination: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(1),
+                    pane: PaneTarget::Index(0),
+                },
+                direction: SplitDirection::Vertical,
+            }
+        );
+
+        let break_command = parse_args(["dmux", "break-pane", "-t", "dev:0.%10"]).unwrap();
+        assert_eq!(
+            break_command,
+            Command::BreakPane {
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(0),
+                    pane: PaneTarget::Id(10),
+                },
+            }
+        );
+
+        let join_command =
+            parse_args(["dmux", "join-pane", "-s", "dev:1.0", "-t", "dev:0.%10"]).unwrap();
+        assert_eq!(
+            join_command,
+            Command::JoinPane {
+                source: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(1),
+                    pane: PaneTarget::Index(0),
+                },
+                destination: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(0),
+                    pane: PaneTarget::Id(10),
+                },
+                direction: SplitDirection::Horizontal,
             }
         );
     }

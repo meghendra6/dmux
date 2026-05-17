@@ -3643,6 +3643,46 @@ fn dispatch_attach_command(
                 false,
             )
         }
+        "swap-pane" | "swapp" => {
+            let (source, destination) = parse_attach_swap_pane_targets(session, args)?;
+            (
+                send_control_request(socket, &protocol::encode_swap_pane(&source, &destination))?,
+                true,
+                false,
+            )
+        }
+        "move-pane" | "movep" => {
+            let (source, destination, direction) =
+                parse_attach_pane_transfer(session, args, "move-pane", true)?;
+            (
+                send_control_request(
+                    socket,
+                    &protocol::encode_move_pane(&source, &destination, direction),
+                )?,
+                true,
+                false,
+            )
+        }
+        "break-pane" | "breakp" => {
+            let target = parse_attach_break_pane_target(session, args)?;
+            (
+                send_control_request(socket, &protocol::encode_break_pane(&target))?,
+                true,
+                false,
+            )
+        }
+        "join-pane" | "joinp" => {
+            let (source, destination, direction) =
+                parse_attach_pane_transfer(session, args, "join-pane", false)?;
+            (
+                send_control_request(
+                    socket,
+                    &protocol::encode_join_pane(&source, &destination, direction),
+                )?,
+                true,
+                false,
+            )
+        }
         "select-layout" | "layout" => {
             let preset = match args {
                 [preset] => protocol::parse_layout_preset_name(preset).map_err(io::Error::other)?,
@@ -3663,7 +3703,7 @@ fn dispatch_attach_command(
         }
         other => {
             return Err(io::Error::other(format!(
-                "unknown attach command {other:?}; press C-b ? for help or try :split -h, :layout tiled, :rename-window <name>, :list-windows"
+                "unknown attach command {other:?}; press C-b ? for help or try :split -h, :swap-pane 1, :break-pane, :layout tiled, :list-windows"
             )));
         }
     };
@@ -3675,20 +3715,179 @@ fn dispatch_attach_command(
     })
 }
 
-fn parse_attach_window_target(args: &[&str]) -> io::Result<protocol::WindowTarget> {
-    let value = args
-        .first()
-        .ok_or_else(|| io::Error::other("select-window requires a target"))?;
+fn parse_attach_swap_pane_targets(
+    session: &str,
+    args: &[&str],
+) -> io::Result<(protocol::Target, protocol::Target)> {
+    if let [pane] = args {
+        return Ok((
+            protocol::Target::active(session.to_string()),
+            parse_attach_pane_target(session, pane, "swap-pane")?,
+        ));
+    }
+
+    let mut source = None;
+    let mut destination = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "-s" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| io::Error::other("swap-pane requires a source after -s"))?;
+                source = Some(parse_attach_pane_target(session, value, "swap-pane")?);
+                i += 2;
+            }
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| io::Error::other("swap-pane requires a destination after -t"))?;
+                destination = Some(parse_attach_pane_target(session, value, "swap-pane")?);
+                i += 2;
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "swap-pane does not support argument {other:?}; try :swap-pane 1"
+                )));
+            }
+        }
+    }
+
+    Ok((
+        source.ok_or_else(|| io::Error::other("swap-pane requires -s <pane>"))?,
+        destination.ok_or_else(|| io::Error::other("swap-pane requires -t <pane>"))?,
+    ))
+}
+
+fn parse_attach_break_pane_target(session: &str, args: &[&str]) -> io::Result<protocol::Target> {
+    match args {
+        [] => Ok(protocol::Target::active(session.to_string())),
+        [pane] => parse_attach_pane_target(session, pane, "break-pane"),
+        _ => Err(io::Error::other(
+            "break-pane accepts at most one pane target; try :break-pane or :break-pane 1",
+        )),
+    }
+}
+
+fn parse_attach_pane_transfer(
+    session: &str,
+    args: &[&str],
+    command: &str,
+    destination_required: bool,
+) -> io::Result<(protocol::Target, protocol::Target, protocol::SplitDirection)> {
+    let mut source = None;
+    let mut destination = None;
+    let mut direction = protocol::SplitDirection::Horizontal;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "-s" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    io::Error::other(format!("{command} requires a source after -s"))
+                })?;
+                source = Some(parse_attach_window_pane_target(session, value, command)?);
+                i += 2;
+            }
+            "-t" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    io::Error::other(format!("{command} requires a destination after -t"))
+                })?;
+                destination = Some(parse_attach_window_pane_target(session, value, command)?);
+                i += 2;
+            }
+            "-h" => {
+                direction = protocol::SplitDirection::Horizontal;
+                i += 1;
+            }
+            "-v" => {
+                direction = protocol::SplitDirection::Vertical;
+                i += 1;
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "{command} does not support argument {other:?}"
+                )));
+            }
+        }
+    }
+
+    let source = source.unwrap_or_else(|| protocol::Target::active(session.to_string()));
+    let destination = if destination_required {
+        destination
+            .ok_or_else(|| io::Error::other(format!("{command} requires -t <window[.pane]>")))?
+    } else {
+        destination.unwrap_or_else(|| protocol::Target::active(session.to_string()))
+    };
+    Ok((source, destination, direction))
+}
+
+fn parse_attach_pane_target(
+    session: &str,
+    value: &str,
+    command: &str,
+) -> io::Result<protocol::Target> {
+    Ok(protocol::Target {
+        session: session.to_string(),
+        window: protocol::WindowTarget::Active,
+        pane: parse_attach_pane_token(value, command)?,
+    })
+}
+
+fn parse_attach_window_pane_target(
+    session: &str,
+    value: &str,
+    command: &str,
+) -> io::Result<protocol::Target> {
+    let (window, pane) = value
+        .split_once('.')
+        .map_or((value, None), |(window, pane)| (window, Some(pane)));
+    Ok(protocol::Target {
+        session: session.to_string(),
+        window: parse_attach_window_token(window)?,
+        pane: match pane {
+            Some(pane) => parse_attach_pane_token(pane, command)?,
+            None => protocol::PaneTarget::Active,
+        },
+    })
+}
+
+fn parse_attach_pane_token(value: &str, command: &str) -> io::Result<protocol::PaneTarget> {
+    if let Some(id) = value.strip_prefix('%') {
+        return id
+            .parse::<usize>()
+            .map(protocol::PaneTarget::Id)
+            .map_err(|_| io::Error::other(format!("{command} has invalid pane id")));
+    }
+    value
+        .parse::<usize>()
+        .map(protocol::PaneTarget::Index)
+        .map_err(|_| io::Error::other(format!("{command} has invalid pane index")))
+}
+
+fn parse_attach_window_token(value: &str) -> io::Result<protocol::WindowTarget> {
+    if value.is_empty() {
+        return Ok(protocol::WindowTarget::Active);
+    }
     if let Some(id) = value.strip_prefix('@') {
         return id
             .parse::<usize>()
             .map(protocol::WindowTarget::Id)
             .map_err(|_| io::Error::other("invalid window id"));
     }
+    if let Some(name) = value.strip_prefix('=') {
+        return Ok(protocol::WindowTarget::Name(name.to_string()));
+    }
     if let Ok(index) = value.parse::<usize>() {
         return Ok(protocol::WindowTarget::Index(index));
     }
-    Ok(protocol::WindowTarget::Name((*value).to_string()))
+    Ok(protocol::WindowTarget::Name(value.to_string()))
+}
+
+fn parse_attach_window_target(args: &[&str]) -> io::Result<protocol::WindowTarget> {
+    let value = args
+        .first()
+        .ok_or_else(|| io::Error::other("select-window requires a target"))?;
+    parse_attach_window_token(value)
 }
 
 fn send_control_request(socket: &Path, line: &str) -> io::Result<Vec<u8>> {

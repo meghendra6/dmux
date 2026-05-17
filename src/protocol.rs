@@ -197,6 +197,23 @@ pub enum Request {
     KillPane {
         target: Target,
     },
+    SwapPane {
+        source: Target,
+        destination: Target,
+    },
+    MovePane {
+        source: Target,
+        destination: Target,
+        direction: SplitDirection,
+    },
+    BreakPane {
+        target: Target,
+    },
+    JoinPane {
+        source: Target,
+        destination: Target,
+        direction: SplitDirection,
+    },
     RespawnPane {
         target: Target,
         force: bool,
@@ -578,6 +595,44 @@ pub fn encode_kill_pane(session: &str, pane: Option<usize>) -> String {
 
 pub fn encode_kill_pane_target(target: &Target) -> String {
     format!("KILL_PANE_TARGET\t{}\n", encode_target(target))
+}
+
+pub fn encode_swap_pane(source: &Target, destination: &Target) -> String {
+    format!(
+        "SWAP_PANE\t{}\t{}\n",
+        encode_target(source),
+        encode_target(destination)
+    )
+}
+
+pub fn encode_move_pane(
+    source: &Target,
+    destination: &Target,
+    direction: SplitDirection,
+) -> String {
+    format!(
+        "MOVE_PANE\t{}\t{}\t{}\n",
+        encode_target(source),
+        encode_target(destination),
+        encode_split_direction(direction)
+    )
+}
+
+pub fn encode_break_pane(target: &Target) -> String {
+    format!("BREAK_PANE\t{}\n", encode_target(target))
+}
+
+pub fn encode_join_pane(
+    source: &Target,
+    destination: &Target,
+    direction: SplitDirection,
+) -> String {
+    format!(
+        "JOIN_PANE\t{}\t{}\t{}\n",
+        encode_target(source),
+        encode_target(destination),
+        encode_split_direction(direction)
+    )
 }
 
 #[allow(dead_code)]
@@ -1199,6 +1254,23 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["KILL_PANE_TARGET", target] => Ok(Request::KillPane {
             target: decode_target(target, "KILL_PANE_TARGET")?,
         }),
+        ["SWAP_PANE", source, destination] => Ok(Request::SwapPane {
+            source: decode_target(source, "SWAP_PANE")?,
+            destination: decode_target(destination, "SWAP_PANE")?,
+        }),
+        ["MOVE_PANE", source, destination, direction] => Ok(Request::MovePane {
+            source: decode_target(source, "MOVE_PANE")?,
+            destination: decode_target(destination, "MOVE_PANE")?,
+            direction: decode_split_direction(direction)?,
+        }),
+        ["BREAK_PANE", target] => Ok(Request::BreakPane {
+            target: decode_target(target, "BREAK_PANE")?,
+        }),
+        ["JOIN_PANE", source, destination, direction] => Ok(Request::JoinPane {
+            source: decode_target(source, "JOIN_PANE")?,
+            destination: decode_target(destination, "JOIN_PANE")?,
+            direction: decode_split_direction(direction)?,
+        }),
         ["RESPAWN_PANE", session, pane, force, argc, joined] => {
             let argc = argc
                 .parse::<usize>()
@@ -1686,6 +1758,60 @@ mod tests {
                 session: "dev".to_string(),
                 window: WindowTarget::Id(7),
                 preset: LayoutPreset::Tiled,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_pane_movement_requests() {
+        let source = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Index(0),
+            pane: PaneTarget::Id(10),
+        };
+        let destination = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Id(7),
+            pane: PaneTarget::Index(1),
+        };
+
+        assert_eq!(
+            decode_request(&encode_swap_pane(&source, &destination)).unwrap(),
+            Request::SwapPane {
+                source: source.clone(),
+                destination: destination.clone(),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_move_pane(
+                &source,
+                &destination,
+                SplitDirection::Vertical
+            ))
+            .unwrap(),
+            Request::MovePane {
+                source: source.clone(),
+                destination: destination.clone(),
+                direction: SplitDirection::Vertical,
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_break_pane(&source)).unwrap(),
+            Request::BreakPane {
+                target: source.clone(),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_join_pane(
+                &source,
+                &destination,
+                SplitDirection::Horizontal
+            ))
+            .unwrap(),
+            Request::JoinPane {
+                source,
+                destination,
+                direction: SplitDirection::Horizontal,
             }
         );
     }
