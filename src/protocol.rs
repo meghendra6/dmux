@@ -24,6 +24,15 @@ pub enum PaneDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutPreset {
+    EvenHorizontal,
+    EvenVertical,
+    Tiled,
+    MainHorizontal,
+    MainVertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneSelectTarget {
     Index(usize),
     Id(usize),
@@ -160,6 +169,11 @@ pub enum Request {
         target: Target,
         direction: PaneResizeDirection,
         amount: usize,
+    },
+    SelectLayout {
+        session: String,
+        window: WindowTarget,
+        preset: LayoutPreset,
     },
     Send {
         target: Target,
@@ -449,6 +463,18 @@ pub fn encode_resize_pane_target(
         "RESIZE_PANE_TARGET\t{}\t{}\t{amount}\n",
         encode_target(target),
         encode_pane_resize_direction(direction)
+    )
+}
+
+pub fn encode_select_layout(session: &str, preset: LayoutPreset) -> String {
+    encode_select_layout_target(&Target::active(session.to_string()), preset)
+}
+
+pub fn encode_select_layout_target(target: &Target, preset: LayoutPreset) -> String {
+    format!(
+        "SELECT_LAYOUT_TARGET\t{}\t{}\n",
+        encode_target(target),
+        encode_layout_preset(preset)
     )
 }
 
@@ -1035,6 +1061,22 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
                 .filter(|amount| *amount > 0)
                 .ok_or_else(|| "RESIZE_PANE amount must be a positive integer".to_string())?,
         }),
+        ["SELECT_LAYOUT", session, preset] => Ok(Request::SelectLayout {
+            session: (*session).to_string(),
+            window: WindowTarget::Active,
+            preset: parse_layout_preset_name(preset)?,
+        }),
+        ["SELECT_LAYOUT_TARGET", target, preset] => {
+            let target = decode_target(target, "SELECT_LAYOUT_TARGET")?;
+            if target.pane != PaneTarget::Active {
+                return Err("SELECT_LAYOUT target must not include a pane".to_string());
+            }
+            Ok(Request::SelectLayout {
+                session: target.session,
+                window: target.window,
+                preset: parse_layout_preset_name(preset)?,
+            })
+        }
         ["SEND", session, hex] => Ok(Request::Send {
             target: Target::active((*session).to_string()),
             bytes: decode_hex(hex)?,
@@ -1342,6 +1384,29 @@ fn encode_pane_direction(direction: PaneDirection) -> &'static str {
     }
 }
 
+fn encode_layout_preset(preset: LayoutPreset) -> &'static str {
+    match preset {
+        LayoutPreset::EvenHorizontal => "even-horizontal",
+        LayoutPreset::EvenVertical => "even-vertical",
+        LayoutPreset::Tiled => "tiled",
+        LayoutPreset::MainHorizontal => "main-horizontal",
+        LayoutPreset::MainVertical => "main-vertical",
+    }
+}
+
+pub fn parse_layout_preset_name(value: &str) -> Result<LayoutPreset, String> {
+    match value {
+        "even-horizontal" => Ok(LayoutPreset::EvenHorizontal),
+        "even-vertical" => Ok(LayoutPreset::EvenVertical),
+        "tiled" => Ok(LayoutPreset::Tiled),
+        "main-horizontal" => Ok(LayoutPreset::MainHorizontal),
+        "main-vertical" => Ok(LayoutPreset::MainVertical),
+        _ => Err(format!(
+            "unknown layout preset {value:?}; expected even-horizontal, even-vertical, tiled, main-horizontal, or main-vertical"
+        )),
+    }
+}
+
 fn encode_capture_mode(mode: CaptureMode) -> &'static str {
     match mode {
         CaptureMode::Screen => "screen",
@@ -1602,6 +1667,25 @@ mod tests {
                 target: active_target("dev"),
                 direction: PaneResizeDirection::Left,
                 amount: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_select_layout_request() {
+        let target = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Id(7),
+            pane: PaneTarget::Active,
+        };
+        let line = encode_select_layout_target(&target, LayoutPreset::Tiled);
+
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::SelectLayout {
+                session: "dev".to_string(),
+                window: WindowTarget::Id(7),
+                preset: LayoutPreset::Tiled,
             }
         );
     }

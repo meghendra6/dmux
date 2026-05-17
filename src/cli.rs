@@ -1,6 +1,6 @@
 use crate::protocol::{
-    BufferSelection, CaptureMode, PaneDirection, PaneResizeDirection, PaneSelectTarget, PaneTarget,
-    SplitDirection, Target, WindowTarget,
+    BufferSelection, CaptureMode, LayoutPreset, PaneDirection, PaneResizeDirection,
+    PaneSelectTarget, PaneTarget, SplitDirection, Target, WindowTarget,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +76,11 @@ pub enum Command {
     ResizePane {
         target: Target,
         resize: PaneResize,
+    },
+    SelectLayout {
+        session: String,
+        window: WindowTarget,
+        preset: LayoutPreset,
     },
     SendKeys {
         target: Target,
@@ -186,6 +191,7 @@ where
         "paste-buffer" => parse_paste_buffer(args),
         "delete-buffer" => parse_delete_buffer(args),
         "resize-pane" => parse_resize_pane(args),
+        "select-layout" => parse_select_layout(args),
         "send-keys" => parse_send_keys(args),
         "split-window" | "split" => parse_split_window(args),
         "list-panes" => parse_list_panes(args),
@@ -288,6 +294,7 @@ Commands:\n\
   attach [-t <name>]                    attach to a session; defaults to default\n\
   ls                                    list sessions\n\
   split-window -t <name> -h|-v [-- command...]\n\
+  select-layout -t <name> <preset>       apply even-horizontal/even-vertical/tiled/main-*\n\
   list-panes -t <name> [-F <format>]\n\
   select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D\n\
   respawn-pane -t <name> [-p <index>] [-k] [-- command...]\n\
@@ -336,9 +343,10 @@ Prompt:\n\
   C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
 Prompt examples:\n\
   :split -h               :split -v               :rename-window api\n\
-  :select-window 0        :list-windows           :paste-buffer\n\
+  :layout tiled           :select-window 0        :list-windows\n\
 CLI equivalents:\n\
   dmux split-window -t <name> -h|-v [-- command...]\n\
+  dmux select-layout -t <name> tiled|even-horizontal|even-vertical|main-horizontal|main-vertical\n\
   dmux resize-pane -t <name> -L|-R|-U|-D [amount]\n\
   dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D\n"
 }
@@ -358,9 +366,10 @@ Prompt:\n\
   C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
 Prompt examples:\n\
   :split -h               :split -v               :rename-window api\n\
-  :select-window 0        :list-windows           :paste-buffer\n\
+  :layout tiled           :select-window 0        :list-windows\n\
 CLI equivalents:\n\
   dmux split-window -t <name> -h|-v [-- command...]\n\
+  dmux select-layout -t <name> tiled|even-horizontal|even-vertical|main-horizontal|main-vertical\n\
   dmux resize-pane -t <name> -L|-R|-U|-D [amount]\n\
   dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D\n"
 }
@@ -938,6 +947,46 @@ fn parse_resize_pane(args: Vec<String>) -> Result<Command, String> {
     };
 
     Ok(Command::ResizePane { target, resize })
+}
+
+fn parse_select_layout(args: Vec<String>) -> Result<Command, String> {
+    let mut target = None;
+    let mut preset = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "select-layout requires a session name after -t".to_string())?;
+                target = Some(parse_structured_target(value, "select-layout")?);
+                i += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("select-layout does not support option {value:?}"));
+            }
+            value => {
+                if preset
+                    .replace(crate::protocol::parse_layout_preset_name(value)?)
+                    .is_some()
+                {
+                    return Err("select-layout accepts exactly one preset".to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+
+    let target = target.ok_or_else(|| "select-layout requires -t <session>".to_string())?;
+    if target.pane != PaneTarget::Active {
+        return Err("select-layout target must not include a pane".to_string());
+    }
+    Ok(Command::SelectLayout {
+        session: target.session,
+        window: target.window,
+        preset: preset.ok_or_else(|| "select-layout requires <preset>".to_string())?,
+    })
 }
 
 fn parse_send_keys(args: Vec<String>) -> Result<Command, String> {
@@ -2376,6 +2425,25 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn parses_select_layout_structured_window_target() {
+        let command = parse_args(["dmux", "select-layout", "-t", "dev:@7", "tiled"]).unwrap();
+        assert_eq!(
+            command,
+            Command::SelectLayout {
+                session: "dev".to_string(),
+                window: WindowTarget::Id(7),
+                preset: crate::protocol::LayoutPreset::Tiled,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_select_layout_pane_target() {
+        let err = parse_args(["dmux", "select-layout", "-t", "dev:1.%2", "tiled"]).unwrap_err();
+        assert!(err.contains("must not include a pane"), "{err}");
     }
 
     #[test]

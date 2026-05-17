@@ -3509,7 +3509,7 @@ fn write_attach_help_message() -> io::Result<()> {
 
 fn attach_command_prompt_text(command: &str) -> String {
     format!(
-        ":{command}  (Enter run | Esc/C-c cancel | Backspace edit | examples: split -h, split -v, rename-window name)"
+        ":{command}  (Enter run | Esc/C-c cancel | Backspace edit | examples: split -h, layout tiled, rename-window name)"
     )
 }
 
@@ -3643,9 +3643,27 @@ fn dispatch_attach_command(
                 false,
             )
         }
+        "select-layout" | "layout" => {
+            let preset = match args {
+                [preset] => protocol::parse_layout_preset_name(preset).map_err(io::Error::other)?,
+                [] => {
+                    return Err(io::Error::other(
+                        "select-layout requires a preset: even-horizontal, even-vertical, tiled, main-horizontal, or main-vertical",
+                    ));
+                }
+                _ => {
+                    return Err(io::Error::other("select-layout accepts exactly one preset"));
+                }
+            };
+            (
+                send_control_request(socket, &protocol::encode_select_layout(session, preset))?,
+                true,
+                false,
+            )
+        }
         other => {
             return Err(io::Error::other(format!(
-                "unknown attach command {other:?}; press C-b ? for help or try :split -h, :rename-window <name>, :list-windows, :paste-buffer"
+                "unknown attach command {other:?}; press C-b ? for help or try :split -h, :layout tiled, :rename-window <name>, :list-windows"
             )));
         }
     };
@@ -5464,6 +5482,16 @@ mod tests {
         assert!(!result.reconnect);
         assert!(result.exit_attach);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn attach_prompt_layout_requires_preset_before_contacting_server() {
+        let err = match dispatch_attach_command(Path::new("unused.sock"), "dev", "layout") {
+            Ok(_) => panic!("layout without preset should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("requires a preset"), "{}", err);
     }
 
     #[test]

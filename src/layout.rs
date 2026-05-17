@@ -1,4 +1,4 @@
-use crate::protocol::{PaneResizeDirection, SplitDirection};
+use crate::protocol::{LayoutPreset, PaneResizeDirection, SplitDirection};
 use crate::pty::PtySize;
 
 const HORIZONTAL_SEPARATOR_CELLS: usize = 3;
@@ -17,6 +17,37 @@ pub(crate) enum LayoutNode {
 }
 
 impl LayoutNode {
+    pub(crate) fn apply_preset(
+        &mut self,
+        preset: LayoutPreset,
+        pane_count: usize,
+        active_pane: usize,
+        size: PtySize,
+    ) -> Result<(), String> {
+        if pane_count == 0 {
+            return Err("missing pane".to_string());
+        }
+        if active_pane >= pane_count {
+            return Err("missing pane".to_string());
+        }
+
+        let arranged = build_preset_layout(preset, pane_count, active_pane, size);
+        let mut regions = layout_regions_for_size(&arranged, size);
+        regions.sort_by_key(|region| region.pane);
+        if regions.len() != pane_count
+            || regions.iter().enumerate().any(|(index, region)| {
+                region.pane != index
+                    || region.row_start >= region.row_end
+                    || region.col_start >= region.col_end
+            })
+        {
+            return Err("resize would exceed minimum pane size".to_string());
+        }
+
+        *self = arranged;
+        Ok(())
+    }
+
     pub(crate) fn split_pane(
         &mut self,
         target: usize,
@@ -379,6 +410,148 @@ fn separator_for_direction(direction: SplitDirection) -> usize {
     }
 }
 
+fn build_preset_layout(
+    preset: LayoutPreset,
+    pane_count: usize,
+    active_pane: usize,
+    size: PtySize,
+) -> LayoutNode {
+    let panes = (0..pane_count).collect::<Vec<_>>();
+    match preset {
+        LayoutPreset::EvenHorizontal => {
+            build_even_layout(&panes, SplitDirection::Horizontal, size.cols as usize)
+        }
+        LayoutPreset::EvenVertical => {
+            build_even_layout(&panes, SplitDirection::Vertical, size.rows as usize)
+        }
+        LayoutPreset::Tiled => build_tiled_layout(&panes, size),
+        LayoutPreset::MainHorizontal => {
+            build_main_layout(&panes, active_pane, SplitDirection::Vertical, size)
+        }
+        LayoutPreset::MainVertical => {
+            build_main_layout(&panes, active_pane, SplitDirection::Horizontal, size)
+        }
+    }
+}
+
+fn build_even_layout(panes: &[usize], direction: SplitDirection, extent: usize) -> LayoutNode {
+    let spans = even_leaf_spans(extent, panes.len(), separator_for_direction(direction));
+    let nodes = panes
+        .iter()
+        .copied()
+        .map(LayoutNode::Pane)
+        .collect::<Vec<_>>();
+    build_sequence_with_leaf_spans(direction, nodes, spans)
+}
+
+fn build_tiled_layout(panes: &[usize], size: PtySize) -> LayoutNode {
+    if panes.len() <= 1 {
+        return LayoutNode::Pane(panes[0]);
+    }
+    let columns = tiled_column_count(panes.len());
+    let row_chunks = panes.chunks(columns).collect::<Vec<_>>();
+    let row_spans = even_leaf_spans(
+        size.rows as usize,
+        row_chunks.len(),
+        VERTICAL_SEPARATOR_CELLS,
+    );
+    let rows = row_chunks
+        .into_iter()
+        .map(|row| build_even_layout(row, SplitDirection::Horizontal, size.cols as usize))
+        .collect::<Vec<_>>();
+    build_sequence_with_leaf_spans(SplitDirection::Vertical, rows, row_spans)
+}
+
+fn build_main_layout(
+    panes: &[usize],
+    active_pane: usize,
+    direction: SplitDirection,
+    size: PtySize,
+) -> LayoutNode {
+    if panes.len() <= 1 {
+        return LayoutNode::Pane(panes[0]);
+    }
+    let secondary = panes
+        .iter()
+        .copied()
+        .filter(|pane| *pane != active_pane)
+        .collect::<Vec<_>>();
+    let secondary_direction = match direction {
+        SplitDirection::Horizontal => SplitDirection::Vertical,
+        SplitDirection::Vertical => SplitDirection::Horizontal,
+    };
+    let secondary_extent = match secondary_direction {
+        SplitDirection::Horizontal => size.cols as usize,
+        SplitDirection::Vertical => size.rows as usize,
+    };
+    LayoutNode::Split {
+        direction,
+        first_weight: 1,
+        second_weight: 1,
+        first: Box::new(LayoutNode::Pane(active_pane)),
+        second: Box::new(build_even_layout(
+            &secondary,
+            secondary_direction,
+            secondary_extent,
+        )),
+    }
+}
+
+fn build_sequence_with_leaf_spans(
+    direction: SplitDirection,
+    mut nodes: Vec<LayoutNode>,
+    spans: Vec<usize>,
+) -> LayoutNode {
+    if nodes.len() == 1 {
+        return nodes.remove(0);
+    }
+    let split = nodes.len() / 2;
+    let second_nodes = nodes.split_off(split);
+    let (first_spans, second_spans) = spans.split_at(split);
+    let first_weight = subtree_span(first_spans, separator_for_direction(direction));
+    let second_weight = subtree_span(second_spans, separator_for_direction(direction));
+    LayoutNode::Split {
+        direction,
+        first_weight: first_weight.max(1),
+        second_weight: second_weight.max(1),
+        first: Box::new(build_sequence_with_leaf_spans(
+            direction,
+            nodes,
+            first_spans.to_vec(),
+        )),
+        second: Box::new(build_sequence_with_leaf_spans(
+            direction,
+            second_nodes,
+            second_spans.to_vec(),
+        )),
+    }
+}
+
+fn even_leaf_spans(extent: usize, count: usize, separator: usize) -> Vec<usize> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let total_separator = separator.saturating_mul(count - 1);
+    let content = extent.saturating_sub(total_separator).max(count);
+    let base = content / count;
+    let extra = content % count;
+    (0..count)
+        .map(|index| base + usize::from(extra > 0 && index >= count - extra))
+        .collect()
+}
+
+fn subtree_span(leaf_spans: &[usize], separator: usize) -> usize {
+    leaf_spans.iter().sum::<usize>() + separator.saturating_mul(leaf_spans.len().saturating_sub(1))
+}
+
+fn tiled_column_count(count: usize) -> usize {
+    let mut columns = 1;
+    while columns * columns < count {
+        columns += 1;
+    }
+    columns
+}
+
 fn split_can_resize_from_first(
     split_direction: SplitDirection,
     resize_direction: PaneResizeDirection,
@@ -659,5 +832,124 @@ mod tests {
 
         assert!(err.contains("minimum pane size"), "{err}");
         assert_eq!(layout_regions_for_size(&layout, size), before);
+    }
+
+    #[test]
+    fn layout_preset_even_horizontal_arranges_equal_columns_in_pane_order() {
+        let mut layout = LayoutNode::Pane(0);
+        layout
+            .apply_preset(
+                LayoutPreset::EvenHorizontal,
+                4,
+                0,
+                PtySize { cols: 92, rows: 20 },
+            )
+            .unwrap();
+
+        assert_eq!(
+            layout_regions_for_size(&layout, PtySize { cols: 92, rows: 20 }),
+            vec![
+                PaneRegion {
+                    pane: 0,
+                    row_start: 0,
+                    row_end: 20,
+                    col_start: 0,
+                    col_end: 20,
+                },
+                PaneRegion {
+                    pane: 1,
+                    row_start: 0,
+                    row_end: 20,
+                    col_start: 23,
+                    col_end: 44,
+                },
+                PaneRegion {
+                    pane: 2,
+                    row_start: 0,
+                    row_end: 20,
+                    col_start: 47,
+                    col_end: 68,
+                },
+                PaneRegion {
+                    pane: 3,
+                    row_start: 0,
+                    row_end: 20,
+                    col_start: 71,
+                    col_end: 92,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn layout_preset_tiled_preserves_all_panes_with_positive_regions() {
+        let mut layout = LayoutNode::Pane(0);
+        layout
+            .apply_preset(LayoutPreset::Tiled, 5, 0, PtySize { cols: 90, rows: 25 })
+            .unwrap();
+
+        let regions = layout_regions_for_size(&layout, PtySize { cols: 90, rows: 25 });
+        assert_eq!(
+            regions.iter().map(|region| region.pane).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert!(regions.iter().all(|region| {
+            region.row_start < region.row_end && region.col_start < region.col_end
+        }));
+        assert_eq!(regions[0].row_start, regions[1].row_start);
+        assert_eq!(regions[1].row_start, regions[2].row_start);
+        assert!(regions[3].row_start > regions[0].row_start);
+    }
+
+    #[test]
+    fn layout_preset_main_vertical_places_active_pane_in_main_area() {
+        let mut layout = LayoutNode::Pane(0);
+        layout
+            .apply_preset(
+                LayoutPreset::MainVertical,
+                4,
+                2,
+                PtySize {
+                    cols: 100,
+                    rows: 30,
+                },
+            )
+            .unwrap();
+
+        let regions = layout_regions_for_size(
+            &layout,
+            PtySize {
+                cols: 100,
+                rows: 30,
+            },
+        );
+        let main = regions.iter().find(|region| region.pane == 2).unwrap();
+        assert_eq!(main.col_start, 0);
+        assert_eq!(main.row_start, 0);
+        assert_eq!(main.row_end, 30);
+        assert!(
+            regions
+                .iter()
+                .filter(|region| region.pane != 2)
+                .all(|region| region.col_start > main.col_end)
+        );
+    }
+
+    #[test]
+    fn layout_preset_rejects_zero_sized_results_without_changing_layout() {
+        let mut layout = LayoutNode::Pane(0);
+        let before = layout.clone();
+
+        let err = layout
+            .apply_preset(
+                LayoutPreset::EvenHorizontal,
+                4,
+                0,
+                PtySize { cols: 3, rows: 20 },
+            )
+            .unwrap_err();
+
+        assert!(err.contains("minimum pane size"), "{err}");
+        assert_eq!(layout, before);
     }
 }

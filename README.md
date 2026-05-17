@@ -21,6 +21,7 @@ Implemented Phase 0/1 commands:
 - `dmux delete-buffer -b <buffer>`
 - `dmux resize-pane -t <name> -x <cols> -y <rows>`
 - `dmux resize-pane -t <name> -L|-R|-U|-D [amount]`
+- `dmux select-layout -t <name> even-horizontal|even-vertical|tiled|main-horizontal|main-vertical`
 - `dmux send-keys -t <name> <keys...>`
 - `dmux new-window -t <name> [-- command...]`
 - `dmux list-windows -t <name> [-F <format>]`
@@ -76,7 +77,7 @@ a grouped attach help overlay covering session, window, pane, copy-mode, and
 command-prompt workflows. Press `C-b :` for an attached command prompt that
 shows the typed command and controls (`Enter` run, Escape/`C-c` cancel,
 Backspace edit), with examples such as `:split -h`, `:split -v`,
-`:rename-window api`, `:list-windows`, and `:paste-buffer`. Unknown attached
+`:layout tiled`, `:rename-window api`, and `:list-windows`. Unknown attached
 commands report a hint to use `C-b ?` and show common examples.
 
 Attached clients can enter the current basic copy-mode view with `C-b [`.
@@ -88,7 +89,7 @@ currently basic line-level selection. In unzoomed multi-pane attach, copy-mode
 copies lines from the rendered composed layout, including pane separators and
 visible content from multiple panes, while input is routed to the server active
 pane. Unzoomed multi-pane attach handles `C-b d` to detach (`C-b D` also detaches), `C-b ?` to show
-attach help, `C-b :` to run attached commands such as rename/select/kill/list/paste/split, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
+attach help, `C-b :` to run attached commands such as rename/select/kill/list/paste/split/layout, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
 `C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` to focus by
 direction, `C-b H/J/K/L` to resize the active pane left/down/up/right by
 5 cells, `C-b o` to cycle the server active pane, `C-b q` followed by a single
@@ -100,7 +101,10 @@ layout view. Pane splitting is also available with
 `dmux split-window -t <name> -h|-v [-- command...]`; active pane focus is
 available with `dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D`;
 active pane resizing is available with
-`dmux resize-pane -t <name> -L|-R|-U|-D [amount]`; use `dmux attach --help` or
+`dmux resize-pane -t <name> -L|-R|-U|-D [amount]`; pane layouts are available
+with `dmux select-layout -t <name> tiled|even-horizontal|even-vertical|main-horizontal|main-vertical`
+or attach prompt `:layout tiled`. `main-horizontal` and `main-vertical` use the
+active pane as the main pane; use `dmux attach --help` or
 `dmux help attach` to list attach-time bindings.
 Unzoomed multi-pane attach redraws from server change events and keeps a polling
 fallback for mixed-version daemons or missed events.
