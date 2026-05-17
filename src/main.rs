@@ -34,7 +34,12 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
             let body = send_request(&socket, protocol::encode_list(), true)?;
             let sessions = String::from_utf8_lossy(&body);
             if !sessions.lines().any(|line| line == "default") {
-                match send_request(&socket, &protocol::encode_new("default", &[]), true) {
+                let cwd = current_request_cwd()?;
+                match send_request(
+                    &socket,
+                    &protocol::encode_new_in_cwd("default", &[], &cwd),
+                    true,
+                ) {
                     Ok(_) => {}
                     Err(error) if is_duplicate_default_create_error(&error) => {}
                     Err(error) => return Err(error),
@@ -56,7 +61,12 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
         } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
-            send_request(&socket, &protocol::encode_new(&session, &command), true)?;
+            let cwd = current_request_cwd()?;
+            send_request(
+                &socket,
+                &protocol::encode_new_in_cwd(&session, &command, &cwd),
+                true,
+            )?;
             if detach {
                 Ok(())
             } else {
@@ -224,9 +234,10 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
         } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
+            let cwd = current_request_cwd()?;
             send_request(
                 &socket,
-                &protocol::encode_split_target(&target, direction, &command),
+                &protocol::encode_split_target_in_cwd(&target, direction, &command, &cwd),
                 true,
             )?;
             Ok(())
@@ -320,9 +331,10 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
         } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
+            let cwd = current_request_cwd()?;
             send_request(
                 &socket,
-                &protocol::encode_respawn_pane_target(&target, force, &command),
+                &protocol::encode_respawn_pane_target_in_cwd(&target, force, &command, &cwd),
                 true,
             )?;
             Ok(())
@@ -330,9 +342,10 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
         cli::Command::NewWindow { session, command } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
+            let cwd = current_request_cwd()?;
             send_request(
                 &socket,
-                &protocol::encode_new_window(&session, &command),
+                &protocol::encode_new_window_in_cwd(&session, &command, &cwd),
                 true,
             )?;
             Ok(())
@@ -760,6 +773,10 @@ fn encode_key_tokens(keys: &[String]) -> Result<Vec<u8>, String> {
 
 fn io_error(message: String) -> std::io::Error {
     std::io::Error::other(message)
+}
+
+fn current_request_cwd() -> Result<std::path::PathBuf, String> {
+    std::env::current_dir().map_err(|err| err.to_string())
 }
 
 fn ensure_server(socket: &std::path::Path) -> Result<(), String> {

@@ -8240,6 +8240,57 @@ fn split_window_creates_second_active_pane() {
 }
 
 #[test]
+fn split_window_starts_new_pane_in_invoking_client_cwd() {
+    let socket = unique_socket("split-window-client-cwd");
+    let session = format!("split-window-client-cwd-{}", std::process::id());
+    let dir = unique_temp_file("split-window-client-cwd-dir");
+    let file = unique_temp_file("split-window-client-cwd-output");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&file);
+    std::fs::create_dir(&dir).expect("create cwd test directory");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    let mut split = Command::new(env!("CARGO_BIN_EXE_dmux"));
+    split.env("DEVMUX_SOCKET", &socket).current_dir(&dir).args([
+        "split-window",
+        "-t",
+        &session,
+        "-h",
+        "--",
+        "sh",
+        "-c",
+        &format!("pwd > {}; sleep 30", file.display()),
+    ]);
+    let split = output_with_timeout(split, "run dmux split from cwd", Duration::from_secs(5));
+    assert_success(&split);
+    let expected_cwd = std::fs::canonicalize(&dir).expect("canonicalize cwd test directory");
+    assert!(poll_file_equals(
+        &file,
+        &format!("{}\n", expected_cwd.display())
+    ));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn select_pane_switches_active_capture_target() {
     let socket = unique_socket("select-pane");
     let session = format!("select-pane-{}", std::process::id());

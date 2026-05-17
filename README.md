@@ -178,6 +178,7 @@ Implemented Phase 2 groundwork:
 - carriage-return overwrite handling in captures
 - explicit PTY resize requests with screen-state resize
 - detached session input through `send-keys`
+- client cwd propagation for new panes, windows, and respawns
 - attach-time PTY resize to the current terminal size when available
 - session formats: `#{session.name}`, `#{session.windows}`, `#{session.window_count}`, `#{session.attached}`, `#{session.attached_count}`, `#{session.created_at}`, and `#{client.count}`
 - client formats: `#{client.id}`, `#{client.session}`, `#{client.type}`, `#{client.attached}`, `#{client.width}`, and `#{client.height}`
