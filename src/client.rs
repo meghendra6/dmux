@@ -3509,7 +3509,7 @@ fn write_attach_help_message() -> io::Result<()> {
 
 fn attach_command_prompt_text(command: &str) -> String {
     format!(
-        ":{command}  (Enter run | Esc/C-c cancel | Backspace edit | examples: split -h, layout tiled, rename-window name)"
+        ":{command}  (Enter run | Esc/C-c cancel | Backspace edit | examples: split -h; layout tiled; source-file path)"
     )
 }
 
@@ -3542,12 +3542,38 @@ struct AttachCommandResult {
     exit_attach: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+struct AttachCommandContext {
+    source_depth: usize,
+}
+
 fn dispatch_attach_command(
     socket: &Path,
     session: &str,
     command: &str,
 ) -> io::Result<AttachCommandResult> {
-    let parts = command.split_whitespace().collect::<Vec<_>>();
+    dispatch_attach_command_with_context(socket, session, command, AttachCommandContext::default())
+}
+
+fn dispatch_attach_command_with_context(
+    socket: &Path,
+    session: &str,
+    command: &str,
+    context: AttachCommandContext,
+) -> io::Result<AttachCommandResult> {
+    let sequence = crate::cli::parse_command_sequence(command).map_err(io::Error::other)?;
+    if sequence.len() > 1 {
+        return dispatch_attach_command_sequence(socket, session, &sequence, context);
+    }
+
+    let Some(command) = sequence.first() else {
+        return Ok(AttachCommandResult {
+            message: None,
+            reconnect: false,
+            exit_attach: false,
+        });
+    };
+    let parts = command.argv.iter().map(String::as_str).collect::<Vec<_>>();
     let Some((name, args)) = parts.split_first() else {
         return Ok(AttachCommandResult {
             message: None,
@@ -3557,6 +3583,17 @@ fn dispatch_attach_command(
     };
 
     let (body, reconnect, exit_attach) = match *name {
+        "source-file" | "source" => {
+            if context.source_depth > 0 {
+                return Err(io::Error::other(
+                    "nested source-file is not allowed in attach scripts",
+                ));
+            }
+            let [path] = args else {
+                return Err(io::Error::other("source-file requires exactly one path"));
+            };
+            return dispatch_attach_source_file(socket, session, path, context);
+        }
         "rename-window" | "renamew" => {
             let name = args.join(" ");
             if name.is_empty() {
@@ -3703,7 +3740,7 @@ fn dispatch_attach_command(
         }
         other => {
             return Err(io::Error::other(format!(
-                "unknown attach command {other:?}; press C-b ? for help or try :split -h, :swap-pane 1, :break-pane, :layout tiled, :list-windows"
+                "unknown attach command {other:?}; press C-b ? for help or try :split -h, :swap-pane 1, :break-pane, :layout tiled, :list-windows; CLI automation is available with dmux run and dmux source-file"
             )));
         }
     };
@@ -3712,6 +3749,94 @@ fn dispatch_attach_command(
         message: (!message.is_empty()).then_some(message),
         reconnect,
         exit_attach,
+    })
+}
+
+fn dispatch_attach_command_sequence(
+    socket: &Path,
+    session: &str,
+    commands: &[crate::cli::ScriptCommand],
+    context: AttachCommandContext,
+) -> io::Result<AttachCommandResult> {
+    let mut reconnect = false;
+    let mut message = None;
+
+    for (index, command) in commands.iter().enumerate() {
+        let result =
+            dispatch_attach_command_with_context(socket, session, &command.source, context)
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "command {} ({}) failed: {err}",
+                        index + 1,
+                        command.source
+                    ))
+                })?;
+        reconnect |= result.reconnect;
+        if result.message.is_some() {
+            message = result.message;
+        }
+        if result.exit_attach {
+            return Ok(AttachCommandResult {
+                message,
+                reconnect,
+                exit_attach: true,
+            });
+        }
+    }
+
+    Ok(AttachCommandResult {
+        message,
+        reconnect,
+        exit_attach: false,
+    })
+}
+
+fn dispatch_attach_source_file(
+    socket: &Path,
+    session: &str,
+    path: &str,
+    context: AttachCommandContext,
+) -> io::Result<AttachCommandResult> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|err| io::Error::other(format!("source-file {path:?}: {err}")))?;
+    let commands = crate::cli::parse_command_file(&contents)
+        .map_err(|err| io::Error::other(format!("source-file {path:?}: {err}")))?;
+
+    let mut reconnect = false;
+    let mut message = None;
+    let nested_context = AttachCommandContext {
+        source_depth: context.source_depth.saturating_add(1),
+    };
+    for entry in commands {
+        let result = dispatch_attach_command_with_context(
+            socket,
+            session,
+            &entry.command.source,
+            nested_context,
+        )
+        .map_err(|err| {
+            io::Error::other(format!(
+                "source-file {path:?} line {} ({}) failed: {err}",
+                entry.line, entry.command.source
+            ))
+        })?;
+        reconnect |= result.reconnect;
+        if result.message.is_some() {
+            message = result.message;
+        }
+        if result.exit_attach {
+            return Ok(AttachCommandResult {
+                message,
+                reconnect,
+                exit_attach: true,
+            });
+        }
+    }
+
+    Ok(AttachCommandResult {
+        message,
+        reconnect,
+        exit_attach: false,
     })
 }
 
@@ -5691,6 +5816,35 @@ mod tests {
         };
 
         assert!(err.to_string().contains("requires a preset"), "{}", err);
+    }
+
+    #[test]
+    fn attach_source_file_rejects_recursive_source_file() {
+        let path = std::env::temp_dir().join(format!(
+            "dmux-recursive-source-{}-{}.dmux",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, format!("source-file {}\n", path.display())).unwrap();
+
+        let err = match dispatch_attach_command(
+            Path::new("unused.sock"),
+            "dev",
+            &format!("source-file {}", path.display()),
+        ) {
+            Ok(_) => panic!("recursive source-file should fail"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("nested source-file is not allowed in attach scripts"),
+            "{message}"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

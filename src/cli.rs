@@ -164,6 +164,15 @@ pub enum Command {
         session: String,
         format: String,
     },
+    Run {
+        sequence: String,
+    },
+    SourceFile {
+        path: String,
+    },
+    RunShell {
+        command: String,
+    },
     KillSession {
         session: String,
     },
@@ -172,6 +181,18 @@ pub enum Command {
         topic: Option<HelpTopic>,
     },
     Server,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptCommand {
+    pub source: String,
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandFileEntry {
+    pub line: usize,
+    pub command: ScriptCommand,
 }
 
 pub fn parse_args<I, S>(args: I) -> Result<Command, String>
@@ -238,10 +259,170 @@ where
         "zoom-pane" => parse_zoom_pane(args),
         "status-line" => parse_status_line(args),
         "display-message" => parse_display_message(args),
+        "run" | "command" => parse_run(args),
+        "source-file" => parse_source_file(args),
+        "run-shell" => parse_run_shell(args),
         "kill-session" => parse_kill_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
     }
+}
+
+pub fn parse_command_sequence(input: &str) -> Result<Vec<ScriptCommand>, String> {
+    split_command_sequence(input)?
+        .into_iter()
+        .map(|source| {
+            let argv = tokenize_command(&source)?;
+            Ok(ScriptCommand { source, argv })
+        })
+        .collect()
+}
+
+pub fn parse_command_file(contents: &str) -> Result<Vec<CommandFileEntry>, String> {
+    let mut commands = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let line_commands =
+            parse_command_sequence(line).map_err(|err| format!("line {line_number}: {err}"))?;
+        commands.extend(line_commands.into_iter().map(|command| CommandFileEntry {
+            line: line_number,
+            command,
+        }));
+    }
+    Ok(commands)
+}
+
+fn split_command_sequence(input: &str) -> Result<Vec<String>, String> {
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escape = false;
+
+    for ch in input.chars() {
+        if escape {
+            current.push('\\');
+            current.push(ch);
+            escape = false;
+            continue;
+        }
+
+        match (quote, ch) {
+            (Some('\''), '\'') => {
+                quote = None;
+                current.push(ch);
+            }
+            (Some('\''), _) => current.push(ch),
+            (Some(_), '\\') => {
+                escape = true;
+            }
+            (Some(active), quote_ch) if quote_ch == active => {
+                quote = None;
+                current.push(ch);
+            }
+            (Some(_), _) => current.push(ch),
+            (None, '\\') => {
+                escape = true;
+            }
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                current.push(ch);
+            }
+            (None, ';') => {
+                let command = current.trim();
+                if !command.is_empty() {
+                    commands.push(command.to_string());
+                }
+                current.clear();
+            }
+            (None, _) => current.push(ch),
+        }
+    }
+
+    if escape {
+        return Err("trailing backslash in command sequence".to_string());
+    }
+    if let Some(active) = quote {
+        return Err(format!("unterminated {active} quote in command sequence"));
+    }
+
+    let command = current.trim();
+    if !command.is_empty() {
+        commands.push(command.to_string());
+    }
+    Ok(commands)
+}
+
+pub fn tokenize_command(input: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escape = false;
+    let mut token_started = false;
+
+    for ch in input.chars() {
+        if escape {
+            current.push(ch);
+            token_started = true;
+            escape = false;
+            continue;
+        }
+
+        match (quote, ch) {
+            (Some('\''), '\'') => {
+                quote = None;
+                token_started = true;
+            }
+            (Some('\''), _) => {
+                current.push(ch);
+                token_started = true;
+            }
+            (Some(active), quote_ch) if quote_ch == active => {
+                quote = None;
+                token_started = true;
+            }
+            (Some(_), '\\') => {
+                escape = true;
+                token_started = true;
+            }
+            (Some(_), _) => {
+                current.push(ch);
+                token_started = true;
+            }
+            (None, '\\') => {
+                escape = true;
+                token_started = true;
+            }
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                token_started = true;
+            }
+            (None, ch) if ch.is_whitespace() => {
+                if token_started {
+                    args.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+            }
+            (None, _) => {
+                current.push(ch);
+                token_started = true;
+            }
+        }
+    }
+
+    if escape {
+        return Err("trailing backslash in command".to_string());
+    }
+    if let Some(active) = quote {
+        return Err(format!("unterminated {active} quote in command"));
+    }
+    if token_started {
+        args.push(current);
+    }
+    Ok(args)
 }
 
 fn parse_help(args: Vec<String>) -> Result<Command, String> {
@@ -335,6 +516,9 @@ Commands:\n\
   rename-tab -t <name> [-i <index>|--tab-id <id>|-n <old-name>] <new-name>\n\
   next-tab/previous-tab -t <name>        aliases for window cycling\n\
   kill-tab -t <name> [-i <index>]        alias for kill-window\n\
+  run <command; command...>              run dmux commands in order; stops on first error\n\
+  source-file <path>                     run newline-separated dmux commands from a file\n\
+  run-shell <shell-command>              run a host shell command and report its status\n\
   kill-session -t <name>\n\
   kill-server\n\
 \n\
@@ -366,6 +550,7 @@ Copy:\n\
   C-b [ copy-mode         copy-mode: j/k arrows PgUp/PgDn y/Enter copy q/Esc exit\n\
 Prompt:\n\
   C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
+  Prompt accepts semicolon-separated commands; source-file reads prompt commands.\n\
 Prompt examples:\n\
   :split -h               :split -v               :rename-window api\n\
   :layout tiled           :swap-pane 1            :break-pane\n\
@@ -390,6 +575,7 @@ Copy:\n\
   C-b [ copy-mode         copy-mode: j/k arrows PgUp/PgDn y/Enter copy q/Esc exit\n\
 Prompt:\n\
   C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
+  Prompt accepts semicolon-separated commands; source-file reads prompt commands.\n\
 Prompt examples:\n\
   :split -h               :split -v               :rename-window api\n\
   :layout tiled           :swap-pane 1            :break-pane\n\
@@ -884,6 +1070,30 @@ fn parse_kill_session(args: Vec<String>) -> Result<Command, String> {
     let session = parse_target(args, "kill-session")?
         .ok_or_else(|| "kill-session requires -t <session>".to_string())?;
     Ok(Command::KillSession { session })
+}
+
+fn parse_run(args: Vec<String>) -> Result<Command, String> {
+    let sequence = args.join(" ");
+    if sequence.trim().is_empty() {
+        return Err("run requires a command sequence".to_string());
+    }
+    Ok(Command::Run { sequence })
+}
+
+fn parse_source_file(args: Vec<String>) -> Result<Command, String> {
+    match args.as_slice() {
+        [path] => Ok(Command::SourceFile { path: path.clone() }),
+        [] => Err("source-file requires a path".to_string()),
+        _ => Err("source-file accepts exactly one path".to_string()),
+    }
+}
+
+fn parse_run_shell(args: Vec<String>) -> Result<Command, String> {
+    let command = args.join(" ");
+    if command.trim().is_empty() {
+        return Err("run-shell requires a shell command".to_string());
+    }
+    Ok(Command::RunShell { command })
 }
 
 fn parse_resize_pane(args: Vec<String>) -> Result<Command, String> {
@@ -2084,6 +2294,108 @@ mod tests {
     }
 
     #[test]
+    fn parses_batch_execution_commands() {
+        assert_eq!(
+            parse_args(["dmux", "run", "new -d -s dev; split-window -t dev -v"]).unwrap(),
+            Command::Run {
+                sequence: "new -d -s dev; split-window -t dev -v".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "command", "ls"]).unwrap(),
+            Command::Run {
+                sequence: "ls".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "source-file", "dmux.commands"]).unwrap(),
+            Command::SourceFile {
+                path: "dmux.commands".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "run-shell", "printf", "ok"]).unwrap(),
+            Command::RunShell {
+                command: "printf ok".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn command_sequence_parser_supports_quotes_and_escaping() {
+        let commands = parse_command_sequence(
+            "display-message -t dev -p 'hello; world'; rename-window -t dev \"api server\"",
+        )
+        .unwrap();
+
+        assert_eq!(
+            commands,
+            vec![
+                ScriptCommand {
+                    source: "display-message -t dev -p 'hello; world'".to_string(),
+                    argv: vec![
+                        "display-message".to_string(),
+                        "-t".to_string(),
+                        "dev".to_string(),
+                        "-p".to_string(),
+                        "hello; world".to_string(),
+                    ],
+                },
+                ScriptCommand {
+                    source: "rename-window -t dev \"api server\"".to_string(),
+                    argv: vec![
+                        "rename-window".to_string(),
+                        "-t".to_string(),
+                        "dev".to_string(),
+                        "api server".to_string(),
+                    ],
+                },
+            ]
+        );
+
+        assert_eq!(
+            tokenize_command(r#"send-keys -t dev hello\ world"#).unwrap(),
+            vec![
+                "send-keys".to_string(),
+                "-t".to_string(),
+                "dev".to_string(),
+                "hello world".to_string(),
+            ]
+        );
+
+        let shell_command =
+            parse_command_sequence(r"run-shell printf '%s\n' '\'; display-message -t dev ok")
+                .unwrap();
+        assert_eq!(shell_command.len(), 2);
+        assert_eq!(shell_command[0].source, r"run-shell printf '%s\n' '\'");
+        assert_eq!(shell_command[0].argv[3], "\\");
+    }
+
+    #[test]
+    fn command_file_parser_skips_blank_lines_and_comments() {
+        let commands = parse_command_file(
+            "\n# setup\nnew -d -s dev\n  \nrename-window -t dev api; list-windows -t dev\n",
+        )
+        .unwrap();
+
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].line, 3);
+        assert_eq!(commands[0].command.argv[0], "new");
+        assert_eq!(commands[1].line, 5);
+        assert_eq!(commands[1].command.argv[0], "rename-window");
+        assert_eq!(commands[2].line, 5);
+        assert_eq!(commands[2].command.argv[0], "list-windows");
+    }
+
+    #[test]
+    fn command_file_parser_reports_line_context_for_parse_errors() {
+        let err = parse_command_file("new -d -s dev\nrename-window 'unterminated\n").unwrap_err();
+
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains("unterminated"), "{err}");
+    }
+
+    #[test]
     fn attach_help_lists_prefix_bindings_and_split_command() {
         let help = attach_help();
 
@@ -2098,6 +2410,7 @@ mod tests {
         assert!(help.contains("C-b ?"), "{help}");
         assert!(help.contains("C-b o"), "{help}");
         assert!(help.contains("split-window"), "{help}");
+        assert!(help.contains("semicolon-separated"), "{help}");
         assert!(help.contains("Session:"), "{help}");
         assert!(help.contains("Prompt examples:"), "{help}");
         assert!(help.contains("copy-mode:"), "{help}");
