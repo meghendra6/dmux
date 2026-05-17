@@ -71,14 +71,15 @@ when needed. `dmux attach` without `-t` also targets `default`. Explicit
 when no server is running instead of starting an empty daemon.
 
 Attached clients can enter the current basic copy-mode view with `C-b [`.
-Inside copy-mode, `j`/`k` and `Ctrl-n`/`Ctrl-p` move the cursor, `y` or Enter
-saves the current line to a buffer, and `q` or Escape exits. Mouse click saves
-one rendered line; mouse drag saves an inclusive line range. Mouse selection is
+Inside copy-mode, `j`/`k`, arrows, `Ctrl-n`/`Ctrl-p`, PageUp/PageDown, and
+Home/End-style `g`/`G` move the cursor and viewport, `y` or Enter saves the
+current line to a buffer, and `q` or Escape exits. Mouse click saves one
+rendered line; mouse drag saves an inclusive line range. Mouse selection is
 currently basic line-level selection. In unzoomed multi-pane attach, copy-mode
 copies lines from the rendered composed layout, including pane separators and
 visible content from multiple panes, while input is routed to the server active
 pane. Unzoomed multi-pane attach handles `C-b d` to detach (`C-b D` also detaches), `C-b ?` to show
-attach help, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
+attach help, `C-b :` to run basic attached commands such as rename/select/kill/list/paste, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
 `C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` to focus by
 direction, `C-b H/J/K/L` to resize the active pane left/down/up/right by
 5 cells, `C-b o` to cycle the server active pane, `C-b q` followed by a single

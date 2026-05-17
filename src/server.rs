@@ -746,18 +746,22 @@ impl Session {
         let name = self.name();
         let mut clients = Vec::new();
         collect_client_descriptions(&mut clients, &self.attach_streams, &name, size);
+        collect_client_descriptions(&mut clients, &self.attach_events, &name, size);
+        collect_client_descriptions(&mut clients, &self.attach_render_clients, &name, size);
         clients.sort_by_key(|client| client.id);
         clients
     }
 
     fn detach_client(&self, client_id: usize) -> bool {
         detach_tracked_client(&self.attach_streams, client_id)
+            || detach_tracked_client(&self.attach_events, client_id)
+            || detach_tracked_client(&self.attach_render_clients, client_id)
     }
 
     fn detach_all_clients(&self) -> usize {
-        let count = detach_all_tracked_clients(&self.attach_streams);
-        shutdown_tracked_clients(&self.attach_events);
-        shutdown_tracked_clients(&self.attach_render_clients);
+        let count = detach_all_tracked_clients(&self.attach_streams)
+            + detach_all_tracked_clients(&self.attach_events)
+            + detach_all_tracked_clients(&self.attach_render_clients);
         count
     }
 
@@ -5451,7 +5455,8 @@ mod tests {
     #[test]
     fn handle_attach_events_removes_event_stream_after_client_disconnect() {
         let attach_events = Arc::new(Mutex::new(Vec::new()));
-        let writer_path = std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir();
+        let writer_path = dir.join(format!(
             "dmux-attach-events-lifetime-{}",
             std::process::id()
         ));
@@ -5502,8 +5507,8 @@ mod tests {
     #[test]
     fn handle_attach_removes_lifetime_stream_after_normal_detach() {
         let attach_events = Arc::new(Mutex::new(Vec::new()));
-        let writer_path =
-            std::env::temp_dir().join(format!("dmux-attach-lifetime-{}", std::process::id()));
+        let dir = std::env::temp_dir();
+        let writer_path = dir.join(format!("dmux-attach-lifetime-{}", std::process::id()));
         let writer = File::create(&writer_path).unwrap();
         let pane = Arc::new(Pane {
             id: PaneId::new(0),
