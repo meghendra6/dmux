@@ -319,35 +319,50 @@ Help:\n\
 pub fn attach_help() -> &'static str {
     "Usage: dmux attach [-t <name>]\n\
 \n\
-If -t is omitted, attach targets default.\n\
+If -t is omitted, attach targets default. The status line shows the active session,\n\
+window, pane, and quick hints for prefix, help, command prompt, and copy-mode.\n\
 \n\
-Attach keys:\n\
-  C-b d       detach\n\
-  C-b c       create a new window\n\
-  C-b n/p     next/previous window\n\
-  C-b %       split right\n\
-  C-b \"       split down\n\
-  C-b ?       show this help\n\
-  C-b :       enter an attached command (rename/select/kill/list/paste basics)\n\
-  C-b [       copy-mode for the active pane\n\
-  C-b o       cycle panes in multi-pane attach\n\
-  C-b h/j/k/l focus left/down/up/right\n\
-  C-b H/J/K/L resize active pane left/down/up/right by 5 cells\n\
-  C-b q       show pane numbers; press a digit to select\n\
-  C-b x       close the active pane\n\
-  C-b z       toggle zoom for the active pane\n\
-  C-b C-b     send a literal prefix\n\
-  mouse click focus a pane in unzoomed multi-pane attach\n\
-\n\
-Pane commands:\n\
-  dmux split-window -t <name> -h [-- command...]  split left/right\n\
-  dmux split-window -t <name> -v [-- command...]  split top/bottom\n\
+Session:\n\
+  C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? show this help\n\
+Windows:\n\
+  C-b c new window        C-b n/p next/previous window\n\
+Panes:\n\
+  C-b % split right       C-b \" split down       C-b o next pane\n\
+  C-b h/j/k/l focus       C-b H/J/K/L resize by 5\n\
+  C-b q pane numbers      C-b x close pane       C-b z zoom pane\n\
+Copy:\n\
+  C-b [ copy-mode         copy-mode: j/k arrows PgUp/PgDn y/Enter copy q/Esc exit\n\
+Prompt:\n\
+  C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
+Prompt examples:\n\
+  :split -h               :split -v               :rename-window api\n\
+  :select-window 0        :list-windows           :paste-buffer\n\
+CLI equivalents:\n\
+  dmux split-window -t <name> -h|-v [-- command...]\n\
   dmux resize-pane -t <name> -L|-R|-U|-D [amount]\n\
   dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D\n"
 }
 
-pub fn attach_help_summary() -> &'static str {
-    "C-b d detach / C-b D detach | C-b ? help | C-b : command prompt | C-b c new window | C-b n/p next/previous window | C-b % split right | C-b \" split down | C-b h/j/k/l focus | C-b H/J/K/L resize by 5 | C-b x close | C-b z zoom | C-b [ copy-mode | C-b o next pane | C-b q pane numbers | C-b C-b literal prefix | mouse click focus pane | split: dmux split-window -t <name> -h|-v | resize: dmux resize-pane -t <name> -L|-R|-U|-D [amount] | select: dmux select-pane -t <name> -p <index>"
+pub fn attach_help_overlay() -> &'static str {
+    "Session:\n\
+  C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? show this help\n\
+Windows:\n\
+  C-b c new window        C-b n/p next/previous window\n\
+Panes:\n\
+  C-b % split right       C-b \" split down       C-b o next pane\n\
+  C-b h/j/k/l focus       C-b H/J/K/L resize by 5\n\
+  C-b q pane numbers      C-b x close pane       C-b z zoom pane\n\
+Copy:\n\
+  C-b [ copy-mode         copy-mode: j/k arrows PgUp/PgDn y/Enter copy q/Esc exit\n\
+Prompt:\n\
+  C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
+Prompt examples:\n\
+  :split -h               :split -v               :rename-window api\n\
+  :select-window 0        :list-windows           :paste-buffer\n\
+CLI equivalents:\n\
+  dmux split-window -t <name> -h|-v [-- command...]\n\
+  dmux resize-pane -t <name> -L|-R|-U|-D [amount]\n\
+  dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D\n"
 }
 
 fn parse_list_sessions(args: Vec<String>, command_name: &str) -> Result<Command, String> {
@@ -1879,6 +1894,21 @@ mod tests {
         assert!(help.contains("C-b ?"), "{help}");
         assert!(help.contains("C-b o"), "{help}");
         assert!(help.contains("split-window"), "{help}");
+        assert!(help.contains("Session:"), "{help}");
+        assert!(help.contains("Prompt examples:"), "{help}");
+        assert!(help.contains("copy-mode:"), "{help}");
+    }
+
+    #[test]
+    fn attach_help_overlay_groups_common_workflows() {
+        let help = attach_help_overlay();
+
+        assert!(help.contains("Session:"), "{help}");
+        assert!(help.contains("Windows:"), "{help}");
+        assert!(help.contains("Panes:"), "{help}");
+        assert!(help.contains("Copy:"), "{help}");
+        assert!(help.contains("Prompt examples:"), "{help}");
+        assert!(help.contains(":split -h"), "{help}");
     }
 
     #[test]

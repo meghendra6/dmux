@@ -2337,7 +2337,9 @@ fn cli_help_lists_attach_and_attach_help() {
     assert!(stdout.contains("C-b x"), "{stdout:?}");
     assert!(stdout.contains("C-b z"), "{stdout:?}");
     assert!(stdout.contains("C-b ?"), "{stdout:?}");
-    assert!(stdout.contains("split-window"), "{stdout:?}");
+    assert!(stdout.contains("Session:"), "{stdout:?}");
+    assert!(stdout.contains("Prompt examples:"), "{stdout:?}");
+    assert!(stdout.contains("copy-mode:"), "{stdout:?}");
 }
 
 #[test]
@@ -4052,7 +4054,9 @@ fn attach_renders_status_line_snapshot() {
         stdout.contains(&format!("{session} [0] pane 0")),
         "{stdout:?}"
     );
-    assert!(stdout.contains("C-b ? help"), "{stdout:?}");
+    assert!(stdout.contains("prefix C-b"), "{stdout:?}");
+    assert!(stdout.contains(": command"), "{stdout:?}");
+    assert!(stdout.contains("[ copy"), "{stdout:?}");
 
     let captured = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
     assert_success(&captured);
@@ -9897,7 +9901,10 @@ fn status_line_uses_default_format() {
     );
     assert_success(&output);
     let line = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(line.trim_end(), "C-b ? help");
+    assert_eq!(
+        line.trim_end(),
+        "prefix C-b | C-b ? help | : command | [ copy"
+    );
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
