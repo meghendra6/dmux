@@ -337,12 +337,7 @@ fn read_raw_attach_layout_epoch(socket: &Path, session: &str) -> io::Result<u64>
 fn read_attach_status_line(socket: &Path, session: &str) -> io::Result<String> {
     let body = send_control_request(
         socket,
-        &protocol::encode_status_line(
-            session,
-            Some(
-                "#{session.name} #{window.list} pane #{pane.index} clients #{client.count} buffers #{buffer.count} | #{status.help}",
-            ),
-        ),
+        &protocol::encode_status_line(session, Some("#{ui.tabs}\n#{ui.info}")),
     )?;
     Ok(String::from_utf8_lossy(&body).trim_end().to_string())
 }
@@ -518,7 +513,10 @@ fn write_attach_status_line(socket: &Path, session: &str) -> io::Result<()> {
     }
 
     let mut stdout = io::stdout().lock();
-    stdout.write_all(format!("{}\r\n", status).as_bytes())?;
+    for line in status.lines() {
+        stdout.write_all(line.as_bytes())?;
+        stdout.write_all(b"\r\n")?;
+    }
     stdout.flush()
 }
 
@@ -616,7 +614,9 @@ fn write_live_frame_to_stdout(
 fn live_header_lines(status: &str, message: Option<&str>, width: Option<usize>) -> Vec<String> {
     let mut lines = Vec::new();
     if !status.is_empty() {
-        lines.push(truncate_header_line(status, width));
+        for line in status.lines() {
+            lines.push(truncate_header_line(line, width));
+        }
     }
     if let Some(message) = message {
         for line in message.lines() {
@@ -2547,6 +2547,7 @@ fn run_live_snapshot_attach(
     let mut fallback_event_stream_started = false;
     let mut pane_number_message = None;
     let mut command_prompt_message: Option<String> = None;
+    let mut help_popup_visible = false;
     let mut pending_input_repaint_deadline = None;
     let mut render_output_state = LiveRenderOutputState::default();
 
@@ -2573,6 +2574,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2599,6 +2601,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2606,6 +2609,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::CommandPromptStart) => {
+                help_popup_visible = false;
                 pane_number_message = None;
                 command_prompt_message = Some(attach_command_prompt_text(""));
                 if !redraw_paused {
@@ -2614,6 +2618,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2621,6 +2626,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::CommandPromptUpdate(command)) => {
+                help_popup_visible = false;
                 pane_number_message = None;
                 command_prompt_message = Some(attach_command_prompt_text(&command));
                 if !redraw_paused {
@@ -2629,6 +2635,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2636,6 +2643,7 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::CommandPromptCancel) => {
+                help_popup_visible = false;
                 command_prompt_message = None;
                 pane_number_message = Some((
                     "cancelled".to_string(),
@@ -2647,6 +2655,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2658,6 +2667,7 @@ fn run_live_snapshot_attach(
                 dispatch_done,
             }) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                help_popup_visible = false;
                 command_prompt_message = None;
                 let command_result = dispatch_attach_command(socket, session, &command);
                 pane_number_message = match command_result {
@@ -2684,6 +2694,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2700,6 +2711,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2716,6 +2728,7 @@ fn run_live_snapshot_attach(
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
+                    help_popup_visible,
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -2723,15 +2736,15 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::ShowHelp) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
-                pane_number_message = Some((
-                    attach_help_message().to_string(),
-                    Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
-                ));
+                help_popup_visible = !help_popup_visible;
+                pane_number_message = None;
+                command_prompt_message = None;
                 frame = write_live_snapshot_frame_with_active_message(
                     socket,
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
+                    help_popup_visible,
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -2747,6 +2760,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2761,6 +2775,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2777,6 +2792,7 @@ fn run_live_snapshot_attach(
                             session,
                             &mut pane_number_message,
                             command_prompt_message.as_deref(),
+                            help_popup_visible,
                         )?;
                         sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                         reset_live_render_output_state(&mut render_output_state);
@@ -2796,6 +2812,7 @@ fn run_live_snapshot_attach(
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
+                    help_popup_visible,
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -2810,6 +2827,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2830,6 +2848,7 @@ fn run_live_snapshot_attach(
                     };
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     if command_prompt_message.is_some()
+                        || help_popup_visible
                         || pane_number_message
                             .as_ref()
                             .is_some_and(|(_, until)| Instant::now() < *until)
@@ -2839,11 +2858,12 @@ fn run_live_snapshot_attach(
                             session,
                             &mut pane_number_message,
                             command_prompt_message.as_deref(),
+                            help_popup_visible,
                         )?;
                         sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                         reset_live_render_output_state(&mut render_output_state);
                     } else {
-                        if command_prompt_message.is_none() {
+                        if command_prompt_message.is_none() && !help_popup_visible {
                             pane_number_message = None;
                         }
                         write_live_render_output(&render_frame, &mut render_output_state)?;
@@ -2901,6 +2921,7 @@ fn run_live_snapshot_attach(
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
+                        help_popup_visible,
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2947,20 +2968,28 @@ fn write_live_snapshot_frame_with_active_message(
     session: &str,
     pane_number_message: &mut Option<(String, Instant)>,
     command_prompt_message: Option<&str>,
+    help_popup_visible: bool,
 ) -> io::Result<LiveSnapshotFrame> {
-    let message = active_live_message(pane_number_message, command_prompt_message, Instant::now());
+    let help_popup_message = help_popup_visible.then(attach_help_popup_message);
+    let message = active_live_message(
+        pane_number_message,
+        command_prompt_message,
+        help_popup_message.as_deref(),
+        Instant::now(),
+    );
     write_live_snapshot_frame_with_message_and_clear(
         socket,
         session,
         message,
         false,
-        command_prompt_message.is_some(),
+        command_prompt_message.is_some() || help_popup_visible,
     )
 }
 
 fn active_live_message<'a>(
     pane_number_message: &'a mut Option<(String, Instant)>,
     command_prompt_message: Option<&'a str>,
+    help_popup_message: Option<&'a str>,
     now: Instant,
 ) -> Option<&'a str> {
     if pane_number_message
@@ -2970,7 +2999,7 @@ fn active_live_message<'a>(
         *pane_number_message = None;
     }
 
-    command_prompt_message.or_else(|| {
+    command_prompt_message.or(help_popup_message).or_else(|| {
         pane_number_message
             .as_ref()
             .map(|(message, _)| message.as_str())
@@ -3717,15 +3746,42 @@ fn attach_help_message() -> &'static str {
     cli::attach_help_overlay()
 }
 
+fn attach_help_popup_message() -> String {
+    let mut content = attach_help_message()
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    content.push("C-b ? close".to_string());
+    let content_width = content
+        .iter()
+        .map(|line| display_cell_width(line))
+        .max()
+        .unwrap_or(0);
+    let title = " dmux help ";
+    let border_width = (content_width + 2).max(display_cell_width(title));
+    let trailing = border_width.saturating_sub(display_cell_width(title));
+    let mut output = Vec::with_capacity(content.len() + 2);
+    output.push(format!("┌{title}{}┐", "─".repeat(trailing)));
+    for line in content {
+        output.push(format!(
+            "│ {}{} │",
+            line,
+            cell_padding(&line, content_width)
+        ));
+    }
+    output.push(format!("└{}┘", "─".repeat(border_width)));
+    output.join("\n")
+}
+
+fn cell_padding(line: &str, target_width: usize) -> String {
+    " ".repeat(target_width.saturating_sub(display_cell_width(line)))
+}
+
 fn write_attach_help_message() -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    stdout.write_all(
-        format!(
-            "\r\n-- dmux help --\r\n{}-- end dmux help --\r\n",
-            attach_help_message()
-        )
-        .as_bytes(),
-    )?;
+    stdout.write_all(format!("\r\n{}\r\n", attach_help_popup_message()).as_bytes())?;
     stdout.flush()
 }
 
@@ -7284,6 +7340,19 @@ mod tests {
     }
 
     #[test]
+    fn attach_help_popup_message_is_boxed_and_has_close_hint() {
+        let popup = attach_help_popup_message();
+
+        assert!(
+            popup.lines().next().unwrap().contains("dmux help"),
+            "{popup}"
+        );
+        assert!(popup.contains("C-b ? close"), "{popup}");
+        assert!(popup.contains("Alt-h/j/k/l"), "{popup}");
+        assert!(popup.contains("Prompt examples:"), "{popup}");
+    }
+
+    #[test]
     fn command_prompt_message_shows_command_and_controls() {
         let message = attach_command_prompt_text("rename-window api");
 
@@ -7353,10 +7422,20 @@ mod tests {
         let now = Instant::now();
         let mut transient = Some(("old".to_string(), now));
 
-        let message = active_live_message(&mut transient, Some(":rename-window api"), now);
+        let message = active_live_message(&mut transient, Some(":rename-window api"), None, now);
 
         assert_eq!(message, Some(":rename-window api"));
         assert!(transient.is_none());
+    }
+
+    #[test]
+    fn active_live_message_keeps_help_popup_visible_without_transient_expiry() {
+        let now = Instant::now();
+        let mut transient = None;
+
+        let message = active_live_message(&mut transient, None, Some("help"), now);
+
+        assert_eq!(message, Some("help"));
     }
 
     #[test]

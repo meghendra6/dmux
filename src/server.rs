@@ -23,7 +23,8 @@ const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFERS: usize = 50;
 const MAX_CONTROL_LINE_BYTES: usize = protocol::MAX_SAVE_BUFFER_TEXT_BYTES * 2 + 4096;
 const ATTACH_REDRAW_EVENT: &[u8] = b"REDRAW\n";
-const ATTACH_RENDER_STATUS_FORMAT: &str = "#{session.name} #{window.list} pane #{pane.index} clients #{client.count} buffers #{buffer.count} | #{status.help}";
+const ATTACH_RENDER_TABS_FORMAT: &str = "#{ui.tabs}";
+const ATTACH_RENDER_INFO_FORMAT: &str = "#{ui.info}";
 const ATTACH_RENDER_RESPONSE: &[u8] = b"OK\tRENDER_OUTPUT_META\n";
 const ATTACH_RENDER_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(16);
 const SYNCHRONIZED_OUTPUT_REDRAW_TIMEOUT: Duration = Duration::from_millis(100);
@@ -1938,6 +1939,7 @@ impl WindowSet {
             window_id: window.id,
             window_name: window.name.clone(),
             window_count: self.windows.len(),
+            windows: self.window_descriptions(),
             pane_index: window.active_pane_index(),
             pane_id: pane.id,
             pane_zoomed: window.active_pane_zoomed(),
@@ -2180,6 +2182,7 @@ struct StatusContext {
     window_id: TabId,
     window_name: String,
     window_count: usize,
+    windows: Vec<WindowDescription>,
     pane_index: usize,
     pane_id: PaneId,
     pane_zoomed: bool,
@@ -2196,6 +2199,7 @@ struct StatusContext {
     prefix_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WindowDescription {
     index: usize,
     id: TabId,
@@ -3904,6 +3908,8 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
     let window_id = context.window_id.as_usize().to_string();
     let window_count = context.window_count.to_string();
     let window_list = format_window_list(context);
+    let ui_tabs = format_attach_ui_tabs(context);
+    let ui_info = format_attach_ui_info(context);
     let pane_index = context.pane_index.to_string();
     let pane_id = context.pane_id.as_usize().to_string();
     let pane_zoomed = if context.pane_zoomed { "1" } else { "0" };
@@ -3961,6 +3967,8 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{window.active}", "1"),
         ("#{window.count}", window_count.as_str()),
         ("#{window.list}", window_list.as_str()),
+        ("#{ui.tabs}", ui_tabs.as_str()),
+        ("#{ui.info}", ui_info.as_str()),
         ("#{tab.index}", window_index.as_str()),
         ("#{tab.id}", window_id.as_str()),
         ("#{tab.name}", context.window_name.as_str()),
@@ -3990,6 +3998,79 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{status.help}", status_help.as_str()),
     ];
     apply_replacements(format, &replacements)
+}
+
+fn format_attach_ui_tabs(context: &StatusContext) -> String {
+    let windows = if context.windows.is_empty() {
+        (0..context.window_count)
+            .map(|index| WindowDescription {
+                index,
+                id: TabId::new(index + 1),
+                name: index.to_string(),
+                active: index == context.window_index,
+                panes: 0,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        context.windows.clone()
+    };
+
+    let tabs = windows
+        .iter()
+        .map(|window| {
+            let label = format!("{}:{}", window.index, compact_tab_name(&window.name));
+            if window.active {
+                format!("[{label}*]")
+            } else {
+                label
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    format!("tabs: {tabs}")
+}
+
+fn compact_tab_name(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return "-".to_string();
+    }
+    take_cells(name, 18)
+}
+
+fn format_attach_ui_info(context: &StatusContext) -> String {
+    let active_window_panes = context
+        .windows
+        .iter()
+        .find(|window| window.active)
+        .map(|window| window.panes)
+        .unwrap_or(0);
+    let mut parts = vec![
+        format!("pane {}", context.pane_index),
+        format!("{active_window_panes} panes"),
+        format!("clients {}", context.session_attached_count),
+        format!("buffers {}", context.buffer_summary.count),
+    ];
+    if context.window_zoomed {
+        parts.push("zoom".to_string());
+    }
+    if context.pane_bell {
+        parts.push("bell".to_string());
+    }
+    if context.pane_activity {
+        parts.push("activity".to_string());
+    }
+    if context.pane_clipboard_blocked > 0 {
+        parts.push(format!("clip {}", context.pane_clipboard_blocked));
+    }
+    if context.status_hints {
+        parts.push(format!(
+            "{} ? help | {} : command | Alt-arrows focus",
+            context.prefix_key, context.prefix_key
+        ));
+    }
+    parts.push(format!("session {}", context.session_name));
+    parts.join(" │ ")
 }
 
 fn apply_replacements(format: &str, replacements: &[(&str, &str)]) -> String {
@@ -4842,23 +4923,33 @@ fn format_attach_layout_snapshot_body(snapshot: &RenderedAttachSnapshot) -> Vec<
 
 fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
     let context = session.status_context()?;
-    let status = format_status_line(ATTACH_RENDER_STATUS_FORMAT, &context);
+    let tabs = format_status_line(ATTACH_RENDER_TABS_FORMAT, &context);
+    let info = format_status_line(ATTACH_RENDER_INFO_FORMAT, &context);
     let message = context.transient_message.as_deref();
     let size = session.active_window_size();
     let width = size.map(|size| usize::from(size.cols));
-    let max_header_rows = size.map(max_attach_render_header_rows);
+    let max_header_rows = size.map(|size| max_attach_render_header_rows(size).min(1));
     let header_lines = cap_attach_render_header_lines(
-        attach_render_header_lines(&status, message, width),
+        attach_render_header_lines(&tabs, None, width),
         max_header_rows,
         width,
     );
+    let footer_lines = attach_render_footer_lines(&info, message, width);
+    let max_footer_rows = size.map(|size| {
+        usize::from(size.rows)
+            .saturating_sub(header_lines.len())
+            .saturating_sub(1)
+            .min(footer_lines.len())
+    });
+    let footer_lines = cap_attach_render_header_lines(footer_lines, max_footer_rows, width);
     let header_rows = header_lines.len();
     let snapshot_rows = size
-        .map(|size| usize::from(size.rows).saturating_sub(header_rows))
+        .map(|size| usize::from(size.rows).saturating_sub(header_rows + footer_lines.len()))
         .unwrap_or(usize::MAX);
     let snapshot = attach_pane_frame_with_regions(session)?;
-    Some(format_attach_render_frame_body_with_header_lines(
+    Some(format_attach_render_frame_body_with_ui_lines(
         &header_lines,
+        &footer_lines,
         &snapshot,
         snapshot_rows,
     ))
@@ -4875,8 +4966,18 @@ fn format_attach_render_frame_body(
     format_attach_render_frame_body_with_header_lines(&header_lines, snapshot, snapshot_rows)
 }
 
+#[cfg(test)]
 fn format_attach_render_frame_body_with_header_lines(
     header_lines: &[String],
+    snapshot: &RenderedAttachSnapshot,
+    snapshot_rows: usize,
+) -> Vec<u8> {
+    format_attach_render_frame_body_with_ui_lines(header_lines, &[], snapshot, snapshot_rows)
+}
+
+fn format_attach_render_frame_body_with_ui_lines(
+    header_lines: &[String],
+    footer_lines: &[String],
     snapshot: &RenderedAttachSnapshot,
     snapshot_rows: usize,
 ) -> Vec<u8> {
@@ -4886,6 +4987,12 @@ fn format_attach_render_frame_body_with_header_lines(
         write_render_output_line(&mut output, line.as_bytes(), true);
     }
     write_render_output_rows(&mut output, snapshot.text.as_bytes(), snapshot_rows);
+    for line in footer_lines {
+        if !header_lines.is_empty() || snapshot_rows > 0 || !output.ends_with(b"\n") {
+            output.extend_from_slice(b"\r\n");
+        }
+        write_render_output_line_without_newline(&mut output, line.as_bytes(), true);
+    }
     if let Some(cursor) = snapshot.cursor {
         write_cursor_position(&mut output, cursor, header_lines.len(), snapshot_rows);
     }
@@ -4937,6 +5044,23 @@ fn attach_render_header_lines(
         for line in message.lines() {
             lines.push(truncate_attach_render_header_line(line, width));
         }
+    }
+    lines
+}
+
+fn attach_render_footer_lines(
+    info: &str,
+    message: Option<&str>,
+    width: Option<usize>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(message) = message {
+        for line in message.lines() {
+            lines.push(truncate_attach_render_header_line(line, width));
+        }
+    }
+    if !info.is_empty() {
+        lines.push(truncate_attach_render_header_line(info, width));
     }
     lines
 }
@@ -5029,6 +5153,13 @@ fn write_render_output_line(output: &mut Vec<u8>, line: &[u8], clear_line: bool)
     }
     output.extend_from_slice(line);
     output.extend_from_slice(b"\r\n");
+}
+
+fn write_render_output_line_without_newline(output: &mut Vec<u8>, line: &[u8], clear_line: bool) {
+    if clear_line {
+        output.extend_from_slice(CLEAR_LINE);
+    }
+    output.extend_from_slice(line);
 }
 
 fn write_render_output_rows(output: &mut Vec<u8>, snapshot: &[u8], max_rows: usize) {
@@ -7744,6 +7875,96 @@ left | right\r\n"
         assert!(body.contains("\x1b[H\x1b[2Kstatus\r\n"), "{body:?}");
         assert!(body.contains("\x1b[2Kleft | right"), "{body:?}");
         assert!(!body.contains("SNAPSHOT\t"), "{body:?}");
+    }
+
+    #[test]
+    fn format_status_line_exposes_attach_ui_tabs_and_info() {
+        let context = StatusContext {
+            session_name: "dev".to_string(),
+            session_attached_count: 2,
+            session_created_at: 0,
+            window_index: 1,
+            window_id: TabId::new(2),
+            window_name: "api".to_string(),
+            window_count: 2,
+            windows: vec![
+                WindowDescription {
+                    index: 0,
+                    id: TabId::new(1),
+                    name: "shell".to_string(),
+                    active: false,
+                    panes: 1,
+                },
+                WindowDescription {
+                    index: 1,
+                    id: TabId::new(2),
+                    name: "api".to_string(),
+                    active: true,
+                    panes: 3,
+                },
+            ],
+            pane_index: 2,
+            pane_id: PaneId::new(7),
+            pane_zoomed: false,
+            window_zoomed: true,
+            pane_process: PaneProcessStatus::Running { pid: 42 },
+            pane_cwd: PathBuf::from("/tmp/project"),
+            pane_title: "nvim".to_string(),
+            pane_bell: true,
+            pane_activity: false,
+            pane_clipboard_blocked: 1,
+            buffer_summary: BufferStatusSummary::default(),
+            transient_message: None,
+            status_hints: true,
+            prefix_key: "C-b".to_string(),
+        };
+
+        let tabs = format_status_line("#{ui.tabs}", &context);
+        let info = format_status_line("#{ui.info}", &context);
+
+        assert_eq!(tabs, "tabs: 0:shell  [1:api*]");
+        assert!(info.contains("session dev"), "{info}");
+        assert!(info.contains("pane 2"), "{info}");
+        assert!(info.contains("3 panes"), "{info}");
+        assert!(info.contains("clients 2"), "{info}");
+        assert!(info.contains("buffers 0"), "{info}");
+        assert!(info.contains("C-b ? help"), "{info}");
+        assert!(info.contains("bell"), "{info}");
+        assert!(info.contains("clip 1"), "{info}");
+    }
+
+    #[test]
+    fn format_attach_render_frame_places_tabs_header_and_info_footer() {
+        let snapshot = RenderedAttachSnapshot {
+            text: "pane\r\n".to_string(),
+            regions: vec![PaneRegion {
+                pane: 0,
+                row_start: 0,
+                row_end: 1,
+                col_start: 0,
+                col_end: 10,
+            }],
+            cursor: Some(RenderedCursor {
+                row: 0,
+                col: 1,
+                visible: true,
+            }),
+        };
+
+        let body = String::from_utf8(format_attach_render_frame_body_with_ui_lines(
+            &["tabs: [0:dev*]".to_string()],
+            &["pane 0 │ clients 1 │ C-b ? help".to_string()],
+            &snapshot,
+            1,
+        ))
+        .expect("render frame utf8");
+
+        assert!(body.starts_with("HEADER_ROWS\t1\n"), "{body:?}");
+        assert!(
+            body.contains("\x1b[H\x1b[2Ktabs: [0:dev*]\r\n\x1b[2Kpane\r\n\x1b[2Kpane 0"),
+            "{body:?}"
+        );
+        assert!(body.ends_with("\x1b[?25h\x1b[2;2H"), "{body:?}");
     }
 
     #[test]

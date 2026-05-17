@@ -562,11 +562,11 @@ Help:\n\
 pub fn attach_help() -> &'static str {
     "Usage: dmux attach [-t <name>]\n\
 \n\
-If -t is omitted, attach targets default. The status line shows the active session,\n\
-window, pane, and quick hints for prefix, help, command prompt, and copy-mode.\n\
+If -t is omitted, attach targets default. Attach shows a top tab line, a bottom\n\
+info line, and quick hints for prefix, help, command prompt, and focus.\n\
 \n\
 Session:\n\
-  C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? show this help\n\
+  C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
@@ -594,7 +594,7 @@ CLI equivalents:\n\
 
 pub fn attach_help_overlay() -> &'static str {
     "Session:\n\
-  C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? show this help\n\
+  C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\

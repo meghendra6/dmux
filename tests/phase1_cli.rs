@@ -409,11 +409,22 @@ fn attach_render_output_from_frame_body(body: &[u8]) -> Vec<u8> {
 fn read_attach_render_frame_body_until_contains(stream: &mut UnixStream, needle: &str) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut last = String::new();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set render poll timeout");
 
     while std::time::Instant::now() < deadline {
-        last = String::from_utf8_lossy(&read_attach_render_frame_body(stream)).to_string();
-        if last.contains(needle) {
-            return last;
+        match try_read_attach_render_frame_body(stream) {
+            Ok(Some(body)) => {
+                last = String::from_utf8_lossy(&body).to_string();
+                if last.contains(needle) {
+                    return last;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                panic!("read render stream frame for {needle:?}: {error}\nlast:\n{last:?}")
+            }
         }
     }
 
@@ -2047,6 +2058,10 @@ impl CapturedDmuxChild {
         String::from_utf8_lossy(&self.stdout.lock().expect("lock stdout")).to_string()
     }
 
+    fn clear_stdout(&mut self) {
+        self.stdout.lock().expect("lock stdout").clear();
+    }
+
     fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr.lock().expect("lock stderr")).to_string()
     }
@@ -2635,7 +2650,7 @@ fn interactive_new_default_shell_splits_and_remains_usable_in_real_pty() {
     child.write_all(b"\x02%");
     let panes = poll_pane_count(&socket, &session, 2);
     assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
-    child.wait_for_stdout_contains_all(&["base-ready", "|"], "pty split redraw");
+    child.wait_for_stdout_contains_all(&["base-ready", "│"], "pty split redraw");
 
     child.write_all(b"printf split-ready\\n\r");
     let split = poll_capture_eventually(&socket, &session, "split-ready");
@@ -2887,7 +2902,7 @@ fn live_snapshot_attach_uses_alternate_screen_and_restores_on_detach() {
     child.write_all(b"\x02%");
     let panes = poll_pane_count(&socket, &session, 2);
     assert_eq!(panes.lines().collect::<Vec<_>>(), vec!["0", "1"]);
-    child.wait_for_stdout_contains_all(&["\x1b[?1049h", "|"], "enter snapshot screen");
+    child.wait_for_stdout_contains_all(&["\x1b[?1049h", "│"], "enter snapshot screen");
 
     child.write_all(b"\x02d");
     let output = wait_for_child_exit(child);
@@ -2961,7 +2976,10 @@ fn live_snapshot_attach_repaints_after_resize_with_render_diff_cache() {
     child.clear_stdout();
 
     child.resize(100, 30);
-    child.wait_for_stdout_contains_all(&[&session, "│"], "resize redraw with diff cache");
+    child.wait_for_stdout_contains_all(
+        &["pane 1", "clients 1", "│"],
+        "resize redraw with diff cache",
+    );
 
     child.clear_stdout();
     child.write_all(b"printf after-resize\\n\r");
@@ -3083,7 +3101,10 @@ fn attach_prefix_question_prints_help_and_keeps_attach_running() {
         stdin.write_all(b"\x02?").expect("write help");
         stdin.flush().expect("flush help");
     }
-    child.wait_for_stdout_contains_all(&["C-b d detach", "split-window"], "attach help output");
+    child.wait_for_stdout_contains_all(
+        &["C-b d detach", "C-b ? close", "split-window"],
+        "attach help output",
+    );
 
     {
         let stdin = child.stdin_mut("attach stdin");
@@ -3146,8 +3167,23 @@ fn attach_prefix_question_prints_multi_pane_help_and_keeps_attach_running() {
         stdin.flush().expect("flush help");
     }
     child.wait_for_stdout_contains_all(
-        &["C-b d detach", "C-b q pane numbers", "split-window"],
+        &[
+            "C-b d detach",
+            "C-b q pane numbers",
+            "C-b ? close",
+            "split-window",
+        ],
         "multi-pane attach help output",
+    );
+    child.clear_stdout();
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_success(&dmux(
+        &socket,
+        &["display-message", "-t", &session, "-p", "after-help-redraw"],
+    ));
+    child.wait_for_stdout_contains_all(
+        &["C-b ? close", "Prompt examples:"],
+        "persistent multi-pane attach help output",
     );
 
     {
@@ -4285,13 +4321,12 @@ fn attach_renders_status_line_snapshot() {
         .expect("run attach");
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains(&format!("{session} [0] pane 0")),
-        "{stdout:?}"
-    );
-    assert!(stdout.contains("prefix C-b"), "{stdout:?}");
-    assert!(stdout.contains(": command"), "{stdout:?}");
-    assert!(stdout.contains("[ copy"), "{stdout:?}");
+    assert!(stdout.contains("tabs: [0:0*]"), "{stdout:?}");
+    assert!(stdout.contains(&format!("session {session}")), "{stdout:?}");
+    assert!(stdout.contains("pane 0"), "{stdout:?}");
+    assert!(stdout.contains("C-b ? help"), "{stdout:?}");
+    assert!(stdout.contains("C-b : command"), "{stdout:?}");
+    assert!(stdout.contains("Alt-arrows focus"), "{stdout:?}");
 
     let captured = dmux(&socket, &["capture-pane", "-t", &session, "-p"]);
     assert_success(&captured);
@@ -7032,7 +7067,9 @@ fn attach_render_stream_sends_initial_terminal_output_frame() {
     assert!(output.contains("\x1b[?25h"), "{output:?}");
     assert!(!body_text.contains("STATUS\t"), "{body_text:?}");
     assert!(!body_text.contains("\nSNAPSHOT\t"), "{body_text:?}");
-    assert!(output.contains(&session), "{output:?}");
+    assert!(output.contains("pane 1"), "{output:?}");
+    assert!(output.contains("clients 0"), "{output:?}");
+    assert!(output.contains("buffers 0"), "{output:?}");
     assert!(output.contains("base-ready"), "{output:?}");
     assert!(output.contains("split-ready"), "{output:?}");
 
