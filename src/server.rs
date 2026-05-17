@@ -3203,8 +3203,21 @@ fn handle_paste_buffer(
         }
     };
 
-    pane.writer.lock().unwrap().write_all(text.as_bytes())?;
+    let paste_bytes = paste_buffer_bytes(&pane, &text);
+    pane.writer.lock().unwrap().write_all(&paste_bytes)?;
     write_ok(stream)
+}
+
+fn paste_buffer_bytes(pane: &Pane, text: &str) -> Vec<u8> {
+    if !pane.terminal.lock().unwrap().bracketed_paste_enabled() {
+        return text.as_bytes().to_vec();
+    }
+
+    let mut bytes = Vec::with_capacity(text.len() + "\x1b[200~".len() + "\x1b[201~".len());
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
 }
 
 fn handle_delete_buffer(

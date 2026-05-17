@@ -7,6 +7,7 @@ pub struct TerminalState {
     alternate_screen: Option<TerminalScreen>,
     use_alternate_screen: bool,
     cursor_visible: bool,
+    bracketed_paste: bool,
     scrollback: Scrollback,
     parser: vte::Parser,
     style: CellStyle,
@@ -34,6 +35,7 @@ impl TerminalState {
             alternate_screen: None,
             use_alternate_screen: false,
             cursor_visible: true,
+            bracketed_paste: false,
             scrollback: Scrollback::new(max_scrollback_lines),
             parser: vte::Parser::new(),
             style: CellStyle::default(),
@@ -94,6 +96,10 @@ impl TerminalState {
 
     pub fn cursor_visible(&self) -> bool {
         self.cursor_visible
+    }
+
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.bracketed_paste
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -174,6 +180,7 @@ impl TerminalState {
         self.alternate_screen = None;
         self.use_alternate_screen = false;
         self.cursor_visible = true;
+        self.bracketed_paste = false;
         self.scrollback.clear();
         self.style = CellStyle::default();
         self.last_printed_char = None;
@@ -420,6 +427,8 @@ impl TerminalState {
                 (1049 | 1047, false) => self.exit_alternate_screen(),
                 (25, true) => self.cursor_visible = true,
                 (25, false) => self.cursor_visible = false,
+                (2004, true) => self.bracketed_paste = true,
+                (2004, false) => self.bracketed_paste = false,
                 (6, true) => self.active_screen_mut().set_origin_mode(true),
                 (6, false) => self.active_screen_mut().set_origin_mode(false),
                 _ => {}
@@ -1550,6 +1559,17 @@ mod tests {
         state.apply_bytes(b"\x1b[?1049;25l");
         assert!(!state.cursor_visible());
         assert_eq!(state.capture_screen_text(), "primary\n");
+    }
+
+    #[test]
+    fn private_mode_tracks_bracketed_paste() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        assert!(!state.bracketed_paste_enabled());
+        state.apply_bytes(b"\x1b[?2004h");
+        assert!(state.bracketed_paste_enabled());
+        state.apply_bytes(b"\x1b[?2004l");
+        assert!(!state.bracketed_paste_enabled());
     }
 
     #[test]
