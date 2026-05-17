@@ -898,6 +898,36 @@ fn buffers_save_capture_list_paste_and_delete() {
 }
 
 #[test]
+fn paste_buffer_wraps_text_when_pane_enables_bracketed_paste() {
+    let socket = unique_socket("buffer-bracketed-paste");
+    let session = format!("buffer-bracketed-paste-{}", std::process::id());
+    let file = unique_temp_file("buffer-bracketed-paste");
+    let _ = std::fs::remove_file(&file);
+    let command = format!(
+        "printf '\\033[?2004hbracketed-ready\\n'; stty raw -echo; cat > {}; sleep 30",
+        file.display()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", &command],
+    ));
+    let ready = poll_capture(&socket, &session, "bracketed-ready");
+    assert!(ready.contains("bracketed-ready"), "{ready:?}");
+    save_buffer_text(&socket, &session, "payload", "buffer-alpha");
+
+    assert_success(&dmux(
+        &socket,
+        &["paste-buffer", "-t", &session, "-b", "payload"],
+    ));
+    assert!(poll_file_equals(&file, "\x1b[200~buffer-alpha\x1b[201~"));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn save_buffer_text_stores_literal_text_and_lists_preview() {
     let socket = unique_socket("save-buffer-text");
     let session = format!("save-buffer-text-{}", std::process::id());
