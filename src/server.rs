@@ -609,6 +609,43 @@ impl Session {
             .kill_pane(target.window.clone(), target.pane.clone())
     }
 
+    fn swap_panes(&self, source: &Target, destination: &Target) -> Result<(), String> {
+        self.windows.lock().unwrap().swap_panes(
+            source.window.clone(),
+            source.pane.clone(),
+            destination.window.clone(),
+            destination.pane.clone(),
+        )
+    }
+
+    fn move_pane(
+        &self,
+        source: &Target,
+        destination: &Target,
+        direction: SplitDirection,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        let size = *self.current_size.lock().unwrap();
+        self.windows.lock().unwrap().move_pane(
+            source.window.clone(),
+            source.pane.clone(),
+            destination.window.clone(),
+            destination.pane.clone(),
+            direction,
+            size,
+        )
+    }
+
+    fn break_pane(&self, target: &Target) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        let id = self.next_tab_id();
+        let size = *self.current_size.lock().unwrap();
+        self.windows.lock().unwrap().break_pane(
+            target.window.clone(),
+            target.pane.clone(),
+            id,
+            size,
+        )
+    }
+
     fn respawn_pane(
         self: &Arc<Self>,
         target: &Target,
@@ -1009,7 +1046,8 @@ impl Window {
 
     #[cfg(test)]
     fn add_pane(&mut self, direction: SplitDirection, pane: Arc<Pane>) {
-        self.add_pane_at_index(self.panes.active_index(), direction, pane);
+        self.add_pane_at_index(self.panes.active_index(), direction, pane)
+            .unwrap();
     }
 
     fn add_pane_to_target(
@@ -1019,8 +1057,7 @@ impl Window {
         pane: Arc<Pane>,
     ) -> Result<(), String> {
         let split_index = self.resolve_pane_target(target)?;
-        self.add_pane_at_index(split_index, direction, pane);
-        Ok(())
+        self.add_pane_at_index(split_index, direction, pane)
     }
 
     fn add_pane_at_index(
@@ -1028,10 +1065,30 @@ impl Window {
         split_index: usize,
         direction: SplitDirection,
         pane: Arc<Pane>,
-    ) {
+    ) -> Result<(), String> {
+        let layout = self.layout_with_added_pane(split_index, direction, self.size)?;
+        self.add_pane_with_layout(pane, layout);
+        Ok(())
+    }
+
+    fn layout_with_added_pane(
+        &self,
+        split_index: usize,
+        direction: SplitDirection,
+        size: PtySize,
+    ) -> Result<LayoutNode, String> {
         let new_index = self.panes.len();
+        let mut layout = self.layout.clone();
+        if !layout.split_pane(split_index, direction, new_index) {
+            return Err("missing pane".to_string());
+        }
+        validate_layout_regions(&layout, new_index + 1, size)?;
+        Ok(layout)
+    }
+
+    fn add_pane_with_layout(&mut self, pane: Arc<Pane>, layout: LayoutNode) {
         self.panes.add(pane);
-        let _ = self.layout.split_pane(split_index, direction, new_index);
+        self.layout = layout;
         if self.zoomed.is_some() {
             self.zoomed = Some(self.panes.active_index());
         }
@@ -1142,6 +1199,26 @@ impl Window {
         Ok(self.remove_pane_at(index))
     }
 
+    fn swap_panes(&mut self, source: PaneTarget, destination: PaneTarget) -> Result<(), String> {
+        let source = self.resolve_pane_target(source)?;
+        let destination = self.resolve_pane_target(destination)?;
+        if source == destination {
+            return Err("cannot swap pane with itself".to_string());
+        }
+        self.panes.panes.swap(source, destination);
+        if self.panes.active == source {
+            self.panes.active = destination;
+        } else if self.panes.active == destination {
+            self.panes.active = source;
+        }
+        if self.zoomed == Some(source) {
+            self.zoomed = Some(destination);
+        } else if self.zoomed == Some(destination) {
+            self.zoomed = Some(source);
+        }
+        Ok(())
+    }
+
     fn mark_pane_exited(&mut self, target: &Arc<Pane>) -> bool {
         let Some(index) = self
             .panes
@@ -1199,6 +1276,22 @@ impl Window {
         self.layout.remove_pane(index);
         self.adjust_zoom_after_pane_removal(index);
         pane
+    }
+
+    fn take_pane_at(&mut self, index: usize) -> Arc<Pane> {
+        if self.panes.len() == 1 {
+            let pane = self.panes.panes.remove(index);
+            self.panes.active = 0;
+            self.layout = LayoutNode::Pane(0);
+            self.zoomed = None;
+            pane
+        } else {
+            self.remove_pane_at(index)
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.panes.len() == 0
     }
 
     fn contains_pane(&self, target: &Arc<Pane>) -> bool {
@@ -1547,6 +1640,127 @@ impl WindowSet {
         self.windows[window_index].kill_pane(target)
     }
 
+    fn swap_panes(
+        &mut self,
+        source_window: WindowTarget,
+        source: PaneTarget,
+        destination_window: WindowTarget,
+        destination: PaneTarget,
+    ) -> Result<(), String> {
+        let source_window = self.resolve_target(source_window)?;
+        let destination_window = self.resolve_target(destination_window)?;
+        if source_window != destination_window {
+            return Err("swap-pane requires panes in the same window".to_string());
+        }
+        self.windows[source_window].swap_panes(source, destination)
+    }
+
+    fn move_pane(
+        &mut self,
+        source_window: WindowTarget,
+        source: PaneTarget,
+        destination_window: WindowTarget,
+        destination: PaneTarget,
+        direction: SplitDirection,
+        size: PtySize,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        let source_window = self.resolve_target(source_window)?;
+        let destination_window = self.resolve_target(destination_window)?;
+        if source_window == destination_window {
+            return Err(
+                "source and destination panes are in the same window; use swap-pane".to_string(),
+            );
+        }
+        let source_pane = self.windows[source_window].resolve_pane_target(source)?;
+        let destination_pane = self.windows[destination_window].resolve_pane_target(destination)?;
+        let destination_layout = self.windows[destination_window].layout_with_added_pane(
+            destination_pane,
+            direction,
+            size,
+        )?;
+        let active_before = self.windows.get(self.active).map(|window| window.id);
+
+        let moved = self.windows[source_window].take_pane_at(source_pane);
+        let source_empty = self.windows[source_window].is_empty();
+        let adjusted_destination = if source_empty && source_window < destination_window {
+            destination_window - 1
+        } else {
+            destination_window
+        };
+
+        if source_empty {
+            self.windows.remove(source_window);
+            if self.active == source_window {
+                self.active = source_window
+                    .saturating_sub(1)
+                    .min(self.windows.len().saturating_sub(1));
+            } else if self.active > source_window {
+                self.active -= 1;
+            }
+        }
+
+        self.windows[adjusted_destination].add_pane_with_layout(moved, destination_layout);
+        self.restore_active_window_or(active_before, adjusted_destination);
+
+        let mut resizes = Vec::new();
+        if !source_empty {
+            resizes.extend(self.windows[source_window].resize_visible_panes(size));
+        }
+        resizes.extend(self.windows[adjusted_destination].resize_visible_panes(size));
+        Ok(resizes)
+    }
+
+    fn restore_active_window_or(&mut self, active_before: Option<TabId>, fallback: usize) {
+        if let Some(active_before) = active_before {
+            if let Some(index) = self
+                .windows
+                .iter()
+                .position(|window| window.id == active_before)
+            {
+                self.active = index;
+                return;
+            }
+        }
+
+        if !self.windows.is_empty() {
+            self.active = fallback.min(self.windows.len() - 1);
+        }
+    }
+
+    fn break_pane(
+        &mut self,
+        source_window: WindowTarget,
+        source: PaneTarget,
+        new_window_id: TabId,
+        size: PtySize,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        let source_window = self.resolve_target(source_window)?;
+        if self.windows[source_window].panes.len() <= 1 {
+            return Err("cannot break last pane in window".to_string());
+        }
+        let source_pane = self.windows[source_window].resolve_pane_target(source)?;
+        let source_was_active = self.active == source_window;
+        let active_before = self.windows.get(self.active).map(|window| window.id);
+        let moved = self.windows[source_window].take_pane_at(source_pane);
+        let mut new_window = Window::new(
+            new_window_id,
+            self.next_default_window_name(new_window_id.as_usize()),
+            moved,
+        );
+        new_window.resize_visible_panes(size);
+
+        let mut resizes = self.windows[source_window].resize_visible_panes(size);
+        self.windows.push(new_window);
+        let new_window_index = self.windows.len() - 1;
+        if source_was_active {
+            self.active = new_window_index;
+        } else {
+            self.restore_active_window_or(active_before, new_window_index);
+        }
+        resizes.extend(self.windows[new_window_index].resize_visible_panes(size));
+        Ok(resizes)
+    }
+
     fn mark_pane_exited(&mut self, target: &Arc<Pane>) -> bool {
         let Some(window_index) = self
             .windows
@@ -1738,6 +1952,35 @@ impl AttachLayoutSnapshot {
             size: PtySize { cols: 1, rows: 1 },
             active_pane_index: 0,
         }
+    }
+}
+
+fn validate_layout_regions(
+    layout: &LayoutNode,
+    pane_count: usize,
+    size: PtySize,
+) -> Result<(), String> {
+    let regions = layout_regions_for_size(layout, size);
+    if regions.len() != pane_count {
+        return Err("resize would exceed minimum pane size".to_string());
+    }
+
+    let mut seen = vec![false; pane_count];
+    for region in regions {
+        if region.pane >= pane_count
+            || seen[region.pane]
+            || region.row_start >= region.row_end
+            || region.col_start >= region.col_end
+        {
+            return Err("resize would exceed minimum pane size".to_string());
+        }
+        seen[region.pane] = true;
+    }
+
+    if seen.into_iter().all(|seen| seen) {
+        Ok(())
+    } else {
+        Err("resize would exceed minimum pane size".to_string())
     }
 }
 
@@ -1933,7 +2176,9 @@ impl<T> PaneSet<T> {
     fn kill_at(&mut self, index: usize) -> T {
         let pane = self.panes.remove(index);
         if self.active == index {
-            self.active = index.saturating_sub(1).min(self.panes.len() - 1);
+            self.active = index
+                .saturating_sub(1)
+                .min(self.panes.len().saturating_sub(1));
         } else if self.active > index {
             self.active -= 1;
         }
@@ -2165,6 +2410,21 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             target,
         } => handle_select_pane(&state, &mut stream, &session, window, target),
         Request::KillPane { target } => handle_kill_pane(&state, &mut stream, &target),
+        Request::SwapPane {
+            source,
+            destination,
+        } => handle_swap_pane(&state, &mut stream, &source, &destination),
+        Request::MovePane {
+            source,
+            destination,
+            direction,
+        } => handle_move_pane(&state, &mut stream, &source, &destination, direction),
+        Request::BreakPane { target } => handle_break_pane(&state, &mut stream, &target),
+        Request::JoinPane {
+            source,
+            destination,
+            direction,
+        } => handle_move_pane(&state, &mut stream, &source, &destination, direction),
         Request::RespawnPane {
             target,
             force,
@@ -3398,6 +3658,123 @@ fn handle_kill_pane(
     session.notify_attach_redraw_immediate();
     terminate_pane_if_running_async(&removed);
     write_ok(stream)
+}
+
+fn handle_swap_pane(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    source: &Target,
+    destination: &Target,
+) -> io::Result<()> {
+    if source.session != destination.session {
+        write_err(
+            stream,
+            "swap-pane requires source and destination in the same session",
+        )?;
+        return Ok(());
+    }
+    let session = resolve_session(state, &source.session);
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    if let Err(message) = session.swap_panes(source, destination) {
+        write_err(stream, &message)?;
+        return Ok(());
+    }
+    let pane_resizes = match session.visible_pane_resizes_for_window(source.window.clone()) {
+        Ok(pane_resizes) => pane_resizes,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    if !resize_panes(pane_resizes)? {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    }
+    let swapped_active = match session.window_is_active(source.window.clone()) {
+        Ok(swapped_active) => swapped_active,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+
+    session.notify_attach_redraw_immediate();
+    let result = write_ok(stream);
+    if swapped_active {
+        session.reconnect_live_raw_pane_streams();
+    }
+    result
+}
+
+fn handle_move_pane(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    source: &Target,
+    destination: &Target,
+    direction: SplitDirection,
+) -> io::Result<()> {
+    if source.session != destination.session {
+        write_err(
+            stream,
+            "pane movement requires source and destination in the same session",
+        )?;
+        return Ok(());
+    }
+    let session = resolve_session(state, &source.session);
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    let pane_resizes = match session.move_pane(source, destination, direction) {
+        Ok(pane_resizes) => pane_resizes,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = resize_panes(pane_resizes) {
+        write_err(stream, &error.to_string())?;
+        return Ok(());
+    }
+
+    session.notify_attach_redraw_immediate();
+    let result = write_ok(stream);
+    session.reconnect_raw_attach_streams();
+    result
+}
+
+fn handle_break_pane(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    target: &Target,
+) -> io::Result<()> {
+    let session = resolve_session(state, &target.session);
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    let pane_resizes = match session.break_pane(target) {
+        Ok(pane_resizes) => pane_resizes,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = resize_panes(pane_resizes) {
+        write_err(stream, &error.to_string())?;
+        return Ok(());
+    }
+
+    session.notify_attach_redraw_immediate();
+    let result = write_ok(stream);
+    session.reconnect_raw_attach_streams();
+    result
 }
 
 fn handle_respawn_pane(
@@ -5908,6 +6285,34 @@ mod tests {
     }
 
     #[test]
+    fn window_swap_panes_preserves_ids_and_active_pane_identity() {
+        let (pane0, path0) = test_pane_with_id(10);
+        let (pane1, path1) = test_pane_with_id(11);
+        let (pane2, path2) = test_pane_with_id(12);
+        let mut window = Window::new(TabId::new(0), "0".to_string(), Arc::clone(&pane0));
+        window.add_pane(SplitDirection::Horizontal, Arc::clone(&pane1));
+        window.add_pane(SplitDirection::Vertical, Arc::clone(&pane2));
+        window.select_pane(PaneSelectTarget::Id(11)).unwrap();
+
+        window
+            .swap_panes(PaneTarget::Index(0), PaneTarget::Index(1))
+            .unwrap();
+
+        assert_eq!(
+            window
+                .panes()
+                .iter()
+                .map(|pane| pane.id.as_usize())
+                .collect::<Vec<_>>(),
+            vec![11, 10, 12]
+        );
+        assert_eq!(window.active_pane_id().unwrap().as_usize(), 11);
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+        let _ = std::fs::remove_file(path2);
+    }
+
+    #[test]
     fn window_set_selects_by_id_and_name_and_cycles_with_wraparound() {
         let (pane0, path0) = test_pane_with_id(0);
         let (pane1, path1) = test_pane_with_id(1);
@@ -5927,6 +6332,240 @@ mod tests {
         windows.select(WindowTarget::Id(11)).unwrap();
         assert_eq!(windows.status_context("dev").unwrap().window_name, "editor");
 
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+        let _ = std::fs::remove_file(path2);
+    }
+
+    #[test]
+    fn window_set_swap_panes_in_non_active_window_preserves_active_window() {
+        let (pane0, path0) = test_pane_with_id(10);
+        let (pane1, path1) = test_pane_with_id(11);
+        let (pane2, path2) = test_pane_with_id(12);
+        let (pane3, path3) = test_pane_with_id(13);
+        let mut base = Window::new(TabId::new(10), "base".to_string(), Arc::clone(&pane0));
+        base.add_pane(SplitDirection::Horizontal, Arc::clone(&pane1));
+        let mut windows = WindowSet::new(base);
+        windows.add(Window::new(
+            TabId::new(11),
+            "logs".to_string(),
+            Arc::clone(&pane2),
+        ));
+        windows.add(Window::new(
+            TabId::new(12),
+            "shell".to_string(),
+            Arc::clone(&pane3),
+        ));
+
+        windows
+            .swap_panes(
+                WindowTarget::Name("base".to_string()),
+                PaneTarget::Index(0),
+                WindowTarget::Name("base".to_string()),
+                PaneTarget::Index(1),
+            )
+            .unwrap();
+
+        assert_eq!(windows.status_context("dev").unwrap().window_name, "shell");
+        assert_eq!(
+            windows
+                .pane_descriptions_for_window(WindowTarget::Name("base".to_string()))
+                .unwrap()
+                .iter()
+                .map(|pane| pane.id.as_usize())
+                .collect::<Vec<_>>(),
+            vec![11, 10]
+        );
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+        let _ = std::fs::remove_file(path2);
+        let _ = std::fs::remove_file(path3);
+    }
+
+    #[test]
+    fn window_set_moves_pane_between_windows_and_removes_empty_source_window() {
+        let (pane0, path0) = test_pane_with_id(10);
+        let (pane1, path1) = test_pane_with_id(11);
+        let (pane2, path2) = test_pane_with_id(12);
+        let mut windows = WindowSet::new(Window::new(
+            TabId::new(10),
+            "base".to_string(),
+            Arc::clone(&pane0),
+        ));
+        windows.add(Window::new(
+            TabId::new(11),
+            "logs".to_string(),
+            Arc::clone(&pane1),
+        ));
+        windows.add(Window::new(
+            TabId::new(12),
+            "shell".to_string(),
+            Arc::clone(&pane2),
+        ));
+
+        let resizes = windows
+            .move_pane(
+                WindowTarget::Index(1),
+                PaneTarget::Id(11),
+                WindowTarget::Index(0),
+                PaneTarget::Index(0),
+                SplitDirection::Horizontal,
+                PtySize { cols: 80, rows: 24 },
+            )
+            .unwrap();
+
+        assert_eq!(windows.window_count(), 2);
+        assert_eq!(
+            windows
+                .pane_descriptions_for_window(WindowTarget::Index(0))
+                .unwrap()
+                .iter()
+                .map(|pane| pane.id.as_usize())
+                .collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+        assert_eq!(windows.status_context("dev").unwrap().window_name, "shell");
+        assert_eq!(
+            windows.status_context("dev").unwrap().pane_id.as_usize(),
+            12
+        );
+        assert_eq!(resizes.len(), 2);
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+        let _ = std::fs::remove_file(path2);
+    }
+
+    #[test]
+    fn window_set_rejects_move_that_would_create_zero_sized_destination_pane() {
+        let (pane0, path0) = test_pane_with_id(10);
+        let (pane1, path1) = test_pane_with_id(11);
+        let mut windows = WindowSet::new(Window::new(
+            TabId::new(10),
+            "base".to_string(),
+            Arc::clone(&pane0),
+        ));
+        windows.add(Window::new(
+            TabId::new(11),
+            "logs".to_string(),
+            Arc::clone(&pane1),
+        ));
+
+        let error = match windows.move_pane(
+            WindowTarget::Name("logs".to_string()),
+            PaneTarget::Index(0),
+            WindowTarget::Name("base".to_string()),
+            PaneTarget::Index(0),
+            SplitDirection::Horizontal,
+            PtySize { cols: 1, rows: 1 },
+        ) {
+            Ok(_) => panic!("move-pane unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error, "resize would exceed minimum pane size");
+        assert_eq!(windows.window_count(), 2);
+        assert_eq!(
+            windows
+                .pane_descriptions_for_window(WindowTarget::Name("base".to_string()))
+                .unwrap()
+                .iter()
+                .map(|pane| pane.id.as_usize())
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert_eq!(
+            windows
+                .pane_descriptions_for_window(WindowTarget::Name("logs".to_string()))
+                .unwrap()
+                .iter()
+                .map(|pane| pane.id.as_usize())
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+    }
+
+    #[test]
+    fn window_set_break_pane_from_non_active_window_preserves_active_window() {
+        let (pane0, path0) = test_pane_with_id(10);
+        let (pane1, path1) = test_pane_with_id(11);
+        let (pane2, path2) = test_pane_with_id(12);
+        let mut base = Window::new(TabId::new(10), "base".to_string(), Arc::clone(&pane0));
+        base.add_pane(SplitDirection::Horizontal, Arc::clone(&pane1));
+        let mut windows = WindowSet::new(base);
+        windows.add(Window::new(
+            TabId::new(11),
+            "shell".to_string(),
+            Arc::clone(&pane2),
+        ));
+
+        let resizes = windows
+            .break_pane(
+                WindowTarget::Name("base".to_string()),
+                PaneTarget::Id(11),
+                TabId::new(12),
+                PtySize { cols: 80, rows: 24 },
+            )
+            .unwrap();
+
+        assert_eq!(windows.window_count(), 3);
+        assert_eq!(windows.status_context("dev").unwrap().window_name, "shell");
+        assert_eq!(
+            windows
+                .pane_descriptions_for_window(WindowTarget::Name("base".to_string()))
+                .unwrap()
+                .iter()
+                .map(|pane| pane.id.as_usize())
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert_eq!(
+            windows
+                .pane_descriptions_for_window(WindowTarget::Name("12".to_string()))
+                .unwrap()
+                .iter()
+                .map(|pane| pane.id.as_usize())
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
+        assert_eq!(resizes.len(), 2);
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+        let _ = std::fs::remove_file(path2);
+    }
+
+    #[test]
+    fn window_set_break_pane_from_active_window_selects_new_window() {
+        let (pane0, path0) = test_pane_with_id(10);
+        let (pane1, path1) = test_pane_with_id(11);
+        let (pane2, path2) = test_pane_with_id(12);
+        let mut base = Window::new(TabId::new(10), "base".to_string(), Arc::clone(&pane0));
+        base.add_pane(SplitDirection::Horizontal, Arc::clone(&pane1));
+        let mut windows = WindowSet::new(base);
+        windows.add(Window::new(
+            TabId::new(11),
+            "shell".to_string(),
+            Arc::clone(&pane2),
+        ));
+        windows
+            .select(WindowTarget::Name("base".to_string()))
+            .unwrap();
+
+        windows
+            .break_pane(
+                WindowTarget::Active,
+                PaneTarget::Id(11),
+                TabId::new(12),
+                PtySize { cols: 80, rows: 24 },
+            )
+            .unwrap();
+
+        assert_eq!(windows.status_context("dev").unwrap().window_name, "12");
+        assert_eq!(
+            windows.status_context("dev").unwrap().pane_id.as_usize(),
+            11
+        );
         let _ = std::fs::remove_file(path0);
         let _ = std::fs::remove_file(path1);
         let _ = std::fs::remove_file(path2);

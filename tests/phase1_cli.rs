@@ -8434,6 +8434,148 @@ fn new_window_creates_second_active_window() {
 }
 
 #[test]
+fn pane_composition_preserves_pane_ids_and_running_processes() {
+    let socket = unique_socket("pane-composition");
+    let session = format!("pane-composition-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf split-ready; sleep 30",
+        ],
+    ));
+    let split = poll_capture(&socket, &session, "split-ready");
+    assert!(split.contains("split-ready"), "{split:?}");
+
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.index}:#{pane.id}:#{pane.pid}:#{pane.active}",
+        ],
+    );
+    assert_success(&panes);
+    let listed = String::from_utf8_lossy(&panes.stdout);
+    let rows = listed
+        .lines()
+        .map(|line| line.split(':').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2, "{listed}");
+    let base_id = rows[0][1].to_string();
+    let base_pid = rows[0][2].to_string();
+    let split_id = rows[1][1].to_string();
+    let split_pid = rows[1][2].to_string();
+    assert_eq!(rows[1][3], "1", "{listed}");
+
+    let source = format!("{session}:.0");
+    let destination = format!("{session}:.1");
+    assert_success(&dmux(
+        &socket,
+        &["swap-pane", "-s", &source, "-t", &destination],
+    ));
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.index}:#{pane.id}:#{pane.pid}:#{pane.active}",
+        ],
+    );
+    assert_success(&panes);
+    assert_eq!(
+        String::from_utf8_lossy(&panes.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            format!("0:{split_id}:{split_pid}:1"),
+            format!("1:{base_id}:{base_pid}:0"),
+        ]
+    );
+
+    let base_target = format!("{session}:.%{base_id}");
+    assert_success(&dmux(&socket, &["break-pane", "-t", &base_target]));
+    let windows = dmux(
+        &socket,
+        &[
+            "list-windows",
+            "-t",
+            &session,
+            "-F",
+            "#{window.index}:#{window.panes}",
+        ],
+    );
+    assert_success(&windows);
+    assert_eq!(
+        String::from_utf8_lossy(&windows.stdout)
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["0:1", "1:1"]
+    );
+
+    let split_target = format!("{session}:0.%{split_id}");
+    let join_target = format!("{session}:1.%{base_id}");
+    assert_success(&dmux(
+        &socket,
+        &["join-pane", "-s", &split_target, "-t", &join_target, "-v"],
+    ));
+    let windows = dmux(
+        &socket,
+        &[
+            "list-windows",
+            "-t",
+            &session,
+            "-F",
+            "#{window.index}:#{window.panes}",
+        ],
+    );
+    assert_success(&windows);
+    assert_eq!(String::from_utf8_lossy(&windows.stdout).trim(), "0:2");
+
+    let panes = dmux(
+        &socket,
+        &["list-panes", "-t", &session, "-F", "#{pane.id}:#{pane.pid}"],
+    );
+    assert_success(&panes);
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    assert!(panes.contains(&format!("{base_id}:{base_pid}")), "{panes}");
+    assert!(
+        panes.contains(&format!("{split_id}:{split_pid}")),
+        "{panes}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn structured_targets_address_non_active_window() {
     let socket = unique_socket("structured-targets");
     let session = format!("structured-targets-{}", std::process::id());

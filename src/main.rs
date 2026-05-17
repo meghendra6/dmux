@@ -259,6 +259,53 @@ fn run() -> Result<(), String> {
             send_request(&socket, &protocol::encode_kill_pane_target(&target), true)?;
             Ok(())
         }
+        cli::Command::SwapPane {
+            source,
+            destination,
+        } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_swap_pane(&source, &destination),
+                true,
+            )?;
+            Ok(())
+        }
+        cli::Command::MovePane {
+            source,
+            destination,
+            direction,
+        } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_move_pane(&source, &destination, direction),
+                true,
+            )?;
+            Ok(())
+        }
+        cli::Command::BreakPane { target } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(&socket, &protocol::encode_break_pane(&target), true)?;
+            Ok(())
+        }
+        cli::Command::JoinPane {
+            source,
+            destination,
+            direction,
+        } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_join_pane(&source, &destination, direction),
+                true,
+            )?;
+            Ok(())
+        }
         cli::Command::RespawnPane {
             target,
             force,

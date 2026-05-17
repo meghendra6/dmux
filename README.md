@@ -41,6 +41,10 @@ Implemented Phase 0/1 commands:
 - `dmux split -t <name> -h|-v [-- command...]`
 - `dmux list-panes -t <name> [-F <format>]`
 - `dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D`
+- `dmux swap-pane -s <target> -t <target>`
+- `dmux move-pane -s <target> -t <target> [-h|-v]`
+- `dmux break-pane -t <target>`
+- `dmux join-pane -s <target> -t <target> [-h|-v]`
 - `dmux kill-pane -t <name> [-p <index>]`
 - `dmux respawn-pane -t <name> [-p <index>] [-k] [-- command...]`
 - `dmux zoom-pane -t <name> [-p <index>]`
@@ -77,7 +81,7 @@ a grouped attach help overlay covering session, window, pane, copy-mode, and
 command-prompt workflows. Press `C-b :` for an attached command prompt that
 shows the typed command and controls (`Enter` run, Escape/`C-c` cancel,
 Backspace edit), with examples such as `:split -h`, `:split -v`,
-`:layout tiled`, `:rename-window api`, and `:list-windows`. Unknown attached
+`:layout tiled`, `:swap-pane 1`, `:break-pane`, and `:list-windows`. Unknown attached
 commands report a hint to use `C-b ?` and show common examples.
 
 Attached clients can enter the current basic copy-mode view with `C-b [`.
@@ -103,7 +107,11 @@ available with `dmux select-pane -t <name> -p <index>|--pane-id <id>|-L|-R|-U|-D
 active pane resizing is available with
 `dmux resize-pane -t <name> -L|-R|-U|-D [amount]`; pane layouts are available
 with `dmux select-layout -t <name> tiled|even-horizontal|even-vertical|main-horizontal|main-vertical`
-or attach prompt `:layout tiled`. `main-horizontal` and `main-vertical` use the
+or attach prompt `:layout tiled`. Pane composition is available with
+`dmux swap-pane`, `dmux move-pane`, `dmux break-pane`, and `dmux join-pane`;
+these preserve pane IDs and running processes while recomputing layouts. Moving
+the last pane out of a window removes the empty source window. `main-horizontal`
+and `main-vertical` use the
 active pane as the main pane; use `dmux attach --help` or
 `dmux help attach` to list attach-time bindings.
 Unzoomed multi-pane attach redraws from server change events and keeps a polling
