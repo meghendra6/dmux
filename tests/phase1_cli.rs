@@ -8291,6 +8291,191 @@ fn split_window_starts_new_pane_in_invoking_client_cwd() {
 }
 
 #[test]
+fn osc7_updates_pane_cwd_and_server_side_split_inherits_it() {
+    let socket = unique_socket("osc7-pane-cwd");
+    let session = format!("osc7-pane-cwd-{}", std::process::id());
+    let dir = unique_temp_file("osc7-pane-cwd-dir");
+    let file = unique_temp_file("osc7-pane-cwd-output");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&file);
+    std::fs::create_dir(&dir).expect("create osc7 cwd directory");
+    let expected_cwd = std::fs::canonicalize(&dir).expect("canonicalize osc7 cwd directory");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "printf '\\033]7;file://localhost{}\\007cwd-ready'; sleep 30",
+                expected_cwd.display()
+            ),
+        ],
+    ));
+
+    let cwd = poll_pane_format(
+        &socket,
+        &session,
+        "#{pane.cwd}",
+        &expected_cwd.display().to_string(),
+    );
+    assert!(
+        cwd.lines()
+            .any(|line| line == expected_cwd.display().to_string()),
+        "{cwd:?}"
+    );
+
+    let mut stream = UnixStream::connect(&socket).expect("connect socket");
+    let split_command = format!("pwd > {}; sleep 30", file.display());
+    stream
+        .write_all(format!("SPLIT\t{session}\th\t3\tsh\u{1f}-c\u{1f}{split_command}\n").as_bytes())
+        .expect("write legacy split request");
+    assert_eq!(read_socket_line(&mut stream), "OK\n");
+    assert!(poll_file_equals(
+        &file,
+        &format!("{}\n", expected_cwd.display())
+    ));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn osc_title_updates_pane_and_status_formats() {
+    let socket = unique_socket("osc-title");
+    let session = format!("osc-title-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf '\\033]2;editor\\007title-ready'; sleep 30",
+        ],
+    ));
+
+    let listed = poll_pane_format(&socket, &session, "#{pane.title}", "editor");
+    assert!(listed.lines().any(|line| line == "editor"), "{listed:?}");
+
+    let status = dmux(
+        &socket,
+        &["status-line", "-t", &session, "-F", "#{pane.title}"],
+    );
+    assert_success(&status);
+    assert_eq!(String::from_utf8_lossy(&status.stdout).trim_end(), "editor");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn pane_bell_and_activity_formats_track_output_and_clear_on_select() {
+    let socket = unique_socket("pane-bell-activity");
+    let session = format!("pane-bell-activity-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    let base = poll_capture(&socket, &session, "base-ready");
+    assert!(base.contains("base-ready"), "{base:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "sleep 0.3; printf 'split-alert\\007'; sleep 30",
+        ],
+    ));
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+
+    let listed = poll_pane_format(
+        &socket,
+        &session,
+        "#{pane.index}:#{pane.active}:#{pane.activity}:#{pane.bell}",
+        "1:0:1:1",
+    );
+    assert!(listed.lines().any(|line| line == "1:0:1:1"), "{listed:?}");
+
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "1"]));
+    let cleared = poll_pane_format(
+        &socket,
+        &session,
+        "#{pane.index}:#{pane.active}:#{pane.activity}:#{pane.bell}",
+        "1:1:0:0",
+    );
+    assert!(cleared.lines().any(|line| line == "1:1:0:0"), "{cleared:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn active_pane_bell_is_exposed_in_status_format() {
+    let socket = unique_socket("pane-bell-status");
+    let session = format!("pane-bell-status-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf '\\007bell-ready'; sleep 30",
+        ],
+    ));
+    let bell = poll_pane_format(&socket, &session, "#{pane.bell}", "1");
+    assert!(bell.lines().any(|line| line == "1"), "{bell:?}");
+
+    let status = dmux(
+        &socket,
+        &[
+            "status-line",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.bell}:#{pane.activity}",
+        ],
+    );
+    assert_success(&status);
+    assert_eq!(String::from_utf8_lossy(&status.stdout).trim_end(), "1:0");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn select_pane_switches_active_capture_target() {
     let socket = unique_socket("select-pane");
     let session = format!("select-pane-{}", std::process::id());
