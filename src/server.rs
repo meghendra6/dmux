@@ -1,8 +1,8 @@
 use crate::ids::{PaneId, TabId};
 use crate::layout::{LayoutNode, PaneRegion, layout_regions_for_size, split_extent_weighted};
 use crate::protocol::{
-    self, BufferSelection, CaptureMode, PaneDirection, PaneResizeDirection, PaneSelectTarget,
-    PaneTarget, Request, SplitDirection, Target, WindowTarget,
+    self, BufferSelection, CaptureMode, LayoutPreset, PaneDirection, PaneResizeDirection,
+    PaneSelectTarget, PaneTarget, Request, SplitDirection, Target, WindowTarget,
 };
 use crate::pty::{self, PtySize, SpawnSpec};
 use crate::term::{TerminalChanges, TerminalState};
@@ -579,6 +579,18 @@ impl Session {
             direction,
             amount,
         )
+    }
+
+    fn select_layout(
+        &self,
+        window: WindowTarget,
+        preset: LayoutPreset,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        let size = *self.current_size.lock().unwrap();
+        self.windows
+            .lock()
+            .unwrap()
+            .select_layout(window, preset, size)
     }
 
     fn active_window_size(&self) -> Option<PtySize> {
@@ -1285,6 +1297,17 @@ impl Window {
         Ok(self.visible_pane_resizes())
     }
 
+    fn apply_layout_preset(
+        &mut self,
+        preset: LayoutPreset,
+        size: PtySize,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        self.layout
+            .apply_preset(preset, self.panes.len(), self.panes.active_index(), size)?;
+        self.size = size;
+        Ok(self.visible_pane_resizes())
+    }
+
     fn visible_pane_resizes(&self) -> Vec<(Arc<Pane>, PtySize)> {
         let layout = self
             .zoomed
@@ -1623,6 +1646,16 @@ impl WindowSet {
     ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
         let window_index = self.resolve_target(window)?;
         self.windows[window_index].resize_pane(target, direction, amount)
+    }
+
+    fn select_layout(
+        &mut self,
+        window: WindowTarget,
+        preset: LayoutPreset,
+        size: PtySize,
+    ) -> Result<Vec<(Arc<Pane>, PtySize)>, String> {
+        let window_index = self.resolve_target(window)?;
+        self.windows[window_index].apply_layout_preset(preset, size)
     }
 
     fn status_context(&self, session_name: &str) -> Option<StatusContext> {
@@ -2110,6 +2143,11 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             direction,
             amount,
         } => handle_resize_pane(&state, &mut stream, &target, direction, amount),
+        Request::SelectLayout {
+            session,
+            window,
+            preset,
+        } => handle_select_layout(&state, &mut stream, &session, window, preset),
         Request::Send { target, bytes } => handle_send(&state, &mut stream, &target, &bytes),
         Request::Split {
             target,
@@ -2906,6 +2944,36 @@ fn handle_resize_pane(
     };
 
     let pane_resizes = match session.resize_pane(target, direction, amount) {
+        Ok(pane_resizes) => pane_resizes,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    if !resize_panes(pane_resizes)? {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    }
+
+    session.notify_attach_redraw_immediate();
+    write_ok(stream)
+}
+
+fn handle_select_layout(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    session_name: &str,
+    window: WindowTarget,
+    preset: LayoutPreset,
+) -> io::Result<()> {
+    let session = resolve_session(state, session_name);
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    let pane_resizes = match session.select_layout(window, preset) {
         Ok(pane_resizes) => pane_resizes,
         Err(message) => {
             write_err(stream, &message)?;
@@ -5800,6 +5868,43 @@ mod tests {
         let _ = std::fs::remove_file(path0);
         let _ = std::fs::remove_file(path1);
         let _ = std::fs::remove_file(path2);
+    }
+
+    #[test]
+    fn window_select_layout_preserves_active_pane_and_pane_identities() {
+        let (pane0, path0) = test_pane_with_id(10);
+        let (pane1, path1) = test_pane_with_id(11);
+        let (pane2, path2) = test_pane_with_id(12);
+        let (pane3, path3) = test_pane_with_id(13);
+        let mut window = Window::new(TabId::new(0), "0".to_string(), Arc::clone(&pane0));
+        window.add_pane(SplitDirection::Horizontal, Arc::clone(&pane1));
+        window.add_pane(SplitDirection::Vertical, Arc::clone(&pane2));
+        window.add_pane(SplitDirection::Horizontal, Arc::clone(&pane3));
+        window.select_pane(PaneSelectTarget::Index(2)).unwrap();
+
+        let resizes = window
+            .apply_layout_preset(LayoutPreset::EvenVertical, PtySize { cols: 80, rows: 27 })
+            .unwrap();
+
+        assert_eq!(window.active_pane_index(), 2);
+        assert_eq!(
+            window
+                .panes()
+                .iter()
+                .map(|pane| pane.id.as_usize())
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12, 13]
+        );
+        assert_eq!(resizes.len(), 4);
+        assert!(
+            resizes
+                .iter()
+                .all(|(_, size)| size.cols == 80 && size.rows >= 6)
+        );
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+        let _ = std::fs::remove_file(path2);
+        let _ = std::fs::remove_file(path3);
     }
 
     #[test]

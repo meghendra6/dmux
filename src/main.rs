@@ -180,6 +180,25 @@ fn run() -> Result<(), String> {
             send_request(&socket, &request, true)?;
             Ok(())
         }
+        cli::Command::SelectLayout {
+            session,
+            window,
+            preset,
+        } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            let target = protocol::Target {
+                session,
+                window,
+                pane: protocol::PaneTarget::Active,
+            };
+            send_request(
+                &socket,
+                &protocol::encode_select_layout_target(&target, preset),
+                true,
+            )?;
+            Ok(())
+        }
         cli::Command::SendKeys { target, keys } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
