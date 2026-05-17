@@ -541,9 +541,9 @@ Commands:\n\
   run <command; command...>              run dmux commands in order; stops on first error\n\
   source-file <path>                     run newline-separated dmux commands from a file\n\
   run-shell <shell-command>              run a host shell command and report its status\n\
-  list-keys [-F <format>]                list runtime prefix key bindings\n\
-  bind-key <key> <action>                bind prefix key to a supported live action\n\
-  unbind-key <key>                       remove a prefix binding\n\
+  list-keys [-F <format>]                list runtime key bindings\n\
+  bind-key <key> <action>                bind a key to a supported live action\n\
+  unbind-key <key>                       remove a key binding\n\
   show-options [-F <format>]             list runtime server options\n\
   set-option <name> <value>              set runtime server option\n\
   kill-session -t <name>\n\
@@ -571,14 +571,16 @@ Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
   C-b % split right       C-b \" split down       C-b o next pane\n\
-  C-b h/j/k/l focus       C-b H/J/K/L resize by 5\n\
+  C-b h/j/k/l or arrows focus    Alt-h/j/k/l or Alt-arrows focus\n\
+  C-b H/J/K/L resize by 5        C-b Ctrl-arrows resize by 1\n\
   C-b q pane numbers      C-b x close pane       C-b z zoom pane\n\
 Copy:\n\
   C-b [ copy-mode         copy-mode: j/k arrows PgUp/PgDn y/Enter copy q/Esc exit\n\
 Prompt:\n\
   C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
   Prompt accepts semicolon-separated commands; source-file reads prompt commands.\n\
-  Key bindings and options are runtime/server-scoped; use list-keys/show-options to inspect.\n\
+  Key bindings and options are runtime/server-scoped; Alt/Meta key bindings run without prefix.\n\
+  Use list-keys/show-options to inspect.\n\
 Prompt examples:\n\
   :split -h               :split -v               :rename-window api\n\
   :layout tiled           :swap-pane 1            :break-pane\n\
@@ -597,14 +599,16 @@ Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
   C-b % split right       C-b \" split down       C-b o next pane\n\
-  C-b h/j/k/l focus       C-b H/J/K/L resize by 5\n\
+  C-b h/j/k/l or arrows focus    Alt-h/j/k/l or Alt-arrows focus\n\
+  C-b H/J/K/L resize by 5        C-b Ctrl-arrows resize by 1\n\
   C-b q pane numbers      C-b x close pane       C-b z zoom pane\n\
 Copy:\n\
   C-b [ copy-mode         copy-mode: j/k arrows PgUp/PgDn y/Enter copy q/Esc exit\n\
 Prompt:\n\
   C-b : command prompt    Enter run    Esc/C-c cancel    Backspace edit\n\
   Prompt accepts semicolon-separated commands; source-file reads prompt commands.\n\
-  Key bindings and options are runtime/server-scoped; use list-keys/show-options to inspect.\n\
+  Key bindings and options are runtime/server-scoped; Alt/Meta key bindings run without prefix.\n\
+  Use list-keys/show-options to inspect.\n\
 Prompt examples:\n\
   :split -h               :split -v               :rename-window api\n\
   :layout tiled           :swap-pane 1            :break-pane\n\
@@ -2426,6 +2430,27 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_args(["dmux", "bind-key", "Left", "select-pane", "-L"]).unwrap(),
+            Command::BindKey {
+                key: "Left".to_string(),
+                command: "select-pane -L".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "bind-key", "M-h", "select-pane", "-L"]).unwrap(),
+            Command::BindKey {
+                key: "M-h".to_string(),
+                command: "select-pane -L".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "bind-key", "C-Left", "resize-pane", "-L", "1"]).unwrap(),
+            Command::BindKey {
+                key: "C-Left".to_string(),
+                command: "resize-pane -L 1".to_string(),
+            }
+        );
+        assert_eq!(
             parse_args(["dmux", "unbind-key", "x"]).unwrap(),
             Command::UnbindKey {
                 key: "x".to_string(),
@@ -2537,6 +2562,8 @@ mod tests {
         assert!(help.contains("C-b %"), "{help}");
         assert!(help.contains("C-b \""), "{help}");
         assert!(help.contains("C-b h/j/k/l"), "{help}");
+        assert!(help.contains("Alt-h/j/k/l"), "{help}");
+        assert!(help.contains("Ctrl-arrows"), "{help}");
         assert!(help.contains("C-b x"), "{help}");
         assert!(help.contains("C-b z"), "{help}");
         assert!(help.contains("C-b ?"), "{help}");

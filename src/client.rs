@@ -1034,10 +1034,10 @@ enum PaneCommand {
     FocusDown,
     FocusUp,
     FocusRight,
-    ResizeLeft,
-    ResizeDown,
-    ResizeUp,
-    ResizeRight,
+    Resize {
+        direction: protocol::PaneResizeDirection,
+        amount: usize,
+    },
     Close,
     ToggleZoom,
 }
@@ -1106,7 +1106,7 @@ struct RawAttachInputState {
 #[derive(Debug, Clone)]
 struct LiveControls {
     prefix: u8,
-    bindings: Vec<(u8, LiveKeyAction)>,
+    bindings: Vec<(crate::config::KeyStroke, LiveKeyAction)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1136,7 +1136,7 @@ impl LiveControls {
         let bindings = bindings
             .into_iter()
             .filter_map(|binding| {
-                let key = crate::config::key_name_to_byte(&binding.key).ok()?;
+                let key = crate::config::parse_key_stroke(&binding.key).ok()?;
                 let action = live_key_action(&binding.command)?;
                 Some((key, action))
             })
@@ -1144,20 +1144,32 @@ impl LiveControls {
         Self { prefix, bindings }
     }
 
-    fn action_for_key(&self, key: u8) -> Option<LiveKeyAction> {
-        self.bindings
-            .iter()
-            .find_map(|(binding_key, action)| (*binding_key == key).then_some(*action))
+    fn action_for_key(&self, key: crate::config::KeyStroke) -> Option<LiveKeyAction> {
+        self.bindings.iter().find_map(|(binding_key, action)| {
+            key_strokes_match(*binding_key, key).then_some(*action)
+        })
     }
 
-    fn key_for_action(&self, target: LiveKeyAction) -> Option<u8> {
+    fn key_for_action(&self, target: LiveKeyAction) -> Option<crate::config::KeyStroke> {
         self.bindings
             .iter()
             .find_map(|(key, action)| (*action == target).then_some(*key))
     }
 }
 
+fn key_strokes_match(binding: crate::config::KeyStroke, input: crate::config::KeyStroke) -> bool {
+    binding.code == input.code
+        && binding.alt == input.alt
+        && binding.shift == input.shift
+        && (binding.ctrl == input.ctrl
+            || matches!(binding.code, crate::config::KeyCode::Byte(1..=26)))
+}
+
 fn live_key_action(command: &str) -> Option<LiveKeyAction> {
+    if let Some(action) = resize_live_key_action(command) {
+        return Some(action);
+    }
+
     match command {
         "send-prefix" => Some(LiveKeyAction::SendPrefix),
         "detach-client" => Some(LiveKeyAction::Detach),
@@ -1175,14 +1187,290 @@ fn live_key_action(command: &str) -> Option<LiveKeyAction> {
         "select-pane -D" => Some(LiveKeyAction::PaneCommand(PaneCommand::FocusDown)),
         "select-pane -U" => Some(LiveKeyAction::PaneCommand(PaneCommand::FocusUp)),
         "select-pane -R" => Some(LiveKeyAction::PaneCommand(PaneCommand::FocusRight)),
-        "resize-pane -L" => Some(LiveKeyAction::PaneCommand(PaneCommand::ResizeLeft)),
-        "resize-pane -D" => Some(LiveKeyAction::PaneCommand(PaneCommand::ResizeDown)),
-        "resize-pane -U" => Some(LiveKeyAction::PaneCommand(PaneCommand::ResizeUp)),
-        "resize-pane -R" => Some(LiveKeyAction::PaneCommand(PaneCommand::ResizeRight)),
         "kill-pane" => Some(LiveKeyAction::PaneCommand(PaneCommand::Close)),
         "zoom-pane" => Some(LiveKeyAction::PaneCommand(PaneCommand::ToggleZoom)),
         _ => None,
     }
+}
+
+fn resize_live_key_action(command: &str) -> Option<LiveKeyAction> {
+    let mut parts = command.split_whitespace();
+    let resize = parts.next()?;
+    let direction = parts.next()?;
+    if resize != "resize-pane" {
+        return None;
+    }
+    let direction = match direction {
+        "-L" => protocol::PaneResizeDirection::Left,
+        "-D" => protocol::PaneResizeDirection::Down,
+        "-U" => protocol::PaneResizeDirection::Up,
+        "-R" => protocol::PaneResizeDirection::Right,
+        _ => return None,
+    };
+    let amount = parts
+        .next()
+        .map(|amount| amount.parse::<usize>().ok())
+        .unwrap_or(Some(ATTACH_RESIZE_AMOUNT))?;
+    if amount == 0 || parts.next().is_some() {
+        return None;
+    }
+    Some(LiveKeyAction::PaneCommand(PaneCommand::Resize {
+        direction,
+        amount,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedInputKey {
+    Key(crate::config::KeyStroke, usize),
+    Unhandled(usize),
+    Incomplete,
+}
+
+fn parse_input_key(input: &[u8]) -> ParsedInputKey {
+    let Some(byte) = input.first().copied() else {
+        return ParsedInputKey::Incomplete;
+    };
+    if byte != 0x1b {
+        return ParsedInputKey::Key(
+            crate::config::KeyStroke {
+                code: crate::config::KeyCode::Byte(byte),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            },
+            1,
+        );
+    }
+
+    match input {
+        [0x1b] => ParsedInputKey::Key(
+            crate::config::KeyStroke {
+                code: crate::config::KeyCode::Byte(0x1b),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            },
+            1,
+        ),
+        [0x1b, b'[', ..] => parse_csi_input_key(input),
+        [0x1b, b'O'] => ParsedInputKey::Incomplete,
+        [0x1b, b'O', final_byte, ..] => {
+            if let Some(code) = arrow_key_code(*final_byte) {
+                ParsedInputKey::Key(
+                    crate::config::KeyStroke {
+                        code,
+                        ctrl: false,
+                        alt: false,
+                        shift: false,
+                    },
+                    3,
+                )
+            } else {
+                ParsedInputKey::Unhandled(3)
+            }
+        }
+        _ => match parse_input_key(&input[1..]) {
+            ParsedInputKey::Key(mut key, consumed) => {
+                key.alt = true;
+                ParsedInputKey::Key(key, consumed + 1)
+            }
+            ParsedInputKey::Unhandled(consumed) => ParsedInputKey::Unhandled(consumed + 1),
+            ParsedInputKey::Incomplete => ParsedInputKey::Key(
+                crate::config::KeyStroke {
+                    code: crate::config::KeyCode::Byte(0x1b),
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                },
+                1,
+            ),
+        },
+    }
+}
+
+fn parse_csi_input_key(input: &[u8]) -> ParsedInputKey {
+    let Some(consumed) = complete_csi_sequence_len(input) else {
+        return if is_incomplete_csi_sequence(input) {
+            ParsedInputKey::Incomplete
+        } else {
+            ParsedInputKey::Unhandled(input.len().min(1))
+        };
+    };
+    let final_byte = input[consumed - 1];
+    let Some(code) = arrow_key_code(final_byte) else {
+        return ParsedInputKey::Unhandled(consumed);
+    };
+    let Some((shift, alt, ctrl)) = csi_modifier_state(&input[2..consumed - 1]) else {
+        return ParsedInputKey::Unhandled(consumed);
+    };
+    ParsedInputKey::Key(
+        crate::config::KeyStroke {
+            code,
+            ctrl,
+            alt,
+            shift,
+        },
+        consumed,
+    )
+}
+
+fn arrow_key_code(final_byte: u8) -> Option<crate::config::KeyCode> {
+    match final_byte {
+        b'D' => Some(crate::config::KeyCode::Left),
+        b'B' => Some(crate::config::KeyCode::Down),
+        b'A' => Some(crate::config::KeyCode::Up),
+        b'C' => Some(crate::config::KeyCode::Right),
+        _ => None,
+    }
+}
+
+fn csi_modifier_state(params: &[u8]) -> Option<(bool, bool, bool)> {
+    if params.is_empty() {
+        return Some((false, false, false));
+    }
+    let params = std::str::from_utf8(params).ok()?;
+    if params.starts_with('<') {
+        return None;
+    }
+
+    let values = params
+        .split(';')
+        .filter(|part| !part.is_empty())
+        .map(str::parse::<u8>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let modifier = if params.contains(';') {
+        values.last().copied().unwrap_or(1)
+    } else {
+        values
+            .first()
+            .copied()
+            .filter(|value| *value >= 2)
+            .unwrap_or(1)
+    };
+    let encoded = modifier.checked_sub(1)?;
+    if encoded > 7 {
+        return None;
+    }
+    Some((encoded & 1 != 0, encoded & 2 != 0, encoded & 4 != 0))
+}
+
+fn key_stroke_input_bytes(key: crate::config::KeyStroke) -> Vec<u8> {
+    match key.code {
+        crate::config::KeyCode::Byte(byte) => {
+            if key.alt {
+                vec![0x1b, byte]
+            } else {
+                vec![byte]
+            }
+        }
+        crate::config::KeyCode::Left
+        | crate::config::KeyCode::Down
+        | crate::config::KeyCode::Up
+        | crate::config::KeyCode::Right => {
+            let final_byte = match key.code {
+                crate::config::KeyCode::Left => b'D',
+                crate::config::KeyCode::Down => b'B',
+                crate::config::KeyCode::Up => b'A',
+                crate::config::KeyCode::Right => b'C',
+                crate::config::KeyCode::Byte(_) => unreachable!(),
+            };
+            let modifier =
+                1 + u8::from(key.shift) + (u8::from(key.alt) * 2) + (u8::from(key.ctrl) * 4);
+            if modifier == 1 {
+                vec![0x1b, b'[', final_byte]
+            } else {
+                format!("\x1b[1;{}{}", modifier, final_byte as char).into_bytes()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyActionFlow {
+    Continue,
+    Stop,
+}
+
+fn push_attach_key_action(
+    actions: &mut Vec<AttachInputAction>,
+    output: &mut Vec<u8>,
+    state: &mut RawAttachInputState,
+    controls: &LiveControls,
+    action: LiveKeyAction,
+    trailing_input: &[u8],
+) -> KeyActionFlow {
+    if !output.is_empty() {
+        actions.push(AttachInputAction::Forward(std::mem::take(output)));
+    }
+    match action {
+        LiveKeyAction::SendPrefix => output.push(controls.prefix),
+        LiveKeyAction::Detach => {
+            actions.push(AttachInputAction::Detach);
+            return KeyActionFlow::Stop;
+        }
+        LiveKeyAction::CopyMode => {
+            actions.push(AttachInputAction::EnterCopyMode {
+                initial_input: trailing_input.to_vec(),
+            });
+            return KeyActionFlow::Stop;
+        }
+        LiveKeyAction::SelectNextPane => actions.push(AttachInputAction::SelectNextPane),
+        LiveKeyAction::ShowPaneNumbers => {
+            state.selecting_pane = true;
+            actions.push(AttachInputAction::ShowPaneNumbers);
+        }
+        LiveKeyAction::ShowHelp => actions.push(AttachInputAction::ShowHelp),
+        LiveKeyAction::CommandPrompt => {
+            state.command_prompt = Some(Vec::new());
+            actions.push(AttachInputAction::CommandPromptStart);
+        }
+        LiveKeyAction::PaneCommand(command) => {
+            actions.push(AttachInputAction::PaneCommand(command))
+        }
+    }
+    KeyActionFlow::Continue
+}
+
+fn push_live_snapshot_key_action(
+    actions: &mut Vec<LiveSnapshotInputAction>,
+    output: &mut Vec<u8>,
+    state: &mut LiveSnapshotInputState,
+    controls: &LiveControls,
+    action: LiveKeyAction,
+    trailing_input: &[u8],
+) -> KeyActionFlow {
+    if !output.is_empty() {
+        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(output)));
+    }
+    match action {
+        LiveKeyAction::SendPrefix => output.push(controls.prefix),
+        LiveKeyAction::Detach => {
+            actions.push(LiveSnapshotInputAction::Detach);
+            return KeyActionFlow::Stop;
+        }
+        LiveKeyAction::CopyMode => {
+            actions.push(LiveSnapshotInputAction::EnterCopyMode {
+                initial_input: trailing_input.to_vec(),
+            });
+            return KeyActionFlow::Stop;
+        }
+        LiveKeyAction::SelectNextPane => actions.push(LiveSnapshotInputAction::SelectNextPane),
+        LiveKeyAction::ShowPaneNumbers => {
+            state.selecting_pane = true;
+            actions.push(LiveSnapshotInputAction::ShowPaneNumbers);
+        }
+        LiveKeyAction::ShowHelp => actions.push(LiveSnapshotInputAction::ShowHelp),
+        LiveKeyAction::CommandPrompt => {
+            state.command_prompt = Some(Vec::new());
+            actions.push(LiveSnapshotInputAction::CommandPromptStart);
+        }
+        LiveKeyAction::PaneCommand(command) => {
+            actions.push(LiveSnapshotInputAction::PaneCommand(command));
+        }
+    }
+    KeyActionFlow::Continue
 }
 
 impl RawAttachInputState {
@@ -1350,51 +1638,82 @@ fn translate_attach_input_with_state_with_controls(
         }
 
         if state.saw_prefix {
-            state.saw_prefix = false;
-            if let Some(action) = controls.action_for_key(byte) {
-                if !output.is_empty() {
-                    actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+            match parse_input_key(&bytes[offset..]) {
+                ParsedInputKey::Key(key, consumed) => {
+                    state.saw_prefix = false;
+                    if let Some(action) = controls.action_for_key(key) {
+                        let flow = push_attach_key_action(
+                            &mut actions,
+                            &mut output,
+                            state,
+                            controls,
+                            action,
+                            &bytes[offset + consumed..],
+                        );
+                        offset += consumed;
+                        if flow == KeyActionFlow::Stop {
+                            return actions;
+                        }
+                        continue;
+                    }
+                    output.push(controls.prefix);
+                    output.extend_from_slice(&bytes[offset..offset + consumed]);
+                    offset += consumed;
+                    continue;
                 }
-                match action {
-                    LiveKeyAction::SendPrefix => output.push(controls.prefix),
-                    LiveKeyAction::Detach => {
-                        actions.push(AttachInputAction::Detach);
-                        return actions;
-                    }
-                    LiveKeyAction::CopyMode => {
-                        actions.push(AttachInputAction::EnterCopyMode {
-                            initial_input: bytes[offset + 1..].to_vec(),
-                        });
-                        return actions;
-                    }
-                    LiveKeyAction::SelectNextPane => {
-                        actions.push(AttachInputAction::SelectNextPane)
-                    }
-                    LiveKeyAction::ShowPaneNumbers => {
-                        state.selecting_pane = true;
-                        actions.push(AttachInputAction::ShowPaneNumbers);
-                    }
-                    LiveKeyAction::ShowHelp => actions.push(AttachInputAction::ShowHelp),
-                    LiveKeyAction::CommandPrompt => {
-                        state.command_prompt = Some(Vec::new());
-                        actions.push(AttachInputAction::CommandPromptStart);
-                    }
-                    LiveKeyAction::PaneCommand(command) => {
-                        actions.push(AttachInputAction::PaneCommand(command));
-                    }
+                ParsedInputKey::Unhandled(consumed) => {
+                    state.saw_prefix = false;
+                    output.push(controls.prefix);
+                    output.extend_from_slice(&bytes[offset..offset + consumed]);
+                    offset += consumed;
+                    continue;
                 }
-                offset += 1;
-                continue;
-            } else {
-                output.push(controls.prefix);
-                output.push(byte);
-                offset += 1;
-                continue;
+                ParsedInputKey::Incomplete => {
+                    if !output.is_empty() {
+                        actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+                    }
+                    state.mouse_pending.extend_from_slice(&bytes[offset..]);
+                    break;
+                }
             }
         }
 
         if byte == controls.prefix {
             state.saw_prefix = true;
+        } else if let ParsedInputKey::Key(key, consumed) = parse_input_key(&bytes[offset..]) {
+            if key.is_global_binding() {
+                if let Some(action) = controls.action_for_key(key) {
+                    let flow = push_attach_key_action(
+                        &mut actions,
+                        &mut output,
+                        state,
+                        controls,
+                        action,
+                        &bytes[offset + consumed..],
+                    );
+                    offset += consumed;
+                    if flow == KeyActionFlow::Stop {
+                        return actions;
+                    }
+                    continue;
+                }
+            }
+            output.extend_from_slice(&bytes[offset..offset + consumed]);
+            offset += consumed;
+            continue;
+        } else if let ParsedInputKey::Unhandled(consumed) = parse_input_key(&bytes[offset..]) {
+            output.extend_from_slice(&bytes[offset..offset + consumed]);
+            offset += consumed;
+            continue;
+        } else if matches!(
+            parse_input_key(&bytes[offset..]),
+            ParsedInputKey::Incomplete
+        ) {
+            if !output.is_empty() {
+                actions.push(AttachInputAction::Forward(std::mem::take(&mut output)));
+            }
+            state.mouse_pending.extend_from_slice(&bytes[offset..]);
+            break;
         } else {
             output.push(byte);
         }
@@ -1560,55 +1879,89 @@ fn translate_live_snapshot_input_with_mouse_and_controls(
         }
 
         if state.saw_prefix {
-            state.saw_prefix = false;
-            if let Some(action) = controls.action_for_key(byte) {
-                if !output.is_empty() {
-                    actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
-                        &mut output,
-                    )));
+            match parse_input_key(&bytes[offset..]) {
+                ParsedInputKey::Key(key, consumed) => {
+                    state.saw_prefix = false;
+                    if let Some(action) = controls.action_for_key(key) {
+                        let flow = push_live_snapshot_key_action(
+                            &mut actions,
+                            &mut output,
+                            state,
+                            controls,
+                            action,
+                            &bytes[offset + consumed..],
+                        );
+                        offset += consumed;
+                        if flow == KeyActionFlow::Stop {
+                            return actions;
+                        }
+                        continue;
+                    }
+                    output.push(controls.prefix);
+                    output.extend_from_slice(&bytes[offset..offset + consumed]);
+                    offset += consumed;
+                    continue;
                 }
-                match action {
-                    LiveKeyAction::SendPrefix => output.push(controls.prefix),
-                    LiveKeyAction::Detach => {
-                        actions.push(LiveSnapshotInputAction::Detach);
-                        return actions;
-                    }
-                    LiveKeyAction::CopyMode => {
-                        actions.push(LiveSnapshotInputAction::EnterCopyMode {
-                            initial_input: bytes[offset + 1..].to_vec(),
-                        });
-                        return actions;
-                    }
-                    LiveKeyAction::SelectNextPane => {
-                        actions.push(LiveSnapshotInputAction::SelectNextPane)
-                    }
-                    LiveKeyAction::ShowPaneNumbers => {
-                        state.selecting_pane = true;
-                        actions.push(LiveSnapshotInputAction::ShowPaneNumbers);
-                    }
-                    LiveKeyAction::ShowHelp => actions.push(LiveSnapshotInputAction::ShowHelp),
-                    LiveKeyAction::CommandPrompt => {
-                        state.command_prompt = Some(Vec::new());
-                        actions.push(LiveSnapshotInputAction::CommandPromptStart);
-                    }
-                    LiveKeyAction::PaneCommand(command) => {
-                        actions.push(LiveSnapshotInputAction::PaneCommand(command));
-                    }
+                ParsedInputKey::Unhandled(consumed) => {
+                    state.saw_prefix = false;
+                    output.push(controls.prefix);
+                    output.extend_from_slice(&bytes[offset..offset + consumed]);
+                    offset += consumed;
+                    continue;
                 }
-                offset += 1;
-                continue;
-            } else {
-                output.push(controls.prefix);
-                output.push(byte);
-                offset += 1;
-                continue;
+                ParsedInputKey::Incomplete => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    state.mouse_pending.extend_from_slice(&bytes[offset..]);
+                    break;
+                }
             }
         }
 
         if byte == controls.prefix {
             state.saw_prefix = true;
         } else {
-            output.push(byte);
+            match parse_input_key(&bytes[offset..]) {
+                ParsedInputKey::Key(key, consumed) => {
+                    if key.is_global_binding() {
+                        if let Some(action) = controls.action_for_key(key) {
+                            let flow = push_live_snapshot_key_action(
+                                &mut actions,
+                                &mut output,
+                                state,
+                                controls,
+                                action,
+                                &bytes[offset + consumed..],
+                            );
+                            offset += consumed;
+                            if flow == KeyActionFlow::Stop {
+                                return actions;
+                            }
+                            continue;
+                        }
+                    }
+                    output.extend_from_slice(&bytes[offset..offset + consumed]);
+                    offset += consumed;
+                    continue;
+                }
+                ParsedInputKey::Unhandled(consumed) => {
+                    output.extend_from_slice(&bytes[offset..offset + consumed]);
+                    offset += consumed;
+                    continue;
+                }
+                ParsedInputKey::Incomplete => {
+                    if !output.is_empty() {
+                        actions.push(LiveSnapshotInputAction::Forward(std::mem::take(
+                            &mut output,
+                        )));
+                    }
+                    state.mouse_pending.extend_from_slice(&bytes[offset..]);
+                    break;
+                }
+            }
         }
         offset += 1;
     }
@@ -2687,30 +3040,9 @@ fn apply_live_pane_command(
         | PaneCommand::FocusDown
         | PaneCommand::FocusUp
         | PaneCommand::FocusRight => select_directional_pane(socket, session, command),
-        PaneCommand::ResizeLeft => resize_pane(
-            socket,
-            session,
-            protocol::PaneResizeDirection::Left,
-            ATTACH_RESIZE_AMOUNT,
-        ),
-        PaneCommand::ResizeDown => resize_pane(
-            socket,
-            session,
-            protocol::PaneResizeDirection::Down,
-            ATTACH_RESIZE_AMOUNT,
-        ),
-        PaneCommand::ResizeUp => resize_pane(
-            socket,
-            session,
-            protocol::PaneResizeDirection::Up,
-            ATTACH_RESIZE_AMOUNT,
-        ),
-        PaneCommand::ResizeRight => resize_pane(
-            socket,
-            session,
-            protocol::PaneResizeDirection::Right,
-            ATTACH_RESIZE_AMOUNT,
-        ),
+        PaneCommand::Resize { direction, amount } => {
+            resize_pane(socket, session, direction, amount)
+        }
         PaneCommand::Close => {
             let _ = send_control_request(socket, &protocol::encode_kill_pane(session, None))?;
             Ok(())
@@ -2885,8 +3217,10 @@ fn push_pending_bound_action(
     let Some(key) = controls.key_for_action(action) else {
         return false;
     };
-    pending.push(controls.prefix);
-    pending.push(key);
+    if !key.is_global_binding() {
+        pending.push(controls.prefix);
+    }
+    pending.extend(key_stroke_input_bytes(key));
     true
 }
 
@@ -3106,26 +3440,8 @@ where
                         });
                     }
                 }
-                AttachInputAction::PaneCommand(PaneCommand::ResizeLeft)
-                | AttachInputAction::PaneCommand(PaneCommand::ResizeDown)
-                | AttachInputAction::PaneCommand(PaneCommand::ResizeUp)
-                | AttachInputAction::PaneCommand(PaneCommand::ResizeRight) => {
-                    let (direction, amount) = match action {
-                        AttachInputAction::PaneCommand(PaneCommand::ResizeLeft) => {
-                            (protocol::PaneResizeDirection::Left, ATTACH_RESIZE_AMOUNT)
-                        }
-                        AttachInputAction::PaneCommand(PaneCommand::ResizeDown) => {
-                            (protocol::PaneResizeDirection::Down, ATTACH_RESIZE_AMOUNT)
-                        }
-                        AttachInputAction::PaneCommand(PaneCommand::ResizeUp) => {
-                            (protocol::PaneResizeDirection::Up, ATTACH_RESIZE_AMOUNT)
-                        }
-                        AttachInputAction::PaneCommand(PaneCommand::ResizeRight) => {
-                            (protocol::PaneResizeDirection::Right, ATTACH_RESIZE_AMOUNT)
-                        }
-                        _ => unreachable!(),
-                    };
-                    if let Err(error) = resize_pane(socket, session, direction, amount) {
+                AttachInputAction::PaneCommand(PaneCommand::Resize { direction, amount }) => {
+                    if let Err(error) = resize_pane(socket, session, *direction, *amount) {
                         write_attach_transient_message(&error.to_string())?;
                     } else {
                         return Ok(RawAttachExit::Reconnect {
@@ -5469,6 +5785,82 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_input_uses_prefix_arrow_keys_for_pane_focus() {
+        let cases = [
+            (b"\x02\x1b[D".as_slice(), PaneCommand::FocusLeft),
+            (b"\x02\x1b[B".as_slice(), PaneCommand::FocusDown),
+            (b"\x02\x1b[A".as_slice(), PaneCommand::FocusUp),
+            (b"\x02\x1b[C".as_slice(), PaneCommand::FocusRight),
+        ];
+
+        for (input, command) in cases {
+            let mut state = LiveSnapshotInputState::default();
+            assert_eq!(
+                translate_live_snapshot_input(input, &mut state),
+                vec![LiveSnapshotInputAction::PaneCommand(command)]
+            );
+            assert!(!state.saw_prefix);
+        }
+    }
+
+    #[test]
+    fn live_snapshot_input_uses_alt_keys_for_pane_focus_without_prefix() {
+        let cases = [
+            (b"\x1bh".as_slice(), PaneCommand::FocusLeft),
+            (b"\x1bj".as_slice(), PaneCommand::FocusDown),
+            (b"\x1bk".as_slice(), PaneCommand::FocusUp),
+            (b"\x1bl".as_slice(), PaneCommand::FocusRight),
+            (b"\x1b[1;3D".as_slice(), PaneCommand::FocusLeft),
+            (b"\x1b[1;3B".as_slice(), PaneCommand::FocusDown),
+            (b"\x1b[1;3A".as_slice(), PaneCommand::FocusUp),
+            (b"\x1b[1;3C".as_slice(), PaneCommand::FocusRight),
+        ];
+
+        for (input, command) in cases {
+            let mut state = LiveSnapshotInputState::default();
+            assert_eq!(
+                translate_live_snapshot_input(input, &mut state),
+                vec![LiveSnapshotInputAction::PaneCommand(command)]
+            );
+            assert!(!state.saw_prefix);
+        }
+    }
+
+    #[test]
+    fn live_snapshot_input_uses_prefix_ctrl_arrow_keys_for_fine_resize() {
+        let cases = [
+            (
+                b"\x02\x1b[1;5D".as_slice(),
+                protocol::PaneResizeDirection::Left,
+            ),
+            (
+                b"\x02\x1b[1;5B".as_slice(),
+                protocol::PaneResizeDirection::Down,
+            ),
+            (
+                b"\x02\x1b[1;5A".as_slice(),
+                protocol::PaneResizeDirection::Up,
+            ),
+            (
+                b"\x02\x1b[1;5C".as_slice(),
+                protocol::PaneResizeDirection::Right,
+            ),
+        ];
+
+        for (input, direction) in cases {
+            let mut state = LiveSnapshotInputState::default();
+            assert_eq!(
+                translate_live_snapshot_input(input, &mut state),
+                vec![LiveSnapshotInputAction::PaneCommand(PaneCommand::Resize {
+                    direction,
+                    amount: 1,
+                })]
+            );
+            assert!(!state.saw_prefix);
+        }
+    }
+
+    #[test]
     fn live_snapshot_input_shows_pane_numbers_on_prefix_q() {
         let mut state = LiveSnapshotInputState::default();
 
@@ -5704,6 +6096,44 @@ mod tests {
         for (key, command) in cases {
             assert_eq!(
                 translate_attach_input(&[0x02, key], &mut false),
+                vec![AttachInputAction::PaneCommand(command)]
+            );
+        }
+    }
+
+    #[test]
+    fn attach_input_uses_prefix_arrow_keys_for_pane_focus() {
+        let cases = [
+            (b"\x02\x1b[D".as_slice(), PaneCommand::FocusLeft),
+            (b"\x02\x1b[B".as_slice(), PaneCommand::FocusDown),
+            (b"\x02\x1b[A".as_slice(), PaneCommand::FocusUp),
+            (b"\x02\x1b[C".as_slice(), PaneCommand::FocusRight),
+        ];
+
+        for (input, command) in cases {
+            assert_eq!(
+                translate_attach_input(input, &mut false),
+                vec![AttachInputAction::PaneCommand(command)]
+            );
+        }
+    }
+
+    #[test]
+    fn attach_input_uses_alt_keys_for_pane_focus_without_prefix() {
+        let cases = [
+            (b"\x1bh".as_slice(), PaneCommand::FocusLeft),
+            (b"\x1bj".as_slice(), PaneCommand::FocusDown),
+            (b"\x1bk".as_slice(), PaneCommand::FocusUp),
+            (b"\x1bl".as_slice(), PaneCommand::FocusRight),
+            (b"\x1b[1;3D".as_slice(), PaneCommand::FocusLeft),
+            (b"\x1b[1;3B".as_slice(), PaneCommand::FocusDown),
+            (b"\x1b[1;3A".as_slice(), PaneCommand::FocusUp),
+            (b"\x1b[1;3C".as_slice(), PaneCommand::FocusRight),
+        ];
+
+        for (input, command) in cases {
+            assert_eq!(
+                translate_attach_input(input, &mut false),
                 vec![AttachInputAction::PaneCommand(command)]
             );
         }

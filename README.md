@@ -107,12 +107,14 @@ newline-separated prompt commands with blank lines and leading-`#` comments
 ignored.
 
 Key bindings and options are runtime/server-scoped and reset when the dmux
-server exits. Use `dmux list-keys` to inspect prefix bindings and
+server exits. Use `dmux list-keys` to inspect bindings and
 `dmux bind-key <key> <action>`/`dmux unbind-key <key>` to customize supported
 live actions such as `copy-mode`, `detach-client`, `command-prompt`,
-`split-window -h|-v`, `select-pane -L|-D|-U|-R`, `resize-pane -L|-D|-U|-R`,
+`split-window -h|-v`, `select-pane -L|-D|-U|-R`, `resize-pane -L|-D|-U|-R [amount]`,
 `next-pane`, `new-window`, `next-window`, `previous-window`, `kill-pane`, and
-`zoom-pane`.
+`zoom-pane`. Keys can be printable characters, `Space`, `Tab`, `Enter`,
+`Escape`, arrows, `C-<letter>`, `C-<arrow>`, or `M-<key>`/`Alt-<key>`. Ordinary
+bindings are prefix chords; `M-`/`Alt-` bindings are no-prefix attach shortcuts.
 Use `dmux show-options` and `dmux set-option prefix C-a` to inspect or change
 validated runtime options; `status-hints` accepts `on` or `off`.
 
@@ -126,11 +128,12 @@ copies lines from the rendered composed layout, including pane separators and
 visible content from multiple panes, while input is routed to the server active
 pane. Unzoomed multi-pane attach handles `C-b d` to detach (`C-b D` also detaches), `C-b ?` to show
 attach help, `C-b :` to run attached commands such as rename/select/kill/list/paste/split/layout, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
-`C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` to focus by
-direction, `C-b H/J/K/L` to resize the active pane left/down/up/right by
-5 cells, `C-b o` to cycle the server active pane, `C-b q` followed by a single
-digit to select a pane by number, `C-b x` to close the active pane, `C-b z` to
-toggle zoom, and mouse click to select a pane. `C-b c`, `C-b n`, `C-b p`,
+`C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` or `C-b` arrows to focus by
+direction, `Alt-h/j/k/l` or `Alt` arrows to focus without prefix, `C-b H/J/K/L`
+to resize the active pane left/down/up/right by 5 cells, `C-b Ctrl-arrows` to
+resize by 1 cell, `C-b o` to cycle the server active pane, `C-b q` followed by
+a single digit to select a pane by number, `C-b x` to close the active pane,
+`C-b z` to toggle zoom, and mouse click to select a pane. `C-b c`, `C-b n`, `C-b p`,
 `C-b %`, and `C-b "` also work
 from a fresh single-pane attach and transition automatically into the multi-pane
 layout view. Pane splitting is also available with
