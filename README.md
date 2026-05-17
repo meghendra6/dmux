@@ -70,6 +70,15 @@ when needed. `dmux attach` without `-t` also targets `default`. Explicit
 `dmux ls`, `dmux attach -t <name>`, and `dmux kill-session -t <name>` report
 when no server is running instead of starting an empty daemon.
 
+Attached clients show a status line with the active session/window/pane plus
+quick affordances: `prefix C-b | C-b ? help | : command | [ copy`. Press `C-b ?` for
+a grouped attach help overlay covering session, window, pane, copy-mode, and
+command-prompt workflows. Press `C-b :` for an attached command prompt that
+shows the typed command and controls (`Enter` run, Escape/`C-c` cancel,
+Backspace edit), with examples such as `:split -h`, `:split -v`,
+`:rename-window api`, `:list-windows`, and `:paste-buffer`. Unknown attached
+commands report a hint to use `C-b ?` and show common examples.
+
 Attached clients can enter the current basic copy-mode view with `C-b [`.
 Inside copy-mode, `j`/`k`, arrows, `Ctrl-n`/`Ctrl-p`, PageUp/PageDown, and
 Home/End-style `g`/`G` move the cursor and viewport, `y` or Enter saves the
@@ -79,7 +88,7 @@ currently basic line-level selection. In unzoomed multi-pane attach, copy-mode
 copies lines from the rendered composed layout, including pane separators and
 visible content from multiple panes, while input is routed to the server active
 pane. Unzoomed multi-pane attach handles `C-b d` to detach (`C-b D` also detaches), `C-b ?` to show
-attach help, `C-b :` to run basic attached commands such as rename/select/kill/list/paste, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
+attach help, `C-b :` to run attached commands such as rename/select/kill/list/paste/split, `C-b c` to create a new window, `C-b n`/`C-b p` to cycle windows,
 `C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` to focus by
 direction, `C-b H/J/K/L` to resize the active pane left/down/up/right by
 5 cells, `C-b o` to cycle the server active pane, `C-b q` followed by a single
@@ -155,9 +164,10 @@ Implemented Phase 2 groundwork:
 - formatted buffer listing with latest marker, byte/line counts, and previews
 - latest-buffer status/display-message format fields with token-like data safety
 - bounded transient display messages in attach render output
+- grouped attach help overlay plus visible command-prompt input and controls
 - attach-time basic copy-mode key handling for line copy
 - attach-time basic copy-mode mouse selection for line ranges
-- attach-time statusline snapshot rendering
+- attach-time statusline snapshot rendering with prefix/help/command/copy affordances
 - attach-time split-pane layout snapshot rendering
 - event-driven live redraw for multi-pane attach with polling fallback
 - active-pane input routing for multi-pane attach

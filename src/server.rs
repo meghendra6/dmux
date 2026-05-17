@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+use unicode_width::UnicodeWidthChar;
 
 const MAX_HISTORY_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
@@ -3219,7 +3220,10 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{buffer.latest}", buffer_latest),
         ("#{buffer.preview}", buffer_preview),
         ("#{window.zoomed_flag}", window_zoomed),
-        ("#{status.help}", "C-b ? help"),
+        (
+            "#{status.help}",
+            "prefix C-b | C-b ? help | : command | [ copy",
+        ),
     ];
     apply_replacements(format, &replacements)
 }
@@ -3926,48 +3930,55 @@ fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
     let context = session.status_context()?;
     let status = format_status_line(ATTACH_RENDER_STATUS_FORMAT, &context);
     let message = context.transient_message.as_deref();
-    let header_rows = usize::from(!status.is_empty()) + usize::from(message.is_some());
-    let snapshot_rows = session
-        .active_window_size()
+    let size = session.active_window_size();
+    let width = size.map(|size| usize::from(size.cols));
+    let max_header_rows = size.map(max_attach_render_header_rows);
+    let header_lines = cap_attach_render_header_lines(
+        attach_render_header_lines(&status, message, width),
+        max_header_rows,
+        width,
+    );
+    let header_rows = header_lines.len();
+    let snapshot_rows = size
         .map(|size| usize::from(size.rows).saturating_sub(header_rows))
         .unwrap_or(usize::MAX);
     let snapshot = attach_pane_frame_with_regions(session)?;
-    Some(format_attach_render_frame_body(
-        &status,
-        message,
+    Some(format_attach_render_frame_body_with_header_lines(
+        &header_lines,
         &snapshot,
         snapshot_rows,
     ))
 }
 
+#[cfg(test)]
 fn format_attach_render_frame_body(
     status: &str,
     message: Option<&str>,
     snapshot: &RenderedAttachSnapshot,
     snapshot_rows: usize,
 ) -> Vec<u8> {
+    let header_lines = attach_render_header_lines(status, message, None);
+    format_attach_render_frame_body_with_header_lines(&header_lines, snapshot, snapshot_rows)
+}
+
+fn format_attach_render_frame_body_with_header_lines(
+    header_lines: &[String],
+    snapshot: &RenderedAttachSnapshot,
+    snapshot_rows: usize,
+) -> Vec<u8> {
     let mut output = Vec::new();
     output.extend_from_slice(CURSOR_HOME);
-    if !status.is_empty() {
-        write_render_output_line(&mut output, status.as_bytes(), true);
-    }
-    if let Some(message) = message {
-        write_render_output_line(&mut output, message.as_bytes(), true);
+    for line in header_lines {
+        write_render_output_line(&mut output, line.as_bytes(), true);
     }
     write_render_output_rows(&mut output, snapshot.text.as_bytes(), snapshot_rows);
     if let Some(cursor) = snapshot.cursor {
-        write_cursor_position(
-            &mut output,
-            cursor,
-            usize::from(!status.is_empty()) + usize::from(message.is_some()),
-            snapshot_rows,
-        );
+        write_cursor_position(&mut output, cursor, header_lines.len(), snapshot_rows);
     }
 
     let mut header = String::new();
     header.push_str("HEADER_ROWS\t");
-    header
-        .push_str(&(usize::from(!status.is_empty()) + usize::from(message.is_some())).to_string());
+    header.push_str(&header_lines.len().to_string());
     header.push('\n');
     header.push_str("REGIONS\t");
     header.push_str(&snapshot.regions.len().to_string());
@@ -3992,6 +4003,91 @@ fn format_attach_render_frame_body(
     let mut bytes = header.into_bytes();
     bytes.extend_from_slice(&output);
     bytes
+}
+
+fn max_attach_render_header_rows(size: PtySize) -> usize {
+    let rows = usize::from(size.rows);
+    if rows > 1 { rows - 1 } else { rows }
+}
+
+fn attach_render_header_lines(
+    status: &str,
+    message: Option<&str>,
+    width: Option<usize>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !status.is_empty() {
+        lines.push(truncate_attach_render_header_line(status, width));
+    }
+    if let Some(message) = message {
+        for line in message.lines() {
+            lines.push(truncate_attach_render_header_line(line, width));
+        }
+    }
+    lines
+}
+
+fn cap_attach_render_header_lines(
+    mut lines: Vec<String>,
+    max_rows: Option<usize>,
+    width: Option<usize>,
+) -> Vec<String> {
+    let Some(max_rows) = max_rows else {
+        return lines;
+    };
+    if lines.len() <= max_rows {
+        return lines;
+    }
+    if max_rows == 0 {
+        return Vec::new();
+    }
+
+    let omitted = lines.len() - max_rows + 1;
+    lines.truncate(max_rows);
+    lines[max_rows - 1] =
+        truncate_attach_render_header_line(&format!("... {omitted} more lines"), width);
+    lines
+}
+
+fn truncate_attach_render_header_line(line: &str, width: Option<usize>) -> String {
+    let line = line.trim_end_matches('\r');
+    let Some(width) = width else {
+        return line.to_string();
+    };
+    if width == 0 {
+        return String::new();
+    }
+    if display_cell_width(line) <= width {
+        return line.to_string();
+    }
+    if width <= 3 {
+        return take_cells(line, width);
+    }
+    let mut output = take_cells(line, width - 3);
+    output.push_str("...");
+    output
+}
+
+fn display_cell_width(line: &str) -> usize {
+    line.chars().map(char_cell_width).sum()
+}
+
+fn take_cells(line: &str, max_cells: usize) -> String {
+    let mut output = String::new();
+    let mut used = 0;
+    for ch in line.chars() {
+        let width = char_cell_width(ch);
+        if used + width > max_cells {
+            break;
+        }
+        output.push(ch);
+        used += width;
+    }
+    output
+}
+
+fn char_cell_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
 }
 
 fn write_cursor_position(
@@ -6244,6 +6340,74 @@ left | right\r\n"
         assert!(body.contains("\x1b[H\x1b[2Kstatus\r\n"), "{body:?}");
         assert!(body.contains("\x1b[2Kleft | right"), "{body:?}");
         assert!(!body.contains("SNAPSHOT\t"), "{body:?}");
+    }
+
+    #[test]
+    fn attach_render_header_lines_truncate_and_count_message_rows() {
+        let lines = attach_render_header_lines(
+            "session-with-a-very-long-status-line",
+            Some("first long line\nsecond"),
+            Some(12),
+        );
+
+        assert_eq!(lines, vec!["session-w...", "first lon...", "second"]);
+    }
+
+    #[test]
+    fn attach_render_header_lines_truncate_wide_chars_to_terminal_cells() {
+        let lines = attach_render_header_lines("界界界界", None, Some(5));
+
+        assert_eq!(lines, vec!["界..."]);
+        assert!(lines.iter().all(|line| display_cell_width(line) <= 5));
+    }
+
+    #[test]
+    fn attach_render_header_lines_cap_to_terminal_height() {
+        let lines = attach_render_header_lines("status", Some("one\ntwo\nthree\nfour"), Some(12));
+
+        let capped = cap_attach_render_header_lines(
+            lines,
+            Some(max_attach_render_header_rows(PtySize { cols: 12, rows: 4 })),
+            Some(12),
+        );
+
+        assert_eq!(capped, vec!["status", "one", "... 3 mor..."]);
+    }
+
+    #[test]
+    fn format_attach_render_frame_uses_capped_header_rows_for_cursor() {
+        let snapshot = RenderedAttachSnapshot {
+            text: "pane\r\n".to_string(),
+            regions: vec![PaneRegion {
+                pane: 0,
+                row_start: 0,
+                row_end: 1,
+                col_start: 0,
+                col_end: 10,
+            }],
+            cursor: Some(RenderedCursor {
+                row: 0,
+                col: 1,
+                visible: true,
+            }),
+        };
+        let header_lines = cap_attach_render_header_lines(
+            attach_render_header_lines("status", Some("one\ntwo\nthree\nfour"), Some(12)),
+            Some(3),
+            Some(12),
+        );
+
+        let body = String::from_utf8(format_attach_render_frame_body_with_header_lines(
+            &header_lines,
+            &snapshot,
+            1,
+        ))
+        .expect("render frame utf8");
+
+        assert!(body.starts_with("HEADER_ROWS\t3\n"), "{body:?}");
+        assert!(body.contains("\x1b[2K... 3 mor...\r\n"), "{body:?}");
+        assert!(body.ends_with("\x1b[?25h\x1b[4;2H"), "{body:?}");
+        assert!(!body.contains("\x1b[2Ktwo\r\n"), "{body:?}");
     }
 
     #[test]

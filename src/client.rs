@@ -9,6 +9,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthChar;
 
 static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
 static MOUSE_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -551,19 +552,7 @@ fn write_initial_live_snapshot_frame(
     socket: &Path,
     session: &str,
 ) -> io::Result<LiveSnapshotFrame> {
-    write_live_snapshot_frame_with_message_and_clear(socket, session, None, true)
-}
-
-fn write_live_snapshot_frame(socket: &Path, session: &str) -> io::Result<LiveSnapshotFrame> {
-    write_live_snapshot_frame_with_message(socket, session, None)
-}
-
-fn write_live_snapshot_frame_with_message(
-    socket: &Path,
-    session: &str,
-    message: Option<&str>,
-) -> io::Result<LiveSnapshotFrame> {
-    write_live_snapshot_frame_with_message_and_clear(socket, session, message, false)
+    write_live_snapshot_frame_with_message_and_clear(socket, session, None, true, false)
 }
 
 fn write_live_snapshot_frame_with_message_and_clear(
@@ -571,10 +560,11 @@ fn write_live_snapshot_frame_with_message_and_clear(
     session: &str,
     message: Option<&str>,
     clear: bool,
+    prioritize_message: bool,
 ) -> io::Result<LiveSnapshotFrame> {
     let status = read_attach_status_line(socket, session)?;
     let snapshot = read_attach_layout_frame(socket, session)?;
-    write_live_frame_to_stdout(&status, message, &snapshot, clear)
+    write_live_frame_to_stdout(&status, message, &snapshot, clear, prioritize_message)
 }
 
 fn write_live_frame_to_stdout(
@@ -582,9 +572,22 @@ fn write_live_frame_to_stdout(
     message: Option<&str>,
     snapshot: &AttachLayoutSnapshotResponse,
     clear: bool,
+    prioritize_message: bool,
 ) -> io::Result<LiveSnapshotFrame> {
-    let header_rows = usize::from(!status.is_empty()) + usize::from(message.is_some());
-    let snapshot_rows = detect_attach_size()
+    let attach_size = detect_attach_size();
+    let width = attach_size.map(|size| usize::from(size.cols));
+    let max_header_rows = attach_size.map(|size| {
+        let rows = usize::from(size.rows);
+        if rows > 1 { rows - 1 } else { rows }
+    });
+    let header_lines = cap_live_header_lines(
+        live_header_lines(status, message, width),
+        max_header_rows,
+        width,
+        prioritize_message && message.is_some(),
+    );
+    let header_rows = header_lines.len();
+    let snapshot_rows = attach_size
         .map(|size| usize::from(size.rows).saturating_sub(header_rows))
         .unwrap_or(usize::MAX);
 
@@ -594,11 +597,8 @@ fn write_live_frame_to_stdout(
     } else {
         stdout.write_all(CURSOR_HOME)?;
     }
-    if !status.is_empty() {
-        write_repaint_line(&mut stdout, status.as_bytes(), !clear)?;
-    }
-    if let Some(message) = message {
-        write_repaint_line(&mut stdout, message.as_bytes(), !clear)?;
+    for line in header_lines {
+        write_repaint_line(&mut stdout, line.as_bytes(), !clear)?;
     }
     if clear {
         write_snapshot_rows(&mut stdout, &snapshot.snapshot, snapshot_rows)?;
@@ -611,6 +611,85 @@ fn write_live_frame_to_stdout(
         regions: snapshot.regions.clone(),
         header_rows,
     })
+}
+
+fn live_header_lines(status: &str, message: Option<&str>, width: Option<usize>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !status.is_empty() {
+        lines.push(truncate_header_line(status, width));
+    }
+    if let Some(message) = message {
+        for line in message.lines() {
+            lines.push(truncate_header_line(line, width));
+        }
+    }
+    lines
+}
+
+fn cap_live_header_lines(
+    mut lines: Vec<String>,
+    max_rows: Option<usize>,
+    width: Option<usize>,
+    prioritize_tail: bool,
+) -> Vec<String> {
+    let Some(max_rows) = max_rows else {
+        return lines;
+    };
+    if lines.len() <= max_rows {
+        return lines;
+    }
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    if prioritize_tail {
+        return lines[lines.len() - max_rows..].to_vec();
+    }
+
+    let omitted = lines.len() - max_rows + 1;
+    lines.truncate(max_rows);
+    lines[max_rows - 1] = truncate_header_line(&format!("... {omitted} more lines"), width);
+    lines
+}
+
+fn truncate_header_line(line: &str, width: Option<usize>) -> String {
+    let line = line.trim_end_matches('\r');
+    let Some(width) = width else {
+        return line.to_string();
+    };
+    if width == 0 {
+        return String::new();
+    }
+    if display_cell_width(line) <= width {
+        return line.to_string();
+    }
+    if width <= 3 {
+        return take_cells(line, width);
+    }
+    let mut output = take_cells(line, width - 3);
+    output.push_str("...");
+    output
+}
+
+fn display_cell_width(line: &str) -> usize {
+    line.chars().map(char_cell_width).sum()
+}
+
+fn take_cells(line: &str, max_cells: usize) -> String {
+    let mut output = String::new();
+    let mut used = 0;
+    for ch in line.chars() {
+        let width = char_cell_width(ch);
+        if used + width > max_cells {
+            break;
+        }
+        output.push(ch);
+        used += width;
+    }
+    output
+}
+
+fn char_cell_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
 }
 
 fn write_repaint_line(stdout: &mut impl Write, line: &[u8], clear_line: bool) -> io::Result<()> {
@@ -968,6 +1047,7 @@ enum AttachInputAction {
     Forward(Vec<u8>),
     PaneCommand(PaneCommand),
     CommandPromptStart,
+    CommandPromptUpdate(String),
     CommandPromptDispatch(String),
     CommandPromptCancel,
     SelectNextPane,
@@ -984,6 +1064,7 @@ enum LiveSnapshotInputAction {
     MousePress(MousePosition),
     PaneCommand(PaneCommand),
     CommandPromptStart,
+    CommandPromptUpdate(String),
     CommandPromptDispatch(String),
     CommandPromptCancel,
     Detach,
@@ -1129,8 +1210,16 @@ fn translate_attach_input_with_state(
                 }
                 0x7f | 0x08 => {
                     command.pop();
+                    actions.push(AttachInputAction::CommandPromptUpdate(
+                        String::from_utf8_lossy(command).to_string(),
+                    ));
                 }
-                byte if !byte.is_ascii_control() => command.push(byte),
+                byte if !byte.is_ascii_control() => {
+                    command.push(byte);
+                    actions.push(AttachInputAction::CommandPromptUpdate(
+                        String::from_utf8_lossy(command).to_string(),
+                    ));
+                }
                 _ => {}
             }
             offset += 1;
@@ -1415,8 +1504,16 @@ fn translate_live_snapshot_input_with_mouse(
                 }
                 0x7f | 0x08 => {
                     command.pop();
+                    actions.push(LiveSnapshotInputAction::CommandPromptUpdate(
+                        String::from_utf8_lossy(command).to_string(),
+                    ));
                 }
-                byte if !byte.is_ascii_control() => command.push(byte),
+                byte if !byte.is_ascii_control() => {
+                    command.push(byte);
+                    actions.push(LiveSnapshotInputAction::CommandPromptUpdate(
+                        String::from_utf8_lossy(command).to_string(),
+                    ));
+                }
                 _ => {}
             }
             offset += 1;
@@ -1824,6 +1921,7 @@ enum LiveSnapshotInputEvent {
     MousePress(MousePosition),
     PaneCommand(PaneCommand),
     CommandPromptStart,
+    CommandPromptUpdate(String),
     CommandPromptDispatch(String),
     CommandPromptCancel,
     SelectNextPane,
@@ -1963,6 +2061,9 @@ fn send_live_snapshot_input_actions<R: Read>(
             }
             LiveSnapshotInputAction::CommandPromptStart => {
                 let _ = sender.send(LiveSnapshotInputEvent::CommandPromptStart);
+            }
+            LiveSnapshotInputAction::CommandPromptUpdate(command) => {
+                let _ = sender.send(LiveSnapshotInputEvent::CommandPromptUpdate(command));
             }
             LiveSnapshotInputAction::CommandPromptDispatch(command) => {
                 let _ = sender.send(LiveSnapshotInputEvent::CommandPromptDispatch(command));
@@ -2237,6 +2338,7 @@ fn run_live_snapshot_attach(
     let mut event_stream_active = false;
     let mut fallback_event_stream_started = false;
     let mut pane_number_message = None;
+    let mut command_prompt_message: Option<String> = None;
     let mut pending_input_repaint_deadline = None;
     let mut render_output_state = LiveRenderOutputState::default();
 
@@ -2258,10 +2360,11 @@ fn run_live_snapshot_attach(
                         || (!event_stream_active
                             && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL))
                 {
-                    frame = write_live_snapshot_frame_with_pane_number_message(
+                    frame = write_live_snapshot_frame_with_active_message(
                         socket,
                         session,
                         &mut pane_number_message,
+                        command_prompt_message.as_deref(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2283,10 +2386,11 @@ fn run_live_snapshot_attach(
                     )),
                 };
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame_with_pane_number_message(
+                    frame = write_live_snapshot_frame_with_active_message(
                         socket,
                         session,
                         &mut pane_number_message,
+                        command_prompt_message.as_deref(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2294,15 +2398,29 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::CommandPromptStart) => {
-                pane_number_message = Some((
-                    ":".to_string(),
-                    Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
-                ));
+                pane_number_message = None;
+                command_prompt_message = Some(attach_command_prompt_text(""));
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame_with_pane_number_message(
+                    frame = write_live_snapshot_frame_with_active_message(
                         socket,
                         session,
                         &mut pane_number_message,
+                        command_prompt_message.as_deref(),
+                    )?;
+                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    reset_live_render_output_state(&mut render_output_state);
+                }
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::CommandPromptUpdate(command)) => {
+                pane_number_message = None;
+                command_prompt_message = Some(attach_command_prompt_text(&command));
+                if !redraw_paused {
+                    frame = write_live_snapshot_frame_with_active_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                        command_prompt_message.as_deref(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2310,15 +2428,17 @@ fn run_live_snapshot_attach(
                 last_redraw = Instant::now();
             }
             Ok(LiveSnapshotInputEvent::CommandPromptCancel) => {
+                command_prompt_message = None;
                 pane_number_message = Some((
                     "cancelled".to_string(),
                     Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
                 ));
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame_with_pane_number_message(
+                    frame = write_live_snapshot_frame_with_active_message(
                         socket,
                         session,
                         &mut pane_number_message,
+                        command_prompt_message.as_deref(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2327,6 +2447,7 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::CommandPromptDispatch(command)) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                command_prompt_message = None;
                 let command_result = dispatch_attach_command(socket, session, &command);
                 pane_number_message = match command_result {
                     Ok(AttachCommandResult {
@@ -2343,10 +2464,11 @@ fn run_live_snapshot_attach(
                     )),
                 };
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame_with_pane_number_message(
+                    frame = write_live_snapshot_frame_with_active_message(
                         socket,
                         session,
                         &mut pane_number_message,
+                        command_prompt_message.as_deref(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2358,7 +2480,12 @@ fn run_live_snapshot_attach(
                 select_next_pane(socket, session)?;
                 pane_number_message = None;
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame(socket, session)?;
+                    frame = write_live_snapshot_frame_with_active_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                        command_prompt_message.as_deref(),
+                    )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
                 }
@@ -2369,10 +2496,11 @@ fn run_live_snapshot_attach(
                 let message = pane_number_message_text(socket, session)?;
                 pane_number_message =
                     Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
-                frame = write_live_snapshot_frame_with_pane_number_message(
+                frame = write_live_snapshot_frame_with_active_message(
                     socket,
                     session,
                     &mut pane_number_message,
+                    command_prompt_message.as_deref(),
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -2384,10 +2512,11 @@ fn run_live_snapshot_attach(
                     attach_help_message().to_string(),
                     Instant::now() + PANE_NUMBER_DISPLAY_DURATION,
                 ));
-                frame = write_live_snapshot_frame_with_pane_number_message(
+                frame = write_live_snapshot_frame_with_active_message(
                     socket,
                     session,
                     &mut pane_number_message,
+                    command_prompt_message.as_deref(),
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -2398,7 +2527,12 @@ fn run_live_snapshot_attach(
                 let _ = select_numbered_pane(socket, session, index)?;
                 pane_number_message = None;
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame(socket, session)?;
+                    frame = write_live_snapshot_frame_with_active_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                        command_prompt_message.as_deref(),
+                    )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
                 }
@@ -2407,7 +2541,12 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::MousePress(position)) => {
                 let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 if resized && !redraw_paused {
-                    frame = write_live_snapshot_frame(socket, session)?;
+                    frame = write_live_snapshot_frame_with_active_message(
+                        socket,
+                        session,
+                        &mut pane_number_message,
+                        command_prompt_message.as_deref(),
+                    )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
                     last_redraw = Instant::now();
@@ -2418,7 +2557,12 @@ fn run_live_snapshot_attach(
                     let _ = select_numbered_pane(socket, session, pane)?;
                     pane_number_message = None;
                     if !redraw_paused {
-                        frame = write_live_snapshot_frame(socket, session)?;
+                        frame = write_live_snapshot_frame_with_active_message(
+                            socket,
+                            session,
+                            &mut pane_number_message,
+                            command_prompt_message.as_deref(),
+                        )?;
                         sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                         reset_live_render_output_state(&mut render_output_state);
                     }
@@ -2432,7 +2576,12 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::RedrawNow) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 redraw_paused = false;
-                frame = write_live_snapshot_frame(socket, session)?;
+                frame = write_live_snapshot_frame_with_active_message(
+                    socket,
+                    session,
+                    &mut pane_number_message,
+                    command_prompt_message.as_deref(),
+                )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
@@ -2441,10 +2590,11 @@ fn run_live_snapshot_attach(
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 redraw_hint_pending.store(false, Ordering::SeqCst);
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame_with_pane_number_message(
+                    frame = write_live_snapshot_frame_with_active_message(
                         socket,
                         session,
                         &mut pane_number_message,
+                        command_prompt_message.as_deref(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2464,19 +2614,23 @@ fn run_live_snapshot_attach(
                         header_rows: render_frame.header_rows,
                     };
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
-                    if pane_number_message
-                        .as_ref()
-                        .is_some_and(|(_, until)| Instant::now() < *until)
+                    if command_prompt_message.is_some()
+                        || pane_number_message
+                            .as_ref()
+                            .is_some_and(|(_, until)| Instant::now() < *until)
                     {
-                        frame = write_live_snapshot_frame_with_pane_number_message(
+                        frame = write_live_snapshot_frame_with_active_message(
                             socket,
                             session,
                             &mut pane_number_message,
+                            command_prompt_message.as_deref(),
                         )?;
                         sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                         reset_live_render_output_state(&mut render_output_state);
                     } else {
-                        pane_number_message = None;
+                        if command_prompt_message.is_none() {
+                            pane_number_message = None;
+                        }
                         write_live_render_output(&render_frame, &mut render_output_state)?;
                     }
                     last_redraw = Instant::now();
@@ -2527,10 +2681,11 @@ fn run_live_snapshot_attach(
                 if !redraw_paused
                     && (!event_stream_active || resized || message_expired || input_repaint_due)
                 {
-                    frame = write_live_snapshot_frame_with_pane_number_message(
+                    frame = write_live_snapshot_frame_with_active_message(
                         socket,
                         session,
                         &mut pane_number_message,
+                        command_prompt_message.as_deref(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2572,22 +2727,39 @@ fn forward_live_snapshot_input(stream: &mut UnixStream, bytes: &[u8]) -> io::Res
     stream.write_all(bytes)
 }
 
-fn write_live_snapshot_frame_with_pane_number_message(
+fn write_live_snapshot_frame_with_active_message(
     socket: &Path,
     session: &str,
     pane_number_message: &mut Option<(String, Instant)>,
+    command_prompt_message: Option<&str>,
 ) -> io::Result<LiveSnapshotFrame> {
+    let message = active_live_message(pane_number_message, command_prompt_message, Instant::now());
+    write_live_snapshot_frame_with_message_and_clear(
+        socket,
+        session,
+        message,
+        false,
+        command_prompt_message.is_some(),
+    )
+}
+
+fn active_live_message<'a>(
+    pane_number_message: &'a mut Option<(String, Instant)>,
+    command_prompt_message: Option<&'a str>,
+    now: Instant,
+) -> Option<&'a str> {
     if pane_number_message
         .as_ref()
-        .is_some_and(|(_, until)| Instant::now() >= *until)
+        .is_some_and(|(_, until)| now >= *until)
     {
         *pane_number_message = None;
     }
 
-    let message = pane_number_message
-        .as_ref()
-        .map(|(message, _)| message.as_str());
-    write_live_snapshot_frame_with_message(socket, session, message)
+    command_prompt_message.or_else(|| {
+        pane_number_message
+            .as_ref()
+            .map(|(message, _)| message.as_str())
+    })
 }
 
 fn pane_entries(socket: &Path, session: &str) -> io::Result<Vec<PaneListEntry>> {
@@ -2831,7 +3003,7 @@ fn raw_pending_input(
                 pending.extend_from_slice(command.as_bytes());
                 pending.push(b'\n');
             }
-            AttachInputAction::CommandPromptCancel => {}
+            AttachInputAction::CommandPromptUpdate(_) | AttachInputAction::CommandPromptCancel => {}
         }
     }
     if saw_prefix {
@@ -2898,7 +3070,10 @@ where
         for (index, action) in actions.iter().enumerate() {
             match action {
                 AttachInputAction::Forward(output) => stream.write_all(&output)?,
-                AttachInputAction::CommandPromptStart => write_attach_command_prompt()?,
+                AttachInputAction::CommandPromptStart => write_attach_command_prompt("", true)?,
+                AttachInputAction::CommandPromptUpdate(command) => {
+                    write_attach_command_prompt(command, false)?
+                }
                 AttachInputAction::CommandPromptCancel => {
                     write_attach_transient_message("cancelled")?
                 }
@@ -3317,18 +3492,41 @@ fn write_copy_mode_message(message: &str) -> io::Result<()> {
 }
 
 fn attach_help_message() -> &'static str {
-    cli::attach_help_summary()
+    cli::attach_help_overlay()
 }
 
 fn write_attach_help_message() -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    stdout.write_all(format!("\r\n-- dmux help: {} --\r\n", attach_help_message()).as_bytes())?;
+    stdout.write_all(
+        format!(
+            "\r\n-- dmux help --\r\n{}-- end dmux help --\r\n",
+            attach_help_message()
+        )
+        .as_bytes(),
+    )?;
     stdout.flush()
 }
 
-fn write_attach_command_prompt() -> io::Result<()> {
+fn attach_command_prompt_text(command: &str) -> String {
+    format!(
+        ":{command}  (Enter run | Esc/C-c cancel | Backspace edit | examples: split -h, split -v, rename-window name)"
+    )
+}
+
+fn attach_command_prompt_display_text(command: &str, width: Option<usize>) -> String {
+    truncate_header_line(&attach_command_prompt_text(command), width)
+}
+
+fn write_attach_command_prompt(command: &str, fresh: bool) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    stdout.write_all(b"\r\n:")?;
+    let width = detect_attach_size().map(|size| usize::from(size.cols));
+    if fresh {
+        stdout.write_all(b"\r\n")?;
+    } else {
+        stdout.write_all(b"\r")?;
+    }
+    stdout.write_all(CLEAR_LINE)?;
+    stdout.write_all(attach_command_prompt_display_text(command, width).as_bytes())?;
     stdout.flush()
 }
 
@@ -3447,7 +3645,7 @@ fn dispatch_attach_command(
         }
         other => {
             return Err(io::Error::other(format!(
-                "unknown attach command {other:?}"
+                "unknown attach command {other:?}; press C-b ? for help or try :split -h, :rename-window <name>, :list-windows, :paste-buffer"
             )));
         }
     };
@@ -4915,12 +5113,22 @@ mod tests {
     fn live_snapshot_input_dispatches_prefix_colon_command_prompt() {
         let mut state = LiveSnapshotInputState::default();
 
+        let actions = translate_live_snapshot_input(b"\x02:rename-window work\r", &mut state);
+
         assert_eq!(
-            translate_live_snapshot_input(b"\x02:rename-window work\r", &mut state),
-            vec![
-                LiveSnapshotInputAction::CommandPromptStart,
-                LiveSnapshotInputAction::CommandPromptDispatch("rename-window work".to_string()),
-            ]
+            actions.first(),
+            Some(&LiveSnapshotInputAction::CommandPromptStart)
+        );
+        assert!(
+            actions.contains(&LiveSnapshotInputAction::CommandPromptUpdate(
+                "rename-window work".to_string()
+            ))
+        );
+        assert_eq!(
+            actions.last(),
+            Some(&LiveSnapshotInputAction::CommandPromptDispatch(
+                "rename-window work".to_string()
+            ))
         );
         assert!(state.command_prompt.is_none());
     }
@@ -5019,12 +5227,20 @@ mod tests {
     fn attach_input_dispatches_prefix_colon_command_prompt() {
         let mut state = RawAttachInputState::default();
 
+        let actions = translate_attach_input_with_state(b"\x02:select-window 1\n", &mut state);
+
         assert_eq!(
-            translate_attach_input_with_state(b"\x02:select-window 1\n", &mut state),
-            vec![
-                AttachInputAction::CommandPromptStart,
-                AttachInputAction::CommandPromptDispatch("select-window 1".to_string()),
-            ]
+            actions.first(),
+            Some(&AttachInputAction::CommandPromptStart)
+        );
+        assert!(actions.contains(&AttachInputAction::CommandPromptUpdate(
+            "select-window 1".to_string()
+        )));
+        assert_eq!(
+            actions.last(),
+            Some(&AttachInputAction::CommandPromptDispatch(
+                "select-window 1".to_string()
+            ))
         );
         assert!(state.command_prompt.is_none());
     }
@@ -5944,10 +6160,110 @@ mod tests {
     }
 
     #[test]
-    fn attach_help_message_reuses_cli_summary() {
-        assert_eq!(attach_help_message(), crate::cli::attach_help_summary());
-        assert!(attach_help_message().contains("C-b C-b literal prefix"));
-        assert!(attach_help_message().contains("dmux select-pane"));
+    fn attach_help_message_reuses_cli_overlay() {
+        assert_eq!(attach_help_message(), crate::cli::attach_help_overlay());
+        assert!(attach_help_message().contains("Session:"));
+        assert!(attach_help_message().contains("Prompt examples:"));
+        assert!(
+            attach_help_message()
+                .contains("copy-mode: j/k arrows PgUp/PgDn y/Enter copy q/Esc exit")
+        );
+    }
+
+    #[test]
+    fn command_prompt_message_shows_command_and_controls() {
+        let message = attach_command_prompt_text("rename-window api");
+
+        assert!(message.contains(":rename-window api"), "{message}");
+        assert!(message.contains("Enter run"), "{message}");
+        assert!(message.contains("Esc/C-c cancel"), "{message}");
+        assert!(message.contains("split -h"), "{message}");
+    }
+
+    #[test]
+    fn raw_command_prompt_display_truncates_to_terminal_cells() {
+        let message = attach_command_prompt_display_text("rename-window 界界界界", Some(24));
+
+        assert!(display_cell_width(&message) <= 24, "{message}");
+        assert!(message.ends_with("..."), "{message}");
+    }
+
+    #[test]
+    fn live_header_lines_truncate_to_terminal_width() {
+        let lines = live_header_lines(
+            "session-with-a-very-long-status-line",
+            Some(&attach_command_prompt_text("rename-window api")),
+            Some(20),
+        );
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| line.chars().count() <= 20));
+        assert_eq!(lines[0], "session-with-a-ve...");
+        assert!(lines[1].ends_with("..."), "{lines:?}");
+    }
+
+    #[test]
+    fn live_header_lines_truncate_wide_chars_to_terminal_cells() {
+        let lines = live_header_lines("界界界界", None, Some(5));
+
+        assert_eq!(lines, vec!["界..."]);
+        assert!(lines.iter().all(|line| display_cell_width(line) <= 5));
+    }
+
+    #[test]
+    fn live_header_lines_count_multiline_help_rows() {
+        let lines = live_header_lines("status", Some("first long line\nsecond"), Some(10));
+
+        assert_eq!(lines, vec!["status", "first l...", "second"]);
+    }
+
+    #[test]
+    fn cap_live_header_lines_reserves_snapshot_row_when_possible() {
+        let lines = live_header_lines("status", Some("one\ntwo\nthree\nfour"), Some(12));
+
+        let capped = cap_live_header_lines(lines, Some(3), Some(12), false);
+
+        assert_eq!(capped, vec!["status", "one", "... 3 mor..."]);
+    }
+
+    #[test]
+    fn cap_live_header_lines_prioritizes_active_prompt_on_tiny_terminals() {
+        let lines = live_header_lines("status", Some(":rename-window api"), Some(20));
+
+        let capped = cap_live_header_lines(lines, Some(1), Some(20), true);
+
+        assert_eq!(capped, vec![":rename-window api"]);
+    }
+
+    #[test]
+    fn active_live_message_keeps_command_prompt_visible_after_transient_expiry() {
+        let now = Instant::now();
+        let mut transient = Some(("old".to_string(), now));
+
+        let message = active_live_message(&mut transient, Some(":rename-window api"), now);
+
+        assert_eq!(message, Some(":rename-window api"));
+        assert!(transient.is_none());
+    }
+
+    #[test]
+    fn attach_input_reports_command_prompt_updates() {
+        let mut state = RawAttachInputState::default();
+
+        let actions = translate_attach_input_with_state(b"\x02:abc\x7fd", &mut state);
+
+        assert_eq!(
+            actions,
+            vec![
+                AttachInputAction::CommandPromptStart,
+                AttachInputAction::CommandPromptUpdate("a".to_string()),
+                AttachInputAction::CommandPromptUpdate("ab".to_string()),
+                AttachInputAction::CommandPromptUpdate("abc".to_string()),
+                AttachInputAction::CommandPromptUpdate("ab".to_string()),
+                AttachInputAction::CommandPromptUpdate("abd".to_string()),
+            ]
+        );
+        assert_eq!(state.command_prompt, Some(b"abd".to_vec()));
     }
 
     #[test]
