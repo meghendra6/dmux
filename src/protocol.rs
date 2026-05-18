@@ -858,6 +858,14 @@ pub fn encode_agent_event(
     source: Option<&str>,
     changed_at: Option<u64>,
 ) -> String {
+    if source.is_none() && changed_at.is_none() {
+        return format!(
+            "AGENT_EVENT\t{}\t{}\t{}\n",
+            encode_target(target),
+            encode_hex(state.as_bytes()),
+            encode_hex(label.as_bytes())
+        );
+    }
     format!(
         "AGENT_EVENT\t{}\t{}\t{}\t{}\t{}\n",
         encode_target(target),
@@ -2719,6 +2727,28 @@ mod tests {
                 label: "codex".to_string(),
                 source: Some("codex".to_string()),
                 changed_at: Some(123),
+            }
+        );
+    }
+
+    #[test]
+    fn encodes_legacy_agent_event_without_metadata() {
+        let target = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Index(1),
+            pane: PaneTarget::Index(0),
+        };
+        let line = encode_agent_event(&target, "waiting", "codex", None, None);
+
+        assert_eq!(line.matches('\t').count(), 3);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::AgentEvent {
+                target,
+                state: "waiting".to_string(),
+                label: "codex".to_string(),
+                source: None,
+                changed_at: None,
             }
         );
     }
