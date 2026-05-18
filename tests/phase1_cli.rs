@@ -67,6 +67,15 @@ fn dmux(socket: &std::path::Path, args: &[&str]) -> Output {
     dmux_with_timeout(socket, args, Duration::from_secs(5))
 }
 
+fn dmux_with_env(socket: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dmux"));
+    command.env("DEVMUX_SOCKET", socket).args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    output_with_timeout(command, "run dmux with env", Duration::from_secs(5))
+}
+
 fn dmux_with_timeout(socket: &std::path::Path, args: &[&str], timeout: Duration) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dmux"));
     command.env("DEVMUX_SOCKET", socket).args(args);
@@ -3158,6 +3167,182 @@ fn attach_prefix_bang_prints_attention_and_keeps_attach_running() {
     assert!(stdout.contains("dmux attention"), "{stdout:?}");
     assert!(stdout.contains("No attention items."), "{stdout:?}");
 
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attach_prefix_popup_keys_print_tree_detail_and_workspace_registry() {
+    let socket = unique_socket("attach-popup-suite");
+    let registry_path = unique_temp_file("attach-popup-registry");
+    let registry_env = registry_path.to_string_lossy().to_string();
+    let workspace_path = std::env::current_dir()
+        .expect("current dir")
+        .to_string_lossy()
+        .to_string();
+    let session = format!("attach-popup-suite-{}", std::process::id());
+
+    assert_success(&dmux_with_env(
+        &socket,
+        &["workspace-add", &workspace_path],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    assert_success(&dmux_with_env(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf popup-suite-ready; sleep 30",
+        ],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    let ready = poll_capture(&socket, &session, "popup-suite-ready");
+    assert!(ready.contains("popup-suite-ready"), "{ready:?}");
+
+    let mut child = spawn_pty_attached_dmux_with_env(
+        &socket,
+        &["attach", "-t", &session],
+        100,
+        32,
+        &["popup-suite-ready"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    );
+
+    child.write_all(b"\x02w");
+    child.wait_for_stdout_contains_all(
+        &["dmux tree", "C-b w close", "window 0", "pane 0"],
+        "tree popup output",
+    );
+
+    child.write_all(b"\x02i");
+    child.wait_for_stdout_contains_all(
+        &["dmux detail", "C-b i close", "Session:", "Pane:"],
+        "detail popup output",
+    );
+
+    child.write_all(b"\x02A");
+    child.wait_for_stdout_contains_all(
+        &[
+            "dmux workspaces",
+            "C-b A close",
+            "Registered paths",
+            "Live sessions",
+        ],
+        "workspace popup output",
+    );
+
+    child.write_all(b"\x02d");
+    assert_success(&assert_child_exits_within(
+        child,
+        "attach popup suite detach",
+    ));
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(registry_path);
+}
+
+#[test]
+fn workspace_add_persists_registered_path() {
+    let socket = unique_socket("workspace-add");
+    let registry_path = unique_temp_file("workspace-add-registry");
+    let registry_env = registry_path.to_string_lossy().to_string();
+    let workspace_path = std::env::current_dir()
+        .expect("current dir")
+        .to_string_lossy()
+        .to_string();
+
+    assert_success(&dmux_with_env(
+        &socket,
+        &["workspace-add", &workspace_path],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    let listed = dmux_with_env(
+        &socket,
+        &["workspace-list"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    );
+
+    assert_success(&listed);
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains(&workspace_path), "{stdout:?}");
+
+    let _ = std::fs::remove_file(registry_path);
+}
+
+#[test]
+fn agent_event_marks_attention_without_terminal_scraping() {
+    let socket = unique_socket("agent-event-attention");
+    let session = format!("agent-event-attention-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf agent-event-ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "agent-event-ready");
+    assert!(ready.contains("agent-event-ready"), "{ready:?}");
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "agent-event",
+            "-t",
+            &session,
+            "--state",
+            "waiting",
+            "--label",
+            "codex",
+        ],
+    ));
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.agent_state}\t#{pane.agent_label}",
+        ],
+    );
+    assert_success(&panes);
+    assert_eq!(
+        String::from_utf8_lossy(&panes.stdout).trim(),
+        "waiting\tcodex"
+    );
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["agent-event-ready"]);
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02!").expect("write attention");
+        stdin.flush().expect("flush attention");
+    }
+    child.wait_for_stdout_contains_all(
+        &["dmux attention", "agent waiting", "codex"],
+        "agent attention output",
+    );
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+
+    assert_success(&wait_for_child_exit(child));
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }

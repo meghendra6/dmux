@@ -6,6 +6,7 @@ mod layout;
 mod paths;
 mod protocol;
 mod pty;
+mod registry;
 mod server;
 mod term;
 mod terminal_query;
@@ -40,7 +41,14 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
                     &protocol::encode_new_in_cwd("default", &[], &cwd),
                     true,
                 ) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        let _ = registry::record_session(
+                            &paths::workspace_registry_path(),
+                            cwd,
+                            "default",
+                            "live",
+                        );
+                    }
                     Err(error) if is_duplicate_default_create_error(&error) => {}
                     Err(error) => return Err(error),
                 }
@@ -67,6 +75,12 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
                 &protocol::encode_new_in_cwd(&session, &command, &cwd),
                 true,
             )?;
+            let _ = registry::record_session(
+                &paths::workspace_registry_path(),
+                cwd,
+                &session,
+                if detach { "detached" } else { "live" },
+            );
             if detach {
                 Ok(())
             } else {
@@ -436,6 +450,33 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
             print!("{}", String::from_utf8_lossy(&body));
             Ok(())
         }
+        cli::Command::WorkspaceAdd { path } => registry::register_workspace(
+            &paths::workspace_registry_path(),
+            std::path::PathBuf::from(path),
+        )
+        .map_err(|err| err.to_string()),
+        cli::Command::WorkspaceList => {
+            let registry =
+                registry::load(&paths::workspace_registry_path()).map_err(|err| err.to_string())?;
+            for workspace in registry.workspaces {
+                println!("{}", workspace.path.display());
+            }
+            Ok(())
+        }
+        cli::Command::AgentEvent {
+            target,
+            state,
+            label,
+        } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_agent_event(&target, &state, &label),
+                false,
+            )?;
+            Ok(())
+        }
         cli::Command::ListKeys { format } => {
             let socket = paths::socket_path();
             require_running_server(&socket)?;
@@ -483,6 +524,7 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
             let socket = paths::socket_path();
             require_running_server(&socket)?;
             send_request(&socket, &protocol::encode_kill(&session), false)?;
+            let _ = registry::mark_session_stopped(&paths::workspace_registry_path(), &session);
             Ok(())
         }
         cli::Command::KillServer => {
