@@ -354,6 +354,34 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
     lines.join("\n")
 }
 
+pub fn render_peek_text(
+    metadata: &str,
+    capture: &str,
+    max_rows: usize,
+    max_bytes: usize,
+) -> String {
+    let bytes = capture.as_bytes();
+    let start = bytes.len().saturating_sub(max_bytes);
+    let capture_tail = String::from_utf8_lossy(&bytes[start..]);
+    let capture_rows = max_rows.saturating_sub(1);
+    let capture_lines = capture_tail
+        .lines()
+        .rev()
+        .take(capture_rows)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let mut lines = metadata.lines().map(str::to_string).collect::<Vec<_>>();
+    if !capture_lines.is_empty() {
+        lines.push("capture tail".to_string());
+        lines.extend(capture_lines);
+    }
+    lines.join("\n")
+}
+
 pub fn state_marker(state: PopupStateKind) -> &'static str {
     match state {
         PopupStateKind::NeedsInput => "!",
@@ -477,5 +505,26 @@ mod tests {
         assert_eq!(state.close_or_clear(), PopupCloseResult::StayOpen);
         assert!(!state.peek);
         assert_eq!(state.close_or_clear(), PopupCloseResult::Close);
+    }
+
+    #[test]
+    fn peek_text_is_bounded() {
+        let long_capture = (0..100)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let text = render_peek_text(
+            "repo=/tmp/repo\nsession=dev\npane=1",
+            &long_capture,
+            40,
+            8 * 1024,
+        );
+
+        assert!(text.contains("repo=/tmp/repo"), "{text}");
+        assert!(text.contains("session=dev"), "{text}");
+        assert!(text.contains("pane=1"), "{text}");
+        assert!(text.contains("line 99"), "{text}");
+        assert!(text.lines().count() <= 43, "{text}");
     }
 }

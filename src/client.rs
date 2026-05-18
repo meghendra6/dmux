@@ -3155,6 +3155,41 @@ fn run_live_snapshot_attach(
         match input.recv_timeout(timeout) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
                 let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                if active_popup == AttachPopup::Attention {
+                    if let (Some(state), Some(input_state)) =
+                        (popup_state.as_mut(), popup_input_state.as_mut())
+                    {
+                        let actions = popup_actions_for_input(&bytes, input_state);
+                        match apply_attention_popup_input_actions(socket, session, state, &actions)?
+                        {
+                            AttentionPopupInputResult::StayOpen => {}
+                            AttentionPopupInputResult::Close => {
+                                active_popup = AttachPopup::None;
+                                popup_state = None;
+                                popup_input_state = None;
+                            }
+                            AttentionPopupInputResult::Message(message) => {
+                                pane_number_message =
+                                    Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
+                            }
+                        }
+                        if !redraw_paused {
+                            frame = write_live_snapshot_frame_with_active_message_and_popup_state(
+                                socket,
+                                session,
+                                &mut pane_number_message,
+                                command_prompt_message.as_deref(),
+                                active_popup,
+                                popup_state.as_mut(),
+                            )?;
+                            sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                            reset_live_render_output_state(&mut render_output_state);
+                            last_redraw = Instant::now();
+                            pending_input_repaint_deadline = None;
+                        }
+                        continue;
+                    }
+                }
                 if active_popup == AttachPopup::Tree {
                     if let (Some(state), Some(input_state)) =
                         (popup_state.as_mut(), popup_input_state.as_mut())
@@ -3450,16 +3485,25 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowAttention) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_attention();
-                popup_state = None;
-                popup_input_state = None;
+                if active_popup == AttachPopup::Attention {
+                    popup_state = Some(crate::popup::PopupState::new(
+                        crate::popup::PopupMode::Attention,
+                    ));
+                    popup_input_state =
+                        Some(PopupInputState::new(crate::popup::PopupMode::Attention));
+                } else {
+                    popup_state = None;
+                    popup_input_state = None;
+                }
                 pane_number_message = None;
                 command_prompt_message = None;
-                frame = write_live_snapshot_frame_with_active_message(
+                frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                     socket,
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
                     active_popup,
+                    popup_state.as_mut(),
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3923,11 +3967,124 @@ fn parse_bool_flag(value: &str, message: &str) -> io::Result<bool> {
     }
 }
 
-fn attach_attention_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
+fn attach_attention_popup_model(
+    socket: &Path,
+    session: &str,
+) -> io::Result<crate::popup::PopupModel> {
     let entries = pane_attention_entries(socket, session)?;
-    Ok(format_attention_popup(&entries))
+    Ok(attention_popup_model(session, &entries))
 }
 
+fn attention_popup_model(
+    session: &str,
+    entries: &[PaneAttentionEntry],
+) -> crate::popup::PopupModel {
+    let mut rows = vec![crate::popup::PopupRow {
+        id: format!("{session}:attention"),
+        kind: crate::popup::PopupRowKind::Header,
+        repo_path: None,
+        target: None,
+        state: crate::popup::PopupStateKind::Idle,
+        source: crate::popup::PopupRowSource::Mux,
+        title: "C-b ! close    Space peek".to_string(),
+        summary: String::new(),
+        last_changed: None,
+        attachable: false,
+    }];
+
+    if entries.is_empty() {
+        rows.push(crate::popup::PopupRow {
+            id: format!("{session}:attention:empty"),
+            kind: crate::popup::PopupRowKind::DisabledItem,
+            repo_path: None,
+            target: None,
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: "No panes.".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+        });
+        return crate::popup::PopupModel::new(rows);
+    }
+
+    let attention_entries = entries
+        .iter()
+        .filter(|entry| pane_attention_reasons(entry).next().is_some())
+        .collect::<Vec<_>>();
+    if attention_entries.is_empty() {
+        rows.push(crate::popup::PopupRow {
+            id: format!("{session}:attention:none"),
+            kind: crate::popup::PopupRowKind::DisabledItem,
+            repo_path: None,
+            target: None,
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: "No attention items.".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+        });
+    }
+
+    let ordered_entries = attention_entries
+        .into_iter()
+        .chain(
+            entries
+                .iter()
+                .filter(|entry| pane_attention_reasons(entry).next().is_none()),
+        )
+        .collect::<Vec<_>>();
+    for entry in ordered_entries {
+        rows.push(crate::popup::PopupRow {
+            id: format!("{session}:attention:{}", entry.index),
+            kind: crate::popup::PopupRowKind::Item,
+            repo_path: Some(PathBuf::from(&entry.cwd)),
+            target: Some(crate::popup::PopupTarget {
+                session: session.to_string(),
+                window_index: None,
+                pane_index: Some(entry.index),
+            }),
+            state: attention_popup_state(entry),
+            source: if entry.agent_state.trim().is_empty() {
+                crate::popup::PopupRowSource::Mux
+            } else {
+                crate::popup::PopupRowSource::AgentEvent
+            },
+            title: format!("pane {}", entry.index),
+            summary: attention_popup_summary(entry),
+            last_changed: None,
+            attachable: false,
+        });
+    }
+
+    crate::popup::PopupModel::new(rows)
+}
+
+fn attention_popup_state(entry: &PaneAttentionEntry) -> crate::popup::PopupStateKind {
+    if !entry.agent_state.trim().is_empty() {
+        return normalize_agent_state(entry.agent_state.trim());
+    }
+    if entry.bell || entry.activity || entry.clipboard_blocked > 0 {
+        return crate::popup::PopupStateKind::Alert;
+    }
+    if entry.state == "exited" {
+        return crate::popup::PopupStateKind::Completed;
+    }
+    crate::popup::PopupStateKind::Idle
+}
+
+fn attention_popup_summary(entry: &PaneAttentionEntry) -> String {
+    let reasons = pane_attention_reasons(entry).collect::<Vec<_>>().join(", ");
+    let reasons = if reasons.is_empty() {
+        "quiet".to_string()
+    } else {
+        reasons
+    };
+    format!("{}  {}", reasons, pane_attention_label(entry))
+}
+
+#[cfg(test)]
 fn format_attention_popup(entries: &[PaneAttentionEntry]) -> String {
     let mut lines = vec!["C-b ! close    digit focus pane".to_string()];
     if entries.is_empty() {
@@ -3955,6 +4112,7 @@ fn format_attention_popup(entries: &[PaneAttentionEntry]) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn format_attention_row(entry: &PaneAttentionEntry) -> String {
     let active = if entry.active { "*" } else { " " };
     let reasons = pane_attention_reasons(entry).collect::<Vec<_>>().join(", ");
@@ -4247,10 +4405,196 @@ fn render_tree_popup_overlay_text(
     state: &mut crate::popup::PopupState,
 ) -> io::Result<PopupOverlayText> {
     let model = tree_popup_visible_model(socket, session, state)?;
+    let peek = popup_selected_peek_text(socket, state, &model)?;
     Ok(PopupOverlayText {
         title: "dmux tree",
-        content: crate::popup::render_popup_text(state, &model, None),
+        content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
     })
+}
+
+fn render_attention_popup_overlay_text(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<PopupOverlayText> {
+    let model = attention_popup_visible_model(socket, session, state)?;
+    let peek = popup_selected_peek_text(socket, state, &model)?;
+    Ok(PopupOverlayText {
+        title: "dmux attention",
+        content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
+    })
+}
+
+fn popup_selected_peek_text(
+    socket: &Path,
+    state: &crate::popup::PopupState,
+    model: &crate::popup::PopupModel,
+) -> io::Result<Option<String>> {
+    if !state.peek {
+        return Ok(None);
+    }
+    state
+        .selected_row(model)
+        .map(|row| popup_peek_text(socket, row))
+        .transpose()
+}
+
+fn popup_peek_text(socket: &Path, row: &crate::popup::PopupRow) -> io::Result<String> {
+    let Some(target) = row.target.as_ref() else {
+        return Ok("row has no target".to_string());
+    };
+
+    let mut metadata = vec![
+        format!("session={}", target.session),
+        format!("state={:?}", row.state),
+        format!("title={}", row.title),
+        format!("summary={}", row.summary),
+    ];
+    if let Some(repo_path) = &row.repo_path {
+        metadata.push(format!("repo={}", repo_path.display()));
+    }
+    if let Some(window_index) = target.window_index {
+        metadata.push(format!("window={window_index}"));
+    }
+    if let Some(pane_index) = target.pane_index {
+        metadata.push(format!("pane={pane_index}"));
+    }
+    let metadata = metadata.join("\n");
+
+    let capture = if let Some(pane_index) = target.pane_index {
+        let target = protocol::Target {
+            session: target.session.clone(),
+            window: target
+                .window_index
+                .map(protocol::WindowTarget::Index)
+                .unwrap_or(protocol::WindowTarget::Active),
+            pane: protocol::PaneTarget::Index(pane_index),
+        };
+        let body = send_control_request(
+            socket,
+            &protocol::encode_capture_target(
+                &target,
+                protocol::CaptureMode::Screen,
+                protocol::BufferSelection::All,
+            ),
+        )?;
+        String::from_utf8_lossy(&body).to_string()
+    } else {
+        String::new()
+    };
+
+    Ok(crate::popup::render_peek_text(
+        &metadata,
+        &capture,
+        40,
+        8 * 1024,
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttentionPopupInputResult {
+    StayOpen,
+    Close,
+    Message(String),
+}
+
+fn attention_popup_visible_model(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<crate::popup::PopupModel> {
+    let model = attach_attention_popup_model(socket, session)?;
+    let rows = crate::popup::filter_rows(&model.rows, &state.filter);
+    let model = crate::popup::PopupModel::new(rows);
+    state.ensure_selection(&model);
+    Ok(model)
+}
+
+fn apply_attention_popup_input_actions(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+    actions: &[PopupInputAction],
+) -> io::Result<AttentionPopupInputResult> {
+    let mut model = attention_popup_visible_model(socket, session, state)?;
+    let mut model_dirty = false;
+    for action in actions {
+        match action {
+            PopupInputAction::MoveUp => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, -1);
+            }
+            PopupInputAction::MoveDown => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, 1);
+            }
+            PopupInputAction::PageUp => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, -10);
+            }
+            PopupInputAction::PageDown => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, 10);
+            }
+            PopupInputAction::Home => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.selected = model.selectable_row_ids().first().cloned();
+            }
+            PopupInputAction::End => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.selected = model.selectable_row_ids().last().cloned();
+            }
+            PopupInputAction::Enter => {
+                return Ok(AttentionPopupInputResult::Message(
+                    "row is read-only".to_string(),
+                ));
+            }
+            PopupInputAction::Escape => {
+                if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
+                    return Ok(AttentionPopupInputResult::Close);
+                }
+                model_dirty = true;
+            }
+            PopupInputAction::Close => return Ok(AttentionPopupInputResult::Close),
+            PopupInputAction::FilterStart => {
+                state.filter_mode = true;
+            }
+            PopupInputAction::FilterPush(ch) => {
+                state.filter.push(*ch);
+                model_dirty = true;
+            }
+            PopupInputAction::FilterBackspace => {
+                state.filter.pop();
+                model_dirty = true;
+            }
+            PopupInputAction::FilterAccept => {
+                state.filter_mode = false;
+            }
+            PopupInputAction::TogglePeek => {
+                state.peek = !state.peek;
+            }
+            PopupInputAction::ToggleGrouping => {}
+        }
+    }
+    Ok(AttentionPopupInputResult::StayOpen)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4353,7 +4697,9 @@ fn apply_tree_popup_input_actions(
             PopupInputAction::FilterAccept => {
                 state.filter_mode = false;
             }
-            PopupInputAction::TogglePeek => {}
+            PopupInputAction::TogglePeek => {
+                state.peek = !state.peek;
+            }
             PopupInputAction::ToggleGrouping => {
                 // Tree rows depend on existing window/session headers for context.
             }
@@ -4397,9 +4743,10 @@ fn render_workspace_popup_overlay_text(
     state: &mut crate::popup::PopupState,
 ) -> io::Result<PopupOverlayText> {
     let model = workspace_popup_visible_model(socket, state)?;
+    let peek = popup_selected_peek_text(socket, state, &model)?;
     Ok(PopupOverlayText {
         title: "dmux workspaces",
-        content: crate::popup::render_popup_text(state, &model, None),
+        content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
     })
 }
 
@@ -4513,7 +4860,9 @@ fn apply_workspace_popup_input_actions(
             PopupInputAction::FilterAccept => {
                 state.filter_mode = false;
             }
-            PopupInputAction::TogglePeek => {}
+            PopupInputAction::TogglePeek => {
+                state.peek = !state.peek;
+            }
             PopupInputAction::ToggleGrouping => {
                 state.toggle_grouping();
                 model_dirty = true;
@@ -4866,14 +5215,16 @@ fn attach_popup_overlay_text_with_state(
             content: attach_help_overlay_text(),
         })),
         AttachPopup::Attention => {
-            let content = attach_attention_overlay_text(socket, session)?;
-            let model = legacy_popup_model(&content, crate::popup::PopupMode::Attention);
-            let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Attention);
-            state.ensure_selection(&model);
-            Ok(Some(PopupOverlayText {
-                title: "dmux attention",
-                content: crate::popup::render_popup_text(&state, &model, None),
-            }))
+            if let Some(state) = popup_state {
+                Ok(Some(render_attention_popup_overlay_text(
+                    socket, session, state,
+                )?))
+            } else {
+                let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Attention);
+                Ok(Some(render_attention_popup_overlay_text(
+                    socket, session, &mut state,
+                )?))
+            }
         }
         AttachPopup::Tree => {
             if let Some(state) = popup_state {
@@ -4902,27 +5253,6 @@ fn attach_popup_overlay_text_with_state(
             }
         }
     }
-}
-
-fn legacy_popup_model(content: &str, mode: crate::popup::PopupMode) -> crate::popup::PopupModel {
-    let rows = content
-        .lines()
-        .enumerate()
-        .map(|(index, line)| crate::popup::PopupRow {
-            id: format!("legacy-{index}"),
-            kind: crate::popup::PopupRowKind::DisabledItem,
-            repo_path: None,
-            target: None,
-            state: crate::popup::PopupStateKind::Idle,
-            source: crate::popup::PopupRowSource::Mux,
-            title: line.to_string(),
-            summary: String::new(),
-            last_changed: None,
-            attachable: false,
-        })
-        .collect();
-    let _ = mode;
-    crate::popup::PopupModel::new(rows)
 }
 
 fn pane_index_exists(entries: &[PaneListEntry], index: usize) -> bool {
@@ -5278,6 +5608,38 @@ where
         for (index, action) in actions.iter().enumerate() {
             match action {
                 AttachInputAction::Forward(output) => {
+                    if active_popup == AttachPopup::Attention {
+                        if let (Some(state), Some(popup_decoder)) =
+                            (popup_state.as_mut(), popup_input_state.as_mut())
+                        {
+                            let popup_actions = popup_actions_for_input(output, popup_decoder);
+                            match apply_attention_popup_input_actions(
+                                socket,
+                                session,
+                                state,
+                                &popup_actions,
+                            )? {
+                                AttentionPopupInputResult::StayOpen => {
+                                    let overlay = render_attention_popup_overlay_text(
+                                        socket, session, state,
+                                    )?;
+                                    write_attach_popup_message(overlay.as_overlay())?;
+                                }
+                                AttentionPopupInputResult::Close => {
+                                    active_popup = AttachPopup::None;
+                                    popup_state = None;
+                                    popup_input_state = None;
+                                    let _ = write_live_snapshot_frame_with_message_and_clear(
+                                        socket, session, None, None, false, false,
+                                    )?;
+                                }
+                                AttentionPopupInputResult::Message(message) => {
+                                    write_attach_transient_message(&message)?;
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     if active_popup == AttachPopup::Tree {
                         if let (Some(state), Some(popup_decoder)) =
                             (popup_state.as_mut(), popup_input_state.as_mut())
@@ -5636,14 +5998,21 @@ where
                 }
                 AttachInputAction::ShowAttention => {
                     active_popup = active_popup.toggle_attention();
-                    popup_state = None;
-                    popup_input_state = None;
                     if active_popup == AttachPopup::Attention {
-                        let overlay =
-                            attach_popup_overlay_text(socket, session, AttachPopup::Attention)?
-                                .expect("attention popup");
+                        popup_state = Some(crate::popup::PopupState::new(
+                            crate::popup::PopupMode::Attention,
+                        ));
+                        popup_input_state =
+                            Some(PopupInputState::new(crate::popup::PopupMode::Attention));
+                        let overlay = render_attention_popup_overlay_text(
+                            socket,
+                            session,
+                            popup_state.as_mut().expect("attention popup state"),
+                        )?;
                         write_attach_popup_message(overlay.as_overlay())?;
                     } else {
+                        popup_state = None;
+                        popup_input_state = None;
                         let _ = write_live_snapshot_frame_with_message_and_clear(
                             socket, session, None, None, false, false,
                         )?;

@@ -3607,6 +3607,69 @@ fn agent_event_marks_attention_without_terminal_scraping() {
 }
 
 #[test]
+fn attention_popup_space_opens_read_only_peek() {
+    let socket = unique_socket("attention-peek");
+    let session = format!("attention-peek-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf peek-ready; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "peek-ready");
+    assert!(ready.contains("peek-ready"), "{ready:?}");
+
+    let target = format!("{session}:0.0");
+    assert_success(&dmux(
+        &socket,
+        &[
+            "agent-event",
+            "-t",
+            &target,
+            "--state",
+            "needs_input",
+            "--label",
+            "choose option",
+        ],
+    ));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["peek-ready"]);
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02!").expect("write attention");
+        stdin.flush().expect("flush attention");
+    }
+    child.wait_for_stdout_contains_all(&["dmux attention", "choose option"], "attention popup");
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b" ").expect("write peek");
+        stdin.flush().expect("flush peek");
+    }
+    child.wait_for_stdout_contains_all(
+        &["Peek", "choose option", "peek-ready"],
+        "attention peek output",
+    );
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_prefix_question_prints_multi_pane_help_and_keeps_attach_running() {
     let socket = unique_socket("attach-multi-help");
     let session = format!("attach-multi-help-{}", std::process::id());
