@@ -3734,6 +3734,180 @@ fn attention_popup_space_opens_read_only_peek() {
 }
 
 #[test]
+fn attention_popup_reply_from_peek_sends_to_selected_pane() {
+    let socket = unique_socket("attention-peek-reply");
+    let session = format!("attention-peek-reply-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf peek-reply-ready; IFS= read -r line; printf 'reply-got:%s' \"$line\"; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "peek-reply-ready");
+    assert!(ready.contains("peek-reply-ready"), "{ready:?}");
+
+    let target = format!("{session}:0.0");
+    assert_success(&dmux(
+        &socket,
+        &[
+            "agent-event",
+            "-t",
+            &target,
+            "--state",
+            "needs_input",
+            "--label",
+            "waiting for reply",
+        ],
+    ));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["peek-reply-ready"]);
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"\x02! rhello from popup\r")
+            .expect("write attention peek reply");
+        stdin.flush().expect("flush attention peek reply");
+    }
+
+    child.wait_for_stdout_contains_all(&["reply sent"], "attention reply confirmation");
+
+    let captured = poll_capture(&socket, &session, "reply-got:hello from popup");
+    assert!(
+        captured.contains("reply-got:hello from popup"),
+        "{captured:?}"
+    );
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn attention_popup_reply_uses_stable_target_after_pane_reindex() {
+    let socket = unique_socket("attention-reply-stable-target");
+    let session = format!("attention-reply-stable-target-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf base-ready; sleep 30",
+        ],
+    ));
+    assert!(poll_capture(&socket, &session, "base-ready").contains("base-ready"));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf target-ready; IFS= read -r line; printf 'target-got:%s' \"$line\"; sleep 30",
+        ],
+    ));
+    let target_before = format!("{session}:0.1");
+    assert!(
+        poll_capture(&socket, &target_before, "target-ready").contains("target-ready"),
+        "target pane did not start"
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "printf wrong-ready; IFS= read -r line; printf 'wrong-got:%s' \"$line\"; sleep 30",
+        ],
+    ));
+    let wrong_before = format!("{session}:0.2");
+    assert!(
+        poll_capture(&socket, &wrong_before, "wrong-ready").contains("wrong-ready"),
+        "wrong pane did not start"
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "agent-event",
+            "-t",
+            &target_before,
+            "--state",
+            "needs_input",
+            "--label",
+            "waiting for stable reply",
+        ],
+    ));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["wrong-ready"]);
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"\x02! r")
+            .expect("start attention popup reply");
+        stdin.flush().expect("flush attention popup reply start");
+    }
+    child.wait_for_stdout_contains_all(&["Reply:"], "reply prompt");
+
+    assert_success(&dmux(&socket, &["kill-pane", "-t", &session, "-p", "0"]));
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"stable reply\r")
+            .expect("submit stable reply");
+        stdin.flush().expect("flush stable reply");
+    }
+    child.wait_for_stdout_contains_all(&["reply sent"], "stable reply confirmation");
+
+    let target_after = format!("{session}:0.0");
+    let captured = poll_capture(&socket, &target_after, "target-got:stable reply");
+    assert!(captured.contains("target-got:stable reply"), "{captured:?}");
+
+    let wrong_after = format!("{session}:0.1");
+    let wrong = dmux(&socket, &["capture-pane", "-t", &wrong_after, "-p"]);
+    assert_success(&wrong);
+    let wrong = String::from_utf8_lossy(&wrong.stdout);
+    assert!(!wrong.contains("wrong-got:stable reply"), "{wrong:?}");
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn attach_prefix_question_prints_multi_pane_help_and_keeps_attach_running() {
     let socket = unique_socket("attach-multi-help");
     let session = format!("attach-multi-help-{}", std::process::id());

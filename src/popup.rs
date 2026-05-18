@@ -45,7 +45,9 @@ pub enum PopupRowSource {
 pub struct PopupTarget {
     pub session: String,
     pub window_index: Option<usize>,
+    pub window_id: Option<usize>,
     pub pane_index: Option<usize>,
+    pub pane_id: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +78,9 @@ pub struct PopupState {
     pub filter: String,
     pub filter_mode: bool,
     pub peek: bool,
+    pub reply_mode: bool,
+    pub reply_text: String,
+    pub reply_target: Option<PopupTarget>,
 }
 
 impl PopupState {
@@ -88,6 +93,9 @@ impl PopupState {
             filter: String::new(),
             filter_mode: false,
             peek: false,
+            reply_mode: false,
+            reply_text: String::new(),
+            reply_target: None,
         }
     }
 
@@ -99,8 +107,14 @@ impl PopupState {
     }
 
     pub fn close_or_clear(&mut self) -> PopupCloseResult {
-        if self.peek {
+        if self.reply_mode {
+            self.reply_mode = false;
+            self.reply_text.clear();
+            self.reply_target = None;
+            PopupCloseResult::StayOpen
+        } else if self.peek {
             self.peek = false;
+            self.reply_target = None;
             PopupCloseResult::StayOpen
         } else if self.filter_mode {
             self.filter_mode = false;
@@ -347,11 +361,18 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
         lines.push("Peek".to_string());
         lines.extend(peek.lines().map(str::to_string));
     }
+    if state.reply_mode {
+        lines.push(String::new());
+        lines.push(format!("Reply: {}", state.reply_text));
+    }
     lines.push(String::new());
     lines.push(match state.mode {
-        PopupMode::Attention => "Space: peek   Tab: group   /: filter   Esc: close".to_string(),
+        PopupMode::Attention => {
+            "Space: peek   r: reply   Tab: group   /: filter   Esc: close".to_string()
+        }
         PopupMode::Workspace | PopupMode::Tree => {
-            "Enter: focus/attach   Space: peek   Tab: group   /: filter   Esc: close".to_string()
+            "Enter: focus/attach   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
+                .to_string()
         }
     });
     lines.join("\n")
@@ -412,7 +433,9 @@ mod tests {
             target: Some(PopupTarget {
                 session: "dev".to_string(),
                 window_index: Some(0),
+                window_id: Some(0),
                 pane_index: Some(0),
+                pane_id: Some(0),
             }),
             state: PopupStateKind::Working,
             source: PopupRowSource::Mux,
@@ -520,6 +543,38 @@ mod tests {
         assert_eq!(state.close_or_clear(), PopupCloseResult::StayOpen);
         assert!(!state.peek);
         assert_eq!(state.close_or_clear(), PopupCloseResult::Close);
+    }
+
+    #[test]
+    fn escape_cancels_reply_before_closing_peek() {
+        let mut state = PopupState::new(PopupMode::Attention);
+        state.peek = true;
+        state.reply_mode = true;
+        state.reply_text = "hello".to_string();
+
+        assert_eq!(state.close_or_clear(), PopupCloseResult::StayOpen);
+        assert!(state.peek);
+        assert!(!state.reply_mode);
+        assert!(state.reply_text.is_empty());
+
+        assert_eq!(state.close_or_clear(), PopupCloseResult::StayOpen);
+        assert!(!state.peek);
+    }
+
+    #[test]
+    fn render_shows_reply_prompt_when_replying_from_peek() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Attention);
+        state.selected = Some("a".to_string());
+        state.peek = true;
+        state.reply_mode = true;
+        state.reply_text = "hello".to_string();
+
+        let text = render_popup_text(&state, &model, Some("session=dev"));
+
+        assert!(text.contains("Peek"), "{text}");
+        assert!(text.contains("Reply: hello"), "{text}");
+        assert!(text.contains("r: reply"), "{text}");
     }
 
     #[test]

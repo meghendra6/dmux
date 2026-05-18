@@ -1394,6 +1394,7 @@ struct RawAttachInputState {
 struct PopupInputState {
     mode: crate::popup::PopupMode,
     filter_mode: bool,
+    reply_mode: bool,
     escape_pending: Vec<u8>,
 }
 
@@ -1402,6 +1403,7 @@ impl PopupInputState {
         Self {
             mode,
             filter_mode: false,
+            reply_mode: false,
             escape_pending: Vec::new(),
         }
     }
@@ -1418,6 +1420,10 @@ enum PopupInputAction {
     Enter,
     TogglePeek,
     ToggleGrouping,
+    ReplyStart,
+    ReplyPush(char),
+    ReplyBackspace,
+    ReplySubmit,
     FilterStart,
     FilterPush(char),
     FilterBackspace,
@@ -2093,6 +2099,32 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
     let mut actions = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
+        if state.reply_mode {
+            match bytes[index] {
+                b'\r' | b'\n' => {
+                    state.reply_mode = false;
+                    actions.push(PopupInputAction::ReplySubmit);
+                    index += 1;
+                }
+                b'\x1b' => {
+                    state.reply_mode = false;
+                    actions.push(PopupInputAction::Escape);
+                    index += 1;
+                }
+                b'\x7f' => {
+                    actions.push(PopupInputAction::ReplyBackspace);
+                    index += 1;
+                }
+                byte if byte.is_ascii_graphic() || byte == b' ' => {
+                    actions.push(PopupInputAction::ReplyPush(byte as char));
+                    index += 1;
+                }
+                _ => {
+                    index += 1;
+                }
+            }
+            continue;
+        }
         match bytes[index] {
             b'/' if !state.filter_mode => {
                 state.filter_mode = true;
@@ -2129,6 +2161,11 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
             }
             b' ' if !state.filter_mode => {
                 actions.push(PopupInputAction::TogglePeek);
+                index += 1;
+            }
+            b'r' if !state.filter_mode => {
+                state.reply_mode = true;
+                actions.push(PopupInputAction::ReplyStart);
                 index += 1;
             }
             b'j' if !state.filter_mode => {
@@ -2507,11 +2544,10 @@ struct PaneListEntry {
 }
 
 const ATTENTION_FIELD_SEPARATOR: char = '\u{1f}';
-const ATTENTION_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.agent_source}\u{1f}#{pane.agent_changed_at}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
-const ACTIVE_WINDOW_INDEX_FORMAT: &str = "#{window.index}";
-const TREE_LIST_WINDOWS_FORMAT: &str =
-    "#{window.index}\u{1f}#{window.active}\u{1f}#{window.name}\u{1f}#{window.panes}";
-const TREE_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.agent_source}\u{1f}#{pane.agent_changed_at}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const ATTENTION_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.id}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.agent_source}\u{1f}#{pane.agent_changed_at}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const ACTIVE_WINDOW_TARGET_FORMAT: &str = "#{window.index}\u{1f}#{window.id}";
+const TREE_LIST_WINDOWS_FORMAT: &str = "#{window.index}\u{1f}#{window.id}\u{1f}#{window.active}\u{1f}#{window.name}\u{1f}#{window.panes}";
+const TREE_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.id}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.agent_source}\u{1f}#{pane.agent_changed_at}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
 const DETAIL_STATUS_FORMAT: &str = "#{session.name}\u{1f}#{session.attached_count}\u{1f}#{session.created_at}\u{1f}#{window.index}\u{1f}#{window.name}\u{1f}#{window.count}\u{1f}#{pane.index}\u{1f}#{pane.id}\u{1f}#{pane.state}\u{1f}#{pane.pid}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.zoomed}\u{1f}#{window.zoomed_flag}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
 const WORKSPACE_LIST_SESSIONS_FORMAT: &str =
     "#{session.name}\u{1f}#{session.window_count}\u{1f}#{session.attached_count}";
@@ -2519,7 +2555,9 @@ const WORKSPACE_LIST_SESSIONS_FORMAT: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneAttentionEntry {
     window_index: usize,
+    window_id: usize,
     index: usize,
+    id: usize,
     active: bool,
     state: String,
     exit_status: Option<i32>,
@@ -2538,6 +2576,7 @@ struct PaneAttentionEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WindowTreeEntry {
     index: usize,
+    id: usize,
     active: bool,
     name: String,
     panes: Vec<PaneTreeEntry>,
@@ -2546,6 +2585,7 @@ struct WindowTreeEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneTreeEntry {
     index: usize,
+    id: usize,
     active: bool,
     state: String,
     bell: bool,
@@ -3165,6 +3205,7 @@ fn run_live_snapshot_attach(
                     if let (Some(state), Some(input_state)) =
                         (popup_state.as_mut(), popup_input_state.as_mut())
                     {
+                        sync_popup_input_state(input_state, state);
                         let actions = popup_actions_for_input(&bytes, input_state);
                         match apply_attention_popup_input_actions(socket, session, state, &actions)?
                         {
@@ -3173,6 +3214,10 @@ fn run_live_snapshot_attach(
                                 active_popup = AttachPopup::None;
                                 popup_state = None;
                                 popup_input_state = None;
+                            }
+                            AttentionPopupInputResult::Message(message) => {
+                                pane_number_message =
+                                    Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
                             }
                         }
                         if !redraw_paused {
@@ -3196,6 +3241,7 @@ fn run_live_snapshot_attach(
                     if let (Some(state), Some(input_state)) =
                         (popup_state.as_mut(), popup_input_state.as_mut())
                     {
+                        sync_popup_input_state(input_state, state);
                         let actions = popup_actions_for_input(&bytes, input_state);
                         match apply_tree_popup_input_actions(socket, session, state, &actions)? {
                             TreePopupInputResult::StayOpen => {}
@@ -3236,6 +3282,7 @@ fn run_live_snapshot_attach(
                     if let (Some(state), Some(input_state)) =
                         (popup_state.as_mut(), popup_input_state.as_mut())
                     {
+                        sync_popup_input_state(input_state, state);
                         let actions = popup_actions_for_input(&bytes, input_state);
                         match apply_workspace_popup_input_actions(socket, session, state, &actions)?
                         {
@@ -3894,38 +3941,50 @@ fn pane_number_message_text(socket: &Path, session: &str) -> io::Result<String> 
 }
 
 fn pane_attention_entries(socket: &Path, session: &str) -> io::Result<Vec<PaneAttentionEntry>> {
-    let window_index = active_window_index(socket, session)?;
+    let (window_index, window_id) = active_window_target(socket, session)?;
     let body = send_control_request(
         socket,
         &protocol::encode_list_panes(session, Some(ATTENTION_LIST_PANES_FORMAT)),
     )?;
     let listing = String::from_utf8_lossy(&body);
-    parse_pane_attention_listing_with_window(&listing, window_index)
+    parse_pane_attention_listing_with_window(&listing, window_index, window_id)
 }
 
-fn active_window_index(socket: &Path, session: &str) -> io::Result<usize> {
+fn active_window_target(socket: &Path, session: &str) -> io::Result<(usize, usize)> {
     let body = send_control_request(
         socket,
-        &protocol::encode_status_line(session, Some(ACTIVE_WINDOW_INDEX_FORMAT)),
+        &protocol::encode_status_line(session, Some(ACTIVE_WINDOW_TARGET_FORMAT)),
     )?;
     let listing = String::from_utf8_lossy(&body);
-    parse_usize_field(listing.trim_end(), "invalid active window index")
+    let fields = listing
+        .trim_end()
+        .split(ATTENTION_FIELD_SEPARATOR)
+        .collect::<Vec<_>>();
+    let [index, id] = fields.as_slice() else {
+        return Err(io::Error::other("invalid active window target"));
+    };
+    Ok((
+        parse_usize_field(index, "invalid active window index")?,
+        parse_usize_field(id, "invalid active window id")?,
+    ))
 }
 
 #[cfg(test)]
 fn parse_pane_attention_listing(listing: &str) -> io::Result<Vec<PaneAttentionEntry>> {
-    parse_pane_attention_listing_with_window(listing, 0)
+    parse_pane_attention_listing_with_window(listing, 0, 0)
 }
 
 fn parse_pane_attention_listing_with_window(
     listing: &str,
     window_index: usize,
+    window_id: usize,
 ) -> io::Result<Vec<PaneAttentionEntry>> {
     let mut entries = Vec::new();
     for line in listing.lines() {
         let fields = line.split(ATTENTION_FIELD_SEPARATOR).collect::<Vec<_>>();
         let [
             index,
+            id,
             active,
             state,
             exit_status,
@@ -3946,7 +4005,9 @@ fn parse_pane_attention_listing_with_window(
 
         entries.push(PaneAttentionEntry {
             window_index,
+            window_id,
             index: parse_usize_field(index, "invalid attention pane index")?,
+            id: parse_usize_field(id, "invalid attention pane id")?,
             active: parse_bool_flag(active, "invalid attention active flag")?,
             state: (*state).to_string(),
             exit_status: parse_optional_i32(exit_status, "invalid attention exit status")?,
@@ -4075,7 +4136,9 @@ fn attention_popup_model(
             target: Some(crate::popup::PopupTarget {
                 session: session.to_string(),
                 window_index: Some(entry.window_index),
+                window_id: Some(entry.window_id),
                 pane_index: Some(entry.index),
+                pane_id: Some(entry.id),
             }),
             state: attention_popup_state(entry),
             source: if entry.agent_state.trim().is_empty() {
@@ -4249,7 +4312,9 @@ fn tree_popup_model(session: &str, windows: &[WindowTreeEntry]) -> crate::popup:
             target: Some(crate::popup::PopupTarget {
                 session: session.to_string(),
                 window_index: Some(window.index),
+                window_id: Some(window.id),
                 pane_index: None,
+                pane_id: None,
             }),
             state: crate::popup::PopupStateKind::Idle,
             source: crate::popup::PopupRowSource::Mux,
@@ -4271,7 +4336,9 @@ fn tree_popup_model(session: &str, windows: &[WindowTreeEntry]) -> crate::popup:
                 target: Some(crate::popup::PopupTarget {
                     session: session.to_string(),
                     window_index: Some(window.index),
+                    window_id: Some(window.id),
                     pane_index: Some(pane.index),
+                    pane_id: Some(pane.id),
                 }),
                 state: pane_tree_state(pane),
                 source: if pane.agent_state.trim().is_empty() {
@@ -4324,18 +4391,19 @@ fn session_tree_entries(socket: &Path, session: &str) -> io::Result<Vec<WindowTr
     let listing = String::from_utf8_lossy(&body);
     let windows = parse_window_tree_listing(&listing)?;
     let mut entries = Vec::with_capacity(windows.len());
-    for (index, active, name, _pane_count) in windows {
+    for (index, id, active, name, _pane_count) in windows {
         let body = send_control_request(
             socket,
             &protocol::encode_list_panes_target(
                 session,
-                protocol::WindowTarget::Index(index),
+                protocol::WindowTarget::Id(id),
                 Some(TREE_LIST_PANES_FORMAT),
             ),
         )?;
         let listing = String::from_utf8_lossy(&body);
         entries.push(WindowTreeEntry {
             index,
+            id,
             active,
             name,
             panes: parse_pane_tree_listing(&listing)?,
@@ -4344,15 +4412,18 @@ fn session_tree_entries(socket: &Path, session: &str) -> io::Result<Vec<WindowTr
     Ok(entries)
 }
 
-fn parse_window_tree_listing(listing: &str) -> io::Result<Vec<(usize, bool, String, usize)>> {
+fn parse_window_tree_listing(
+    listing: &str,
+) -> io::Result<Vec<(usize, usize, bool, String, usize)>> {
     let mut entries = Vec::new();
     for line in listing.lines() {
         let fields = line.split(ATTENTION_FIELD_SEPARATOR).collect::<Vec<_>>();
-        let [index, active, name, panes] = fields.as_slice() else {
+        let [index, id, active, name, panes] = fields.as_slice() else {
             return Err(io::Error::other("invalid tree window listing"));
         };
         entries.push((
             parse_usize_field(index, "invalid tree window index")?,
+            parse_usize_field(id, "invalid tree window id")?,
             parse_bool_flag(active, "invalid tree window active flag")?,
             (*name).to_string(),
             parse_usize_field(panes, "invalid tree window pane count")?,
@@ -4367,6 +4438,7 @@ fn parse_pane_tree_listing(listing: &str) -> io::Result<Vec<PaneTreeEntry>> {
         let fields = line.split(ATTENTION_FIELD_SEPARATOR).collect::<Vec<_>>();
         let [
             index,
+            id,
             active,
             state,
             bell,
@@ -4383,6 +4455,7 @@ fn parse_pane_tree_listing(listing: &str) -> io::Result<Vec<PaneTreeEntry>> {
         };
         entries.push(PaneTreeEntry {
             index: parse_usize_field(index, "invalid tree pane index")?,
+            id: parse_usize_field(id, "invalid tree pane id")?,
             active: parse_bool_flag(active, "invalid tree pane active flag")?,
             state: (*state).to_string(),
             bell: parse_bool_flag(bell, "invalid tree pane bell flag")?,
@@ -4495,20 +4568,18 @@ fn popup_peek_text(socket: &Path, row: &crate::popup::PopupRow) -> String {
     if let Some(window_index) = target.window_index {
         metadata.push(format!("window={window_index}"));
     }
+    if let Some(window_id) = target.window_id {
+        metadata.push(format!("window_id={window_id}"));
+    }
     if let Some(pane_index) = target.pane_index {
         metadata.push(format!("pane={pane_index}"));
     }
+    if let Some(pane_id) = target.pane_id {
+        metadata.push(format!("pane_id={pane_id}"));
+    }
     let metadata = metadata.join("\n");
 
-    let capture = if let Some(pane_index) = target.pane_index {
-        let target = protocol::Target {
-            session: target.session.clone(),
-            window: target
-                .window_index
-                .map(protocol::WindowTarget::Index)
-                .unwrap_or(protocol::WindowTarget::Active),
-            pane: protocol::PaneTarget::Index(pane_index),
-        };
+    let capture = if let Some(target) = popup_capture_protocol_target(target) {
         match send_control_request(
             socket,
             &protocol::encode_capture_target(
@@ -4527,10 +4598,143 @@ fn popup_peek_text(socket: &Path, row: &crate::popup::PopupRow) -> String {
     crate::popup::render_peek_text(&metadata, &capture, 40, 8 * 1024)
 }
 
+fn popup_capture_protocol_target(target: &crate::popup::PopupTarget) -> Option<protocol::Target> {
+    let pane = target
+        .pane_id
+        .map(protocol::PaneTarget::Id)
+        .or_else(|| target.pane_index.map(protocol::PaneTarget::Index))?;
+    let window = target
+        .window_id
+        .map(protocol::WindowTarget::Id)
+        .or_else(|| target.window_index.map(protocol::WindowTarget::Index))
+        .unwrap_or(protocol::WindowTarget::Active);
+    Some(protocol::Target {
+        session: target.session.clone(),
+        window,
+        pane,
+    })
+}
+
+fn sync_popup_input_state(
+    input_state: &mut PopupInputState,
+    popup_state: &crate::popup::PopupState,
+) {
+    input_state.filter_mode = popup_state.filter_mode;
+    input_state.reply_mode = popup_state.reply_mode;
+}
+
+fn popup_reply_target(
+    state: &crate::popup::PopupState,
+    model: &crate::popup::PopupModel,
+) -> Result<crate::popup::PopupTarget, String> {
+    if !state.peek {
+        return Err("open peek before replying".to_string());
+    }
+    let row = state
+        .selected_row(model)
+        .ok_or_else(|| "row is not replyable".to_string())?;
+    if row.kind == crate::popup::PopupRowKind::DisabledItem {
+        return Err("row is not replyable".to_string());
+    }
+    let target = row
+        .target
+        .as_ref()
+        .ok_or_else(|| "row has no reply target".to_string())?;
+    if target.window_id.is_none() || target.pane_id.is_none() {
+        return Err("row has no stable pane reply target".to_string());
+    }
+    Ok(target.clone())
+}
+
+fn popup_target_to_protocol(
+    target: &crate::popup::PopupTarget,
+) -> Result<protocol::Target, String> {
+    let Some(window_id) = target.window_id else {
+        return Err("row has no stable pane reply target".to_string());
+    };
+    let Some(pane_id) = target.pane_id else {
+        return Err("row has no stable pane reply target".to_string());
+    };
+    Ok(protocol::Target {
+        session: target.session.clone(),
+        window: protocol::WindowTarget::Id(window_id),
+        pane: protocol::PaneTarget::Id(pane_id),
+    })
+}
+
+fn popup_reply_submit_target(state: &crate::popup::PopupState) -> Result<protocol::Target, String> {
+    let target = state
+        .reply_target
+        .as_ref()
+        .ok_or_else(|| "reply target disappeared".to_string())?;
+    popup_target_to_protocol(target)
+}
+
+fn apply_popup_reply_input_action(
+    socket: &Path,
+    state: &mut crate::popup::PopupState,
+    model: &crate::popup::PopupModel,
+    action: &PopupInputAction,
+) -> io::Result<Option<String>> {
+    match action {
+        PopupInputAction::ReplyStart => match popup_reply_target(state, model) {
+            Ok(target) => {
+                state.reply_mode = true;
+                state.reply_text.clear();
+                state.reply_target = Some(target);
+                Ok(None)
+            }
+            Err(message) => Ok(Some(message)),
+        },
+        PopupInputAction::ReplyPush(ch) => {
+            if state.reply_mode && state.reply_text.len() < 4096 {
+                state.reply_text.push(*ch);
+            }
+            Ok(None)
+        }
+        PopupInputAction::ReplyBackspace => {
+            if state.reply_mode {
+                state.reply_text.pop();
+            }
+            Ok(None)
+        }
+        PopupInputAction::ReplySubmit => {
+            if !state.reply_mode {
+                return Ok(None);
+            }
+            let reply = state.reply_text.trim_end().to_string();
+            if reply.is_empty() {
+                state.reply_mode = false;
+                state.reply_text.clear();
+                state.reply_target = None;
+                return Ok(Some("reply cancelled".to_string()));
+            }
+            let target = match popup_reply_submit_target(state) {
+                Ok(target) => target,
+                Err(message) => {
+                    state.reply_mode = false;
+                    state.reply_text.clear();
+                    state.reply_target = None;
+                    return Ok(Some(message));
+                }
+            };
+            let mut bytes = reply.into_bytes();
+            bytes.push(b'\r');
+            send_control_request(socket, &protocol::encode_send_target(&target, &bytes))?;
+            state.reply_mode = false;
+            state.reply_text.clear();
+            state.reply_target = None;
+            Ok(Some("reply sent".to_string()))
+        }
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttentionPopupInputResult {
     StayOpen,
     Close,
+    Message(String),
 }
 
 fn attention_popup_visible_model(
@@ -4555,6 +4759,20 @@ fn apply_attention_popup_input_actions(
     let mut model_dirty = false;
     for action in actions {
         match action {
+            PopupInputAction::ReplyStart
+            | PopupInputAction::ReplyPush(_)
+            | PopupInputAction::ReplyBackspace
+            | PopupInputAction::ReplySubmit => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                if let Some(message) =
+                    apply_popup_reply_input_action(socket, state, &model, action)?
+                {
+                    return Ok(AttentionPopupInputResult::Message(message));
+                }
+            }
             PopupInputAction::MoveUp => {
                 if model_dirty {
                     model = attention_popup_visible_model(socket, session, state)?;
@@ -4621,6 +4839,11 @@ fn apply_attention_popup_input_actions(
             }
             PopupInputAction::TogglePeek => {
                 state.peek = !state.peek;
+                if !state.peek {
+                    state.reply_mode = false;
+                    state.reply_text.clear();
+                    state.reply_target = None;
+                }
             }
             PopupInputAction::ToggleGrouping => {}
         }
@@ -4646,6 +4869,20 @@ fn apply_tree_popup_input_actions(
     let mut model_dirty = false;
     for action in actions {
         match action {
+            PopupInputAction::ReplyStart
+            | PopupInputAction::ReplyPush(_)
+            | PopupInputAction::ReplyBackspace
+            | PopupInputAction::ReplySubmit => {
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                if let Some(message) =
+                    apply_popup_reply_input_action(socket, state, &model, action)?
+                {
+                    return Ok(TreePopupInputResult::Message(message));
+                }
+            }
             PopupInputAction::MoveUp => {
                 if model_dirty {
                     model = tree_popup_visible_model(socket, session, state)?;
@@ -4730,6 +4967,11 @@ fn apply_tree_popup_input_actions(
             }
             PopupInputAction::TogglePeek => {
                 state.peek = !state.peek;
+                if !state.peek {
+                    state.reply_mode = false;
+                    state.reply_text.clear();
+                    state.reply_target = None;
+                }
             }
             PopupInputAction::ToggleGrouping => {
                 // Tree rows depend on existing window/session headers for context.
@@ -4791,6 +5033,20 @@ fn apply_workspace_popup_input_actions(
     let mut model_dirty = false;
     for action in actions {
         match action {
+            PopupInputAction::ReplyStart
+            | PopupInputAction::ReplyPush(_)
+            | PopupInputAction::ReplyBackspace
+            | PopupInputAction::ReplySubmit => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                    model_dirty = false;
+                }
+                if let Some(message) =
+                    apply_popup_reply_input_action(socket, state, &model, action)?
+                {
+                    return Ok(WorkspacePopupInputResult::Message(message));
+                }
+            }
             PopupInputAction::MoveUp => {
                 if model_dirty {
                     model = workspace_popup_visible_model(socket, state)?;
@@ -4893,6 +5149,11 @@ fn apply_workspace_popup_input_actions(
             }
             PopupInputAction::TogglePeek => {
                 state.peek = !state.peek;
+                if !state.peek {
+                    state.reply_mode = false;
+                    state.reply_text.clear();
+                    state.reply_target = None;
+                }
             }
             PopupInputAction::ToggleGrouping => {
                 state.toggle_grouping();
@@ -5141,7 +5402,9 @@ fn workspace_popup_model(
                 target: Some(crate::popup::PopupTarget {
                     session: session.name.clone(),
                     window_index: None,
+                    window_id: None,
                     pane_index: None,
+                    pane_id: None,
                 }),
                 state: if session.attached_count == 0 {
                     crate::popup::PopupStateKind::Detached
@@ -5191,7 +5454,9 @@ fn workspace_popup_model(
             target: Some(crate::popup::PopupTarget {
                 session: record.name.clone(),
                 window_index: record.last_window,
+                window_id: None,
                 pane_index: record.last_pane,
+                pane_id: None,
             }),
             state: crate::popup::PopupStateKind::Previous,
             source: crate::popup::PopupRowSource::Registry,
@@ -5643,6 +5908,7 @@ where
                         if let (Some(state), Some(popup_decoder)) =
                             (popup_state.as_mut(), popup_input_state.as_mut())
                         {
+                            sync_popup_input_state(popup_decoder, state);
                             let popup_actions = popup_actions_for_input(output, popup_decoder);
                             match apply_attention_popup_input_actions(
                                 socket,
@@ -5664,6 +5930,9 @@ where
                                         socket, session, None, None, false, false,
                                     )?;
                                 }
+                                AttentionPopupInputResult::Message(message) => {
+                                    write_attach_transient_message(&message)?;
+                                }
                             }
                             continue;
                         }
@@ -5672,6 +5941,7 @@ where
                         if let (Some(state), Some(popup_decoder)) =
                             (popup_state.as_mut(), popup_input_state.as_mut())
                         {
+                            sync_popup_input_state(popup_decoder, state);
                             let popup_actions = popup_actions_for_input(output, popup_decoder);
                             match apply_tree_popup_input_actions(
                                 socket,
@@ -5712,6 +5982,7 @@ where
                         if let (Some(state), Some(popup_decoder)) =
                             (popup_state.as_mut(), popup_input_state.as_mut())
                         {
+                            sync_popup_input_state(popup_decoder, state);
                             let popup_actions = popup_actions_for_input(output, popup_decoder);
                             match apply_workspace_popup_input_actions(
                                 socket,
@@ -8734,11 +9005,13 @@ mod tests {
     fn tree_popup_rows_include_window_and_pane_targets() {
         let windows = vec![WindowTreeEntry {
             index: 0,
+            id: 10,
             active: true,
             name: "main".to_string(),
             panes: vec![
                 PaneTreeEntry {
                     index: 0,
+                    id: 20,
                     active: true,
                     state: "running".to_string(),
                     bell: false,
@@ -8752,6 +9025,7 @@ mod tests {
                 },
                 PaneTreeEntry {
                     index: 1,
+                    id: 21,
                     active: false,
                     state: "running".to_string(),
                     bell: true,
@@ -8982,6 +9256,91 @@ mod tests {
         assert_eq!(
             popup_actions_for_input(b"j", &mut state),
             vec![PopupInputAction::MoveDown]
+        );
+    }
+
+    #[test]
+    fn popup_reply_mode_collects_text_until_submit() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Attention);
+
+        assert_eq!(
+            popup_actions_for_input(b"rhello\x7f!\r", &mut state),
+            vec![
+                PopupInputAction::ReplyStart,
+                PopupInputAction::ReplyPush('h'),
+                PopupInputAction::ReplyPush('e'),
+                PopupInputAction::ReplyPush('l'),
+                PopupInputAction::ReplyPush('l'),
+                PopupInputAction::ReplyPush('o'),
+                PopupInputAction::ReplyBackspace,
+                PopupInputAction::ReplyPush('!'),
+                PopupInputAction::ReplySubmit,
+            ]
+        );
+    }
+
+    #[test]
+    fn popup_reply_submit_uses_target_snapshotted_at_reply_start() {
+        let model = crate::popup::PopupModel::new(vec![
+            crate::popup::PopupRow {
+                id: "a".to_string(),
+                kind: crate::popup::PopupRowKind::Item,
+                repo_path: None,
+                target: Some(crate::popup::PopupTarget {
+                    session: "dev".to_string(),
+                    window_index: Some(0),
+                    window_id: Some(10),
+                    pane_index: Some(0),
+                    pane_id: Some(20),
+                }),
+                state: crate::popup::PopupStateKind::NeedsInput,
+                source: crate::popup::PopupRowSource::AgentEvent,
+                title: "pane 0".to_string(),
+                summary: String::new(),
+                last_changed: None,
+                attachable: false,
+            },
+            crate::popup::PopupRow {
+                id: "b".to_string(),
+                kind: crate::popup::PopupRowKind::Item,
+                repo_path: None,
+                target: Some(crate::popup::PopupTarget {
+                    session: "dev".to_string(),
+                    window_index: Some(0),
+                    window_id: Some(10),
+                    pane_index: Some(1),
+                    pane_id: Some(21),
+                }),
+                state: crate::popup::PopupStateKind::NeedsInput,
+                source: crate::popup::PopupRowSource::AgentEvent,
+                title: "pane 1".to_string(),
+                summary: String::new(),
+                last_changed: None,
+                attachable: false,
+            },
+        ]);
+        let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Attention);
+        state.peek = true;
+        state.selected = Some("a".to_string());
+
+        apply_popup_reply_input_action(
+            std::path::Path::new("/tmp/missing-dmux.sock"),
+            &mut state,
+            &model,
+            &PopupInputAction::ReplyStart,
+        )
+        .unwrap();
+        state.selected = Some("b".to_string());
+
+        let target = popup_reply_submit_target(&state).unwrap();
+
+        assert_eq!(
+            target,
+            protocol::Target {
+                session: "dev".to_string(),
+                window: protocol::WindowTarget::Id(10),
+                pane: protocol::PaneTarget::Id(20),
+            }
         );
     }
 
@@ -10262,7 +10621,7 @@ mod tests {
     fn parse_attention_entries_rejects_invalid_flags() {
         let sep = ATTENTION_FIELD_SEPARATOR;
         let listing = format!(
-            "0{sep}x{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}{sep}{sep}{sep}{sep}shell{sep}/tmp\n"
+            "0{sep}0{sep}x{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}{sep}{sep}{sep}{sep}shell{sep}/tmp\n"
         );
 
         assert!(parse_pane_attention_listing(&listing).is_err());
@@ -10272,14 +10631,14 @@ mod tests {
     fn popup_parsers_treat_agent_changed_at_placeholder_as_absent() {
         let sep = ATTENTION_FIELD_SEPARATOR;
         let attention_listing = format!(
-            "0{sep}1{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}#{{pane.agent_changed_at}}{sep}shell{sep}/tmp\n"
+            "0{sep}10{sep}1{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}#{{pane.agent_changed_at}}{sep}shell{sep}/tmp\n"
         );
         let attention = parse_pane_attention_listing(&attention_listing).unwrap();
 
         assert_eq!(attention[0].agent_changed_at, None);
 
         let malformed_attention_listing = format!(
-            "0{sep}1{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}not-a-time{sep}shell{sep}/tmp\n"
+            "0{sep}10{sep}1{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}not-a-time{sep}shell{sep}/tmp\n"
         );
         let malformed_attention =
             parse_pane_attention_listing(&malformed_attention_listing).unwrap();
@@ -10287,7 +10646,7 @@ mod tests {
         assert_eq!(malformed_attention[0].agent_changed_at, None);
 
         let tree_listing = format!(
-            "0{sep}1{sep}running{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}#{{pane.agent_changed_at}}{sep}shell{sep}/tmp\n"
+            "0{sep}10{sep}1{sep}running{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}#{{pane.agent_changed_at}}{sep}shell{sep}/tmp\n"
         );
         let tree = parse_pane_tree_listing(&tree_listing).unwrap();
 
@@ -10298,7 +10657,9 @@ mod tests {
     fn format_attention_popup_lists_attention_before_quiet_panes() {
         let quiet = PaneAttentionEntry {
             window_index: 0,
+            window_id: 0,
             index: 0,
+            id: 0,
             active: true,
             state: "running".to_string(),
             exit_status: None,
@@ -10315,7 +10676,9 @@ mod tests {
         };
         let attention = PaneAttentionEntry {
             window_index: 0,
+            window_id: 0,
             index: 1,
+            id: 1,
             active: false,
             state: "running".to_string(),
             exit_status: None,
@@ -10343,7 +10706,9 @@ mod tests {
     fn format_attention_popup_reports_empty_attention() {
         let quiet = PaneAttentionEntry {
             window_index: 0,
+            window_id: 0,
             index: 0,
+            id: 0,
             active: true,
             state: "running".to_string(),
             exit_status: None,
