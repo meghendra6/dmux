@@ -3473,7 +3473,10 @@ fn workspace_popup_tab_switches_to_repo_grouping() {
         .stdin_mut("workspace popup stdin")
         .write_all(b"\x02A")
         .unwrap();
-    child.wait_for_stdout_contains_all(&["dmux workspaces", "Idle"], "workspace popup");
+    child.wait_for_stdout_contains_all(
+        &["dmux workspaces", "Registered paths", "Live sessions"],
+        "workspace popup",
+    );
     child.clear_stdout();
     child
         .stdin_mut("workspace popup stdin")

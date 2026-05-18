@@ -4236,7 +4236,7 @@ fn tree_popup_visible_model(
 ) -> io::Result<crate::popup::PopupModel> {
     let model = attach_tree_popup_model(socket, session)?;
     let rows = crate::popup::filter_rows(&model.rows, &state.filter);
-    let model = crate::popup::group_rows(rows, state.grouping);
+    let model = crate::popup::PopupModel::new(rows);
     state.ensure_selection(&model);
     Ok(model)
 }
@@ -4355,8 +4355,7 @@ fn apply_tree_popup_input_actions(
             }
             PopupInputAction::TogglePeek => {}
             PopupInputAction::ToggleGrouping => {
-                state.toggle_grouping();
-                model_dirty = true;
+                // Tree rows depend on existing window/session headers for context.
             }
         }
     }
@@ -4385,7 +4384,10 @@ fn workspace_popup_visible_model_from_model(
     state: &mut crate::popup::PopupState,
 ) -> crate::popup::PopupModel {
     let rows = crate::popup::filter_rows(&model.rows, &state.filter);
-    let model = crate::popup::group_rows(rows, state.grouping);
+    let model = match state.grouping {
+        crate::popup::PopupGrouping::Attention => crate::popup::PopupModel::new(rows),
+        crate::popup::PopupGrouping::Repo => crate::popup::group_rows(rows, state.grouping),
+    };
     state.ensure_selection(&model);
     model
 }
@@ -8450,6 +8452,47 @@ mod tests {
 
         assert!(rendered.contains("needle-session"), "{rendered}");
         assert!(!rendered.contains("other-session"), "{rendered}");
+    }
+
+    #[test]
+    fn workspace_popup_toggle_grouping_switches_from_sections_to_repo_headers() {
+        let repo_path = PathBuf::from("/tmp/grouped-workspace");
+        let registry = crate::registry::WorkspaceRegistry {
+            workspaces: Vec::new(),
+            sessions: vec![crate::registry::SessionRecord {
+                name: "live-dev".to_string(),
+                path: repo_path.clone(),
+                state: "detached".to_string(),
+                last_seen: 456,
+            }],
+        };
+        let live_sessions = vec![LiveWorkspaceSession {
+            name: "live-dev".to_string(),
+            window_count: 1,
+            attached_count: 0,
+        }];
+        let model = workspace_popup_model(&registry, &live_sessions);
+        let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Workspace);
+
+        let default = workspace_popup_visible_model_from_model(&model, &mut state);
+        assert!(
+            default.rows.iter().any(|row| row.title == "Live sessions"),
+            "{default:?}"
+        );
+
+        state.toggle_grouping();
+        let grouped = workspace_popup_visible_model_from_model(&model, &mut state);
+        assert!(
+            grouped
+                .rows
+                .iter()
+                .any(|row| row.title == repo_path.display().to_string()),
+            "{grouped:?}"
+        );
+        assert!(
+            !grouped.rows.iter().any(|row| row.title == "Live sessions"),
+            "{grouped:?}"
+        );
     }
 
     #[test]
