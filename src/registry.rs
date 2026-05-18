@@ -131,7 +131,7 @@ fn now_seconds() -> u64 {
 fn parse(contents: &str) -> io::Result<WorkspaceRegistry> {
     let mut registry = WorkspaceRegistry::default();
     for (line_index, line) in contents.lines().enumerate() {
-        let line = line.trim_end();
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -341,6 +341,25 @@ mod tests {
                 last_seen: 42,
                 last_window: Some(1),
                 last_pane: Some(2),
+            }],
+        };
+
+        assert_eq!(parse(&render(&registry)).unwrap(), registry);
+    }
+
+    #[test]
+    fn registry_round_trips_partial_optional_session_metadata() {
+        let registry = WorkspaceRegistry {
+            workspaces: vec![WorkspaceRecord {
+                path: PathBuf::from("/tmp/project"),
+            }],
+            sessions: vec![SessionRecord {
+                name: "dev".to_string(),
+                path: PathBuf::from("/tmp/project"),
+                state: "detached".to_string(),
+                last_seen: 42,
+                last_window: Some(1),
+                last_pane: None,
             }],
         };
 
