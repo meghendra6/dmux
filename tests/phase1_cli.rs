@@ -1719,6 +1719,23 @@ fn poll_list_panes_contains(
     last
 }
 
+fn poll_list_sessions_contains(socket: &std::path::Path, format: &str, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(socket, &["list-sessions", "-F", format]);
+        assert_success(&output);
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if last.contains(needle) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
+}
+
 fn active_pane_index_and_id(socket: &std::path::Path, session: &str) -> (usize, usize) {
     let output = dmux(
         socket,
@@ -2242,9 +2259,21 @@ fn spawn_attached_dmux(
     args: &[&str],
     readiness_needles: &[&str],
 ) -> CapturedDmuxChild {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
-        .env("DEVMUX_SOCKET", socket)
-        .args(args)
+    spawn_attached_dmux_with_env(socket, args, readiness_needles, &[])
+}
+
+fn spawn_attached_dmux_with_env(
+    socket: &std::path::Path,
+    args: &[&str],
+    readiness_needles: &[&str],
+    envs: &[(&str, &str)],
+) -> CapturedDmuxChild {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dmux"));
+    command.env("DEVMUX_SOCKET", socket).args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3349,6 +3378,67 @@ fn tree_popup_enter_does_not_forward_same_read_payload_after_filter() {
         .unwrap();
     assert_success(&wait_for_child_exit(child));
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+}
+
+#[test]
+fn workspace_popup_enter_switches_to_detached_live_session() {
+    let socket = unique_socket("workspace-popup-switch");
+    let registry_path = unique_temp_file("workspace-popup-switch-registry");
+    let registry_env = registry_path.to_string_lossy().to_string();
+    let session_a = format!("workspace-popup-switch-a-{}", std::process::id());
+    let session_b = format!("workspace-popup-switch-b-{}", std::process::id());
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &session_a, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &session_b, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+
+    let mut child = spawn_attached_dmux_with_env(
+        &socket,
+        &["attach", "-t", &session_a],
+        &[],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    );
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02A")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["dmux workspaces", &session_b], "workspace popup");
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(format!("/{session_b}\r\r").as_bytes())
+        .unwrap();
+    let switched = poll_list_sessions_contains(
+        &socket,
+        "#{session.name}\t#{session.attached_count}",
+        &format!("{session_b}\t1"),
+    );
+    assert!(
+        switched.contains(&format!("{session_b}\t1")),
+        "{switched:?}"
+    );
+    child
+        .stdin_mut("workspace switched stdin")
+        .write_all(b"from-b\n")
+        .unwrap();
+
+    let captured = poll_capture(&socket, &session_b, "from-b");
+    assert!(captured.contains("from-b"), "{captured:?}");
+
+    child
+        .stdin_mut("workspace switched stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session_a]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session_b]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(registry_path);
 }
 
 #[test]
