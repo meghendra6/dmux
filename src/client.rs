@@ -2508,6 +2508,7 @@ struct PaneListEntry {
 
 const ATTENTION_FIELD_SEPARATOR: char = '\u{1f}';
 const ATTENTION_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const ACTIVE_WINDOW_INDEX_FORMAT: &str = "#{window.index}";
 const TREE_LIST_WINDOWS_FORMAT: &str =
     "#{window.index}\u{1f}#{window.active}\u{1f}#{window.name}\u{1f}#{window.panes}";
 const TREE_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
@@ -2517,6 +2518,7 @@ const WORKSPACE_LIST_SESSIONS_FORMAT: &str =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneAttentionEntry {
+    window_index: usize,
     index: usize,
     active: bool,
     state: String,
@@ -3167,10 +3169,6 @@ fn run_live_snapshot_attach(
                                 active_popup = AttachPopup::None;
                                 popup_state = None;
                                 popup_input_state = None;
-                            }
-                            AttentionPopupInputResult::Message(message) => {
-                                pane_number_message =
-                                    Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
                             }
                         }
                         if !redraw_paused {
@@ -3892,15 +3890,33 @@ fn pane_number_message_text(socket: &Path, session: &str) -> io::Result<String> 
 }
 
 fn pane_attention_entries(socket: &Path, session: &str) -> io::Result<Vec<PaneAttentionEntry>> {
+    let window_index = active_window_index(socket, session)?;
     let body = send_control_request(
         socket,
         &protocol::encode_list_panes(session, Some(ATTENTION_LIST_PANES_FORMAT)),
     )?;
     let listing = String::from_utf8_lossy(&body);
-    parse_pane_attention_listing(&listing)
+    parse_pane_attention_listing_with_window(&listing, window_index)
 }
 
+fn active_window_index(socket: &Path, session: &str) -> io::Result<usize> {
+    let body = send_control_request(
+        socket,
+        &protocol::encode_status_line(session, Some(ACTIVE_WINDOW_INDEX_FORMAT)),
+    )?;
+    let listing = String::from_utf8_lossy(&body);
+    parse_usize_field(listing.trim_end(), "invalid active window index")
+}
+
+#[cfg(test)]
 fn parse_pane_attention_listing(listing: &str) -> io::Result<Vec<PaneAttentionEntry>> {
+    parse_pane_attention_listing_with_window(listing, 0)
+}
+
+fn parse_pane_attention_listing_with_window(
+    listing: &str,
+    window_index: usize,
+) -> io::Result<Vec<PaneAttentionEntry>> {
     let mut entries = Vec::new();
     for line in listing.lines() {
         let fields = line.split(ATTENTION_FIELD_SEPARATOR).collect::<Vec<_>>();
@@ -3923,6 +3939,7 @@ fn parse_pane_attention_listing(listing: &str) -> io::Result<Vec<PaneAttentionEn
         };
 
         entries.push(PaneAttentionEntry {
+            window_index,
             index: parse_usize_field(index, "invalid attention pane index")?,
             active: parse_bool_flag(active, "invalid attention active flag")?,
             state: (*state).to_string(),
@@ -4042,7 +4059,7 @@ fn attention_popup_model(
             repo_path: Some(PathBuf::from(&entry.cwd)),
             target: Some(crate::popup::PopupTarget {
                 session: session.to_string(),
-                window_index: None,
+                window_index: Some(entry.window_index),
                 pane_index: Some(entry.index),
             }),
             state: attention_popup_state(entry),
@@ -4405,7 +4422,7 @@ fn render_tree_popup_overlay_text(
     state: &mut crate::popup::PopupState,
 ) -> io::Result<PopupOverlayText> {
     let model = tree_popup_visible_model(socket, session, state)?;
-    let peek = popup_selected_peek_text(socket, state, &model)?;
+    let peek = popup_selected_peek_text(socket, state, &model);
     Ok(PopupOverlayText {
         title: "dmux tree",
         content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
@@ -4418,7 +4435,7 @@ fn render_attention_popup_overlay_text(
     state: &mut crate::popup::PopupState,
 ) -> io::Result<PopupOverlayText> {
     let model = attention_popup_visible_model(socket, session, state)?;
-    let peek = popup_selected_peek_text(socket, state, &model)?;
+    let peek = popup_selected_peek_text(socket, state, &model);
     Ok(PopupOverlayText {
         title: "dmux attention",
         content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
@@ -4429,19 +4446,18 @@ fn popup_selected_peek_text(
     socket: &Path,
     state: &crate::popup::PopupState,
     model: &crate::popup::PopupModel,
-) -> io::Result<Option<String>> {
+) -> Option<String> {
     if !state.peek {
-        return Ok(None);
+        return None;
     }
     state
         .selected_row(model)
         .map(|row| popup_peek_text(socket, row))
-        .transpose()
 }
 
-fn popup_peek_text(socket: &Path, row: &crate::popup::PopupRow) -> io::Result<String> {
+fn popup_peek_text(socket: &Path, row: &crate::popup::PopupRow) -> String {
     let Some(target) = row.target.as_ref() else {
-        return Ok("row has no target".to_string());
+        return "row has no target".to_string();
     };
 
     let mut metadata = vec![
@@ -4470,32 +4486,28 @@ fn popup_peek_text(socket: &Path, row: &crate::popup::PopupRow) -> io::Result<St
                 .unwrap_or(protocol::WindowTarget::Active),
             pane: protocol::PaneTarget::Index(pane_index),
         };
-        let body = send_control_request(
+        match send_control_request(
             socket,
             &protocol::encode_capture_target(
                 &target,
                 protocol::CaptureMode::Screen,
                 protocol::BufferSelection::All,
             ),
-        )?;
-        String::from_utf8_lossy(&body).to_string()
+        ) {
+            Ok(body) => String::from_utf8_lossy(&body).to_string(),
+            Err(error) => format!("capture error: {error}"),
+        }
     } else {
         String::new()
     };
 
-    Ok(crate::popup::render_peek_text(
-        &metadata,
-        &capture,
-        40,
-        8 * 1024,
-    ))
+    crate::popup::render_peek_text(&metadata, &capture, 40, 8 * 1024)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttentionPopupInputResult {
     StayOpen,
     Close,
-    Message(String),
 }
 
 fn attention_popup_visible_model(
@@ -4562,11 +4574,7 @@ fn apply_attention_popup_input_actions(
                 }
                 state.selected = model.selectable_row_ids().last().cloned();
             }
-            PopupInputAction::Enter => {
-                return Ok(AttentionPopupInputResult::Message(
-                    "row is read-only".to_string(),
-                ));
-            }
+            PopupInputAction::Enter => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(AttentionPopupInputResult::Close);
@@ -4743,7 +4751,7 @@ fn render_workspace_popup_overlay_text(
     state: &mut crate::popup::PopupState,
 ) -> io::Result<PopupOverlayText> {
     let model = workspace_popup_visible_model(socket, state)?;
-    let peek = popup_selected_peek_text(socket, state, &model)?;
+    let peek = popup_selected_peek_text(socket, state, &model);
     Ok(PopupOverlayText {
         title: "dmux workspaces",
         content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
@@ -5632,9 +5640,6 @@ where
                                     let _ = write_live_snapshot_frame_with_message_and_clear(
                                         socket, session, None, None, false, false,
                                     )?;
-                                }
-                                AttentionPopupInputResult::Message(message) => {
-                                    write_attach_transient_message(&message)?;
                                 }
                             }
                             continue;
@@ -10219,6 +10224,7 @@ mod tests {
     #[test]
     fn format_attention_popup_lists_attention_before_quiet_panes() {
         let quiet = PaneAttentionEntry {
+            window_index: 0,
             index: 0,
             active: true,
             state: "running".to_string(),
@@ -10233,6 +10239,7 @@ mod tests {
             cwd: "/tmp/project".to_string(),
         };
         let attention = PaneAttentionEntry {
+            window_index: 0,
             index: 1,
             active: false,
             state: "running".to_string(),
@@ -10258,6 +10265,7 @@ mod tests {
     #[test]
     fn format_attention_popup_reports_empty_attention() {
         let quiet = PaneAttentionEntry {
+            window_index: 0,
             index: 0,
             active: true,
             state: "running".to_string(),

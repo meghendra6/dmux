@@ -348,9 +348,12 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
         lines.extend(peek.lines().map(str::to_string));
     }
     lines.push(String::new());
-    lines.push(
-        "Enter: focus/attach   Space: peek   Tab: group   /: filter   Esc: close".to_string(),
-    );
+    lines.push(match state.mode {
+        PopupMode::Attention => "Space: peek   Tab: group   /: filter   Esc: close".to_string(),
+        PopupMode::Workspace | PopupMode::Tree => {
+            "Enter: focus/attach   Space: peek   Tab: group   /: filter   Esc: close".to_string()
+        }
+    });
     lines.join("\n")
 }
 
@@ -495,6 +498,18 @@ mod tests {
         assert!(text.contains("Working"));
         assert!(text.contains("> * alpha"));
         assert!(text.contains("Enter: focus/attach"));
+    }
+
+    #[test]
+    fn attention_footer_omits_enter_action() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Attention);
+        state.selected = Some("a".to_string());
+
+        let text = render_popup_text(&state, &model, None);
+
+        assert!(text.contains("Space: peek"));
+        assert!(!text.contains("Enter: focus/attach"), "{text}");
     }
 
     #[test]

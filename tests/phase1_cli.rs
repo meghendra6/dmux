@@ -3621,11 +3621,11 @@ fn attention_popup_space_opens_read_only_peek() {
             "--",
             "sh",
             "-c",
-            "printf peek-ready; sleep 30",
+            "printf peek-capture-ready; IFS= read -r line; printf 'forwarded:%s' \"$line\"; sleep 30",
         ],
     ));
-    let ready = poll_capture(&socket, &session, "peek-ready");
-    assert!(ready.contains("peek-ready"), "{ready:?}");
+    let ready = poll_capture(&socket, &session, "peek-capture-ready");
+    assert!(ready.contains("peek-capture-ready"), "{ready:?}");
 
     let target = format!("{session}:0.0");
     assert_success(&dmux(
@@ -3641,13 +3641,14 @@ fn attention_popup_space_opens_read_only_peek() {
         ],
     ));
 
-    let mut child = spawn_attached_to_session(&socket, &session, &["peek-ready"]);
+    let mut child = spawn_attached_to_session(&socket, &session, &["peek-capture-ready"]);
     {
         let stdin = child.stdin_mut("attach stdin");
         stdin.write_all(b"\x02!").expect("write attention");
         stdin.flush().expect("flush attention");
     }
     child.wait_for_stdout_contains_all(&["dmux attention", "choose option"], "attention popup");
+    child.clear_stdout();
 
     {
         let stdin = child.stdin_mut("attach stdin");
@@ -3655,9 +3656,26 @@ fn attention_popup_space_opens_read_only_peek() {
         stdin.flush().expect("flush peek");
     }
     child.wait_for_stdout_contains_all(
-        &["Peek", "choose option", "peek-ready"],
+        &["Peek", "capture tail", "peek-capture-ready"],
         "attention peek output",
     );
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"q").expect("close attention popup");
+        stdin.flush().expect("flush close attention popup");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"X\n")
+            .expect("write pane input after peek");
+        stdin.flush().expect("flush pane input after peek");
+    }
+    child.wait_for_stdout_contains_all(&["forwarded:X"], "space consumed before pane input");
+    let stdout = child.stdout_text();
+    assert!(!stdout.contains("forwarded: X"), "{stdout:?}");
 
     {
         let stdin = child.stdin_mut("attach stdin");
