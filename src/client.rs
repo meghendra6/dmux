@@ -3057,6 +3057,8 @@ fn run_live_snapshot_attach(
     let mut pane_number_message = None;
     let mut command_prompt_message: Option<String> = None;
     let mut active_popup = AttachPopup::None;
+    let mut popup_state: Option<crate::popup::PopupState> = None;
+    let mut popup_input_state: Option<PopupInputState> = None;
     let mut pending_input_repaint_deadline = None;
     let mut render_output_state = LiveRenderOutputState::default();
 
@@ -3072,18 +3074,63 @@ fn run_live_snapshot_attach(
         match input.recv_timeout(timeout) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
                 let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                if active_popup == AttachPopup::Tree {
+                    if let (Some(state), Some(input_state)) =
+                        (popup_state.as_mut(), popup_input_state.as_mut())
+                    {
+                        let trailing = popup_plain_enter_trailing(&bytes, input_state);
+                        let actions = popup_actions_for_input(&bytes, input_state);
+                        match apply_tree_popup_input_actions(socket, session, state, &actions)? {
+                            TreePopupInputResult::StayOpen => {}
+                            TreePopupInputResult::Close => {
+                                active_popup = AttachPopup::None;
+                                popup_state = None;
+                                popup_input_state = None;
+                            }
+                            TreePopupInputResult::Reconnect => {
+                                active_popup = AttachPopup::None;
+                                popup_state = None;
+                                popup_input_state = None;
+                                pane_number_message = None;
+                                if let Some(trailing) = trailing {
+                                    forward_live_snapshot_input(stream, &trailing)?;
+                                }
+                            }
+                            TreePopupInputResult::Message(message) => {
+                                pane_number_message =
+                                    Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
+                            }
+                        }
+                        if !redraw_paused {
+                            frame = write_live_snapshot_frame_with_active_message_and_popup_state(
+                                socket,
+                                session,
+                                &mut pane_number_message,
+                                command_prompt_message.as_deref(),
+                                active_popup,
+                                popup_state.as_mut(),
+                            )?;
+                            sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                            reset_live_render_output_state(&mut render_output_state);
+                            last_redraw = Instant::now();
+                            pending_input_repaint_deadline = None;
+                        }
+                        continue;
+                    }
+                }
                 forward_live_snapshot_input(stream, &bytes)?;
                 if !redraw_paused
                     && (resized
                         || (!event_stream_active
                             && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL))
                 {
-                    frame = write_live_snapshot_frame_with_active_message(
+                    frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                         socket,
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
                         active_popup,
+                        popup_state.as_mut(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3105,12 +3152,13 @@ fn run_live_snapshot_attach(
                     )),
                 };
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame_with_active_message(
+                    frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                         socket,
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
                         active_popup,
+                        popup_state.as_mut(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3119,15 +3167,18 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::CommandPromptStart) => {
                 active_popup = AttachPopup::None;
+                popup_state = None;
+                popup_input_state = None;
                 pane_number_message = None;
                 command_prompt_message = Some(attach_command_prompt_text(""));
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame_with_active_message(
+                    frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                         socket,
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
                         active_popup,
+                        popup_state.as_mut(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3136,6 +3187,8 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::CommandPromptUpdate(command)) => {
                 active_popup = AttachPopup::None;
+                popup_state = None;
+                popup_input_state = None;
                 pane_number_message = None;
                 command_prompt_message = Some(attach_command_prompt_text(&command));
                 if !redraw_paused {
@@ -3153,6 +3206,8 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::CommandPromptCancel) => {
                 active_popup = AttachPopup::None;
+                popup_state = None;
+                popup_input_state = None;
                 command_prompt_message = None;
                 pane_number_message = Some((
                     "cancelled".to_string(),
@@ -3177,6 +3232,8 @@ fn run_live_snapshot_attach(
             }) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = AttachPopup::None;
+                popup_state = None;
+                popup_input_state = None;
                 command_prompt_message = None;
                 let command_result = dispatch_attach_command(socket, session, &command);
                 pane_number_message = match command_result {
@@ -3229,6 +3286,9 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::ShowPaneNumbers) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                active_popup = AttachPopup::None;
+                popup_state = None;
+                popup_input_state = None;
                 let message = pane_number_message_text(socket, session)?;
                 pane_number_message =
                     Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
@@ -3246,6 +3306,8 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowHelp) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_help();
+                popup_state = None;
+                popup_input_state = None;
                 pane_number_message = None;
                 command_prompt_message = None;
                 frame = write_live_snapshot_frame_with_active_message(
@@ -3262,6 +3324,8 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowAttention) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_attention();
+                popup_state = None;
+                popup_input_state = None;
                 pane_number_message = None;
                 command_prompt_message = None;
                 frame = write_live_snapshot_frame_with_active_message(
@@ -3278,14 +3342,23 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowTree) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_tree();
+                if active_popup == AttachPopup::Tree {
+                    popup_state =
+                        Some(crate::popup::PopupState::new(crate::popup::PopupMode::Tree));
+                    popup_input_state = Some(PopupInputState::new(crate::popup::PopupMode::Tree));
+                } else {
+                    popup_state = None;
+                    popup_input_state = None;
+                }
                 pane_number_message = None;
                 command_prompt_message = None;
-                frame = write_live_snapshot_frame_with_active_message(
+                frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                     socket,
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
                     active_popup,
+                    popup_state.as_mut(),
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3294,6 +3367,8 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowDetail) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_detail();
+                popup_state = None;
+                popup_input_state = None;
                 pane_number_message = None;
                 command_prompt_message = None;
                 frame = write_live_snapshot_frame_with_active_message(
@@ -3310,6 +3385,8 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowWorkspaceRegistry) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_workspace_registry();
+                popup_state = None;
+                popup_input_state = None;
                 pane_number_message = None;
                 command_prompt_message = None;
                 frame = write_live_snapshot_frame_with_active_message(
@@ -3438,8 +3515,12 @@ fn run_live_snapshot_attach(
                         if command_prompt_message.is_none() && active_popup == AttachPopup::None {
                             pane_number_message = None;
                         }
-                        let popup_overlay =
-                            attach_popup_overlay_text(socket, session, active_popup)?;
+                        let popup_overlay = attach_popup_overlay_text_with_state(
+                            socket,
+                            session,
+                            active_popup,
+                            popup_state.as_mut(),
+                        )?;
                         write_live_render_output(
                             &render_frame,
                             &mut render_output_state,
@@ -3548,7 +3629,26 @@ fn write_live_snapshot_frame_with_active_message(
     command_prompt_message: Option<&str>,
     active_popup: AttachPopup,
 ) -> io::Result<LiveSnapshotFrame> {
-    let popup_overlay = attach_popup_overlay_text(socket, session, active_popup)?;
+    write_live_snapshot_frame_with_active_message_and_popup_state(
+        socket,
+        session,
+        pane_number_message,
+        command_prompt_message,
+        active_popup,
+        None,
+    )
+}
+
+fn write_live_snapshot_frame_with_active_message_and_popup_state(
+    socket: &Path,
+    session: &str,
+    pane_number_message: &mut Option<(String, Instant)>,
+    command_prompt_message: Option<&str>,
+    active_popup: AttachPopup,
+    popup_state: Option<&mut crate::popup::PopupState>,
+) -> io::Result<LiveSnapshotFrame> {
+    let popup_overlay =
+        attach_popup_overlay_text_with_state(socket, session, active_popup, popup_state)?;
     let message = active_live_message(pane_number_message, command_prompt_message, Instant::now());
     write_live_snapshot_frame_with_message_and_clear(
         socket,
@@ -3774,9 +3874,116 @@ fn pane_attention_label(entry: &PaneAttentionEntry) -> String {
         .to_string()
 }
 
-fn attach_tree_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
+fn attach_tree_popup_model(socket: &Path, session: &str) -> io::Result<crate::popup::PopupModel> {
     let windows = session_tree_entries(socket, session)?;
-    Ok(format_session_tree_popup(session, &windows))
+    Ok(tree_popup_model(session, &windows))
+}
+
+fn tree_popup_model(session: &str, windows: &[WindowTreeEntry]) -> crate::popup::PopupModel {
+    let mut rows = vec![crate::popup::PopupRow {
+        id: format!("{session}:tree"),
+        kind: crate::popup::PopupRowKind::Header,
+        repo_path: None,
+        target: None,
+        state: crate::popup::PopupStateKind::Idle,
+        source: crate::popup::PopupRowSource::Mux,
+        title: format!("C-b w close    current session: {session}"),
+        summary: String::new(),
+        last_changed: None,
+        attachable: false,
+    }];
+
+    if windows.is_empty() {
+        rows.push(crate::popup::PopupRow {
+            id: format!("{session}:empty"),
+            kind: crate::popup::PopupRowKind::DisabledItem,
+            repo_path: None,
+            target: None,
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: "No windows.".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+        });
+        return crate::popup::PopupModel::new(rows);
+    }
+
+    for window in windows {
+        let active = if window.active { "*" } else { " " };
+        let name = if window.name.trim().is_empty() {
+            window.index.to_string()
+        } else {
+            window.name.clone()
+        };
+        rows.push(crate::popup::PopupRow {
+            id: format!("{session}:{}:window", window.index),
+            kind: crate::popup::PopupRowKind::Header,
+            repo_path: None,
+            target: Some(crate::popup::PopupTarget {
+                session: session.to_string(),
+                window_index: Some(window.index),
+                pane_index: None,
+            }),
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: format!(
+                "{active} window {}  {}  panes {}",
+                window.index,
+                name,
+                window.panes.len()
+            ),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+        });
+        for pane in &window.panes {
+            rows.push(crate::popup::PopupRow {
+                id: format!("{session}:{}:{}", window.index, pane.index),
+                kind: crate::popup::PopupRowKind::Item,
+                repo_path: Some(PathBuf::from(&pane.cwd)),
+                target: Some(crate::popup::PopupTarget {
+                    session: session.to_string(),
+                    window_index: Some(window.index),
+                    pane_index: Some(pane.index),
+                }),
+                state: pane_tree_state(pane),
+                source: crate::popup::PopupRowSource::Mux,
+                title: format!("pane {}", pane.index),
+                summary: format!("{}  {}", pane.state, pane_tree_label(pane)),
+                last_changed: None,
+                attachable: true,
+            });
+        }
+    }
+
+    crate::popup::PopupModel::new(rows)
+}
+
+fn pane_tree_state(entry: &PaneTreeEntry) -> crate::popup::PopupStateKind {
+    let agent_state = entry.agent_state.trim();
+    if !agent_state.is_empty() {
+        return normalize_agent_state(agent_state);
+    }
+    if entry.bell || entry.activity {
+        return crate::popup::PopupStateKind::Alert;
+    }
+    if entry.state == "exited" {
+        return crate::popup::PopupStateKind::Completed;
+    }
+    crate::popup::PopupStateKind::Working
+}
+
+fn normalize_agent_state(state: &str) -> crate::popup::PopupStateKind {
+    match state {
+        "needs_input" | "waiting" | "permission" => crate::popup::PopupStateKind::NeedsInput,
+        "ready" | "review" => crate::popup::PopupStateKind::Ready,
+        "failed" | "error" => crate::popup::PopupStateKind::Failed,
+        "completed" | "done" => crate::popup::PopupStateKind::Completed,
+        "alert" => crate::popup::PopupStateKind::Alert,
+        "working" | "running" => crate::popup::PopupStateKind::Working,
+        _ => crate::popup::PopupStateKind::Idle,
+    }
 }
 
 fn session_tree_entries(socket: &Path, session: &str) -> io::Result<Vec<WindowTreeEntry>> {
@@ -3857,44 +4064,6 @@ fn parse_pane_tree_listing(listing: &str) -> io::Result<Vec<PaneTreeEntry>> {
     Ok(entries)
 }
 
-fn format_session_tree_popup(session: &str, windows: &[WindowTreeEntry]) -> String {
-    let mut lines = vec![
-        "C-b w close    targets: :select-window N / :select-pane -t S:W.P".to_string(),
-        format!("Session: {session}"),
-    ];
-    if windows.is_empty() {
-        lines.push("No windows.".to_string());
-        return lines.join("\n");
-    }
-    for window in windows {
-        let active = if window.active { "*" } else { " " };
-        let name = if window.name.trim().is_empty() {
-            window.index.to_string()
-        } else {
-            window.name.clone()
-        };
-        lines.push(format!(
-            "{active} window {}  {}  panes {}",
-            window.index,
-            name,
-            window.panes.len()
-        ));
-        for pane in &window.panes {
-            lines.push(format!(
-                "  {} pane {}  {}  {}  target {}:{}.{}",
-                if pane.active { "*" } else { " " },
-                pane.index,
-                pane.state,
-                pane_tree_label(pane),
-                session,
-                window.index,
-                pane.index
-            ));
-        }
-    }
-    lines.join("\n")
-}
-
 fn pane_tree_label(entry: &PaneTreeEntry) -> String {
     let mut parts = Vec::new();
     if entry.bell {
@@ -3922,6 +4091,118 @@ fn pane_tree_label(entry: &PaneTreeEntry) -> String {
     } else {
         format!("{} ({})", label, parts.join(", "))
     }
+}
+
+fn tree_popup_visible_model(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<crate::popup::PopupModel> {
+    let model = attach_tree_popup_model(socket, session)?;
+    let rows = crate::popup::filter_rows(&model.rows, &state.filter);
+    let model = crate::popup::PopupModel::new(rows);
+    state.ensure_selection(&model);
+    Ok(model)
+}
+
+fn render_tree_popup_overlay_text(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<PopupOverlayText> {
+    let model = tree_popup_visible_model(socket, session, state)?;
+    Ok(PopupOverlayText {
+        title: "dmux tree",
+        content: crate::popup::render_popup_text(state, &model, None),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreePopupInputResult {
+    StayOpen,
+    Close,
+    Reconnect,
+    Message(String),
+}
+
+fn apply_tree_popup_input_actions(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+    actions: &[PopupInputAction],
+) -> io::Result<TreePopupInputResult> {
+    for action in actions {
+        match action {
+            PopupInputAction::MoveUp => {
+                let model = tree_popup_visible_model(socket, session, state)?;
+                state.move_selection(&model, -1);
+            }
+            PopupInputAction::MoveDown => {
+                let model = tree_popup_visible_model(socket, session, state)?;
+                state.move_selection(&model, 1);
+            }
+            PopupInputAction::PageUp => {
+                let model = tree_popup_visible_model(socket, session, state)?;
+                state.move_selection(&model, -10);
+            }
+            PopupInputAction::PageDown => {
+                let model = tree_popup_visible_model(socket, session, state)?;
+                state.move_selection(&model, 10);
+            }
+            PopupInputAction::Home => {
+                let model = tree_popup_visible_model(socket, session, state)?;
+                state.selected = model.selectable_row_ids().first().cloned();
+            }
+            PopupInputAction::End => {
+                let model = tree_popup_visible_model(socket, session, state)?;
+                state.selected = model.selectable_row_ids().last().cloned();
+            }
+            PopupInputAction::Enter => {
+                let model = tree_popup_visible_model(socket, session, state)?;
+                let Some(row) = state.selected_row(&model) else {
+                    return Ok(TreePopupInputResult::Message(
+                        "row is not attachable".to_string(),
+                    ));
+                };
+                return match perform_popup_enter_same_session(socket, session, row)? {
+                    PopupEnterResult::Reconnect => Ok(TreePopupInputResult::Reconnect),
+                    PopupEnterResult::Message(message) => {
+                        Ok(TreePopupInputResult::Message(message))
+                    }
+                };
+            }
+            PopupInputAction::Escape => {
+                if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
+                    return Ok(TreePopupInputResult::Close);
+                }
+            }
+            PopupInputAction::Close => return Ok(TreePopupInputResult::Close),
+            PopupInputAction::FilterStart => {
+                state.filter_mode = true;
+            }
+            PopupInputAction::FilterPush(ch) => {
+                state.filter.push(*ch);
+            }
+            PopupInputAction::FilterBackspace => {
+                state.filter.pop();
+            }
+            PopupInputAction::FilterAccept => {
+                state.filter_mode = false;
+            }
+            PopupInputAction::TogglePeek | PopupInputAction::ToggleGrouping => {}
+        }
+    }
+    Ok(TreePopupInputResult::StayOpen)
+}
+
+fn popup_plain_enter_trailing(input: &[u8], state: &PopupInputState) -> Option<Vec<u8>> {
+    if state.filter_mode {
+        return None;
+    }
+    input
+        .iter()
+        .position(|byte| matches!(byte, b'\r' | b'\n'))
+        .map(|index| input[index + 1..].to_vec())
 }
 
 fn attach_detail_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
@@ -4151,6 +4432,15 @@ fn attach_popup_overlay_text(
     session: &str,
     popup: AttachPopup,
 ) -> io::Result<Option<PopupOverlayText>> {
+    attach_popup_overlay_text_with_state(socket, session, popup, None)
+}
+
+fn attach_popup_overlay_text_with_state(
+    socket: &Path,
+    session: &str,
+    popup: AttachPopup,
+    popup_state: Option<&mut crate::popup::PopupState>,
+) -> io::Result<Option<PopupOverlayText>> {
     match popup {
         AttachPopup::None => Ok(None),
         AttachPopup::Help => Ok(Some(PopupOverlayText {
@@ -4168,14 +4458,16 @@ fn attach_popup_overlay_text(
             }))
         }
         AttachPopup::Tree => {
-            let content = attach_tree_overlay_text(socket, session)?;
-            let model = legacy_popup_model(&content, crate::popup::PopupMode::Tree);
-            let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Tree);
-            state.ensure_selection(&model);
-            Ok(Some(PopupOverlayText {
-                title: "dmux tree",
-                content: crate::popup::render_popup_text(&state, &model, None),
-            }))
+            if let Some(state) = popup_state {
+                Ok(Some(render_tree_popup_overlay_text(
+                    socket, session, state,
+                )?))
+            } else {
+                let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Tree);
+                Ok(Some(render_tree_popup_overlay_text(
+                    socket, session, &mut state,
+                )?))
+            }
         }
         AttachPopup::Detail => Ok(Some(PopupOverlayText {
             title: "dmux detail",
@@ -4332,6 +4624,42 @@ fn select_numbered_pane(socket: &Path, session: &str, index: usize) -> io::Resul
     Ok(true)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PopupEnterResult {
+    Reconnect,
+    Message(String),
+}
+
+fn perform_popup_enter_same_session(
+    socket: &Path,
+    current_session: &str,
+    row: &crate::popup::PopupRow,
+) -> io::Result<PopupEnterResult> {
+    let Some(target) = row.target.as_ref() else {
+        return Ok(PopupEnterResult::Message(
+            "row is not attachable".to_string(),
+        ));
+    };
+    if !row.attachable || target.session != current_session {
+        return Ok(PopupEnterResult::Message(
+            "row is not attachable here".to_string(),
+        ));
+    }
+    if let Some(window_index) = target.window_index {
+        let _ = send_control_request(
+            socket,
+            &protocol::encode_select_window(current_session, window_index),
+        )?;
+    }
+    if let Some(pane_index) = target.pane_index {
+        let _ = send_control_request(
+            socket,
+            &protocol::encode_select_pane(current_session, pane_index),
+        )?;
+    }
+    Ok(PopupEnterResult::Reconnect)
+}
+
 fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
     let entries = pane_entries(socket, session)?;
     let next = next_pane_index_from_entries(&entries)?;
@@ -4465,6 +4793,8 @@ where
     let mut initial_input = Some(initial_input);
     let mut controls = load_live_controls(socket);
     let mut active_popup = AttachPopup::None;
+    let mut popup_state: Option<crate::popup::PopupState> = None;
+    let mut popup_input_state: Option<PopupInputState> = None;
 
     loop {
         tick()?;
@@ -4507,8 +4837,57 @@ where
 
         for (index, action) in actions.iter().enumerate() {
             match action {
-                AttachInputAction::Forward(output) => stream.write_all(&output)?,
-                AttachInputAction::CommandPromptStart => write_attach_command_prompt("", true)?,
+                AttachInputAction::Forward(output) => {
+                    if active_popup == AttachPopup::Tree {
+                        if let (Some(state), Some(popup_decoder)) =
+                            (popup_state.as_mut(), popup_input_state.as_mut())
+                        {
+                            let trailing = popup_plain_enter_trailing(output, popup_decoder);
+                            let popup_actions = popup_actions_for_input(output, popup_decoder);
+                            match apply_tree_popup_input_actions(
+                                socket,
+                                session,
+                                state,
+                                &popup_actions,
+                            )? {
+                                TreePopupInputResult::StayOpen => {
+                                    let overlay =
+                                        render_tree_popup_overlay_text(socket, session, state)?;
+                                    write_attach_popup_message(overlay.as_overlay())?;
+                                }
+                                TreePopupInputResult::Close => {
+                                    active_popup = AttachPopup::None;
+                                    popup_state = None;
+                                    popup_input_state = None;
+                                    let _ = write_live_snapshot_frame_with_message_and_clear(
+                                        socket, session, None, None, false, false,
+                                    )?;
+                                }
+                                TreePopupInputResult::Reconnect => {
+                                    let mut pending_input = trailing.unwrap_or_default();
+                                    pending_input.extend(raw_pending_input(
+                                        &actions[index + 1..],
+                                        input_state.saw_prefix,
+                                        RawPendingFocus::Preserve,
+                                        &controls,
+                                    ));
+                                    return Ok(RawAttachExit::Reconnect { pending_input });
+                                }
+                                TreePopupInputResult::Message(message) => {
+                                    write_attach_transient_message(&message)?;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    stream.write_all(&output)?;
+                }
+                AttachInputAction::CommandPromptStart => {
+                    active_popup = AttachPopup::None;
+                    popup_state = None;
+                    popup_input_state = None;
+                    write_attach_command_prompt("", true)?;
+                }
                 AttachInputAction::CommandPromptUpdate(command) => {
                     write_attach_command_prompt(command, false)?
                 }
@@ -4712,6 +5091,9 @@ where
                     }
                 }
                 AttachInputAction::ShowPaneNumbers => {
+                    active_popup = AttachPopup::None;
+                    popup_state = None;
+                    popup_input_state = None;
                     match pane_number_message_text(socket, session) {
                         Ok(message) => write_attach_transient_message(&message)?,
                         Err(error) => write_attach_transient_message(&error.to_string())?,
@@ -4735,6 +5117,8 @@ where
                 }
                 AttachInputAction::EnterCopyMode { initial_input } => {
                     active_popup = AttachPopup::None;
+                    popup_state = None;
+                    popup_input_state = None;
                     copy_mode_active.store(true, Ordering::SeqCst);
                     let result = enter_copy_mode(initial_input);
                     copy_mode_active.store(false, Ordering::SeqCst);
@@ -4742,6 +5126,8 @@ where
                 }
                 AttachInputAction::ShowHelp => {
                     active_popup = active_popup.toggle_help();
+                    popup_state = None;
+                    popup_input_state = None;
                     if active_popup == AttachPopup::Help {
                         let overlay =
                             attach_popup_overlay_text(socket, session, AttachPopup::Help)?
@@ -4755,6 +5141,8 @@ where
                 }
                 AttachInputAction::ShowAttention => {
                     active_popup = active_popup.toggle_attention();
+                    popup_state = None;
+                    popup_input_state = None;
                     if active_popup == AttachPopup::Attention {
                         let overlay =
                             attach_popup_overlay_text(socket, session, AttachPopup::Attention)?
@@ -4769,11 +5157,19 @@ where
                 AttachInputAction::ShowTree => {
                     active_popup = active_popup.toggle_tree();
                     if active_popup == AttachPopup::Tree {
-                        let overlay =
-                            attach_popup_overlay_text(socket, session, AttachPopup::Tree)?
-                                .expect("tree popup");
+                        popup_state =
+                            Some(crate::popup::PopupState::new(crate::popup::PopupMode::Tree));
+                        popup_input_state =
+                            Some(PopupInputState::new(crate::popup::PopupMode::Tree));
+                        let overlay = render_tree_popup_overlay_text(
+                            socket,
+                            session,
+                            popup_state.as_mut().expect("tree popup state"),
+                        )?;
                         write_attach_popup_message(overlay.as_overlay())?;
                     } else {
+                        popup_state = None;
+                        popup_input_state = None;
                         let _ = write_live_snapshot_frame_with_message_and_clear(
                             socket, session, None, None, false, false,
                         )?;
@@ -4781,6 +5177,8 @@ where
                 }
                 AttachInputAction::ShowDetail => {
                     active_popup = active_popup.toggle_detail();
+                    popup_state = None;
+                    popup_input_state = None;
                     if active_popup == AttachPopup::Detail {
                         let overlay =
                             attach_popup_overlay_text(socket, session, AttachPopup::Detail)?
@@ -4794,6 +5192,8 @@ where
                 }
                 AttachInputAction::ShowWorkspaceRegistry => {
                     active_popup = active_popup.toggle_workspace_registry();
+                    popup_state = None;
+                    popup_input_state = None;
                     if active_popup == AttachPopup::WorkspaceRegistry {
                         let overlay = attach_popup_overlay_text(
                             socket,
@@ -7430,6 +7830,55 @@ mod tests {
             popup_actions_for_input(b" ", &mut state),
             vec![PopupInputAction::TogglePeek]
         );
+    }
+
+    #[test]
+    fn tree_popup_rows_include_window_and_pane_targets() {
+        let windows = vec![WindowTreeEntry {
+            index: 0,
+            active: true,
+            name: "main".to_string(),
+            panes: vec![
+                PaneTreeEntry {
+                    index: 0,
+                    active: true,
+                    state: "running".to_string(),
+                    bell: false,
+                    activity: false,
+                    agent_state: String::new(),
+                    agent_label: String::new(),
+                    title: "shell".to_string(),
+                    cwd: "/tmp/project".to_string(),
+                },
+                PaneTreeEntry {
+                    index: 1,
+                    active: false,
+                    state: "running".to_string(),
+                    bell: true,
+                    activity: false,
+                    agent_state: String::new(),
+                    agent_label: String::new(),
+                    title: "tests".to_string(),
+                    cwd: "/tmp/project".to_string(),
+                },
+            ],
+        }];
+
+        let model = tree_popup_model("dev", &windows);
+
+        assert!(
+            model
+                .rows
+                .iter()
+                .any(|row| row.kind == crate::popup::PopupRowKind::Header)
+        );
+        let pane = model
+            .rows
+            .iter()
+            .find(|row| row.target.as_ref().and_then(|target| target.pane_index) == Some(1))
+            .expect("pane row");
+        assert_eq!(pane.state, crate::popup::PopupStateKind::Alert);
+        assert!(pane.attachable);
     }
 
     #[test]

@@ -3248,6 +3248,50 @@ fn attach_prefix_popup_keys_print_tree_detail_and_workspace_registry() {
 }
 
 #[test]
+fn interactive_tree_popup_enter_selects_pane_for_input() {
+    let socket = unique_socket("interactive-tree-enter");
+    let session = format!("interactive-tree-enter-{}", std::process::id());
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "cat"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-lc",
+            "cat",
+        ],
+    ));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &[]);
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02w")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["Enter: focus/attach"], "tree popup");
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"j\rselected-pane\n")
+        .unwrap();
+
+    let captured = poll_capture(&socket, &session, "selected-pane");
+    assert!(captured.contains("selected-pane"), "{captured:?}");
+
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+}
+
+#[test]
 fn workspace_add_persists_registered_path() {
     let socket = unique_socket("workspace-add");
     let registry_path = unique_temp_file("workspace-add-registry");
