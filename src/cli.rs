@@ -164,6 +164,15 @@ pub enum Command {
         session: String,
         format: String,
     },
+    WorkspaceAdd {
+        path: String,
+    },
+    WorkspaceList,
+    AgentEvent {
+        target: Target,
+        state: String,
+        label: String,
+    },
     ListKeys {
         format: Option<String>,
     },
@@ -276,6 +285,9 @@ where
         "zoom-pane" => parse_zoom_pane(args),
         "status-line" => parse_status_line(args),
         "display-message" => parse_display_message(args),
+        "workspace-add" | "register-workspace" => parse_workspace_add(args),
+        "workspace-list" | "list-workspaces" => parse_workspace_list(args),
+        "agent-event" => parse_agent_event(args),
         "list-keys" => parse_list_keys(args),
         "bind-key" => parse_bind_key(args),
         "unbind-key" => parse_unbind_key(args),
@@ -541,6 +553,9 @@ Commands:\n\
   run <command; command...>              run dmux commands in order; stops on first error\n\
   source-file <path>                     run newline-separated dmux commands from a file\n\
   run-shell <shell-command>              run a host shell command and report its status\n\
+  workspace-add <path>                   register a repo/workspace path locally\n\
+  workspace-list                         list registered workspace paths\n\
+  agent-event -t <target> --state <state> [--label <text>]\n\
   list-keys [-F <format>]                list runtime key bindings\n\
   bind-key <key> <action>                bind a key to a supported live action\n\
   unbind-key <key>                       remove a key binding\n\
@@ -567,7 +582,7 @@ info line, and quick hints for prefix, help, command prompt, and focus.\n\
 \n\
 Session:\n\
   C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
-  C-b ! attention popup\n\
+  C-b ! attention popup   C-b w tree popup   C-b i detail popup   C-b A workspaces\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
@@ -2165,6 +2180,83 @@ fn parse_display_message(args: Vec<String>) -> Result<Command, String> {
     })
 }
 
+fn parse_workspace_add(args: Vec<String>) -> Result<Command, String> {
+    match args.as_slice() {
+        [path] => Ok(Command::WorkspaceAdd { path: path.clone() }),
+        [] => Err("workspace-add requires a path".to_string()),
+        _ => Err("workspace-add accepts exactly one path".to_string()),
+    }
+}
+
+fn parse_workspace_list(args: Vec<String>) -> Result<Command, String> {
+    if args.is_empty() {
+        Ok(Command::WorkspaceList)
+    } else {
+        Err(format!(
+            "workspace-list does not support argument {:?}",
+            args[0]
+        ))
+    }
+}
+
+fn parse_agent_event(args: Vec<String>) -> Result<Command, String> {
+    let mut target = None;
+    let mut state = None;
+    let mut label = String::new();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "agent-event requires a target after -t".to_string())?;
+                target = Some(parse_structured_target(value, "agent-event")?);
+                i += 2;
+            }
+            "--state" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "agent-event requires a state after --state".to_string())?;
+                state = Some(value.clone());
+                i += 2;
+            }
+            "--label" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "agent-event requires text after --label".to_string())?;
+                label = value.clone();
+                i += 2;
+            }
+            value => return Err(format!("agent-event does not support argument {value:?}")),
+        }
+    }
+
+    let state = state.ok_or_else(|| "agent-event requires --state <state>".to_string())?;
+    validate_agent_event_field("state", &state)?;
+    validate_agent_event_field("label", &label)?;
+    Ok(Command::AgentEvent {
+        target: target.ok_or_else(|| "agent-event requires -t <target>".to_string())?,
+        state,
+        label,
+    })
+}
+
+fn validate_agent_event_field(name: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!(
+            "agent-event {name} cannot contain control characters"
+        ));
+    }
+    if value.len() > 120 {
+        return Err(format!("agent-event {name} is too long"));
+    }
+    if name == "state" && value.trim().is_empty() {
+        return Err("agent-event state cannot be empty".to_string());
+    }
+    Ok(())
+}
+
 fn set_split_direction(
     direction: &mut Option<SplitDirection>,
     value: SplitDirection,
@@ -2352,6 +2444,46 @@ mod tests {
             Command::DetachClient {
                 session: Some("dev".to_string()),
                 client_id: Some(3),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_workspace_registry_commands() {
+        assert_eq!(
+            parse_args(["dmux", "workspace-add", "/tmp/project"]).unwrap(),
+            Command::WorkspaceAdd {
+                path: "/tmp/project".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "workspace-list"]).unwrap(),
+            Command::WorkspaceList
+        );
+    }
+
+    #[test]
+    fn parses_agent_event_command() {
+        assert_eq!(
+            parse_args([
+                "dmux",
+                "agent-event",
+                "-t",
+                "dev:1.0",
+                "--state",
+                "waiting",
+                "--label",
+                "codex",
+            ])
+            .unwrap(),
+            Command::AgentEvent {
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(1),
+                    pane: PaneTarget::Index(0),
+                },
+                state: "waiting".to_string(),
+                label: "codex".to_string(),
             }
         );
     }

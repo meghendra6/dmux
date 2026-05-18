@@ -277,6 +277,11 @@ pub enum Request {
         session: String,
         format: String,
     },
+    AgentEvent {
+        target: Target,
+        state: String,
+        label: String,
+    },
     ListKeys {
         format: Option<String>,
     },
@@ -841,6 +846,15 @@ pub fn encode_display_message(session: &str, format: &str) -> String {
     format!(
         "DISPLAY_MESSAGE\t{session}\t{}\n",
         encode_hex(format.as_bytes())
+    )
+}
+
+pub fn encode_agent_event(target: &Target, state: &str, label: &str) -> String {
+    format!(
+        "AGENT_EVENT\t{}\t{}\t{}\n",
+        encode_target(target),
+        encode_hex(state.as_bytes()),
+        encode_hex(label.as_bytes())
     )
 }
 
@@ -1633,6 +1647,11 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["DISPLAY_MESSAGE", session, format] => Ok(Request::DisplayMessage {
             session: (*session).to_string(),
             format: decode_utf8_hex(format, "DISPLAY_MESSAGE")?,
+        }),
+        ["AGENT_EVENT", target, state, label] => Ok(Request::AgentEvent {
+            target: decode_target(target, "AGENT_EVENT")?,
+            state: decode_utf8_hex(state, "AGENT_EVENT")?,
+            label: decode_utf8_hex(label, "AGENT_EVENT")?,
         }),
         ["LIST_KEYS", format] => Ok(Request::ListKeys {
             format: decode_optional_text(format, "LIST_KEYS")?,
@@ -2648,6 +2667,24 @@ mod tests {
                 session: "dev".to_string(),
                 window: WindowTarget::Active,
                 format: Some("#{pane.index}:#{pane.zoomed}".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn round_trips_agent_event_request() {
+        let target = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Index(1),
+            pane: PaneTarget::Index(0),
+        };
+        let line = encode_agent_event(&target, "waiting", "codex");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::AgentEvent {
+                target,
+                state: "waiting".to_string(),
+                label: "codex".to_string(),
             }
         );
     }

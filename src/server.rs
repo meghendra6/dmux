@@ -1389,6 +1389,8 @@ impl Window {
                     bell: pane.bell(),
                     activity: pane.activity(),
                     clipboard_blocked: pane.clipboard_blocked(),
+                    agent_state: pane.agent_state(),
+                    agent_label: pane.agent_label(),
                 })
             })
             .collect()
@@ -2011,6 +2013,8 @@ struct PaneDescription {
     bell: bool,
     activity: bool,
     clipboard_blocked: usize,
+    agent_state: String,
+    agent_label: String,
 }
 
 struct IndexedPane {
@@ -2380,6 +2384,7 @@ struct Pane {
     bell: AtomicBool,
     activity: AtomicBool,
     clipboard_blocked: AtomicUsize,
+    agent_event: Mutex<Option<PaneAgentEvent>>,
     synchronized_output_redraw_pending: AtomicBool,
     size: Mutex<PtySize>,
     raw_history: Arc<Mutex<Vec<u8>>>,
@@ -2389,6 +2394,12 @@ struct Pane {
     next_client_id: AtomicUsize,
     attach_events: AttachEventClients,
     session: Mutex<Option<Weak<Session>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneAgentEvent {
+    state: String,
+    label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2481,6 +2492,28 @@ impl Pane {
 
     fn clipboard_blocked(&self) -> usize {
         self.clipboard_blocked.load(Ordering::SeqCst)
+    }
+
+    fn set_agent_event(&self, state: String, label: String) {
+        *self.agent_event.lock().unwrap() = Some(PaneAgentEvent { state, label });
+    }
+
+    fn agent_state(&self) -> String {
+        self.agent_event
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|event| event.state.clone())
+            .unwrap_or_default()
+    }
+
+    fn agent_label(&self) -> String {
+        self.agent_event
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|event| event.label.clone())
+            .unwrap_or_default()
     }
 
     fn clear_alerts(&self) {
@@ -2699,6 +2732,11 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::DisplayMessage { session, format } => {
             handle_display_message(&state, &mut stream, &session, &format)
         }
+        Request::AgentEvent {
+            target,
+            state: event_state,
+            label,
+        } => handle_agent_event(&state, &mut stream, &target, event_state, label),
         Request::ListKeys { format } => handle_list_keys(&state, &mut stream, format.as_deref()),
         Request::BindKey { key, command } => handle_bind_key(&state, &mut stream, &key, &command),
         Request::UnbindKey { key } => handle_unbind_key(&state, &mut stream, &key),
@@ -2836,6 +2874,7 @@ fn spawn_pane(
         bell: AtomicBool::new(false),
         activity: AtomicBool::new(false),
         clipboard_blocked: AtomicUsize::new(0),
+        agent_event: Mutex::new(None),
         synchronized_output_redraw_pending: AtomicBool::new(false),
         size: Mutex::new(spec.size),
         raw_history: Arc::new(Mutex::new(Vec::new())),
@@ -3695,6 +3734,8 @@ fn format_pane_line(format: &str, pane: &PaneDescription) -> String {
         .replace("#{pane.bell}", if pane.bell { "1" } else { "0" })
         .replace("#{pane.activity}", if pane.activity { "1" } else { "0" })
         .replace("#{pane.clipboard_blocked}", &clipboard_blocked)
+        .replace("#{pane.agent_state}", &pane.agent_state)
+        .replace("#{pane.agent_label}", &pane.agent_label)
         .replace(
             "#{window.zoomed_flag}",
             if pane.window_zoomed { "1" } else { "0" },
@@ -3763,6 +3804,37 @@ fn handle_display_message(
     }
     write_ok(stream)?;
     writeln!(stream, "{rendered}")
+}
+
+fn handle_agent_event(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    target: &Target,
+    event_state: String,
+    label: String,
+) -> io::Result<()> {
+    if event_state.trim().is_empty()
+        || event_state.chars().any(char::is_control)
+        || label.chars().any(char::is_control)
+    {
+        write_err(stream, "invalid agent event")?;
+        return Ok(());
+    }
+    let session = resolve_session(state, &target.session);
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+    let pane = match session.target_pane(target) {
+        Ok(pane) => pane,
+        Err(message) => {
+            write_err(stream, &message)?;
+            return Ok(());
+        }
+    };
+    pane.set_agent_event(event_state, label);
+    session.notify_attach_redraw_immediate();
+    write_ok(stream)
 }
 
 fn handle_list_keys(
@@ -6376,6 +6448,7 @@ mod tests {
             bell: AtomicBool::new(false),
             activity: AtomicBool::new(false),
             clipboard_blocked: AtomicUsize::new(0),
+            agent_event: Mutex::new(None),
             synchronized_output_redraw_pending: AtomicBool::new(false),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
@@ -6882,6 +6955,7 @@ mod tests {
             bell: AtomicBool::new(false),
             activity: AtomicBool::new(false),
             clipboard_blocked: AtomicUsize::new(0),
+            agent_event: Mutex::new(None),
             synchronized_output_redraw_pending: AtomicBool::new(false),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),
@@ -6939,6 +7013,7 @@ mod tests {
             bell: AtomicBool::new(false),
             activity: AtomicBool::new(false),
             clipboard_blocked: AtomicUsize::new(0),
+            agent_event: Mutex::new(None),
             synchronized_output_redraw_pending: AtomicBool::new(false),
             size: Mutex::new(PtySize { cols: 80, rows: 24 }),
             raw_history: Arc::new(Mutex::new(Vec::new())),

@@ -63,21 +63,34 @@ enum AttachPopup {
     None,
     Help,
     Attention,
+    Tree,
+    Detail,
+    WorkspaceRegistry,
 }
 
 impl AttachPopup {
+    fn toggle(self, target: Self) -> Self {
+        if self == target { Self::None } else { target }
+    }
+
     fn toggle_help(self) -> Self {
-        match self {
-            Self::Help => Self::None,
-            Self::None | Self::Attention => Self::Help,
-        }
+        self.toggle(Self::Help)
     }
 
     fn toggle_attention(self) -> Self {
-        match self {
-            Self::Attention => Self::None,
-            Self::None | Self::Help => Self::Attention,
-        }
+        self.toggle(Self::Attention)
+    }
+
+    fn toggle_tree(self) -> Self {
+        self.toggle(Self::Tree)
+    }
+
+    fn toggle_detail(self) -> Self {
+        self.toggle(Self::Detail)
+    }
+
+    fn toggle_workspace_registry(self) -> Self {
+        self.toggle(Self::WorkspaceRegistry)
     }
 }
 
@@ -1263,6 +1276,9 @@ enum AttachInputAction {
         initial_input: Vec<u8>,
     },
     ShowAttention,
+    ShowTree,
+    ShowDetail,
+    ShowWorkspaceRegistry,
     ShowHelp,
     Detach,
 }
@@ -1283,6 +1299,9 @@ enum LiveSnapshotInputAction {
     SelectNextPane,
     ShowPaneNumbers,
     ShowAttention,
+    ShowTree,
+    ShowDetail,
+    ShowWorkspaceRegistry,
     ShowHelp,
     SelectPane(usize),
     EnterCopyMode {
@@ -1322,6 +1341,9 @@ enum LiveKeyAction {
     SelectNextPane,
     ShowPaneNumbers,
     ShowAttention,
+    ShowTree,
+    ShowDetail,
+    ShowWorkspaceRegistry,
     ShowHelp,
     CommandPrompt,
     PaneCommand(PaneCommand),
@@ -1383,6 +1405,9 @@ fn live_key_action(command: &str) -> Option<LiveKeyAction> {
         "next-pane" => Some(LiveKeyAction::SelectNextPane),
         "display-panes" => Some(LiveKeyAction::ShowPaneNumbers),
         "show-attention" => Some(LiveKeyAction::ShowAttention),
+        "show-tree" => Some(LiveKeyAction::ShowTree),
+        "show-detail" => Some(LiveKeyAction::ShowDetail),
+        "show-workspace-registry" => Some(LiveKeyAction::ShowWorkspaceRegistry),
         "show-help" => Some(LiveKeyAction::ShowHelp),
         "command-prompt" => Some(LiveKeyAction::CommandPrompt),
         "new-window" => Some(LiveKeyAction::PaneCommand(PaneCommand::NewWindow)),
@@ -1632,6 +1657,11 @@ fn push_attach_key_action(
             state.selecting_pane = true;
             actions.push(AttachInputAction::ShowAttention);
         }
+        LiveKeyAction::ShowTree => actions.push(AttachInputAction::ShowTree),
+        LiveKeyAction::ShowDetail => actions.push(AttachInputAction::ShowDetail),
+        LiveKeyAction::ShowWorkspaceRegistry => {
+            actions.push(AttachInputAction::ShowWorkspaceRegistry);
+        }
         LiveKeyAction::ShowHelp => actions.push(AttachInputAction::ShowHelp),
         LiveKeyAction::CommandPrompt => {
             state.command_prompt = Some(Vec::new());
@@ -1675,6 +1705,11 @@ fn push_live_snapshot_key_action(
         LiveKeyAction::ShowAttention => {
             state.selecting_pane = true;
             actions.push(LiveSnapshotInputAction::ShowAttention);
+        }
+        LiveKeyAction::ShowTree => actions.push(LiveSnapshotInputAction::ShowTree),
+        LiveKeyAction::ShowDetail => actions.push(LiveSnapshotInputAction::ShowDetail),
+        LiveKeyAction::ShowWorkspaceRegistry => {
+            actions.push(LiveSnapshotInputAction::ShowWorkspaceRegistry);
         }
         LiveKeyAction::ShowHelp => actions.push(LiveSnapshotInputAction::ShowHelp),
         LiveKeyAction::CommandPrompt => {
@@ -2242,7 +2277,13 @@ struct PaneListEntry {
 }
 
 const ATTENTION_FIELD_SEPARATOR: char = '\u{1f}';
-const ATTENTION_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const ATTENTION_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const TREE_LIST_WINDOWS_FORMAT: &str =
+    "#{window.index}\u{1f}#{window.active}\u{1f}#{window.name}\u{1f}#{window.panes}";
+const TREE_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const DETAIL_STATUS_FORMAT: &str = "#{session.name}\u{1f}#{session.attached_count}\u{1f}#{session.created_at}\u{1f}#{window.index}\u{1f}#{window.name}\u{1f}#{window.count}\u{1f}#{pane.index}\u{1f}#{pane.id}\u{1f}#{pane.state}\u{1f}#{pane.pid}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.zoomed}\u{1f}#{window.zoomed_flag}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const WORKSPACE_LIST_SESSIONS_FORMAT: &str =
+    "#{session.name}\u{1f}#{session.window_count}\u{1f}#{session.attached_count}";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneAttentionEntry {
@@ -2254,8 +2295,61 @@ struct PaneAttentionEntry {
     bell: bool,
     activity: bool,
     clipboard_blocked: usize,
+    agent_state: String,
+    agent_label: String,
     title: String,
     cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowTreeEntry {
+    index: usize,
+    active: bool,
+    name: String,
+    panes: Vec<PaneTreeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneTreeEntry {
+    index: usize,
+    active: bool,
+    state: String,
+    bell: bool,
+    activity: bool,
+    agent_state: String,
+    agent_label: String,
+    title: String,
+    cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneDetailEntry {
+    session_name: String,
+    session_attached_count: usize,
+    session_created_at: usize,
+    window_index: usize,
+    window_name: String,
+    window_count: usize,
+    pane_index: usize,
+    pane_id: usize,
+    pane_state: String,
+    pane_pid: usize,
+    pane_exit_status: Option<i32>,
+    pane_exit_signal: Option<i32>,
+    pane_zoomed: bool,
+    window_zoomed: bool,
+    pane_bell: bool,
+    pane_activity: bool,
+    pane_clipboard_blocked: usize,
+    pane_title: String,
+    pane_cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveWorkspaceSession {
+    name: String,
+    window_count: usize,
+    attached_count: usize,
 }
 
 #[cfg(test)]
@@ -2310,6 +2404,9 @@ enum LiveSnapshotInputEvent {
     SelectNextPane,
     ShowPaneNumbers,
     ShowAttention,
+    ShowTree,
+    ShowDetail,
+    ShowWorkspaceRegistry,
     ShowHelp,
     SelectPane(usize),
     PauseRedraw(mpsc::Sender<()>),
@@ -2524,6 +2621,15 @@ fn send_live_snapshot_input_actions<R: Read>(
             }
             LiveSnapshotInputAction::ShowAttention => {
                 let _ = sender.send(LiveSnapshotInputEvent::ShowAttention);
+            }
+            LiveSnapshotInputAction::ShowTree => {
+                let _ = sender.send(LiveSnapshotInputEvent::ShowTree);
+            }
+            LiveSnapshotInputAction::ShowDetail => {
+                let _ = sender.send(LiveSnapshotInputEvent::ShowDetail);
+            }
+            LiveSnapshotInputAction::ShowWorkspaceRegistry => {
+                let _ = sender.send(LiveSnapshotInputEvent::ShowWorkspaceRegistry);
             }
             LiveSnapshotInputAction::ShowHelp => {
                 let _ = sender.send(LiveSnapshotInputEvent::ShowHelp);
@@ -3002,6 +3108,54 @@ fn run_live_snapshot_attach(
                 reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
+            Ok(LiveSnapshotInputEvent::ShowTree) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                active_popup = active_popup.toggle_tree();
+                pane_number_message = None;
+                command_prompt_message = None;
+                frame = write_live_snapshot_frame_with_active_message(
+                    socket,
+                    session,
+                    &mut pane_number_message,
+                    command_prompt_message.as_deref(),
+                    active_popup,
+                )?;
+                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                reset_live_render_output_state(&mut render_output_state);
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::ShowDetail) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                active_popup = active_popup.toggle_detail();
+                pane_number_message = None;
+                command_prompt_message = None;
+                frame = write_live_snapshot_frame_with_active_message(
+                    socket,
+                    session,
+                    &mut pane_number_message,
+                    command_prompt_message.as_deref(),
+                    active_popup,
+                )?;
+                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                reset_live_render_output_state(&mut render_output_state);
+                last_redraw = Instant::now();
+            }
+            Ok(LiveSnapshotInputEvent::ShowWorkspaceRegistry) => {
+                let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                active_popup = active_popup.toggle_workspace_registry();
+                pane_number_message = None;
+                command_prompt_message = None;
+                frame = write_live_snapshot_frame_with_active_message(
+                    socket,
+                    session,
+                    &mut pane_number_message,
+                    command_prompt_message.as_deref(),
+                    active_popup,
+                )?;
+                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                reset_live_render_output_state(&mut render_output_state);
+                last_redraw = Instant::now();
+            }
             Ok(LiveSnapshotInputEvent::SelectPane(index)) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 let _ = select_numbered_pane(socket, session, index)?;
@@ -3312,6 +3466,8 @@ fn parse_pane_attention_listing(listing: &str) -> io::Result<Vec<PaneAttentionEn
             bell,
             activity,
             clipboard_blocked,
+            agent_state,
+            agent_label,
             title,
             cwd,
         ] = fields.as_slice()
@@ -3331,6 +3487,8 @@ fn parse_pane_attention_listing(listing: &str) -> io::Result<Vec<PaneAttentionEn
                 clipboard_blocked,
                 "invalid attention clipboard count",
             )?,
+            agent_state: (*agent_state).to_string(),
+            agent_label: (*agent_label).to_string(),
             title: (*title).to_string(),
             cwd: (*cwd).to_string(),
         });
@@ -3426,10 +3584,17 @@ fn pane_attention_reasons(entry: &PaneAttentionEntry) -> impl Iterator<Item = St
     if entry.clipboard_blocked > 0 {
         reasons.push(format!("clip {}", entry.clipboard_blocked));
     }
+    if !entry.agent_state.trim().is_empty() {
+        reasons.push(format!("agent {}", entry.agent_state.trim()));
+    }
     reasons.into_iter()
 }
 
 fn pane_attention_label(entry: &PaneAttentionEntry) -> String {
+    let agent = entry.agent_label.trim();
+    if !agent.is_empty() {
+        return agent.to_string();
+    }
     let title = entry.title.trim();
     if !title.is_empty() {
         return title.to_string();
@@ -3440,6 +3605,378 @@ fn pane_attention_label(entry: &PaneAttentionEntry) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("pane")
         .to_string()
+}
+
+fn attach_tree_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
+    let windows = session_tree_entries(socket, session)?;
+    Ok(format_session_tree_popup(session, &windows))
+}
+
+fn session_tree_entries(socket: &Path, session: &str) -> io::Result<Vec<WindowTreeEntry>> {
+    let body = send_control_request(
+        socket,
+        &protocol::encode_list_windows(session, Some(TREE_LIST_WINDOWS_FORMAT)),
+    )?;
+    let listing = String::from_utf8_lossy(&body);
+    let windows = parse_window_tree_listing(&listing)?;
+    let mut entries = Vec::with_capacity(windows.len());
+    for (index, active, name, _pane_count) in windows {
+        let body = send_control_request(
+            socket,
+            &protocol::encode_list_panes_target(
+                session,
+                protocol::WindowTarget::Index(index),
+                Some(TREE_LIST_PANES_FORMAT),
+            ),
+        )?;
+        let listing = String::from_utf8_lossy(&body);
+        entries.push(WindowTreeEntry {
+            index,
+            active,
+            name,
+            panes: parse_pane_tree_listing(&listing)?,
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_window_tree_listing(listing: &str) -> io::Result<Vec<(usize, bool, String, usize)>> {
+    let mut entries = Vec::new();
+    for line in listing.lines() {
+        let fields = line.split(ATTENTION_FIELD_SEPARATOR).collect::<Vec<_>>();
+        let [index, active, name, panes] = fields.as_slice() else {
+            return Err(io::Error::other("invalid tree window listing"));
+        };
+        entries.push((
+            parse_usize_field(index, "invalid tree window index")?,
+            parse_bool_flag(active, "invalid tree window active flag")?,
+            (*name).to_string(),
+            parse_usize_field(panes, "invalid tree window pane count")?,
+        ));
+    }
+    Ok(entries)
+}
+
+fn parse_pane_tree_listing(listing: &str) -> io::Result<Vec<PaneTreeEntry>> {
+    let mut entries = Vec::new();
+    for line in listing.lines() {
+        let fields = line.split(ATTENTION_FIELD_SEPARATOR).collect::<Vec<_>>();
+        let [
+            index,
+            active,
+            state,
+            bell,
+            activity,
+            agent_state,
+            agent_label,
+            title,
+            cwd,
+        ] = fields.as_slice()
+        else {
+            return Err(io::Error::other("invalid tree pane listing"));
+        };
+        entries.push(PaneTreeEntry {
+            index: parse_usize_field(index, "invalid tree pane index")?,
+            active: parse_bool_flag(active, "invalid tree pane active flag")?,
+            state: (*state).to_string(),
+            bell: parse_bool_flag(bell, "invalid tree pane bell flag")?,
+            activity: parse_bool_flag(activity, "invalid tree pane activity flag")?,
+            agent_state: (*agent_state).to_string(),
+            agent_label: (*agent_label).to_string(),
+            title: (*title).to_string(),
+            cwd: (*cwd).to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+fn format_session_tree_popup(session: &str, windows: &[WindowTreeEntry]) -> String {
+    let mut lines = vec![
+        "C-b w close    targets: :select-window N / :select-pane -t S:W.P".to_string(),
+        format!("Session: {session}"),
+    ];
+    if windows.is_empty() {
+        lines.push("No windows.".to_string());
+        return lines.join("\n");
+    }
+    for window in windows {
+        let active = if window.active { "*" } else { " " };
+        let name = if window.name.trim().is_empty() {
+            window.index.to_string()
+        } else {
+            window.name.clone()
+        };
+        lines.push(format!(
+            "{active} window {}  {}  panes {}",
+            window.index,
+            name,
+            window.panes.len()
+        ));
+        for pane in &window.panes {
+            lines.push(format!(
+                "  {} pane {}  {}  {}  target {}:{}.{}",
+                if pane.active { "*" } else { " " },
+                pane.index,
+                pane.state,
+                pane_tree_label(pane),
+                session,
+                window.index,
+                pane.index
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn pane_tree_label(entry: &PaneTreeEntry) -> String {
+    let mut parts = Vec::new();
+    if entry.bell {
+        parts.push("bell".to_string());
+    }
+    if entry.activity {
+        parts.push("activity".to_string());
+    }
+    if !entry.agent_state.trim().is_empty() {
+        parts.push(format!("agent {}", entry.agent_state.trim()));
+    }
+    let label = if !entry.agent_label.trim().is_empty() {
+        entry.agent_label.trim().to_string()
+    } else if !entry.title.trim().is_empty() {
+        entry.title.trim().to_string()
+    } else {
+        Path::new(&entry.cwd)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("pane")
+            .to_string()
+    };
+    if parts.is_empty() {
+        label
+    } else {
+        format!("{} ({})", label, parts.join(", "))
+    }
+}
+
+fn attach_detail_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
+    let body = send_control_request(
+        socket,
+        &protocol::encode_status_line(session, Some(DETAIL_STATUS_FORMAT)),
+    )?;
+    let listing = String::from_utf8_lossy(&body);
+    let detail = parse_pane_detail_listing(listing.trim_end())?;
+    Ok(format_detail_popup(&detail))
+}
+
+fn parse_pane_detail_listing(line: &str) -> io::Result<PaneDetailEntry> {
+    let fields = line.split(ATTENTION_FIELD_SEPARATOR).collect::<Vec<_>>();
+    let [
+        session_name,
+        session_attached_count,
+        session_created_at,
+        window_index,
+        window_name,
+        window_count,
+        pane_index,
+        pane_id,
+        pane_state,
+        pane_pid,
+        pane_exit_status,
+        pane_exit_signal,
+        pane_zoomed,
+        window_zoomed,
+        pane_bell,
+        pane_activity,
+        pane_clipboard_blocked,
+        pane_title,
+        pane_cwd,
+    ] = fields.as_slice()
+    else {
+        return Err(io::Error::other("invalid detail listing"));
+    };
+    Ok(PaneDetailEntry {
+        session_name: (*session_name).to_string(),
+        session_attached_count: parse_usize_field(
+            session_attached_count,
+            "invalid detail client count",
+        )?,
+        session_created_at: parse_usize_field(session_created_at, "invalid detail created id")?,
+        window_index: parse_usize_field(window_index, "invalid detail window index")?,
+        window_name: (*window_name).to_string(),
+        window_count: parse_usize_field(window_count, "invalid detail window count")?,
+        pane_index: parse_usize_field(pane_index, "invalid detail pane index")?,
+        pane_id: parse_usize_field(pane_id, "invalid detail pane id")?,
+        pane_state: (*pane_state).to_string(),
+        pane_pid: parse_usize_field(pane_pid, "invalid detail pane pid")?,
+        pane_exit_status: parse_optional_i32(pane_exit_status, "invalid detail exit status")?,
+        pane_exit_signal: parse_optional_i32(pane_exit_signal, "invalid detail exit signal")?,
+        pane_zoomed: parse_bool_flag(pane_zoomed, "invalid detail pane zoom flag")?,
+        window_zoomed: parse_bool_flag(window_zoomed, "invalid detail window zoom flag")?,
+        pane_bell: parse_bool_flag(pane_bell, "invalid detail bell flag")?,
+        pane_activity: parse_bool_flag(pane_activity, "invalid detail activity flag")?,
+        pane_clipboard_blocked: parse_usize_field(
+            pane_clipboard_blocked,
+            "invalid detail clipboard count",
+        )?,
+        pane_title: (*pane_title).to_string(),
+        pane_cwd: (*pane_cwd).to_string(),
+    })
+}
+
+fn format_detail_popup(detail: &PaneDetailEntry) -> String {
+    let mut lines = vec!["C-b i close".to_string()];
+    lines.push(format!(
+        "Session: {}  clients {}  created {}",
+        detail.session_name, detail.session_attached_count, detail.session_created_at
+    ));
+    lines.push(format!(
+        "Window:  {}  {}  windows {}{}",
+        detail.window_index,
+        if detail.window_name.is_empty() {
+            "(unnamed)"
+        } else {
+            detail.window_name.as_str()
+        },
+        detail.window_count,
+        if detail.window_zoomed { "  zoomed" } else { "" }
+    ));
+    lines.push(format!(
+        "Pane:    %{} index {}  {}  pid {}{}",
+        detail.pane_id,
+        detail.pane_index,
+        detail.pane_state,
+        detail.pane_pid,
+        if detail.pane_zoomed { "  zoomed" } else { "" }
+    ));
+    if detail.pane_state == "exited" {
+        if let Some(status) = detail.pane_exit_status {
+            lines.push(format!("Exit:    status {status}"));
+        } else if let Some(signal) = detail.pane_exit_signal {
+            lines.push(format!("Exit:    signal {signal}"));
+        }
+    }
+    let alerts = detail_alerts(detail);
+    lines.push(format!(
+        "Alerts:  {}",
+        if alerts.is_empty() {
+            "quiet".to_string()
+        } else {
+            alerts.join(", ")
+        }
+    ));
+    lines.push(format!(
+        "Title:   {}",
+        if detail.pane_title.trim().is_empty() {
+            "(empty)"
+        } else {
+            detail.pane_title.as_str()
+        }
+    ));
+    lines.push(format!("CWD:     {}", detail.pane_cwd));
+    lines.join("\n")
+}
+
+fn detail_alerts(detail: &PaneDetailEntry) -> Vec<String> {
+    let mut alerts = Vec::new();
+    if detail.pane_bell {
+        alerts.push("bell".to_string());
+    }
+    if detail.pane_activity {
+        alerts.push("activity".to_string());
+    }
+    if detail.pane_clipboard_blocked > 0 {
+        alerts.push(format!("clip {}", detail.pane_clipboard_blocked));
+    }
+    alerts
+}
+
+fn attach_workspace_registry_overlay_text(socket: &Path) -> io::Result<String> {
+    let registry = crate::registry::load(&crate::paths::workspace_registry_path())?;
+    let live_sessions = live_workspace_sessions(socket)?;
+    Ok(format_workspace_registry_popup(&registry, &live_sessions))
+}
+
+fn live_workspace_sessions(socket: &Path) -> io::Result<Vec<LiveWorkspaceSession>> {
+    let body = send_control_request(
+        socket,
+        &protocol::encode_list_sessions(Some(WORKSPACE_LIST_SESSIONS_FORMAT)),
+    )?;
+    let listing = String::from_utf8_lossy(&body);
+    parse_live_workspace_sessions(&listing)
+}
+
+fn parse_live_workspace_sessions(listing: &str) -> io::Result<Vec<LiveWorkspaceSession>> {
+    let mut sessions = Vec::new();
+    for line in listing.lines() {
+        let fields = line.split(ATTENTION_FIELD_SEPARATOR).collect::<Vec<_>>();
+        let [name, window_count, attached_count] = fields.as_slice() else {
+            return Err(io::Error::other("invalid workspace session listing"));
+        };
+        sessions.push(LiveWorkspaceSession {
+            name: (*name).to_string(),
+            window_count: parse_usize_field(window_count, "invalid workspace window count")?,
+            attached_count: parse_usize_field(attached_count, "invalid workspace attached count")?,
+        });
+    }
+    Ok(sessions)
+}
+
+fn format_workspace_registry_popup(
+    registry: &crate::registry::WorkspaceRegistry,
+    live_sessions: &[LiveWorkspaceSession],
+) -> String {
+    let mut lines = vec!["C-b A close".to_string()];
+    lines.push("Registered paths".to_string());
+    if registry.workspaces.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        lines.extend(
+            registry
+                .workspaces
+                .iter()
+                .map(|record| format!("  {}", record.path.display())),
+        );
+    }
+
+    lines.push("Live sessions".to_string());
+    if live_sessions.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        lines.extend(live_sessions.iter().map(|session| {
+            let state = if session.attached_count > 0 {
+                "attached"
+            } else {
+                "detached"
+            };
+            format!(
+                "  {}  {}  windows {}  clients {}",
+                session.name, state, session.window_count, session.attached_count
+            )
+        }));
+    }
+
+    lines.push("Previous sessions".to_string());
+    let previous = registry
+        .sessions
+        .iter()
+        .filter(|record| {
+            !live_sessions
+                .iter()
+                .any(|session| session.name == record.name)
+        })
+        .collect::<Vec<_>>();
+    if previous.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        lines.extend(previous.into_iter().map(|record| {
+            format!(
+                "  {}  {}  {}",
+                record.name,
+                record.state,
+                record.path.display()
+            )
+        }));
+    }
+    lines.join("\n")
 }
 
 fn attach_popup_overlay_text(
@@ -3456,6 +3993,18 @@ fn attach_popup_overlay_text(
         AttachPopup::Attention => Ok(Some(PopupOverlayText {
             title: "dmux attention",
             content: attach_attention_overlay_text(socket, session)?,
+        })),
+        AttachPopup::Tree => Ok(Some(PopupOverlayText {
+            title: "dmux tree",
+            content: attach_tree_overlay_text(socket, session)?,
+        })),
+        AttachPopup::Detail => Ok(Some(PopupOverlayText {
+            title: "dmux detail",
+            content: attach_detail_overlay_text(socket, session)?,
+        })),
+        AttachPopup::WorkspaceRegistry => Ok(Some(PopupOverlayText {
+            title: "dmux workspaces",
+            content: attach_workspace_registry_overlay_text(socket)?,
         })),
     }
 }
@@ -3631,6 +4180,19 @@ fn raw_pending_input(
             }
             AttachInputAction::ShowAttention => {
                 push_pending_bound_action(&mut pending, controls, LiveKeyAction::ShowAttention);
+            }
+            AttachInputAction::ShowTree => {
+                push_pending_bound_action(&mut pending, controls, LiveKeyAction::ShowTree);
+            }
+            AttachInputAction::ShowDetail => {
+                push_pending_bound_action(&mut pending, controls, LiveKeyAction::ShowDetail);
+            }
+            AttachInputAction::ShowWorkspaceRegistry => {
+                push_pending_bound_action(
+                    &mut pending,
+                    controls,
+                    LiveKeyAction::ShowWorkspaceRegistry,
+                );
             }
             AttachInputAction::SelectPane(index) => {
                 if *index < 10 {
@@ -3991,6 +4553,48 @@ where
                         let overlay =
                             attach_popup_overlay_text(socket, session, AttachPopup::Attention)?
                                 .expect("attention popup");
+                        write_attach_popup_message(overlay.as_overlay())?;
+                    } else {
+                        let _ = write_live_snapshot_frame_with_message_and_clear(
+                            socket, session, None, None, false, false,
+                        )?;
+                    }
+                }
+                AttachInputAction::ShowTree => {
+                    active_popup = active_popup.toggle_tree();
+                    if active_popup == AttachPopup::Tree {
+                        let overlay =
+                            attach_popup_overlay_text(socket, session, AttachPopup::Tree)?
+                                .expect("tree popup");
+                        write_attach_popup_message(overlay.as_overlay())?;
+                    } else {
+                        let _ = write_live_snapshot_frame_with_message_and_clear(
+                            socket, session, None, None, false, false,
+                        )?;
+                    }
+                }
+                AttachInputAction::ShowDetail => {
+                    active_popup = active_popup.toggle_detail();
+                    if active_popup == AttachPopup::Detail {
+                        let overlay =
+                            attach_popup_overlay_text(socket, session, AttachPopup::Detail)?
+                                .expect("detail popup");
+                        write_attach_popup_message(overlay.as_overlay())?;
+                    } else {
+                        let _ = write_live_snapshot_frame_with_message_and_clear(
+                            socket, session, None, None, false, false,
+                        )?;
+                    }
+                }
+                AttachInputAction::ShowWorkspaceRegistry => {
+                    active_popup = active_popup.toggle_workspace_registry();
+                    if active_popup == AttachPopup::WorkspaceRegistry {
+                        let overlay = attach_popup_overlay_text(
+                            socket,
+                            session,
+                            AttachPopup::WorkspaceRegistry,
+                        )?
+                        .expect("workspace registry popup");
                         write_attach_popup_message(overlay.as_overlay())?;
                     } else {
                         let _ = write_live_snapshot_frame_with_message_and_clear(
@@ -7763,6 +8367,22 @@ mod tests {
     }
 
     #[test]
+    fn attach_input_shows_tree_detail_and_workspace_popups() {
+        assert_eq!(
+            translate_attach_input(b"\x02w", &mut false),
+            vec![AttachInputAction::ShowTree]
+        );
+        assert_eq!(
+            translate_attach_input(b"\x02i", &mut false),
+            vec![AttachInputAction::ShowDetail]
+        );
+        assert_eq!(
+            translate_attach_input(b"\x02A", &mut false),
+            vec![AttachInputAction::ShowWorkspaceRegistry]
+        );
+    }
+
+    #[test]
     fn default_controls_bind_prefix_bang_to_attention() {
         let controls = LiveControls::default();
         let key = crate::config::parse_key_stroke("!").expect("parse key");
@@ -7771,6 +8391,26 @@ mod tests {
             controls.action_for_key(key),
             Some(LiveKeyAction::ShowAttention)
         );
+    }
+
+    #[test]
+    fn default_controls_bind_popup_keys_without_stealing_detach() {
+        let controls = LiveControls::default();
+        let tree = crate::config::parse_key_stroke("w").expect("parse tree key");
+        let detail = crate::config::parse_key_stroke("i").expect("parse detail key");
+        let workspace = crate::config::parse_key_stroke("A").expect("parse workspace key");
+        let detach = crate::config::parse_key_stroke("d").expect("parse detach key");
+
+        assert_eq!(controls.action_for_key(tree), Some(LiveKeyAction::ShowTree));
+        assert_eq!(
+            controls.action_for_key(detail),
+            Some(LiveKeyAction::ShowDetail)
+        );
+        assert_eq!(
+            controls.action_for_key(workspace),
+            Some(LiveKeyAction::ShowWorkspaceRegistry)
+        );
+        assert_eq!(controls.action_for_key(detach), Some(LiveKeyAction::Detach));
     }
 
     #[test]
@@ -7840,8 +8480,9 @@ mod tests {
     #[test]
     fn parse_attention_entries_rejects_invalid_flags() {
         let sep = ATTENTION_FIELD_SEPARATOR;
-        let listing =
-            format!("0{sep}x{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}shell{sep}/tmp\n");
+        let listing = format!(
+            "0{sep}x{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}{sep}{sep}shell{sep}/tmp\n"
+        );
 
         assert!(parse_pane_attention_listing(&listing).is_err());
     }
@@ -7857,6 +8498,8 @@ mod tests {
             bell: false,
             activity: false,
             clipboard_blocked: 0,
+            agent_state: String::new(),
+            agent_label: String::new(),
             title: "shell".to_string(),
             cwd: "/tmp/project".to_string(),
         };
@@ -7869,6 +8512,8 @@ mod tests {
             bell: true,
             activity: true,
             clipboard_blocked: 2,
+            agent_state: String::new(),
+            agent_label: String::new(),
             title: "codex".to_string(),
             cwd: "/tmp/project".to_string(),
         };
@@ -7892,6 +8537,8 @@ mod tests {
             bell: false,
             activity: false,
             clipboard_blocked: 0,
+            agent_state: String::new(),
+            agent_label: String::new(),
             title: String::new(),
             cwd: "/tmp/project".to_string(),
         };
@@ -8062,6 +8709,30 @@ mod tests {
         let actions = translate_live_snapshot_input(b"\x02!", &mut state);
 
         assert_eq!(actions, vec![LiveSnapshotInputAction::ShowAttention]);
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_shows_tree_detail_and_workspace_popups() {
+        let mut state = LiveSnapshotInputState::default();
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02w", &mut state),
+            vec![LiveSnapshotInputAction::ShowTree]
+        );
+        assert!(!state.saw_prefix);
+
+        let mut state = LiveSnapshotInputState::default();
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02i", &mut state),
+            vec![LiveSnapshotInputAction::ShowDetail]
+        );
+        assert!(!state.saw_prefix);
+
+        let mut state = LiveSnapshotInputState::default();
+        assert_eq!(
+            translate_live_snapshot_input(b"\x02A", &mut state),
+            vec![LiveSnapshotInputAction::ShowWorkspaceRegistry]
+        );
         assert!(!state.saw_prefix);
     }
 
