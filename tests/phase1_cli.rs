@@ -3442,6 +3442,68 @@ fn workspace_popup_enter_switches_to_detached_live_session() {
 }
 
 #[test]
+fn workspace_popup_tab_switches_to_repo_grouping() {
+    let socket = unique_socket("workspace-popup-repo-grouping");
+    let registry_path = unique_temp_file("workspace-popup-repo-grouping-registry");
+    let registry_env = registry_path.to_string_lossy().to_string();
+    let session = format!("workspace-popup-repo-grouping-{}", std::process::id());
+    let workspace_path = std::env::current_dir()
+        .expect("current dir")
+        .to_string_lossy()
+        .to_string();
+
+    assert_success(&dmux_with_env(
+        &socket,
+        &["workspace-add", &workspace_path],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+
+    let mut child = spawn_attached_dmux_with_env(
+        &socket,
+        &["attach", "-t", &session],
+        &[],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    );
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02A")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["dmux workspaces", "Idle"], "workspace popup");
+    child.clear_stdout();
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\t")
+        .unwrap();
+    child.wait_for_stdout_contains_all(
+        &["dmux workspaces", &workspace_path, "Enter: focus/attach"],
+        "workspace popup repo grouping",
+    );
+    let grouped_render = child.stdout_text();
+    assert!(
+        !grouped_render.contains("Registered paths"),
+        "{grouped_render:?}"
+    );
+    assert!(
+        !grouped_render.contains("Live sessions"),
+        "{grouped_render:?}"
+    );
+
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(registry_path);
+}
+
+#[test]
 fn workspace_add_persists_registered_path() {
     let socket = unique_socket("workspace-add");
     let registry_path = unique_temp_file("workspace-add-registry");

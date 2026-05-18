@@ -4236,7 +4236,7 @@ fn tree_popup_visible_model(
 ) -> io::Result<crate::popup::PopupModel> {
     let model = attach_tree_popup_model(socket, session)?;
     let rows = crate::popup::filter_rows(&model.rows, &state.filter);
-    let model = crate::popup::PopupModel::new(rows);
+    let model = crate::popup::group_rows(rows, state.grouping);
     state.ensure_selection(&model);
     Ok(model)
 }
@@ -4353,7 +4353,11 @@ fn apply_tree_popup_input_actions(
             PopupInputAction::FilterAccept => {
                 state.filter_mode = false;
             }
-            PopupInputAction::TogglePeek | PopupInputAction::ToggleGrouping => {}
+            PopupInputAction::TogglePeek => {}
+            PopupInputAction::ToggleGrouping => {
+                state.toggle_grouping();
+                model_dirty = true;
+            }
         }
     }
     Ok(TreePopupInputResult::StayOpen)
@@ -4381,7 +4385,7 @@ fn workspace_popup_visible_model_from_model(
     state: &mut crate::popup::PopupState,
 ) -> crate::popup::PopupModel {
     let rows = crate::popup::filter_rows(&model.rows, &state.filter);
-    let model = crate::popup::PopupModel::new(rows);
+    let model = crate::popup::group_rows(rows, state.grouping);
     state.ensure_selection(&model);
     model
 }
@@ -4507,7 +4511,11 @@ fn apply_workspace_popup_input_actions(
             PopupInputAction::FilterAccept => {
                 state.filter_mode = false;
             }
-            PopupInputAction::TogglePeek | PopupInputAction::ToggleGrouping => {}
+            PopupInputAction::TogglePeek => {}
+            PopupInputAction::ToggleGrouping => {
+                state.toggle_grouping();
+                model_dirty = true;
+            }
         }
     }
     Ok(WorkspacePopupInputResult::StayOpen)

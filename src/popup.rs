@@ -223,6 +223,104 @@ pub fn filter_rows(rows: &[PopupRow], filter: &str) -> Vec<PopupRow> {
         .collect()
 }
 
+pub fn group_rows(rows: Vec<PopupRow>, grouping: PopupGrouping) -> PopupModel {
+    match grouping {
+        PopupGrouping::Attention => group_rows_by_attention(rows),
+        PopupGrouping::Repo => group_rows_by_repo(rows),
+    }
+}
+
+fn group_rows_by_attention(rows: Vec<PopupRow>) -> PopupModel {
+    let mut grouped = Vec::new();
+    for (state, title) in attention_groups() {
+        let group_rows = rows
+            .iter()
+            .filter(|row| row.kind != PopupRowKind::Header && row.state == state)
+            .cloned()
+            .collect::<Vec<_>>();
+        if group_rows.is_empty() {
+            continue;
+        }
+        grouped.push(header_row(
+            format!("group:attention:{state:?}"),
+            title.to_string(),
+            state,
+            None,
+        ));
+        grouped.extend(group_rows);
+    }
+    PopupModel::new(grouped)
+}
+
+fn attention_groups() -> [(PopupStateKind, &'static str); 10] {
+    [
+        (PopupStateKind::NeedsInput, "Needs input"),
+        (PopupStateKind::Alert, "Alerts"),
+        (PopupStateKind::Ready, "Ready"),
+        (PopupStateKind::Failed, "Failed"),
+        (PopupStateKind::Working, "Working"),
+        (PopupStateKind::Completed, "Completed"),
+        (PopupStateKind::Idle, "Idle"),
+        (PopupStateKind::Detached, "Detached"),
+        (PopupStateKind::Previous, "Previous"),
+        (PopupStateKind::Stale, "Stale"),
+    ]
+}
+
+fn group_rows_by_repo(rows: Vec<PopupRow>) -> PopupModel {
+    let mut grouped = Vec::new();
+    let mut groups: Vec<(Option<PathBuf>, String, Vec<PopupRow>)> = Vec::new();
+    for row in rows
+        .into_iter()
+        .filter(|row| row.kind != PopupRowKind::Header)
+    {
+        let title = row
+            .repo_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Unregistered".to_string());
+        if let Some((_, _, group_rows)) = groups
+            .iter_mut()
+            .find(|(repo_path, _, _)| *repo_path == row.repo_path)
+        {
+            group_rows.push(row);
+        } else {
+            groups.push((row.repo_path.clone(), title, vec![row]));
+        }
+    }
+
+    for (repo_path, title, group_rows) in groups {
+        grouped.push(header_row(
+            format!("group:repo:{title}"),
+            title,
+            PopupStateKind::Idle,
+            repo_path,
+        ));
+        grouped.extend(group_rows);
+    }
+    PopupModel::new(grouped)
+}
+
+fn header_row(
+    id: String,
+    title: String,
+    state: PopupStateKind,
+    repo_path: Option<PathBuf>,
+) -> PopupRow {
+    PopupRow {
+        id,
+        kind: PopupRowKind::Header,
+        repo_path,
+        target: None,
+        state,
+        source: PopupRowSource::Mux,
+        title,
+        summary: String::new(),
+        last_changed: None,
+        attachable: false,
+    }
+}
+
 pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&str>) -> String {
     let mut lines = Vec::new();
     for row in &model.rows {
@@ -328,6 +426,30 @@ mod tests {
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["h", "a"]
+        );
+    }
+
+    #[test]
+    fn attention_grouping_orders_rows_by_state_priority() {
+        let mut working = row("working", "working row", PopupRowKind::Item);
+        working.state = PopupStateKind::Working;
+        let mut needs = row("needs", "needs row", PopupRowKind::Item);
+        needs.state = PopupStateKind::NeedsInput;
+
+        let grouped = group_rows(vec![working, needs], PopupGrouping::Attention);
+
+        assert_eq!(
+            grouped
+                .rows
+                .iter()
+                .map(|row| (row.kind, row.title.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (PopupRowKind::Header, "Needs input"),
+                (PopupRowKind::Item, "needs row"),
+                (PopupRowKind::Header, "Working"),
+                (PopupRowKind::Item, "working row"),
+            ]
         );
     }
 
