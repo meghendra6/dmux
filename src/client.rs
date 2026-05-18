@@ -178,44 +178,71 @@ where
     F: FnMut(PtySize) -> io::Result<()>,
 {
     let mut stream = UnixStream::connect(socket)?;
-    stream.write_all(protocol::encode_attach(session).as_bytes())?;
+    let mut current_session = session.to_string();
+    stream.write_all(protocol::encode_attach(&current_session).as_bytes())?;
 
     let response = read_line(&mut stream)?;
     if let Some(message) = response.strip_prefix("ERR ") {
         return Err(io::Error::other(message.trim_end().to_string()));
     }
-    let mut raw_layout_epoch = match parse_attach_ok(&response)? {
+    let (mut raw_layout_epoch, mut pending_input) = match parse_attach_ok(&response)? {
         AttachMode::Snapshot => {
             let _guard = RawModeGuard::enable();
             install_winch_handler();
             let mut last_size = initial_size;
-            return run_live_snapshot_attach(
-                socket,
-                session,
-                &mut stream,
-                Vec::new(),
-                &mut last_size,
-                &mut on_resize,
-            );
+            let mut pending_input = Vec::new();
+            loop {
+                let snapshot_exit = run_live_snapshot_attach(
+                    socket,
+                    &current_session,
+                    &mut stream,
+                    std::mem::take(&mut pending_input),
+                    &mut last_size,
+                    &mut on_resize,
+                )?;
+                let LiveAttachExit::SwitchSession {
+                    session,
+                    pending_input: pending_after_switch,
+                } = snapshot_exit
+                else {
+                    return Ok(());
+                };
+                current_session = session;
+                stream = UnixStream::connect(socket)?;
+                stream.write_all(protocol::encode_attach(&current_session).as_bytes())?;
+                let response = read_line(&mut stream)?;
+                if let Some(message) = response.strip_prefix("ERR ") {
+                    return Err(io::Error::other(message.trim_end().to_string()));
+                }
+                match parse_attach_ok(&response)? {
+                    AttachMode::Snapshot => {
+                        pending_input = pending_after_switch;
+                    }
+                    AttachMode::Live {
+                        raw_layout_epoch: next_raw_layout_epoch,
+                    } => {
+                        break (next_raw_layout_epoch, pending_after_switch);
+                    }
+                }
+            }
         }
-        AttachMode::Live { raw_layout_epoch } => raw_layout_epoch,
+        AttachMode::Live { raw_layout_epoch } => (raw_layout_epoch, Vec::new()),
     };
 
     let _guard = RawModeGuard::enable();
     install_winch_handler();
     let mut last_size = initial_size;
     let copy_mode_socket = socket.to_path_buf();
-    let copy_mode_session = session.to_string();
-    let mut pending_input = Vec::new();
+    let mut copy_mode_session = current_session.clone();
 
     loop {
-        write_attach_status_line(socket, session)?;
+        write_attach_status_line(socket, &current_session)?;
         let worker_copy_mode_socket = copy_mode_socket.clone();
         let worker_copy_mode_session = copy_mode_session.clone();
         let raw_exit = run_raw_attach_session(
             &mut stream,
             socket,
-            session,
+            &current_session,
             raw_layout_epoch,
             std::mem::take(&mut pending_input),
             || {
@@ -234,15 +261,21 @@ where
         )?;
         let _ = stream.shutdown(std::net::Shutdown::Both);
 
-        let RawAttachExit::Reconnect {
-            pending_input: pending_after_transition,
-        } = raw_exit
-        else {
-            return Ok(());
+        let pending_after_transition = match raw_exit {
+            RawAttachExit::Detach => return Ok(()),
+            RawAttachExit::Reconnect { pending_input } => pending_input,
+            RawAttachExit::SwitchSession {
+                session,
+                pending_input,
+            } => {
+                current_session = session;
+                copy_mode_session = current_session.clone();
+                pending_input
+            }
         };
 
         stream = UnixStream::connect(socket)?;
-        stream.write_all(protocol::encode_attach(session).as_bytes())?;
+        stream.write_all(protocol::encode_attach(&current_session).as_bytes())?;
         let response = read_line(&mut stream)?;
         if let Some(message) = response.strip_prefix("ERR ") {
             return Err(io::Error::other(message.trim_end().to_string()));
@@ -250,14 +283,44 @@ where
         match parse_attach_ok(&response)? {
             AttachMode::Snapshot => {
                 install_winch_handler();
-                return run_live_snapshot_attach(
-                    socket,
-                    session,
-                    &mut stream,
-                    pending_after_transition,
-                    &mut last_size,
-                    &mut on_resize,
-                );
+                pending_input = pending_after_transition;
+                loop {
+                    let snapshot_exit = run_live_snapshot_attach(
+                        socket,
+                        &current_session,
+                        &mut stream,
+                        std::mem::take(&mut pending_input),
+                        &mut last_size,
+                        &mut on_resize,
+                    )?;
+                    let LiveAttachExit::SwitchSession {
+                        session,
+                        pending_input: pending_after_switch,
+                    } = snapshot_exit
+                    else {
+                        return Ok(());
+                    };
+                    current_session = session;
+                    copy_mode_session = current_session.clone();
+                    stream = UnixStream::connect(socket)?;
+                    stream.write_all(protocol::encode_attach(&current_session).as_bytes())?;
+                    let response = read_line(&mut stream)?;
+                    if let Some(message) = response.strip_prefix("ERR ") {
+                        return Err(io::Error::other(message.trim_end().to_string()));
+                    }
+                    match parse_attach_ok(&response)? {
+                        AttachMode::Snapshot => {
+                            pending_input = pending_after_switch;
+                        }
+                        AttachMode::Live {
+                            raw_layout_epoch: next_raw_layout_epoch,
+                        } => {
+                            raw_layout_epoch = next_raw_layout_epoch;
+                            pending_input = pending_after_switch;
+                            break;
+                        }
+                    }
+                }
             }
             AttachMode::Live {
                 raw_layout_epoch: next_raw_layout_epoch,
@@ -1327,6 +1390,49 @@ struct RawAttachInputState {
     prompt_pending_since: Option<Instant>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PopupInputState {
+    mode: crate::popup::PopupMode,
+    filter_mode: bool,
+    escape_pending: Vec<u8>,
+}
+
+impl PopupInputState {
+    fn new(mode: crate::popup::PopupMode) -> Self {
+        Self {
+            mode,
+            filter_mode: false,
+            escape_pending: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PopupInputAction {
+    MoveUp,
+    MoveDown,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Enter,
+    TogglePeek,
+    ToggleGrouping,
+    FilterStart,
+    FilterPush(char),
+    FilterBackspace,
+    FilterAccept,
+    Escape,
+    Close,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PopupEscapeDecode {
+    Complete(PopupInputAction, usize),
+    Incomplete,
+    Escape,
+}
+
 #[derive(Debug, Clone)]
 struct LiveControls {
     prefix: u8,
@@ -1976,6 +2082,130 @@ fn translate_attach_input_with_state_with_controls(
     actions
 }
 
+fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<PopupInputAction> {
+    let mut bytes = Vec::new();
+    if !state.escape_pending.is_empty() {
+        bytes.extend_from_slice(&state.escape_pending);
+        state.escape_pending.clear();
+    }
+    bytes.extend_from_slice(input);
+
+    let mut actions = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'/' if !state.filter_mode => {
+                state.filter_mode = true;
+                actions.push(PopupInputAction::FilterStart);
+                index += 1;
+            }
+            b'\r' | b'\n' if state.filter_mode => {
+                state.filter_mode = false;
+                actions.push(PopupInputAction::FilterAccept);
+                index += 1;
+            }
+            b'\r' | b'\n' => {
+                actions.push(PopupInputAction::Enter);
+                index += 1;
+            }
+            b'\x1b' => match decode_popup_escape(&bytes[index..]) {
+                PopupEscapeDecode::Complete(action, consumed) => {
+                    actions.push(action);
+                    index += consumed;
+                }
+                PopupEscapeDecode::Incomplete => {
+                    state.escape_pending.extend_from_slice(&bytes[index..]);
+                    break;
+                }
+                PopupEscapeDecode::Escape => {
+                    state.filter_mode = false;
+                    actions.push(PopupInputAction::Escape);
+                    index += 1;
+                }
+            },
+            b'\t' if !state.filter_mode => {
+                actions.push(PopupInputAction::ToggleGrouping);
+                index += 1;
+            }
+            b' ' if !state.filter_mode => {
+                actions.push(PopupInputAction::TogglePeek);
+                index += 1;
+            }
+            b'j' if !state.filter_mode => {
+                actions.push(PopupInputAction::MoveDown);
+                index += 1;
+            }
+            b'k' if !state.filter_mode => {
+                actions.push(PopupInputAction::MoveUp);
+                index += 1;
+            }
+            b'q' if !state.filter_mode => {
+                actions.push(PopupInputAction::Close);
+                index += 1;
+            }
+            b'\x7f' if state.filter_mode => {
+                actions.push(PopupInputAction::FilterBackspace);
+                index += 1;
+            }
+            byte if state.filter_mode && (byte.is_ascii_graphic() || byte == b' ') => {
+                actions.push(PopupInputAction::FilterPush(byte as char));
+                index += 1;
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+    actions
+}
+
+fn decode_popup_escape(input: &[u8]) -> PopupEscapeDecode {
+    if input.len() >= 3 {
+        if input.get(..3) == Some(b"\x1b[A") {
+            return PopupEscapeDecode::Complete(PopupInputAction::MoveUp, 3);
+        }
+        if input.get(..3) == Some(b"\x1b[B") {
+            return PopupEscapeDecode::Complete(PopupInputAction::MoveDown, 3);
+        }
+        if input.get(..3) == Some(b"\x1b[C") {
+            return PopupEscapeDecode::Complete(PopupInputAction::Enter, 3);
+        }
+        if input.get(..3) == Some(b"\x1b[H") {
+            return PopupEscapeDecode::Complete(PopupInputAction::Home, 3);
+        }
+        if input.get(..3) == Some(b"\x1b[F") {
+            return PopupEscapeDecode::Complete(PopupInputAction::End, 3);
+        }
+    }
+
+    if input.len() >= 4 {
+        if input.get(..4) == Some(b"\x1b[1~") {
+            return PopupEscapeDecode::Complete(PopupInputAction::Home, 4);
+        }
+        if input.get(..4) == Some(b"\x1b[4~") {
+            return PopupEscapeDecode::Complete(PopupInputAction::End, 4);
+        }
+        if input.get(..4) == Some(b"\x1b[5~") {
+            return PopupEscapeDecode::Complete(PopupInputAction::PageUp, 4);
+        }
+        if input.get(..4) == Some(b"\x1b[6~") {
+            return PopupEscapeDecode::Complete(PopupInputAction::PageDown, 4);
+        }
+    }
+
+    if input.len() >= 2 && input.get(..2) == Some(b"\x1b[") {
+        let suffix = &input[2..];
+        if suffix.is_empty() {
+            return PopupEscapeDecode::Incomplete;
+        }
+        if suffix.len() == 1 && matches!(suffix[0], b'1' | b'4' | b'5' | b'6') {
+            return PopupEscapeDecode::Incomplete;
+        }
+    }
+
+    PopupEscapeDecode::Escape
+}
+
 #[cfg(test)]
 fn translate_live_snapshot_input(
     input: &[u8],
@@ -2277,16 +2507,18 @@ struct PaneListEntry {
 }
 
 const ATTENTION_FIELD_SEPARATOR: char = '\u{1f}';
-const ATTENTION_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const ATTENTION_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.agent_source}\u{1f}#{pane.agent_changed_at}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const ACTIVE_WINDOW_INDEX_FORMAT: &str = "#{window.index}";
 const TREE_LIST_WINDOWS_FORMAT: &str =
     "#{window.index}\u{1f}#{window.active}\u{1f}#{window.name}\u{1f}#{window.panes}";
-const TREE_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const TREE_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.agent_source}\u{1f}#{pane.agent_changed_at}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
 const DETAIL_STATUS_FORMAT: &str = "#{session.name}\u{1f}#{session.attached_count}\u{1f}#{session.created_at}\u{1f}#{window.index}\u{1f}#{window.name}\u{1f}#{window.count}\u{1f}#{pane.index}\u{1f}#{pane.id}\u{1f}#{pane.state}\u{1f}#{pane.pid}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.zoomed}\u{1f}#{window.zoomed_flag}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
 const WORKSPACE_LIST_SESSIONS_FORMAT: &str =
     "#{session.name}\u{1f}#{session.window_count}\u{1f}#{session.attached_count}";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneAttentionEntry {
+    window_index: usize,
     index: usize,
     active: bool,
     state: String,
@@ -2297,6 +2529,8 @@ struct PaneAttentionEntry {
     clipboard_blocked: usize,
     agent_state: String,
     agent_label: String,
+    agent_source: String,
+    agent_changed_at: Option<u64>,
     title: String,
     cwd: String,
 }
@@ -2318,6 +2552,8 @@ struct PaneTreeEntry {
     activity: bool,
     agent_state: String,
     agent_label: String,
+    agent_source: String,
+    agent_changed_at: Option<u64>,
     title: String,
     cwd: String,
 }
@@ -2446,6 +2682,7 @@ fn spawn_live_snapshot_input_thread(
     socket: PathBuf,
     session: String,
     mouse_focus_enabled: Arc<AtomicBool>,
+    input_active: Arc<AtomicBool>,
     initial_input: Vec<u8>,
     sender: mpsc::Sender<LiveSnapshotInputEvent>,
 ) {
@@ -2475,6 +2712,9 @@ fn spawn_live_snapshot_input_thread(
         }
 
         loop {
+            if !input_active.load(Ordering::SeqCst) {
+                return;
+            }
             if let Some(action) = input_state.prompt_pending_timeout_action(Instant::now()) {
                 if !send_live_snapshot_input_actions(
                     &socket,
@@ -2489,12 +2729,15 @@ fn spawn_live_snapshot_input_thread(
                     return;
                 }
             }
-            let read_result = if input_state.prompt_pending_since.is_some() && stdin_is_tty() {
-                match NonBlockingFdGuard::enable(STDIN_FILENO) {
-                    Ok(_guard) => stdin.read(&mut buf),
-                    Err(error) => Err(error),
-                }
-            } else {
+            let read_result = {
+                let _nonblocking_stdin = match NonBlockingFdGuard::enable(STDIN_FILENO) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        let _ = sender.send(LiveSnapshotInputEvent::Eof);
+                        let _ = error;
+                        break;
+                    }
+                };
                 stdin.read(&mut buf)
             };
             let n = match read_result {
@@ -2858,6 +3101,15 @@ fn handle_render_frame_received(event_stream_active: &mut bool) {
     *event_stream_active = true;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveAttachExit {
+    Detach,
+    SwitchSession {
+        session: String,
+        pending_input: Vec<u8>,
+    },
+}
+
 fn run_live_snapshot_attach(
     socket: &Path,
     session: &str,
@@ -2865,13 +3117,15 @@ fn run_live_snapshot_attach(
     initial_input: Vec<u8>,
     last_size: &mut Option<PtySize>,
     on_resize: &mut impl FnMut(PtySize) -> io::Result<()>,
-) -> io::Result<()> {
+) -> io::Result<LiveAttachExit> {
     let mouse_focus_enabled = Arc::new(AtomicBool::new(false));
+    let input_active = Arc::new(AtomicBool::new(true));
     let (sender, input) = mpsc::channel();
     spawn_live_snapshot_input_thread(
         socket.to_path_buf(),
         session.to_string(),
         Arc::clone(&mouse_focus_enabled),
+        Arc::clone(&input_active),
         initial_input,
         sender.clone(),
     );
@@ -2890,6 +3144,8 @@ fn run_live_snapshot_attach(
     let mut pane_number_message = None;
     let mut command_prompt_message: Option<String> = None;
     let mut active_popup = AttachPopup::None;
+    let mut popup_state: Option<crate::popup::PopupState> = None;
+    let mut popup_input_state: Option<PopupInputState> = None;
     let mut pending_input_repaint_deadline = None;
     let mut render_output_state = LiveRenderOutputState::default();
 
@@ -2905,18 +3161,139 @@ fn run_live_snapshot_attach(
         match input.recv_timeout(timeout) {
             Ok(LiveSnapshotInputEvent::Forward(bytes)) => {
                 let resized = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                if active_popup == AttachPopup::Attention {
+                    if let (Some(state), Some(input_state)) =
+                        (popup_state.as_mut(), popup_input_state.as_mut())
+                    {
+                        let actions = popup_actions_for_input(&bytes, input_state);
+                        match apply_attention_popup_input_actions(socket, session, state, &actions)?
+                        {
+                            AttentionPopupInputResult::StayOpen => {}
+                            AttentionPopupInputResult::Close => {
+                                active_popup = AttachPopup::None;
+                                popup_state = None;
+                                popup_input_state = None;
+                            }
+                        }
+                        if !redraw_paused {
+                            frame = write_live_snapshot_frame_with_active_message_and_popup_state(
+                                socket,
+                                session,
+                                &mut pane_number_message,
+                                command_prompt_message.as_deref(),
+                                active_popup,
+                                popup_state.as_mut(),
+                            )?;
+                            sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                            reset_live_render_output_state(&mut render_output_state);
+                            last_redraw = Instant::now();
+                            pending_input_repaint_deadline = None;
+                        }
+                        continue;
+                    }
+                }
+                if active_popup == AttachPopup::Tree {
+                    if let (Some(state), Some(input_state)) =
+                        (popup_state.as_mut(), popup_input_state.as_mut())
+                    {
+                        let actions = popup_actions_for_input(&bytes, input_state);
+                        match apply_tree_popup_input_actions(socket, session, state, &actions)? {
+                            TreePopupInputResult::StayOpen => {}
+                            TreePopupInputResult::Close => {
+                                active_popup = AttachPopup::None;
+                                popup_state = None;
+                                popup_input_state = None;
+                            }
+                            TreePopupInputResult::Reconnect => {
+                                active_popup = AttachPopup::None;
+                                popup_state = None;
+                                popup_input_state = None;
+                                pane_number_message = None;
+                            }
+                            TreePopupInputResult::Message(message) => {
+                                pane_number_message =
+                                    Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
+                            }
+                        }
+                        if !redraw_paused {
+                            frame = write_live_snapshot_frame_with_active_message_and_popup_state(
+                                socket,
+                                session,
+                                &mut pane_number_message,
+                                command_prompt_message.as_deref(),
+                                active_popup,
+                                popup_state.as_mut(),
+                            )?;
+                            sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                            reset_live_render_output_state(&mut render_output_state);
+                            last_redraw = Instant::now();
+                            pending_input_repaint_deadline = None;
+                        }
+                        continue;
+                    }
+                }
+                if active_popup == AttachPopup::WorkspaceRegistry {
+                    if let (Some(state), Some(input_state)) =
+                        (popup_state.as_mut(), popup_input_state.as_mut())
+                    {
+                        let actions = popup_actions_for_input(&bytes, input_state);
+                        match apply_workspace_popup_input_actions(socket, session, state, &actions)?
+                        {
+                            WorkspacePopupInputResult::StayOpen => {}
+                            WorkspacePopupInputResult::Close => {
+                                active_popup = AttachPopup::None;
+                                popup_state = None;
+                                popup_input_state = None;
+                            }
+                            WorkspacePopupInputResult::Reconnect => {
+                                active_popup = AttachPopup::None;
+                                popup_state = None;
+                                popup_input_state = None;
+                                pane_number_message = None;
+                            }
+                            WorkspacePopupInputResult::SwitchSession { session } => {
+                                input_active.store(false, Ordering::SeqCst);
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                return Ok(LiveAttachExit::SwitchSession {
+                                    session,
+                                    pending_input: Vec::new(),
+                                });
+                            }
+                            WorkspacePopupInputResult::Message(message) => {
+                                pane_number_message =
+                                    Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
+                            }
+                        }
+                        if !redraw_paused {
+                            frame = write_live_snapshot_frame_with_active_message_and_popup_state(
+                                socket,
+                                session,
+                                &mut pane_number_message,
+                                command_prompt_message.as_deref(),
+                                active_popup,
+                                popup_state.as_mut(),
+                            )?;
+                            sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                            reset_live_render_output_state(&mut render_output_state);
+                            last_redraw = Instant::now();
+                            pending_input_repaint_deadline = None;
+                        }
+                        continue;
+                    }
+                }
                 forward_live_snapshot_input(stream, &bytes)?;
                 if !redraw_paused
                     && (resized
                         || (!event_stream_active
                             && last_redraw.elapsed() >= LIVE_SNAPSHOT_REDRAW_INTERVAL))
                 {
-                    frame = write_live_snapshot_frame_with_active_message(
+                    frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                         socket,
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
                         active_popup,
+                        popup_state.as_mut(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2938,12 +3315,13 @@ fn run_live_snapshot_attach(
                     )),
                 };
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame_with_active_message(
+                    frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                         socket,
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
                         active_popup,
+                        popup_state.as_mut(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2952,15 +3330,18 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::CommandPromptStart) => {
                 active_popup = AttachPopup::None;
+                popup_state = None;
+                popup_input_state = None;
                 pane_number_message = None;
                 command_prompt_message = Some(attach_command_prompt_text(""));
                 if !redraw_paused {
-                    frame = write_live_snapshot_frame_with_active_message(
+                    frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                         socket,
                         session,
                         &mut pane_number_message,
                         command_prompt_message.as_deref(),
                         active_popup,
+                        popup_state.as_mut(),
                     )?;
                     sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -2969,6 +3350,8 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::CommandPromptUpdate(command)) => {
                 active_popup = AttachPopup::None;
+                popup_state = None;
+                popup_input_state = None;
                 pane_number_message = None;
                 command_prompt_message = Some(attach_command_prompt_text(&command));
                 if !redraw_paused {
@@ -2986,6 +3369,8 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::CommandPromptCancel) => {
                 active_popup = AttachPopup::None;
+                popup_state = None;
+                popup_input_state = None;
                 command_prompt_message = None;
                 pane_number_message = Some((
                     "cancelled".to_string(),
@@ -3010,6 +3395,8 @@ fn run_live_snapshot_attach(
             }) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = AttachPopup::None;
+                popup_state = None;
+                popup_input_state = None;
                 command_prompt_message = None;
                 let command_result = dispatch_attach_command(socket, session, &command);
                 pane_number_message = match command_result {
@@ -3062,6 +3449,9 @@ fn run_live_snapshot_attach(
             }
             Ok(LiveSnapshotInputEvent::ShowPaneNumbers) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
+                active_popup = AttachPopup::None;
+                popup_state = None;
+                popup_input_state = None;
                 let message = pane_number_message_text(socket, session)?;
                 pane_number_message =
                     Some((message, Instant::now() + PANE_NUMBER_DISPLAY_DURATION));
@@ -3079,6 +3469,8 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowHelp) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_help();
+                popup_state = None;
+                popup_input_state = None;
                 pane_number_message = None;
                 command_prompt_message = None;
                 frame = write_live_snapshot_frame_with_active_message(
@@ -3095,14 +3487,25 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowAttention) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_attention();
+                if active_popup == AttachPopup::Attention {
+                    popup_state = Some(crate::popup::PopupState::new(
+                        crate::popup::PopupMode::Attention,
+                    ));
+                    popup_input_state =
+                        Some(PopupInputState::new(crate::popup::PopupMode::Attention));
+                } else {
+                    popup_state = None;
+                    popup_input_state = None;
+                }
                 pane_number_message = None;
                 command_prompt_message = None;
-                frame = write_live_snapshot_frame_with_active_message(
+                frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                     socket,
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
                     active_popup,
+                    popup_state.as_mut(),
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3111,14 +3514,23 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowTree) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_tree();
+                if active_popup == AttachPopup::Tree {
+                    popup_state =
+                        Some(crate::popup::PopupState::new(crate::popup::PopupMode::Tree));
+                    popup_input_state = Some(PopupInputState::new(crate::popup::PopupMode::Tree));
+                } else {
+                    popup_state = None;
+                    popup_input_state = None;
+                }
                 pane_number_message = None;
                 command_prompt_message = None;
-                frame = write_live_snapshot_frame_with_active_message(
+                frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                     socket,
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
                     active_popup,
+                    popup_state.as_mut(),
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3127,6 +3539,8 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowDetail) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_detail();
+                popup_state = None;
+                popup_input_state = None;
                 pane_number_message = None;
                 command_prompt_message = None;
                 frame = write_live_snapshot_frame_with_active_message(
@@ -3143,14 +3557,25 @@ fn run_live_snapshot_attach(
             Ok(LiveSnapshotInputEvent::ShowWorkspaceRegistry) => {
                 let _ = maybe_handle_live_snapshot_resize(last_size, on_resize)?;
                 active_popup = active_popup.toggle_workspace_registry();
+                if active_popup == AttachPopup::WorkspaceRegistry {
+                    popup_state = Some(crate::popup::PopupState::new(
+                        crate::popup::PopupMode::Workspace,
+                    ));
+                    popup_input_state =
+                        Some(PopupInputState::new(crate::popup::PopupMode::Workspace));
+                } else {
+                    popup_state = None;
+                    popup_input_state = None;
+                }
                 pane_number_message = None;
                 command_prompt_message = None;
-                frame = write_live_snapshot_frame_with_active_message(
+                frame = write_live_snapshot_frame_with_active_message_and_popup_state(
                     socket,
                     session,
                     &mut pane_number_message,
                     command_prompt_message.as_deref(),
                     active_popup,
+                    popup_state.as_mut(),
                 )?;
                 sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3271,8 +3696,12 @@ fn run_live_snapshot_attach(
                         if command_prompt_message.is_none() && active_popup == AttachPopup::None {
                             pane_number_message = None;
                         }
-                        let popup_overlay =
-                            attach_popup_overlay_text(socket, session, active_popup)?;
+                        let popup_overlay = attach_popup_overlay_text_with_state(
+                            socket,
+                            session,
+                            active_popup,
+                            popup_state.as_mut(),
+                        )?;
                         write_live_render_output(
                             &render_frame,
                             &mut render_output_state,
@@ -3344,8 +3773,9 @@ fn run_live_snapshot_attach(
         }
     }
 
+    input_active.store(false, Ordering::SeqCst);
     let _ = stream.shutdown(std::net::Shutdown::Both);
-    Ok(())
+    Ok(LiveAttachExit::Detach)
 }
 
 fn sync_live_mouse_mode(
@@ -3381,7 +3811,26 @@ fn write_live_snapshot_frame_with_active_message(
     command_prompt_message: Option<&str>,
     active_popup: AttachPopup,
 ) -> io::Result<LiveSnapshotFrame> {
-    let popup_overlay = attach_popup_overlay_text(socket, session, active_popup)?;
+    write_live_snapshot_frame_with_active_message_and_popup_state(
+        socket,
+        session,
+        pane_number_message,
+        command_prompt_message,
+        active_popup,
+        None,
+    )
+}
+
+fn write_live_snapshot_frame_with_active_message_and_popup_state(
+    socket: &Path,
+    session: &str,
+    pane_number_message: &mut Option<(String, Instant)>,
+    command_prompt_message: Option<&str>,
+    active_popup: AttachPopup,
+    popup_state: Option<&mut crate::popup::PopupState>,
+) -> io::Result<LiveSnapshotFrame> {
+    let popup_overlay =
+        attach_popup_overlay_text_with_state(socket, session, active_popup, popup_state)?;
     let message = active_live_message(pane_number_message, command_prompt_message, Instant::now());
     write_live_snapshot_frame_with_message_and_clear(
         socket,
@@ -3445,15 +3894,33 @@ fn pane_number_message_text(socket: &Path, session: &str) -> io::Result<String> 
 }
 
 fn pane_attention_entries(socket: &Path, session: &str) -> io::Result<Vec<PaneAttentionEntry>> {
+    let window_index = active_window_index(socket, session)?;
     let body = send_control_request(
         socket,
         &protocol::encode_list_panes(session, Some(ATTENTION_LIST_PANES_FORMAT)),
     )?;
     let listing = String::from_utf8_lossy(&body);
-    parse_pane_attention_listing(&listing)
+    parse_pane_attention_listing_with_window(&listing, window_index)
 }
 
+fn active_window_index(socket: &Path, session: &str) -> io::Result<usize> {
+    let body = send_control_request(
+        socket,
+        &protocol::encode_status_line(session, Some(ACTIVE_WINDOW_INDEX_FORMAT)),
+    )?;
+    let listing = String::from_utf8_lossy(&body);
+    parse_usize_field(listing.trim_end(), "invalid active window index")
+}
+
+#[cfg(test)]
 fn parse_pane_attention_listing(listing: &str) -> io::Result<Vec<PaneAttentionEntry>> {
+    parse_pane_attention_listing_with_window(listing, 0)
+}
+
+fn parse_pane_attention_listing_with_window(
+    listing: &str,
+    window_index: usize,
+) -> io::Result<Vec<PaneAttentionEntry>> {
     let mut entries = Vec::new();
     for line in listing.lines() {
         let fields = line.split(ATTENTION_FIELD_SEPARATOR).collect::<Vec<_>>();
@@ -3468,6 +3935,8 @@ fn parse_pane_attention_listing(listing: &str) -> io::Result<Vec<PaneAttentionEn
             clipboard_blocked,
             agent_state,
             agent_label,
+            agent_source,
+            agent_changed_at,
             title,
             cwd,
         ] = fields.as_slice()
@@ -3476,6 +3945,7 @@ fn parse_pane_attention_listing(listing: &str) -> io::Result<Vec<PaneAttentionEn
         };
 
         entries.push(PaneAttentionEntry {
+            window_index,
             index: parse_usize_field(index, "invalid attention pane index")?,
             active: parse_bool_flag(active, "invalid attention active flag")?,
             state: (*state).to_string(),
@@ -3489,6 +3959,8 @@ fn parse_pane_attention_listing(listing: &str) -> io::Result<Vec<PaneAttentionEn
             )?,
             agent_state: (*agent_state).to_string(),
             agent_label: (*agent_label).to_string(),
+            agent_source: (*agent_source).to_string(),
+            agent_changed_at: parse_optional_agent_changed_at(agent_changed_at),
             title: (*title).to_string(),
             cwd: (*cwd).to_string(),
         });
@@ -3512,6 +3984,13 @@ fn parse_optional_i32(value: &str, message: &str) -> io::Result<Option<i32>> {
         .map_err(|_| io::Error::other(message))
 }
 
+fn parse_optional_agent_changed_at(value: &str) -> Option<u64> {
+    if value.is_empty() || value == "#{pane.agent_changed_at}" {
+        return None;
+    }
+    value.parse::<u64>().ok()
+}
+
 fn parse_bool_flag(value: &str, message: &str) -> io::Result<bool> {
     match value {
         "0" => Ok(false),
@@ -3520,11 +3999,124 @@ fn parse_bool_flag(value: &str, message: &str) -> io::Result<bool> {
     }
 }
 
-fn attach_attention_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
+fn attach_attention_popup_model(
+    socket: &Path,
+    session: &str,
+) -> io::Result<crate::popup::PopupModel> {
     let entries = pane_attention_entries(socket, session)?;
-    Ok(format_attention_popup(&entries))
+    Ok(attention_popup_model(session, &entries))
 }
 
+fn attention_popup_model(
+    session: &str,
+    entries: &[PaneAttentionEntry],
+) -> crate::popup::PopupModel {
+    let mut rows = vec![crate::popup::PopupRow {
+        id: format!("{session}:attention"),
+        kind: crate::popup::PopupRowKind::Header,
+        repo_path: None,
+        target: None,
+        state: crate::popup::PopupStateKind::Idle,
+        source: crate::popup::PopupRowSource::Mux,
+        title: "C-b ! close    Space peek".to_string(),
+        summary: String::new(),
+        last_changed: None,
+        attachable: false,
+    }];
+
+    if entries.is_empty() {
+        rows.push(crate::popup::PopupRow {
+            id: format!("{session}:attention:empty"),
+            kind: crate::popup::PopupRowKind::DisabledItem,
+            repo_path: None,
+            target: None,
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: "No panes.".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+        });
+        return crate::popup::PopupModel::new(rows);
+    }
+
+    let attention_entries = entries
+        .iter()
+        .filter(|entry| pane_attention_reasons(entry).next().is_some())
+        .collect::<Vec<_>>();
+    if attention_entries.is_empty() {
+        rows.push(crate::popup::PopupRow {
+            id: format!("{session}:attention:none"),
+            kind: crate::popup::PopupRowKind::DisabledItem,
+            repo_path: None,
+            target: None,
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: "No attention items.".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+        });
+    }
+
+    let ordered_entries = attention_entries
+        .into_iter()
+        .chain(
+            entries
+                .iter()
+                .filter(|entry| pane_attention_reasons(entry).next().is_none()),
+        )
+        .collect::<Vec<_>>();
+    for entry in ordered_entries {
+        rows.push(crate::popup::PopupRow {
+            id: format!("{session}:attention:{}", entry.index),
+            kind: crate::popup::PopupRowKind::Item,
+            repo_path: Some(PathBuf::from(&entry.cwd)),
+            target: Some(crate::popup::PopupTarget {
+                session: session.to_string(),
+                window_index: Some(entry.window_index),
+                pane_index: Some(entry.index),
+            }),
+            state: attention_popup_state(entry),
+            source: if entry.agent_state.trim().is_empty() {
+                crate::popup::PopupRowSource::Mux
+            } else {
+                crate::popup::PopupRowSource::AgentEvent
+            },
+            title: format!("pane {}", entry.index),
+            summary: attention_popup_summary(entry),
+            last_changed: entry.agent_changed_at,
+            attachable: false,
+        });
+    }
+
+    crate::popup::PopupModel::new(rows)
+}
+
+fn attention_popup_state(entry: &PaneAttentionEntry) -> crate::popup::PopupStateKind {
+    if !entry.agent_state.trim().is_empty() {
+        return normalize_agent_state(entry.agent_state.trim());
+    }
+    if entry.bell || entry.activity || entry.clipboard_blocked > 0 {
+        return crate::popup::PopupStateKind::Alert;
+    }
+    if entry.state == "exited" {
+        return crate::popup::PopupStateKind::Completed;
+    }
+    crate::popup::PopupStateKind::Idle
+}
+
+fn attention_popup_summary(entry: &PaneAttentionEntry) -> String {
+    let reasons = pane_attention_reasons(entry).collect::<Vec<_>>().join(", ");
+    let reasons = if reasons.is_empty() {
+        "quiet".to_string()
+    } else {
+        reasons
+    };
+    format!("{}  {}", reasons, pane_attention_label(entry))
+}
+
+#[cfg(test)]
 fn format_attention_popup(entries: &[PaneAttentionEntry]) -> String {
     let mut lines = vec!["C-b ! close    digit focus pane".to_string()];
     if entries.is_empty() {
@@ -3552,6 +4144,7 @@ fn format_attention_popup(entries: &[PaneAttentionEntry]) -> String {
     lines.join("\n")
 }
 
+#[cfg(test)]
 fn format_attention_row(entry: &PaneAttentionEntry) -> String {
     let active = if entry.active { "*" } else { " " };
     let reasons = pane_attention_reasons(entry).collect::<Vec<_>>().join(", ");
@@ -3607,9 +4200,120 @@ fn pane_attention_label(entry: &PaneAttentionEntry) -> String {
         .to_string()
 }
 
-fn attach_tree_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
+fn attach_tree_popup_model(socket: &Path, session: &str) -> io::Result<crate::popup::PopupModel> {
     let windows = session_tree_entries(socket, session)?;
-    Ok(format_session_tree_popup(session, &windows))
+    Ok(tree_popup_model(session, &windows))
+}
+
+fn tree_popup_model(session: &str, windows: &[WindowTreeEntry]) -> crate::popup::PopupModel {
+    let mut rows = vec![crate::popup::PopupRow {
+        id: format!("{session}:tree"),
+        kind: crate::popup::PopupRowKind::Header,
+        repo_path: None,
+        target: None,
+        state: crate::popup::PopupStateKind::Idle,
+        source: crate::popup::PopupRowSource::Mux,
+        title: format!("C-b w close    current session: {session}"),
+        summary: String::new(),
+        last_changed: None,
+        attachable: false,
+    }];
+
+    if windows.is_empty() {
+        rows.push(crate::popup::PopupRow {
+            id: format!("{session}:empty"),
+            kind: crate::popup::PopupRowKind::DisabledItem,
+            repo_path: None,
+            target: None,
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: "No windows.".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+        });
+        return crate::popup::PopupModel::new(rows);
+    }
+
+    for window in windows {
+        let active = if window.active { "*" } else { " " };
+        let name = if window.name.trim().is_empty() {
+            window.index.to_string()
+        } else {
+            window.name.clone()
+        };
+        rows.push(crate::popup::PopupRow {
+            id: format!("{session}:{}:window", window.index),
+            kind: crate::popup::PopupRowKind::Header,
+            repo_path: None,
+            target: Some(crate::popup::PopupTarget {
+                session: session.to_string(),
+                window_index: Some(window.index),
+                pane_index: None,
+            }),
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: format!(
+                "{active} window {}  {}  panes {}",
+                window.index,
+                name,
+                window.panes.len()
+            ),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+        });
+        for pane in &window.panes {
+            rows.push(crate::popup::PopupRow {
+                id: format!("{session}:{}:{}", window.index, pane.index),
+                kind: crate::popup::PopupRowKind::Item,
+                repo_path: Some(PathBuf::from(&pane.cwd)),
+                target: Some(crate::popup::PopupTarget {
+                    session: session.to_string(),
+                    window_index: Some(window.index),
+                    pane_index: Some(pane.index),
+                }),
+                state: pane_tree_state(pane),
+                source: if pane.agent_state.trim().is_empty() {
+                    crate::popup::PopupRowSource::Mux
+                } else {
+                    crate::popup::PopupRowSource::AgentEvent
+                },
+                title: format!("pane {}", pane.index),
+                summary: format!("{}  {}", pane.state, pane_tree_label(pane)),
+                last_changed: pane.agent_changed_at,
+                attachable: true,
+            });
+        }
+    }
+
+    crate::popup::PopupModel::new(rows)
+}
+
+fn pane_tree_state(entry: &PaneTreeEntry) -> crate::popup::PopupStateKind {
+    let agent_state = entry.agent_state.trim();
+    if !agent_state.is_empty() {
+        return normalize_agent_state(agent_state);
+    }
+    if entry.bell || entry.activity {
+        return crate::popup::PopupStateKind::Alert;
+    }
+    if entry.state == "exited" {
+        return crate::popup::PopupStateKind::Completed;
+    }
+    crate::popup::PopupStateKind::Working
+}
+
+fn normalize_agent_state(state: &str) -> crate::popup::PopupStateKind {
+    match state {
+        "needs_input" | "waiting" | "permission" => crate::popup::PopupStateKind::NeedsInput,
+        "ready" | "review" => crate::popup::PopupStateKind::Ready,
+        "failed" | "error" => crate::popup::PopupStateKind::Failed,
+        "completed" | "done" => crate::popup::PopupStateKind::Completed,
+        "alert" => crate::popup::PopupStateKind::Alert,
+        "working" | "running" => crate::popup::PopupStateKind::Working,
+        _ => crate::popup::PopupStateKind::Idle,
+    }
 }
 
 fn session_tree_entries(socket: &Path, session: &str) -> io::Result<Vec<WindowTreeEntry>> {
@@ -3669,6 +4373,8 @@ fn parse_pane_tree_listing(listing: &str) -> io::Result<Vec<PaneTreeEntry>> {
             activity,
             agent_state,
             agent_label,
+            agent_source,
+            agent_changed_at,
             title,
             cwd,
         ] = fields.as_slice()
@@ -3683,49 +4389,13 @@ fn parse_pane_tree_listing(listing: &str) -> io::Result<Vec<PaneTreeEntry>> {
             activity: parse_bool_flag(activity, "invalid tree pane activity flag")?,
             agent_state: (*agent_state).to_string(),
             agent_label: (*agent_label).to_string(),
+            agent_source: (*agent_source).to_string(),
+            agent_changed_at: parse_optional_agent_changed_at(agent_changed_at),
             title: (*title).to_string(),
             cwd: (*cwd).to_string(),
         });
     }
     Ok(entries)
-}
-
-fn format_session_tree_popup(session: &str, windows: &[WindowTreeEntry]) -> String {
-    let mut lines = vec![
-        "C-b w close    targets: :select-window N / :select-pane -t S:W.P".to_string(),
-        format!("Session: {session}"),
-    ];
-    if windows.is_empty() {
-        lines.push("No windows.".to_string());
-        return lines.join("\n");
-    }
-    for window in windows {
-        let active = if window.active { "*" } else { " " };
-        let name = if window.name.trim().is_empty() {
-            window.index.to_string()
-        } else {
-            window.name.clone()
-        };
-        lines.push(format!(
-            "{active} window {}  {}  panes {}",
-            window.index,
-            name,
-            window.panes.len()
-        ));
-        for pane in &window.panes {
-            lines.push(format!(
-                "  {} pane {}  {}  {}  target {}:{}.{}",
-                if pane.active { "*" } else { " " },
-                pane.index,
-                pane.state,
-                pane_tree_label(pane),
-                session,
-                window.index,
-                pane.index
-            ));
-        }
-    }
-    lines.join("\n")
 }
 
 fn pane_tree_label(entry: &PaneTreeEntry) -> String {
@@ -3755,6 +4425,482 @@ fn pane_tree_label(entry: &PaneTreeEntry) -> String {
     } else {
         format!("{} ({})", label, parts.join(", "))
     }
+}
+
+fn tree_popup_visible_model(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<crate::popup::PopupModel> {
+    let model = attach_tree_popup_model(socket, session)?;
+    let rows = crate::popup::filter_rows(&model.rows, &state.filter);
+    let model = crate::popup::PopupModel::new(rows);
+    state.ensure_selection(&model);
+    Ok(model)
+}
+
+fn render_tree_popup_overlay_text(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<PopupOverlayText> {
+    let model = tree_popup_visible_model(socket, session, state)?;
+    let peek = popup_selected_peek_text(socket, state, &model);
+    Ok(PopupOverlayText {
+        title: "dmux tree",
+        content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
+    })
+}
+
+fn render_attention_popup_overlay_text(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<PopupOverlayText> {
+    let model = attention_popup_visible_model(socket, session, state)?;
+    let peek = popup_selected_peek_text(socket, state, &model);
+    Ok(PopupOverlayText {
+        title: "dmux attention",
+        content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
+    })
+}
+
+fn popup_selected_peek_text(
+    socket: &Path,
+    state: &crate::popup::PopupState,
+    model: &crate::popup::PopupModel,
+) -> Option<String> {
+    if !state.peek {
+        return None;
+    }
+    state
+        .selected_row(model)
+        .map(|row| popup_peek_text(socket, row))
+}
+
+fn popup_peek_text(socket: &Path, row: &crate::popup::PopupRow) -> String {
+    let Some(target) = row.target.as_ref() else {
+        return "row has no target".to_string();
+    };
+
+    let mut metadata = vec![
+        format!("session={}", target.session),
+        format!("state={:?}", row.state),
+        format!("title={}", row.title),
+        format!("summary={}", row.summary),
+    ];
+    if let Some(repo_path) = &row.repo_path {
+        metadata.push(format!("repo={}", repo_path.display()));
+    }
+    if let Some(window_index) = target.window_index {
+        metadata.push(format!("window={window_index}"));
+    }
+    if let Some(pane_index) = target.pane_index {
+        metadata.push(format!("pane={pane_index}"));
+    }
+    let metadata = metadata.join("\n");
+
+    let capture = if let Some(pane_index) = target.pane_index {
+        let target = protocol::Target {
+            session: target.session.clone(),
+            window: target
+                .window_index
+                .map(protocol::WindowTarget::Index)
+                .unwrap_or(protocol::WindowTarget::Active),
+            pane: protocol::PaneTarget::Index(pane_index),
+        };
+        match send_control_request(
+            socket,
+            &protocol::encode_capture_target(
+                &target,
+                protocol::CaptureMode::Screen,
+                protocol::BufferSelection::All,
+            ),
+        ) {
+            Ok(body) => String::from_utf8_lossy(&body).to_string(),
+            Err(error) => format!("capture error: {error}"),
+        }
+    } else {
+        String::new()
+    };
+
+    crate::popup::render_peek_text(&metadata, &capture, 40, 8 * 1024)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttentionPopupInputResult {
+    StayOpen,
+    Close,
+}
+
+fn attention_popup_visible_model(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<crate::popup::PopupModel> {
+    let model = attach_attention_popup_model(socket, session)?;
+    let rows = crate::popup::filter_rows(&model.rows, &state.filter);
+    let model = crate::popup::PopupModel::new(rows);
+    state.ensure_selection(&model);
+    Ok(model)
+}
+
+fn apply_attention_popup_input_actions(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+    actions: &[PopupInputAction],
+) -> io::Result<AttentionPopupInputResult> {
+    let mut model = attention_popup_visible_model(socket, session, state)?;
+    let mut model_dirty = false;
+    for action in actions {
+        match action {
+            PopupInputAction::MoveUp => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, -1);
+            }
+            PopupInputAction::MoveDown => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, 1);
+            }
+            PopupInputAction::PageUp => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, -10);
+            }
+            PopupInputAction::PageDown => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, 10);
+            }
+            PopupInputAction::Home => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.selected = model.selectable_row_ids().first().cloned();
+            }
+            PopupInputAction::End => {
+                if model_dirty {
+                    model = attention_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.selected = model.selectable_row_ids().last().cloned();
+            }
+            PopupInputAction::Enter => {}
+            PopupInputAction::Escape => {
+                if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
+                    return Ok(AttentionPopupInputResult::Close);
+                }
+                model_dirty = true;
+            }
+            PopupInputAction::Close => return Ok(AttentionPopupInputResult::Close),
+            PopupInputAction::FilterStart => {
+                state.filter_mode = true;
+            }
+            PopupInputAction::FilterPush(ch) => {
+                state.filter.push(*ch);
+                model_dirty = true;
+            }
+            PopupInputAction::FilterBackspace => {
+                state.filter.pop();
+                model_dirty = true;
+            }
+            PopupInputAction::FilterAccept => {
+                state.filter_mode = false;
+            }
+            PopupInputAction::TogglePeek => {
+                state.peek = !state.peek;
+            }
+            PopupInputAction::ToggleGrouping => {}
+        }
+    }
+    Ok(AttentionPopupInputResult::StayOpen)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreePopupInputResult {
+    StayOpen,
+    Close,
+    Reconnect,
+    Message(String),
+}
+
+fn apply_tree_popup_input_actions(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+    actions: &[PopupInputAction],
+) -> io::Result<TreePopupInputResult> {
+    let mut model = tree_popup_visible_model(socket, session, state)?;
+    let mut model_dirty = false;
+    for action in actions {
+        match action {
+            PopupInputAction::MoveUp => {
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, -1);
+            }
+            PopupInputAction::MoveDown => {
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, 1);
+            }
+            PopupInputAction::PageUp => {
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, -10);
+            }
+            PopupInputAction::PageDown => {
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, 10);
+            }
+            PopupInputAction::Home => {
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.selected = model.selectable_row_ids().first().cloned();
+            }
+            PopupInputAction::End => {
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                state.selected = model.selectable_row_ids().last().cloned();
+            }
+            PopupInputAction::Enter => {
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                }
+                let Some(row) = state.selected_row(&model) else {
+                    return Ok(TreePopupInputResult::Message(
+                        "row is not attachable".to_string(),
+                    ));
+                };
+                return match perform_popup_enter_same_session(socket, session, row)? {
+                    PopupEnterResult::Reconnect => Ok(TreePopupInputResult::Reconnect),
+                    PopupEnterResult::SwitchSession { .. } => Ok(TreePopupInputResult::Message(
+                        "row is not attachable here".to_string(),
+                    )),
+                    PopupEnterResult::Message(message) => {
+                        Ok(TreePopupInputResult::Message(message))
+                    }
+                };
+            }
+            PopupInputAction::Escape => {
+                if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
+                    return Ok(TreePopupInputResult::Close);
+                }
+                model_dirty = true;
+            }
+            PopupInputAction::Close => return Ok(TreePopupInputResult::Close),
+            PopupInputAction::FilterStart => {
+                state.filter_mode = true;
+            }
+            PopupInputAction::FilterPush(ch) => {
+                state.filter.push(*ch);
+                model_dirty = true;
+            }
+            PopupInputAction::FilterBackspace => {
+                state.filter.pop();
+                model_dirty = true;
+            }
+            PopupInputAction::FilterAccept => {
+                state.filter_mode = false;
+            }
+            PopupInputAction::TogglePeek => {
+                state.peek = !state.peek;
+            }
+            PopupInputAction::ToggleGrouping => {
+                // Tree rows depend on existing window/session headers for context.
+            }
+        }
+    }
+    Ok(TreePopupInputResult::StayOpen)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspacePopupInputResult {
+    StayOpen,
+    Close,
+    Reconnect,
+    SwitchSession { session: String },
+    Message(String),
+}
+
+fn workspace_popup_visible_model(
+    socket: &Path,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<crate::popup::PopupModel> {
+    let model = attach_workspace_registry_popup_model(socket)?;
+    Ok(workspace_popup_visible_model_from_model(&model, state))
+}
+
+fn workspace_popup_visible_model_from_model(
+    model: &crate::popup::PopupModel,
+    state: &mut crate::popup::PopupState,
+) -> crate::popup::PopupModel {
+    let rows = crate::popup::filter_rows(&model.rows, &state.filter);
+    let model = match state.grouping {
+        crate::popup::PopupGrouping::Attention => crate::popup::PopupModel::new(rows),
+        crate::popup::PopupGrouping::Repo => crate::popup::group_rows(rows, state.grouping),
+    };
+    state.ensure_selection(&model);
+    model
+}
+
+fn render_workspace_popup_overlay_text(
+    socket: &Path,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<PopupOverlayText> {
+    let model = workspace_popup_visible_model(socket, state)?;
+    let peek = popup_selected_peek_text(socket, state, &model);
+    Ok(PopupOverlayText {
+        title: "dmux workspaces",
+        content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
+    })
+}
+
+fn apply_workspace_popup_input_actions(
+    socket: &Path,
+    session: &str,
+    state: &mut crate::popup::PopupState,
+    actions: &[PopupInputAction],
+) -> io::Result<WorkspacePopupInputResult> {
+    let mut model = workspace_popup_visible_model(socket, state)?;
+    let mut model_dirty = false;
+    for action in actions {
+        match action {
+            PopupInputAction::MoveUp => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, -1);
+            }
+            PopupInputAction::MoveDown => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, 1);
+            }
+            PopupInputAction::PageUp => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, -10);
+            }
+            PopupInputAction::PageDown => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                    model_dirty = false;
+                }
+                state.move_selection(&model, 10);
+            }
+            PopupInputAction::Home => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                    model_dirty = false;
+                }
+                state.selected = model.selectable_row_ids().first().cloned();
+            }
+            PopupInputAction::End => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                    model_dirty = false;
+                }
+                state.selected = model.selectable_row_ids().last().cloned();
+            }
+            PopupInputAction::Enter => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                }
+                let Some(row) = state.selected_row(&model) else {
+                    return Ok(WorkspacePopupInputResult::Message(
+                        "row is not attachable".to_string(),
+                    ));
+                };
+                return match perform_popup_enter(session, row) {
+                    PopupEnterResult::Reconnect => {
+                        if row.target.as_ref().is_some_and(|target| {
+                            target.window_index.is_some() || target.pane_index.is_some()
+                        }) {
+                            match perform_popup_enter_same_session(socket, session, row)? {
+                                PopupEnterResult::Reconnect => {
+                                    Ok(WorkspacePopupInputResult::Reconnect)
+                                }
+                                PopupEnterResult::SwitchSession { session } => {
+                                    Ok(WorkspacePopupInputResult::SwitchSession { session })
+                                }
+                                PopupEnterResult::Message(message) => {
+                                    Ok(WorkspacePopupInputResult::Message(message))
+                                }
+                            }
+                        } else {
+                            Ok(WorkspacePopupInputResult::Reconnect)
+                        }
+                    }
+                    PopupEnterResult::SwitchSession { session } => {
+                        Ok(WorkspacePopupInputResult::SwitchSession { session })
+                    }
+                    PopupEnterResult::Message(message) => {
+                        Ok(WorkspacePopupInputResult::Message(message))
+                    }
+                };
+            }
+            PopupInputAction::Escape => {
+                if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
+                    return Ok(WorkspacePopupInputResult::Close);
+                }
+                model_dirty = true;
+            }
+            PopupInputAction::Close => return Ok(WorkspacePopupInputResult::Close),
+            PopupInputAction::FilterStart => {
+                state.filter_mode = true;
+            }
+            PopupInputAction::FilterPush(ch) => {
+                state.filter.push(*ch);
+                model_dirty = true;
+            }
+            PopupInputAction::FilterBackspace => {
+                state.filter.pop();
+                model_dirty = true;
+            }
+            PopupInputAction::FilterAccept => {
+                state.filter_mode = false;
+            }
+            PopupInputAction::TogglePeek => {
+                state.peek = !state.peek;
+            }
+            PopupInputAction::ToggleGrouping => {
+                state.toggle_grouping();
+                model_dirty = true;
+            }
+        }
+    }
+    Ok(WorkspacePopupInputResult::StayOpen)
 }
 
 fn attach_detail_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
@@ -3889,10 +5035,10 @@ fn detail_alerts(detail: &PaneDetailEntry) -> Vec<String> {
     alerts
 }
 
-fn attach_workspace_registry_overlay_text(socket: &Path) -> io::Result<String> {
+fn attach_workspace_registry_popup_model(socket: &Path) -> io::Result<crate::popup::PopupModel> {
     let registry = crate::registry::load(&crate::paths::workspace_registry_path())?;
     let live_sessions = live_workspace_sessions(socket)?;
-    Ok(format_workspace_registry_popup(&registry, &live_sessions))
+    Ok(workspace_popup_model(&registry, &live_sessions))
 }
 
 fn live_workspace_sessions(socket: &Path) -> io::Result<Vec<LiveWorkspaceSession>> {
@@ -3920,41 +5066,112 @@ fn parse_live_workspace_sessions(listing: &str) -> io::Result<Vec<LiveWorkspaceS
     Ok(sessions)
 }
 
-fn format_workspace_registry_popup(
+fn workspace_popup_model(
     registry: &crate::registry::WorkspaceRegistry,
     live_sessions: &[LiveWorkspaceSession],
-) -> String {
-    let mut lines = vec!["C-b A close".to_string()];
-    lines.push("Registered paths".to_string());
-    if registry.workspaces.is_empty() {
-        lines.push("  (none)".to_string());
-    } else {
-        lines.extend(
-            registry
-                .workspaces
-                .iter()
-                .map(|record| format!("  {}", record.path.display())),
-        );
-    }
+) -> crate::popup::PopupModel {
+    let mut rows = vec![crate::popup::PopupRow {
+        id: "workspace:root".to_string(),
+        kind: crate::popup::PopupRowKind::Header,
+        repo_path: None,
+        target: None,
+        state: crate::popup::PopupStateKind::Idle,
+        source: crate::popup::PopupRowSource::Registry,
+        title: "C-b A close".to_string(),
+        summary: String::new(),
+        last_changed: None,
+        attachable: false,
+    }];
 
-    lines.push("Live sessions".to_string());
-    if live_sessions.is_empty() {
-        lines.push("  (none)".to_string());
+    rows.push(crate::popup::PopupRow {
+        id: "workspace:registered-paths".to_string(),
+        kind: crate::popup::PopupRowKind::Header,
+        repo_path: None,
+        target: None,
+        state: crate::popup::PopupStateKind::Idle,
+        source: crate::popup::PopupRowSource::Registry,
+        title: "Registered paths".to_string(),
+        summary: String::new(),
+        last_changed: None,
+        attachable: false,
+    });
+    if registry.workspaces.is_empty() {
+        rows.push(workspace_disabled_row(
+            "workspace:registered-paths:none",
+            "none",
+            "",
+            None,
+        ));
     } else {
-        lines.extend(live_sessions.iter().map(|session| {
-            let state = if session.attached_count > 0 {
-                "attached"
-            } else {
-                "detached"
-            };
-            format!(
-                "  {}  {}  windows {}  clients {}",
-                session.name, state, session.window_count, session.attached_count
+        rows.extend(registry.workspaces.iter().map(|record| {
+            workspace_disabled_row(
+                &format!("workspace:path:{}", record.path.display()),
+                &record.path.display().to_string(),
+                "",
+                Some(record.path.clone()),
             )
         }));
     }
 
-    lines.push("Previous sessions".to_string());
+    rows.push(crate::popup::PopupRow {
+        id: "workspace:live-sessions".to_string(),
+        kind: crate::popup::PopupRowKind::Header,
+        repo_path: None,
+        target: None,
+        state: crate::popup::PopupStateKind::Idle,
+        source: crate::popup::PopupRowSource::Mux,
+        title: "Live sessions".to_string(),
+        summary: String::new(),
+        last_changed: None,
+        attachable: false,
+    });
+    if live_sessions.is_empty() {
+        rows.push(workspace_disabled_row("live:none", "none", "", None));
+    } else {
+        rows.extend(live_sessions.iter().map(|session| {
+            let repo_path = registry
+                .sessions
+                .iter()
+                .find(|record| record.name == session.name)
+                .map(|record| record.path.clone());
+            crate::popup::PopupRow {
+                id: format!("live:{}", session.name),
+                kind: crate::popup::PopupRowKind::Item,
+                repo_path,
+                target: Some(crate::popup::PopupTarget {
+                    session: session.name.clone(),
+                    window_index: None,
+                    pane_index: None,
+                }),
+                state: if session.attached_count == 0 {
+                    crate::popup::PopupStateKind::Detached
+                } else {
+                    crate::popup::PopupStateKind::Idle
+                },
+                source: crate::popup::PopupRowSource::Mux,
+                title: session.name.clone(),
+                summary: format!(
+                    "windows {} clients {}",
+                    session.window_count, session.attached_count
+                ),
+                last_changed: None,
+                attachable: true,
+            }
+        }));
+    }
+
+    rows.push(crate::popup::PopupRow {
+        id: "workspace:previous-sessions".to_string(),
+        kind: crate::popup::PopupRowKind::Header,
+        repo_path: None,
+        target: None,
+        state: crate::popup::PopupStateKind::Previous,
+        source: crate::popup::PopupRowSource::Registry,
+        title: "Previous sessions".to_string(),
+        summary: String::new(),
+        last_changed: None,
+        attachable: false,
+    });
     let previous = registry
         .sessions
         .iter()
@@ -3965,18 +5182,47 @@ fn format_workspace_registry_popup(
         })
         .collect::<Vec<_>>();
     if previous.is_empty() {
-        lines.push("  (none)".to_string());
+        rows.push(workspace_disabled_row("previous:none", "none", "", None));
     } else {
-        lines.extend(previous.into_iter().map(|record| {
-            format!(
-                "  {}  {}  {}",
-                record.name,
-                record.state,
-                record.path.display()
-            )
+        rows.extend(previous.into_iter().map(|record| crate::popup::PopupRow {
+            id: format!("previous:{}", record.name),
+            kind: crate::popup::PopupRowKind::DisabledItem,
+            repo_path: Some(record.path.clone()),
+            target: Some(crate::popup::PopupTarget {
+                session: record.name.clone(),
+                window_index: record.last_window,
+                pane_index: record.last_pane,
+            }),
+            state: crate::popup::PopupStateKind::Previous,
+            source: crate::popup::PopupRowSource::Registry,
+            title: record.name.clone(),
+            summary: format!("{} {}", record.state, record.path.display()),
+            last_changed: Some(record.last_seen),
+            attachable: false,
         }));
     }
-    lines.join("\n")
+
+    crate::popup::PopupModel::new(rows)
+}
+
+fn workspace_disabled_row(
+    id: &str,
+    title: &str,
+    summary: &str,
+    repo_path: Option<PathBuf>,
+) -> crate::popup::PopupRow {
+    crate::popup::PopupRow {
+        id: id.to_string(),
+        kind: crate::popup::PopupRowKind::DisabledItem,
+        repo_path,
+        target: None,
+        state: crate::popup::PopupStateKind::Idle,
+        source: crate::popup::PopupRowSource::Registry,
+        title: title.to_string(),
+        summary: summary.to_string(),
+        last_changed: None,
+        attachable: false,
+    }
 }
 
 fn attach_popup_overlay_text(
@@ -3984,28 +5230,59 @@ fn attach_popup_overlay_text(
     session: &str,
     popup: AttachPopup,
 ) -> io::Result<Option<PopupOverlayText>> {
+    attach_popup_overlay_text_with_state(socket, session, popup, None)
+}
+
+fn attach_popup_overlay_text_with_state(
+    socket: &Path,
+    session: &str,
+    popup: AttachPopup,
+    popup_state: Option<&mut crate::popup::PopupState>,
+) -> io::Result<Option<PopupOverlayText>> {
     match popup {
         AttachPopup::None => Ok(None),
         AttachPopup::Help => Ok(Some(PopupOverlayText {
             title: "dmux help",
             content: attach_help_overlay_text(),
         })),
-        AttachPopup::Attention => Ok(Some(PopupOverlayText {
-            title: "dmux attention",
-            content: attach_attention_overlay_text(socket, session)?,
-        })),
-        AttachPopup::Tree => Ok(Some(PopupOverlayText {
-            title: "dmux tree",
-            content: attach_tree_overlay_text(socket, session)?,
-        })),
+        AttachPopup::Attention => {
+            if let Some(state) = popup_state {
+                Ok(Some(render_attention_popup_overlay_text(
+                    socket, session, state,
+                )?))
+            } else {
+                let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Attention);
+                Ok(Some(render_attention_popup_overlay_text(
+                    socket, session, &mut state,
+                )?))
+            }
+        }
+        AttachPopup::Tree => {
+            if let Some(state) = popup_state {
+                Ok(Some(render_tree_popup_overlay_text(
+                    socket, session, state,
+                )?))
+            } else {
+                let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Tree);
+                Ok(Some(render_tree_popup_overlay_text(
+                    socket, session, &mut state,
+                )?))
+            }
+        }
         AttachPopup::Detail => Ok(Some(PopupOverlayText {
             title: "dmux detail",
             content: attach_detail_overlay_text(socket, session)?,
         })),
-        AttachPopup::WorkspaceRegistry => Ok(Some(PopupOverlayText {
-            title: "dmux workspaces",
-            content: attach_workspace_registry_overlay_text(socket)?,
-        })),
+        AttachPopup::WorkspaceRegistry => {
+            if let Some(state) = popup_state {
+                Ok(Some(render_workspace_popup_overlay_text(socket, state)?))
+            } else {
+                let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Workspace);
+                Ok(Some(render_workspace_popup_overlay_text(
+                    socket, &mut state,
+                )?))
+            }
+        }
     }
 }
 
@@ -4126,6 +5403,58 @@ fn select_numbered_pane(socket: &Path, session: &str, index: usize) -> io::Resul
     Ok(true)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PopupEnterResult {
+    Reconnect,
+    SwitchSession { session: String },
+    Message(String),
+}
+
+fn perform_popup_enter(current_session: &str, row: &crate::popup::PopupRow) -> PopupEnterResult {
+    let Some(target) = row.target.as_ref() else {
+        return PopupEnterResult::Message("row is not attachable".to_string());
+    };
+    if !row.attachable {
+        return PopupEnterResult::Message("row is not currently attachable".to_string());
+    }
+    if target.session == current_session {
+        return PopupEnterResult::Reconnect;
+    }
+    PopupEnterResult::SwitchSession {
+        session: target.session.clone(),
+    }
+}
+
+fn perform_popup_enter_same_session(
+    socket: &Path,
+    current_session: &str,
+    row: &crate::popup::PopupRow,
+) -> io::Result<PopupEnterResult> {
+    let Some(target) = row.target.as_ref() else {
+        return Ok(PopupEnterResult::Message(
+            "row is not attachable".to_string(),
+        ));
+    };
+    if !row.attachable || target.session != current_session {
+        return Ok(PopupEnterResult::Message(
+            "row is not attachable here".to_string(),
+        ));
+    }
+    if let Some(window_index) = target.window_index {
+        let _ = send_control_request(
+            socket,
+            &protocol::encode_select_window(current_session, window_index),
+        )?;
+    }
+    if let Some(pane_index) = target.pane_index {
+        let _ = send_control_request(
+            socket,
+            &protocol::encode_select_pane(current_session, pane_index),
+        )?;
+    }
+    Ok(perform_popup_enter(current_session, row))
+}
+
 fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
     let entries = pane_entries(socket, session)?;
     let next = next_pane_index_from_entries(&entries)?;
@@ -4136,7 +5465,13 @@ fn select_next_pane(socket: &Path, session: &str) -> io::Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RawAttachExit {
     Detach,
-    Reconnect { pending_input: Vec<u8> },
+    Reconnect {
+        pending_input: Vec<u8>,
+    },
+    SwitchSession {
+        session: String,
+        pending_input: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4259,6 +5594,8 @@ where
     let mut initial_input = Some(initial_input);
     let mut controls = load_live_controls(socket);
     let mut active_popup = AttachPopup::None;
+    let mut popup_state: Option<crate::popup::PopupState> = None;
+    let mut popup_input_state: Option<PopupInputState> = None;
 
     loop {
         tick()?;
@@ -4301,8 +5638,141 @@ where
 
         for (index, action) in actions.iter().enumerate() {
             match action {
-                AttachInputAction::Forward(output) => stream.write_all(&output)?,
-                AttachInputAction::CommandPromptStart => write_attach_command_prompt("", true)?,
+                AttachInputAction::Forward(output) => {
+                    if active_popup == AttachPopup::Attention {
+                        if let (Some(state), Some(popup_decoder)) =
+                            (popup_state.as_mut(), popup_input_state.as_mut())
+                        {
+                            let popup_actions = popup_actions_for_input(output, popup_decoder);
+                            match apply_attention_popup_input_actions(
+                                socket,
+                                session,
+                                state,
+                                &popup_actions,
+                            )? {
+                                AttentionPopupInputResult::StayOpen => {
+                                    let overlay = render_attention_popup_overlay_text(
+                                        socket, session, state,
+                                    )?;
+                                    write_attach_popup_message(overlay.as_overlay())?;
+                                }
+                                AttentionPopupInputResult::Close => {
+                                    active_popup = AttachPopup::None;
+                                    popup_state = None;
+                                    popup_input_state = None;
+                                    let _ = write_live_snapshot_frame_with_message_and_clear(
+                                        socket, session, None, None, false, false,
+                                    )?;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if active_popup == AttachPopup::Tree {
+                        if let (Some(state), Some(popup_decoder)) =
+                            (popup_state.as_mut(), popup_input_state.as_mut())
+                        {
+                            let popup_actions = popup_actions_for_input(output, popup_decoder);
+                            match apply_tree_popup_input_actions(
+                                socket,
+                                session,
+                                state,
+                                &popup_actions,
+                            )? {
+                                TreePopupInputResult::StayOpen => {
+                                    let overlay =
+                                        render_tree_popup_overlay_text(socket, session, state)?;
+                                    write_attach_popup_message(overlay.as_overlay())?;
+                                }
+                                TreePopupInputResult::Close => {
+                                    active_popup = AttachPopup::None;
+                                    popup_state = None;
+                                    popup_input_state = None;
+                                    let _ = write_live_snapshot_frame_with_message_and_clear(
+                                        socket, session, None, None, false, false,
+                                    )?;
+                                }
+                                TreePopupInputResult::Reconnect => {
+                                    let pending_input = raw_pending_input(
+                                        &actions[index + 1..],
+                                        input_state.saw_prefix,
+                                        RawPendingFocus::Preserve,
+                                        &controls,
+                                    );
+                                    return Ok(RawAttachExit::Reconnect { pending_input });
+                                }
+                                TreePopupInputResult::Message(message) => {
+                                    write_attach_transient_message(&message)?;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    if active_popup == AttachPopup::WorkspaceRegistry {
+                        if let (Some(state), Some(popup_decoder)) =
+                            (popup_state.as_mut(), popup_input_state.as_mut())
+                        {
+                            let popup_actions = popup_actions_for_input(output, popup_decoder);
+                            match apply_workspace_popup_input_actions(
+                                socket,
+                                session,
+                                state,
+                                &popup_actions,
+                            )? {
+                                WorkspacePopupInputResult::StayOpen => {
+                                    let overlay = attach_popup_overlay_text_with_state(
+                                        socket,
+                                        session,
+                                        AttachPopup::WorkspaceRegistry,
+                                        Some(state),
+                                    )?
+                                    .expect("workspace registry popup");
+                                    write_attach_popup_message(overlay.as_overlay())?;
+                                }
+                                WorkspacePopupInputResult::Close => {
+                                    active_popup = AttachPopup::None;
+                                    popup_state = None;
+                                    popup_input_state = None;
+                                    let _ = write_live_snapshot_frame_with_message_and_clear(
+                                        socket, session, None, None, false, false,
+                                    )?;
+                                }
+                                WorkspacePopupInputResult::Reconnect => {
+                                    let pending_input = raw_pending_input(
+                                        &actions[index + 1..],
+                                        input_state.saw_prefix,
+                                        RawPendingFocus::Preserve,
+                                        &controls,
+                                    );
+                                    return Ok(RawAttachExit::Reconnect { pending_input });
+                                }
+                                WorkspacePopupInputResult::SwitchSession { session } => {
+                                    let pending_input = raw_pending_input(
+                                        &actions[index + 1..],
+                                        input_state.saw_prefix,
+                                        RawPendingFocus::Preserve,
+                                        &controls,
+                                    );
+                                    return Ok(RawAttachExit::SwitchSession {
+                                        session,
+                                        pending_input,
+                                    });
+                                }
+                                WorkspacePopupInputResult::Message(message) => {
+                                    write_attach_transient_message(&message)?;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    stream.write_all(&output)?;
+                }
+                AttachInputAction::CommandPromptStart => {
+                    active_popup = AttachPopup::None;
+                    popup_state = None;
+                    popup_input_state = None;
+                    write_attach_command_prompt("", true)?;
+                }
                 AttachInputAction::CommandPromptUpdate(command) => {
                     write_attach_command_prompt(command, false)?
                 }
@@ -4506,6 +5976,9 @@ where
                     }
                 }
                 AttachInputAction::ShowPaneNumbers => {
+                    active_popup = AttachPopup::None;
+                    popup_state = None;
+                    popup_input_state = None;
                     match pane_number_message_text(socket, session) {
                         Ok(message) => write_attach_transient_message(&message)?,
                         Err(error) => write_attach_transient_message(&error.to_string())?,
@@ -4529,6 +6002,8 @@ where
                 }
                 AttachInputAction::EnterCopyMode { initial_input } => {
                     active_popup = AttachPopup::None;
+                    popup_state = None;
+                    popup_input_state = None;
                     copy_mode_active.store(true, Ordering::SeqCst);
                     let result = enter_copy_mode(initial_input);
                     copy_mode_active.store(false, Ordering::SeqCst);
@@ -4536,6 +6011,8 @@ where
                 }
                 AttachInputAction::ShowHelp => {
                     active_popup = active_popup.toggle_help();
+                    popup_state = None;
+                    popup_input_state = None;
                     if active_popup == AttachPopup::Help {
                         let overlay =
                             attach_popup_overlay_text(socket, session, AttachPopup::Help)?
@@ -4550,11 +6027,20 @@ where
                 AttachInputAction::ShowAttention => {
                     active_popup = active_popup.toggle_attention();
                     if active_popup == AttachPopup::Attention {
-                        let overlay =
-                            attach_popup_overlay_text(socket, session, AttachPopup::Attention)?
-                                .expect("attention popup");
+                        popup_state = Some(crate::popup::PopupState::new(
+                            crate::popup::PopupMode::Attention,
+                        ));
+                        popup_input_state =
+                            Some(PopupInputState::new(crate::popup::PopupMode::Attention));
+                        let overlay = render_attention_popup_overlay_text(
+                            socket,
+                            session,
+                            popup_state.as_mut().expect("attention popup state"),
+                        )?;
                         write_attach_popup_message(overlay.as_overlay())?;
                     } else {
+                        popup_state = None;
+                        popup_input_state = None;
                         let _ = write_live_snapshot_frame_with_message_and_clear(
                             socket, session, None, None, false, false,
                         )?;
@@ -4563,11 +6049,19 @@ where
                 AttachInputAction::ShowTree => {
                     active_popup = active_popup.toggle_tree();
                     if active_popup == AttachPopup::Tree {
-                        let overlay =
-                            attach_popup_overlay_text(socket, session, AttachPopup::Tree)?
-                                .expect("tree popup");
+                        popup_state =
+                            Some(crate::popup::PopupState::new(crate::popup::PopupMode::Tree));
+                        popup_input_state =
+                            Some(PopupInputState::new(crate::popup::PopupMode::Tree));
+                        let overlay = render_tree_popup_overlay_text(
+                            socket,
+                            session,
+                            popup_state.as_mut().expect("tree popup state"),
+                        )?;
                         write_attach_popup_message(overlay.as_overlay())?;
                     } else {
+                        popup_state = None;
+                        popup_input_state = None;
                         let _ = write_live_snapshot_frame_with_message_and_clear(
                             socket, session, None, None, false, false,
                         )?;
@@ -4575,6 +6069,8 @@ where
                 }
                 AttachInputAction::ShowDetail => {
                     active_popup = active_popup.toggle_detail();
+                    popup_state = None;
+                    popup_input_state = None;
                     if active_popup == AttachPopup::Detail {
                         let overlay =
                             attach_popup_overlay_text(socket, session, AttachPopup::Detail)?
@@ -4589,14 +6085,22 @@ where
                 AttachInputAction::ShowWorkspaceRegistry => {
                     active_popup = active_popup.toggle_workspace_registry();
                     if active_popup == AttachPopup::WorkspaceRegistry {
-                        let overlay = attach_popup_overlay_text(
+                        popup_state = Some(crate::popup::PopupState::new(
+                            crate::popup::PopupMode::Workspace,
+                        ));
+                        popup_input_state =
+                            Some(PopupInputState::new(crate::popup::PopupMode::Workspace));
+                        let overlay = attach_popup_overlay_text_with_state(
                             socket,
                             session,
                             AttachPopup::WorkspaceRegistry,
+                            popup_state.as_mut(),
                         )?
                         .expect("workspace registry popup");
                         write_attach_popup_message(overlay.as_overlay())?;
                     } else {
+                        popup_state = None;
+                        popup_input_state = None;
                         let _ = write_live_snapshot_frame_with_message_and_clear(
                             socket, session, None, None, false, false,
                         )?;
@@ -7205,6 +8709,283 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_popup_mode_consumes_navigation_keys() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Attention);
+
+        assert_eq!(
+            popup_actions_for_input(b"j", &mut state),
+            vec![PopupInputAction::MoveDown]
+        );
+        assert_eq!(
+            popup_actions_for_input(b"k", &mut state),
+            vec![PopupInputAction::MoveUp]
+        );
+        assert_eq!(
+            popup_actions_for_input(b"\r", &mut state),
+            vec![PopupInputAction::Enter]
+        );
+        assert_eq!(
+            popup_actions_for_input(b" ", &mut state),
+            vec![PopupInputAction::TogglePeek]
+        );
+    }
+
+    #[test]
+    fn tree_popup_rows_include_window_and_pane_targets() {
+        let windows = vec![WindowTreeEntry {
+            index: 0,
+            active: true,
+            name: "main".to_string(),
+            panes: vec![
+                PaneTreeEntry {
+                    index: 0,
+                    active: true,
+                    state: "running".to_string(),
+                    bell: false,
+                    activity: false,
+                    agent_state: String::new(),
+                    agent_label: String::new(),
+                    agent_source: String::new(),
+                    agent_changed_at: None,
+                    title: "shell".to_string(),
+                    cwd: "/tmp/project".to_string(),
+                },
+                PaneTreeEntry {
+                    index: 1,
+                    active: false,
+                    state: "running".to_string(),
+                    bell: true,
+                    activity: false,
+                    agent_state: String::new(),
+                    agent_label: String::new(),
+                    agent_source: String::new(),
+                    agent_changed_at: None,
+                    title: "tests".to_string(),
+                    cwd: "/tmp/project".to_string(),
+                },
+            ],
+        }];
+
+        let model = tree_popup_model("dev", &windows);
+
+        assert!(
+            model
+                .rows
+                .iter()
+                .any(|row| row.kind == crate::popup::PopupRowKind::Header)
+        );
+        let pane = model
+            .rows
+            .iter()
+            .find(|row| row.target.as_ref().and_then(|target| target.pane_index) == Some(1))
+            .expect("pane row");
+        assert_eq!(pane.state, crate::popup::PopupStateKind::Alert);
+        assert!(pane.attachable);
+    }
+
+    #[test]
+    fn workspace_popup_model_marks_previous_records_disabled() {
+        let registry = crate::registry::WorkspaceRegistry {
+            workspaces: Vec::new(),
+            sessions: vec![
+                crate::registry::SessionRecord {
+                    name: "previous-dev".to_string(),
+                    path: PathBuf::from("/tmp/previous-dev"),
+                    state: "stopped".to_string(),
+                    last_seen: 123,
+                    last_window: Some(1),
+                    last_pane: Some(2),
+                },
+                crate::registry::SessionRecord {
+                    name: "live-dev".to_string(),
+                    path: PathBuf::from("/tmp/live-dev"),
+                    state: "detached".to_string(),
+                    last_seen: 456,
+                    last_window: None,
+                    last_pane: None,
+                },
+            ],
+        };
+        let live_sessions = vec![LiveWorkspaceSession {
+            name: "live-dev".to_string(),
+            window_count: 2,
+            attached_count: 0,
+        }];
+
+        let model = workspace_popup_model(&registry, &live_sessions);
+
+        let previous = model
+            .rows
+            .iter()
+            .find(|row| row.id == "previous:previous-dev")
+            .expect("previous row");
+        assert_eq!(previous.kind, crate::popup::PopupRowKind::DisabledItem);
+        assert!(!previous.attachable);
+        assert_eq!(
+            previous
+                .target
+                .as_ref()
+                .and_then(|target| target.window_index),
+            Some(1)
+        );
+        assert_eq!(
+            previous
+                .target
+                .as_ref()
+                .and_then(|target| target.pane_index),
+            Some(2)
+        );
+        let live = model
+            .rows
+            .iter()
+            .find(|row| row.id == "live:live-dev")
+            .expect("live row");
+        assert_eq!(live.kind, crate::popup::PopupRowKind::Item);
+        assert!(live.attachable);
+    }
+
+    #[test]
+    fn workspace_popup_filtered_render_hides_non_matching_rows() {
+        let registry = crate::registry::WorkspaceRegistry {
+            workspaces: Vec::new(),
+            sessions: Vec::new(),
+        };
+        let live_sessions = vec![
+            LiveWorkspaceSession {
+                name: "needle-session".to_string(),
+                window_count: 1,
+                attached_count: 0,
+            },
+            LiveWorkspaceSession {
+                name: "other-session".to_string(),
+                window_count: 1,
+                attached_count: 0,
+            },
+        ];
+        let model = workspace_popup_model(&registry, &live_sessions);
+        let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Workspace);
+        state.filter = "needle".to_string();
+
+        let visible = workspace_popup_visible_model_from_model(&model, &mut state);
+        let rendered = crate::popup::render_popup_text(&state, &visible, None);
+
+        assert!(rendered.contains("needle-session"), "{rendered}");
+        assert!(!rendered.contains("other-session"), "{rendered}");
+    }
+
+    #[test]
+    fn workspace_popup_toggle_grouping_switches_from_sections_to_repo_headers() {
+        let repo_path = PathBuf::from("/tmp/grouped-workspace");
+        let registry = crate::registry::WorkspaceRegistry {
+            workspaces: Vec::new(),
+            sessions: vec![crate::registry::SessionRecord {
+                name: "live-dev".to_string(),
+                path: repo_path.clone(),
+                state: "detached".to_string(),
+                last_seen: 456,
+                last_window: None,
+                last_pane: None,
+            }],
+        };
+        let live_sessions = vec![LiveWorkspaceSession {
+            name: "live-dev".to_string(),
+            window_count: 1,
+            attached_count: 0,
+        }];
+        let model = workspace_popup_model(&registry, &live_sessions);
+        let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Workspace);
+
+        let default = workspace_popup_visible_model_from_model(&model, &mut state);
+        assert!(
+            default.rows.iter().any(|row| row.title == "Live sessions"),
+            "{default:?}"
+        );
+
+        state.toggle_grouping();
+        let grouped = workspace_popup_visible_model_from_model(&model, &mut state);
+        assert!(
+            grouped
+                .rows
+                .iter()
+                .any(|row| row.title == repo_path.display().to_string()),
+            "{grouped:?}"
+        );
+        assert!(
+            !grouped.rows.iter().any(|row| row.title == "Live sessions"),
+            "{grouped:?}"
+        );
+    }
+
+    #[test]
+    fn live_snapshot_popup_mode_decodes_page_home_and_end_keys() {
+        let cases = [
+            (b"\x1b[H".as_slice(), PopupInputAction::Home),
+            (b"\x1b[1~".as_slice(), PopupInputAction::Home),
+            (b"\x1b[F".as_slice(), PopupInputAction::End),
+            (b"\x1b[4~".as_slice(), PopupInputAction::End),
+            (b"\x1b[5~".as_slice(), PopupInputAction::PageUp),
+            (b"\x1b[6~".as_slice(), PopupInputAction::PageDown),
+        ];
+
+        for (input, action) in cases {
+            let mut state = PopupInputState::new(crate::popup::PopupMode::Attention);
+            assert_eq!(popup_actions_for_input(input, &mut state), vec![action]);
+        }
+    }
+
+    #[test]
+    fn live_snapshot_popup_mode_buffers_split_arrow_sequence() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Attention);
+
+        assert!(popup_actions_for_input(b"\x1b[", &mut state).is_empty());
+        assert_eq!(
+            popup_actions_for_input(b"A", &mut state),
+            vec![PopupInputAction::MoveUp]
+        );
+    }
+
+    #[test]
+    fn popup_filter_mode_collects_text() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+
+        assert_eq!(
+            popup_actions_for_input(b"/api\x7f2\r", &mut state),
+            vec![
+                PopupInputAction::FilterStart,
+                PopupInputAction::FilterPush('a'),
+                PopupInputAction::FilterPush('p'),
+                PopupInputAction::FilterPush('i'),
+                PopupInputAction::FilterBackspace,
+                PopupInputAction::FilterPush('2'),
+                PopupInputAction::FilterAccept,
+            ]
+        );
+    }
+
+    #[test]
+    fn popup_filter_mode_escape_exits_filter_then_j_moves_down() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+
+        assert_eq!(
+            popup_actions_for_input(b"/api", &mut state),
+            vec![
+                PopupInputAction::FilterStart,
+                PopupInputAction::FilterPush('a'),
+                PopupInputAction::FilterPush('p'),
+                PopupInputAction::FilterPush('i'),
+            ]
+        );
+        assert_eq!(
+            popup_actions_for_input(b"\x1b", &mut state),
+            vec![PopupInputAction::Escape]
+        );
+        assert_eq!(
+            popup_actions_for_input(b"j", &mut state),
+            vec![PopupInputAction::MoveDown]
+        );
+    }
+
+    #[test]
     fn attach_input_translates_pane_commands() {
         let cases = [
             (b'c', PaneCommand::NewWindow),
@@ -8481,15 +10262,42 @@ mod tests {
     fn parse_attention_entries_rejects_invalid_flags() {
         let sep = ATTENTION_FIELD_SEPARATOR;
         let listing = format!(
-            "0{sep}x{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}{sep}{sep}shell{sep}/tmp\n"
+            "0{sep}x{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}{sep}{sep}{sep}{sep}shell{sep}/tmp\n"
         );
 
         assert!(parse_pane_attention_listing(&listing).is_err());
     }
 
     #[test]
+    fn popup_parsers_treat_agent_changed_at_placeholder_as_absent() {
+        let sep = ATTENTION_FIELD_SEPARATOR;
+        let attention_listing = format!(
+            "0{sep}1{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}#{{pane.agent_changed_at}}{sep}shell{sep}/tmp\n"
+        );
+        let attention = parse_pane_attention_listing(&attention_listing).unwrap();
+
+        assert_eq!(attention[0].agent_changed_at, None);
+
+        let malformed_attention_listing = format!(
+            "0{sep}1{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}not-a-time{sep}shell{sep}/tmp\n"
+        );
+        let malformed_attention =
+            parse_pane_attention_listing(&malformed_attention_listing).unwrap();
+
+        assert_eq!(malformed_attention[0].agent_changed_at, None);
+
+        let tree_listing = format!(
+            "0{sep}1{sep}running{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}#{{pane.agent_changed_at}}{sep}shell{sep}/tmp\n"
+        );
+        let tree = parse_pane_tree_listing(&tree_listing).unwrap();
+
+        assert_eq!(tree[0].agent_changed_at, None);
+    }
+
+    #[test]
     fn format_attention_popup_lists_attention_before_quiet_panes() {
         let quiet = PaneAttentionEntry {
+            window_index: 0,
             index: 0,
             active: true,
             state: "running".to_string(),
@@ -8500,10 +10308,13 @@ mod tests {
             clipboard_blocked: 0,
             agent_state: String::new(),
             agent_label: String::new(),
+            agent_source: String::new(),
+            agent_changed_at: None,
             title: "shell".to_string(),
             cwd: "/tmp/project".to_string(),
         };
         let attention = PaneAttentionEntry {
+            window_index: 0,
             index: 1,
             active: false,
             state: "running".to_string(),
@@ -8514,6 +10325,8 @@ mod tests {
             clipboard_blocked: 2,
             agent_state: String::new(),
             agent_label: String::new(),
+            agent_source: String::new(),
+            agent_changed_at: None,
             title: "codex".to_string(),
             cwd: "/tmp/project".to_string(),
         };
@@ -8529,6 +10342,7 @@ mod tests {
     #[test]
     fn format_attention_popup_reports_empty_attention() {
         let quiet = PaneAttentionEntry {
+            window_index: 0,
             index: 0,
             active: true,
             state: "running".to_string(),
@@ -8539,6 +10353,8 @@ mod tests {
             clipboard_blocked: 0,
             agent_state: String::new(),
             agent_label: String::new(),
+            agent_source: String::new(),
+            agent_changed_at: None,
             title: String::new(),
             cwd: "/tmp/project".to_string(),
         };

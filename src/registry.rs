@@ -15,6 +15,8 @@ pub struct SessionRecord {
     pub path: PathBuf,
     pub state: String,
     pub last_seen: u64,
+    pub last_window: Option<usize>,
+    pub last_pane: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -77,6 +79,8 @@ pub fn record_session(
             path: workspace,
             state: state.to_string(),
             last_seen,
+            last_window: None,
+            last_pane: None,
         });
     }
     registry
@@ -127,7 +131,7 @@ fn now_seconds() -> u64 {
 fn parse(contents: &str) -> io::Result<WorkspaceRegistry> {
     let mut registry = WorkspaceRegistry::default();
     for (line_index, line) in contents.lines().enumerate() {
-        let line = line.trim_end();
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -141,29 +145,10 @@ fn parse(contents: &str) -> io::Result<WorkspaceRegistry> {
                     )
                 })?,
             }),
-            ["session", name, path, state, last_seen] => {
-                let last_seen = last_seen.parse::<u64>().map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("line {}: invalid last_seen", line_index + 1),
-                    )
-                })?;
-                registry.sessions.push(SessionRecord {
-                    name: decode_text(name).map_err(|message| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("line {}: {message}", line_index + 1),
-                        )
-                    })?,
-                    path: decode_path(path).map_err(|message| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("line {}: {message}", line_index + 1),
-                        )
-                    })?,
-                    state: (*state).to_string(),
-                    last_seen,
-                });
+            ["session", rest @ ..] => {
+                registry
+                    .sessions
+                    .push(parse_session_record(rest, line_index + 1)?);
             }
             _ => {
                 return Err(io::Error::new(
@@ -182,6 +167,69 @@ fn parse(contents: &str) -> io::Result<WorkspaceRegistry> {
     Ok(registry)
 }
 
+fn parse_session_record(fields: &[&str], line_number: usize) -> io::Result<SessionRecord> {
+    let (name, path, state, last_seen, last_window, last_pane) = match fields {
+        [name, path, state, last_seen] => (name, path, state, last_seen, None, None),
+        [name, path, state, last_seen, last_window, last_pane] => (
+            name,
+            path,
+            state,
+            last_seen,
+            Some(last_window),
+            Some(last_pane),
+        ),
+        _ => {
+            return Err(invalid_registry_data(
+                line_number,
+                "invalid session record field count",
+            ));
+        }
+    };
+    Ok(SessionRecord {
+        name: decode_text_field(name, line_number)?,
+        path: decode_path_field(path, line_number)?,
+        state: (*state).to_string(),
+        last_seen: parse_u64_field(last_seen, line_number, "last_seen")?,
+        last_window: parse_optional_usize_field(last_window, line_number, "last_window")?,
+        last_pane: parse_optional_usize_field(last_pane, line_number, "last_pane")?,
+    })
+}
+
+fn decode_text_field(value: &str, line_number: usize) -> io::Result<String> {
+    decode_text(value).map_err(|message| invalid_registry_data(line_number, &message))
+}
+
+fn decode_path_field(value: &str, line_number: usize) -> io::Result<PathBuf> {
+    decode_path(value).map_err(|message| invalid_registry_data(line_number, &message))
+}
+
+fn parse_u64_field(value: &str, line_number: usize, field: &str) -> io::Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| invalid_registry_data(line_number, &format!("invalid {field}")))
+}
+
+fn parse_optional_usize_field(
+    value: Option<&&str>,
+    line_number: usize,
+    field: &str,
+) -> io::Result<Option<usize>> {
+    match value {
+        None | Some(&"") => Ok(None),
+        Some(value) => value
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| invalid_registry_data(line_number, &format!("invalid {field}"))),
+    }
+}
+
+fn invalid_registry_data(line_number: usize, message: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("line {line_number}: {message}"),
+    )
+}
+
 fn render(registry: &WorkspaceRegistry) -> String {
     let mut lines = vec!["# dmux workspace registry v1".to_string()];
     for workspace in &registry.workspaces {
@@ -189,15 +237,21 @@ fn render(registry: &WorkspaceRegistry) -> String {
     }
     for session in &registry.sessions {
         lines.push(format!(
-            "session\t{}\t{}\t{}\t{}",
+            "session\t{}\t{}\t{}\t{}\t{}\t{}",
             encode_text(&session.name),
             encode_path(&session.path),
             session.state,
-            session.last_seen
+            session.last_seen,
+            render_optional_usize(session.last_window),
+            render_optional_usize(session.last_pane)
         ));
     }
     lines.push(String::new());
     lines.join("\n")
+}
+
+fn render_optional_usize(value: Option<usize>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
 }
 
 fn encode_text(value: &str) -> String {
@@ -266,9 +320,73 @@ mod tests {
                 path: PathBuf::from("/tmp/project"),
                 state: "detached".to_string(),
                 last_seen: 42,
+                last_window: None,
+                last_pane: None,
             }],
         };
 
         assert_eq!(parse(&render(&registry)).unwrap(), registry);
+    }
+
+    #[test]
+    fn registry_round_trips_optional_session_metadata() {
+        let registry = WorkspaceRegistry {
+            workspaces: vec![WorkspaceRecord {
+                path: PathBuf::from("/tmp/project"),
+            }],
+            sessions: vec![SessionRecord {
+                name: "dev".to_string(),
+                path: PathBuf::from("/tmp/project"),
+                state: "detached".to_string(),
+                last_seen: 42,
+                last_window: Some(1),
+                last_pane: Some(2),
+            }],
+        };
+
+        assert_eq!(parse(&render(&registry)).unwrap(), registry);
+    }
+
+    #[test]
+    fn registry_round_trips_partial_optional_session_metadata() {
+        let registry = WorkspaceRegistry {
+            workspaces: vec![WorkspaceRecord {
+                path: PathBuf::from("/tmp/project"),
+            }],
+            sessions: vec![SessionRecord {
+                name: "dev".to_string(),
+                path: PathBuf::from("/tmp/project"),
+                state: "detached".to_string(),
+                last_seen: 42,
+                last_window: Some(1),
+                last_pane: None,
+            }],
+        };
+
+        assert_eq!(parse(&render(&registry)).unwrap(), registry);
+    }
+
+    #[test]
+    fn registry_parses_legacy_session_metadata_as_empty() {
+        let contents = format!(
+            "session\t{}\t{}\tdetached\t42\n",
+            encode_text("dev"),
+            encode_path(Path::new("/tmp/project"))
+        );
+
+        assert_eq!(
+            parse(&contents).unwrap(),
+            WorkspaceRegistry {
+                workspaces: Vec::new(),
+                sessions: vec![SessionRecord {
+                    name: "dev".to_string(),
+                    path: PathBuf::from("/tmp/project"),
+                    state: "detached".to_string(),
+                    last_seen: 42,
+                    last_window: None,
+                    last_pane: None,
+                }],
+            }
+        );
     }
 }

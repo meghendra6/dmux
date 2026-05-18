@@ -281,6 +281,8 @@ pub enum Request {
         target: Target,
         state: String,
         label: String,
+        source: Option<String>,
+        changed_at: Option<u64>,
     },
     ListKeys {
         format: Option<String>,
@@ -849,12 +851,30 @@ pub fn encode_display_message(session: &str, format: &str) -> String {
     )
 }
 
-pub fn encode_agent_event(target: &Target, state: &str, label: &str) -> String {
+pub fn encode_agent_event(
+    target: &Target,
+    state: &str,
+    label: &str,
+    source: Option<&str>,
+    changed_at: Option<u64>,
+) -> String {
+    if source.is_none() && changed_at.is_none() {
+        return format!(
+            "AGENT_EVENT\t{}\t{}\t{}\n",
+            encode_target(target),
+            encode_hex(state.as_bytes()),
+            encode_hex(label.as_bytes())
+        );
+    }
     format!(
-        "AGENT_EVENT\t{}\t{}\t{}\n",
+        "AGENT_EVENT\t{}\t{}\t{}\t{}\t{}\n",
         encode_target(target),
         encode_hex(state.as_bytes()),
-        encode_hex(label.as_bytes())
+        encode_hex(label.as_bytes()),
+        encode_optional_text(source),
+        changed_at
+            .map(|value| value.to_string())
+            .unwrap_or_default()
     )
 }
 
@@ -1652,6 +1672,15 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             target: decode_target(target, "AGENT_EVENT")?,
             state: decode_utf8_hex(state, "AGENT_EVENT")?,
             label: decode_utf8_hex(label, "AGENT_EVENT")?,
+            source: None,
+            changed_at: None,
+        }),
+        ["AGENT_EVENT", target, state, label, source, changed_at] => Ok(Request::AgentEvent {
+            target: decode_target(target, "AGENT_EVENT")?,
+            state: decode_utf8_hex(state, "AGENT_EVENT")?,
+            label: decode_utf8_hex(label, "AGENT_EVENT")?,
+            source: decode_optional_text(source, "AGENT_EVENT")?,
+            changed_at: decode_optional_u64(changed_at, "AGENT_EVENT changed_at")?,
         }),
         ["LIST_KEYS", format] => Ok(Request::ListKeys {
             format: decode_optional_text(format, "LIST_KEYS")?,
@@ -1870,6 +1899,17 @@ fn decode_optional_text(value: &str, command: &str) -> Result<Option<String>, St
         Ok(None)
     } else {
         decode_utf8_hex(value, command).map(Some)
+    }
+}
+
+fn decode_optional_u64(value: &str, name: &str) -> Result<Option<u64>, String> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("{name} has invalid value"))
     }
 }
 
@@ -2678,13 +2718,60 @@ mod tests {
             window: WindowTarget::Index(1),
             pane: PaneTarget::Index(0),
         };
-        let line = encode_agent_event(&target, "waiting", "codex");
+        let line = encode_agent_event(&target, "waiting", "codex", Some("codex"), Some(123));
         assert_eq!(
             decode_request(&line).unwrap(),
             Request::AgentEvent {
                 target,
                 state: "waiting".to_string(),
                 label: "codex".to_string(),
+                source: Some("codex".to_string()),
+                changed_at: Some(123),
+            }
+        );
+    }
+
+    #[test]
+    fn encodes_legacy_agent_event_without_metadata() {
+        let target = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Index(1),
+            pane: PaneTarget::Index(0),
+        };
+        let line = encode_agent_event(&target, "waiting", "codex", None, None);
+
+        assert_eq!(line.matches('\t').count(), 3);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::AgentEvent {
+                target,
+                state: "waiting".to_string(),
+                label: "codex".to_string(),
+                source: None,
+                changed_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_legacy_agent_event_request() {
+        let target = Target {
+            session: "dev".to_string(),
+            window: WindowTarget::Index(1),
+            pane: PaneTarget::Index(0),
+        };
+        let line = format!(
+            "AGENT_EVENT\t{}\t77616974696e67\t636f646578\n",
+            encode_target(&target)
+        );
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::AgentEvent {
+                target,
+                state: "waiting".to_string(),
+                label: "codex".to_string(),
+                source: None,
+                changed_at: None,
             }
         );
     }

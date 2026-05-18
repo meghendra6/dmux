@@ -1719,6 +1719,23 @@ fn poll_list_panes_contains(
     last
 }
 
+fn poll_list_sessions_contains(socket: &std::path::Path, format: &str, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(socket, &["list-sessions", "-F", format]);
+        assert_success(&output);
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if last.contains(needle) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
+}
+
 fn active_pane_index_and_id(socket: &std::path::Path, session: &str) -> (usize, usize) {
     let output = dmux(
         socket,
@@ -2242,9 +2259,21 @@ fn spawn_attached_dmux(
     args: &[&str],
     readiness_needles: &[&str],
 ) -> CapturedDmuxChild {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dmux"))
-        .env("DEVMUX_SOCKET", socket)
-        .args(args)
+    spawn_attached_dmux_with_env(socket, args, readiness_needles, &[])
+}
+
+fn spawn_attached_dmux_with_env(
+    socket: &std::path::Path,
+    args: &[&str],
+    readiness_needles: &[&str],
+    envs: &[(&str, &str)],
+) -> CapturedDmuxChild {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dmux"));
+    command.env("DEVMUX_SOCKET", socket).args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3248,6 +3277,236 @@ fn attach_prefix_popup_keys_print_tree_detail_and_workspace_registry() {
 }
 
 #[test]
+fn interactive_tree_popup_enter_selects_pane_for_input() {
+    let socket = unique_socket("interactive-tree-enter");
+    let session = format!("interactive-tree-enter-{}", std::process::id());
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "cat"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-lc",
+            "cat",
+        ],
+    ));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &[]);
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02w")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["Enter: focus/attach"], "tree popup");
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"j\r")
+        .unwrap();
+
+    let panes =
+        poll_list_panes_contains(&socket, &session, "#{pane.index}\t#{pane.active}", "1\t1");
+    assert!(panes.contains("1\t1"), "{panes:?}");
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"selected-pane\n")
+        .unwrap();
+
+    let target = format!("{session}:0.1");
+    let captured = poll_capture(&socket, &target, "selected-pane");
+    assert!(captured.contains("selected-pane"), "{captured:?}");
+
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+}
+
+#[test]
+fn tree_popup_enter_does_not_forward_same_read_payload_after_filter() {
+    let socket = unique_socket("interactive-tree-filter-enter");
+    let session = format!("interactive-tree-filter-enter-{}", std::process::id());
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "cat"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-lc",
+            "cat",
+        ],
+    ));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &[]);
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02w")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["Enter: focus/attach"], "tree popup");
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"/pane\rj\rleaked-payload\n")
+        .unwrap();
+
+    let panes =
+        poll_list_panes_contains(&socket, &session, "#{pane.index}\t#{pane.active}", "1\t1");
+    assert!(panes.contains("1\t1"), "{panes:?}");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let target = format!("{session}:0.1");
+    let output = dmux(&socket, &["capture-pane", "-t", &target, "-p"]);
+    assert_success(&output);
+    let captured = String::from_utf8_lossy(&output.stdout);
+    assert!(!captured.contains("leaked-payload"), "{captured:?}");
+
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+}
+
+#[test]
+fn workspace_popup_enter_switches_to_detached_live_session() {
+    let socket = unique_socket("workspace-popup-switch");
+    let registry_path = unique_temp_file("workspace-popup-switch-registry");
+    let registry_env = registry_path.to_string_lossy().to_string();
+    let session_a = format!("workspace-popup-switch-a-{}", std::process::id());
+    let session_b = format!("workspace-popup-switch-b-{}", std::process::id());
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &session_a, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &session_b, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+
+    let mut child = spawn_attached_dmux_with_env(
+        &socket,
+        &["attach", "-t", &session_a],
+        &[],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    );
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02A")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["dmux workspaces", &session_b], "workspace popup");
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(format!("/{session_b}\r\r").as_bytes())
+        .unwrap();
+    let switched = poll_list_sessions_contains(
+        &socket,
+        "#{session.name}\t#{session.attached_count}",
+        &format!("{session_b}\t1"),
+    );
+    assert!(
+        switched.contains(&format!("{session_b}\t1")),
+        "{switched:?}"
+    );
+    child
+        .stdin_mut("workspace switched stdin")
+        .write_all(b"from-b\n")
+        .unwrap();
+
+    let captured = poll_capture(&socket, &session_b, "from-b");
+    assert!(captured.contains("from-b"), "{captured:?}");
+
+    child
+        .stdin_mut("workspace switched stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session_a]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session_b]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(registry_path);
+}
+
+#[test]
+fn workspace_popup_tab_switches_to_repo_grouping() {
+    let socket = unique_socket("workspace-popup-repo-grouping");
+    let registry_path = unique_temp_file("workspace-popup-repo-grouping-registry");
+    let registry_env = registry_path.to_string_lossy().to_string();
+    let session = format!("workspace-popup-repo-grouping-{}", std::process::id());
+    let workspace_path = std::env::current_dir()
+        .expect("current dir")
+        .to_string_lossy()
+        .to_string();
+
+    assert_success(&dmux_with_env(
+        &socket,
+        &["workspace-add", &workspace_path],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+
+    let mut child = spawn_attached_dmux_with_env(
+        &socket,
+        &["attach", "-t", &session],
+        &[],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    );
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02A")
+        .unwrap();
+    child.wait_for_stdout_contains_all(
+        &["dmux workspaces", "Registered paths", "Live sessions"],
+        "workspace popup",
+    );
+    child.clear_stdout();
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\t")
+        .unwrap();
+    child.wait_for_stdout_contains_all(
+        &["dmux workspaces", &workspace_path, "Enter: focus/attach"],
+        "workspace popup repo grouping",
+    );
+    let grouped_render = child.stdout_text();
+    assert!(
+        !grouped_render.contains("Registered paths"),
+        "{grouped_render:?}"
+    );
+    assert!(
+        !grouped_render.contains("Live sessions"),
+        "{grouped_render:?}"
+    );
+
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(registry_path);
+}
+
+#[test]
 fn workspace_add_persists_registered_path() {
     let socket = unique_socket("workspace-add");
     let registry_path = unique_temp_file("workspace-add-registry");
@@ -3342,6 +3601,133 @@ fn agent_event_marks_attention_without_terminal_scraping() {
         stdin.flush().expect("flush detach");
     }
 
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn agent_event_source_and_changed_at_feed_attention_popup() {
+    let socket = unique_socket("agent-event-source");
+    let session = format!("agent-event-source-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sleep", "30"],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "agent-event",
+            "-t",
+            &format!("{session}:0.0"),
+            "--state",
+            "ready",
+            "--label",
+            "review ready",
+            "--source",
+            "codex",
+            "--changed-at",
+            "123",
+        ],
+    ));
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.agent_state}\t#{pane.agent_label}\t#{pane.agent_source}\t#{pane.agent_changed_at}",
+        ],
+    );
+    assert_success(&panes);
+    let stdout = String::from_utf8_lossy(&panes.stdout);
+    assert!(
+        stdout.contains("ready\treview ready\tcodex\t123"),
+        "{stdout:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+}
+
+#[test]
+fn attention_popup_space_opens_read_only_peek() {
+    let socket = unique_socket("attention-peek");
+    let session = format!("attention-peek-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf peek-capture-ready; IFS= read -r line; printf 'forwarded:%s' \"$line\"; sleep 30",
+        ],
+    ));
+    let ready = poll_capture(&socket, &session, "peek-capture-ready");
+    assert!(ready.contains("peek-capture-ready"), "{ready:?}");
+
+    let target = format!("{session}:0.0");
+    assert_success(&dmux(
+        &socket,
+        &[
+            "agent-event",
+            "-t",
+            &target,
+            "--state",
+            "needs_input",
+            "--label",
+            "choose option",
+        ],
+    ));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &["peek-capture-ready"]);
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02!").expect("write attention");
+        stdin.flush().expect("flush attention");
+    }
+    child.wait_for_stdout_contains_all(&["dmux attention", "choose option"], "attention popup");
+    child.clear_stdout();
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b" ").expect("write peek");
+        stdin.flush().expect("flush peek");
+    }
+    child.wait_for_stdout_contains_all(
+        &["Peek", "capture tail", "peek-capture-ready"],
+        "attention peek output",
+    );
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"q").expect("close attention popup");
+        stdin.flush().expect("flush close attention popup");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin
+            .write_all(b"X\n")
+            .expect("write pane input after peek");
+        stdin.flush().expect("flush pane input after peek");
+    }
+    child.wait_for_stdout_contains_all(&["forwarded:X"], "space consumed before pane input");
+    let stdout = child.stdout_text();
+    assert!(!stdout.contains("forwarded: X"), "{stdout:?}");
+
+    {
+        let stdin = child.stdin_mut("attach stdin");
+        stdin.write_all(b"\x02d").expect("write detach");
+        stdin.flush().expect("flush detach");
+    }
     assert_success(&wait_for_child_exit(child));
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));

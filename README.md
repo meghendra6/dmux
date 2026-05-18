@@ -98,9 +98,11 @@ Attached clients show a top tab line for windows and a bottom info line with
 the active session, pane, client/buffer counts, alerts, and quick affordances
 such as `C-b ? help`, `C-b : command`, and Alt-arrow focus. Press `C-b ?` to
 toggle a boxed attach help popup covering session, window, pane, copy-mode, and
-command-prompt workflows; the popup stays visible until closed. Press `C-b !`
-to open an on-demand attention popup for mux-level pane alerts such as bell,
-activity, exited panes, and blocked clipboard attempts. Press `C-b :`
+command-prompt workflows; the popup stays visible until closed. Interactive
+attach popups provide attention, current-session tree, and workspace navigation;
+`Enter` focuses or attaches from tree and workspace rows, `Space` opens
+read-only peek, `Tab` toggles grouping, and `/` filters rows. Attention rows
+are read-only in this slice. Press `C-b :`
 for an attached command prompt that
 shows the typed command and controls (`Enter` run, Escape/`C-c` cancel,
 Backspace edit), with examples such as `:split -h`, `:split -v`,
@@ -133,7 +135,8 @@ copies lines from the rendered composed layout, including pane separators and
 visible content from multiple panes, while input is routed to the server active
 pane. Unzoomed multi-pane attach handles `C-b d` to detach (`C-b D` also
 detaches), `C-b ?` to toggle attach help, `C-b !` to toggle the attention
-popup, `C-b :` to run attached commands such as
+navigator, `C-b w` to open the current-session tree navigator, `C-b A` to open
+workspace navigation, `C-b :` to run attached commands such as
 rename/select/kill/list/paste/split/layout, `C-b c` to create a new window,
 `C-b n`/`C-b p` to cycle windows,
 `C-b %` to split right, `C-b "` to split down, `C-b h/j/k/l` or `C-b` arrows to focus by
@@ -159,6 +162,9 @@ active pane as the main pane; use `dmux attach --help` or
 `dmux help attach` to list attach-time bindings.
 Unzoomed multi-pane attach redraws from server change events and keeps a polling
 fallback for mixed-version daemons or missed events.
+
+Popup reply, dispatch, pin/rename, stop/delete, PR status, and worktree
+management are intentionally future slices.
 
 `save-buffer` stores captured active-pane text in an in-memory buffer with a
 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name the

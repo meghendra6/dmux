@@ -172,6 +172,8 @@ pub enum Command {
         target: Target,
         state: String,
         label: String,
+        source: Option<String>,
+        changed_at: Option<u64>,
     },
     ListKeys {
         format: Option<String>,
@@ -555,7 +557,7 @@ Commands:\n\
   run-shell <shell-command>              run a host shell command and report its status\n\
   workspace-add <path>                   register a repo/workspace path locally\n\
   workspace-list                         list registered workspace paths\n\
-  agent-event -t <target> --state <state> [--label <text>]\n\
+  agent-event -t <target> --state <state> [--label <text>] [--source <text>] [--changed-at <unix-seconds>]\n\
   list-keys [-F <format>]                list runtime key bindings\n\
   bind-key <key> <action>                bind a key to a supported live action\n\
   unbind-key <key>                       remove a key binding\n\
@@ -582,7 +584,8 @@ info line, and quick hints for prefix, help, command prompt, and focus.\n\
 \n\
 Session:\n\
   C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
-  C-b ! attention popup   C-b w tree popup   C-b i detail popup   C-b A workspaces\n\
+  C-b ! attention navigator   C-b w tree navigator   C-b i detail popup   C-b A workspaces\n\
+  popup: j/k move   Enter tree/workspace focus   Space peek   Tab group   / filter   Esc close\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
@@ -611,7 +614,8 @@ CLI equivalents:\n\
 pub fn attach_help_overlay() -> &'static str {
     "Session:\n\
   C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
-  C-b ! attention popup\n\
+  C-b ! attention navigator   C-b w tree navigator   C-b i detail popup   C-b A workspaces\n\
+  popup: j/k move   Enter tree/workspace focus   Space peek   Tab group   / filter   Esc close\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
@@ -2203,29 +2207,38 @@ fn parse_agent_event(args: Vec<String>) -> Result<Command, String> {
     let mut target = None;
     let mut state = None;
     let mut label = String::new();
+    let mut source = None;
+    let mut changed_at = None;
     let mut i = 0;
 
     while i < args.len() {
         match args[i].as_str() {
             "-t" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "agent-event requires a target after -t".to_string())?;
+                let value = agent_event_option_value(&args, i, "-t", "a target")?;
                 target = Some(parse_structured_target(value, "agent-event")?);
                 i += 2;
             }
             "--state" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "agent-event requires a state after --state".to_string())?;
+                let value = agent_event_option_value(&args, i, "--state", "a state")?;
                 state = Some(value.clone());
                 i += 2;
             }
             "--label" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "agent-event requires text after --label".to_string())?;
+                let value = agent_event_option_value(&args, i, "--label", "text")?;
                 label = value.clone();
+                i += 2;
+            }
+            "--source" => {
+                let value = agent_event_option_value(&args, i, "--source", "text")?;
+                source = Some(value.clone());
+                i += 2;
+            }
+            "--changed-at" => {
+                let value = agent_event_option_value(&args, i, "--changed-at", "unix seconds")?;
+                changed_at =
+                    Some(value.parse::<u64>().map_err(|_| {
+                        "agent-event --changed-at must be unix seconds".to_string()
+                    })?);
                 i += 2;
             }
             value => return Err(format!("agent-event does not support argument {value:?}")),
@@ -2235,11 +2248,31 @@ fn parse_agent_event(args: Vec<String>) -> Result<Command, String> {
     let state = state.ok_or_else(|| "agent-event requires --state <state>".to_string())?;
     validate_agent_event_field("state", &state)?;
     validate_agent_event_field("label", &label)?;
+    if let Some(source) = source.as_deref() {
+        validate_agent_event_field("source", source)?;
+    }
     Ok(Command::AgentEvent {
         target: target.ok_or_else(|| "agent-event requires -t <target>".to_string())?,
         state,
         label,
+        source,
+        changed_at,
     })
+}
+
+fn agent_event_option_value<'a>(
+    args: &'a [String],
+    index: usize,
+    option: &str,
+    value_name: &str,
+) -> Result<&'a String, String> {
+    let value = args
+        .get(index + 1)
+        .ok_or_else(|| format!("agent-event requires {value_name} after {option}"))?;
+    if value.starts_with("--") {
+        return Err(format!("agent-event requires {value_name} after {option}"));
+    }
+    Ok(value)
 }
 
 fn validate_agent_event_field(name: &str, value: &str) -> Result<(), String> {
@@ -2484,7 +2517,71 @@ mod tests {
                 },
                 state: "waiting".to_string(),
                 label: "codex".to_string(),
+                source: None,
+                changed_at: None,
             }
+        );
+    }
+
+    #[test]
+    fn parses_agent_event_source_and_timestamp() {
+        assert_eq!(
+            parse_args([
+                "dmux",
+                "agent-event",
+                "-t",
+                "dev:0.1",
+                "--state",
+                "needs_input",
+                "--label",
+                "permission requested",
+                "--source",
+                "codex",
+                "--changed-at",
+                "123",
+            ])
+            .unwrap(),
+            Command::AgentEvent {
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(0),
+                    pane: PaneTarget::Index(1),
+                },
+                state: "needs_input".to_string(),
+                label: "permission requested".to_string(),
+                source: Some("codex".to_string()),
+                changed_at: Some(123),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_agent_event_missing_source_value_before_next_option() {
+        let err = parse_args([
+            "dmux",
+            "agent-event",
+            "-t",
+            "dev:0.1",
+            "--state",
+            "needs_input",
+            "--source",
+            "--changed-at",
+            "123",
+        ])
+        .unwrap_err();
+
+        assert!(err.contains("source"), "{err}");
+    }
+
+    #[test]
+    fn general_help_lists_agent_event_metadata_options() {
+        let help = general_help();
+
+        assert!(
+            help.contains(
+                "agent-event -t <target> --state <state> [--label <text>] [--source <text>] [--changed-at <unix-seconds>]"
+            ),
+            "{help}"
         );
     }
 
@@ -2701,6 +2798,12 @@ mod tests {
         assert!(help.contains("C-b x"), "{help}");
         assert!(help.contains("C-b z"), "{help}");
         assert!(help.contains("C-b ?"), "{help}");
+        assert!(help.contains("attention navigator"), "{help}");
+        assert!(help.contains("tree navigator"), "{help}");
+        assert!(help.contains("popup: j/k move"), "{help}");
+        assert!(help.contains("Enter tree/workspace focus"), "{help}");
+        assert!(help.contains("Space peek"), "{help}");
+        assert!(help.contains("/ filter"), "{help}");
         assert!(help.contains("C-b o"), "{help}");
         assert!(help.contains("split-window"), "{help}");
         assert!(help.contains("semicolon-separated"), "{help}");
@@ -2716,6 +2819,9 @@ mod tests {
         assert!(help.contains("Session:"), "{help}");
         assert!(help.contains("Windows:"), "{help}");
         assert!(help.contains("Panes:"), "{help}");
+        assert!(help.contains("attention navigator"), "{help}");
+        assert!(help.contains("tree navigator"), "{help}");
+        assert!(help.contains("popup: j/k move"), "{help}");
         assert!(help.contains("Copy:"), "{help}");
         assert!(help.contains("Prompt examples:"), "{help}");
         assert!(help.contains(":split -h"), "{help}");

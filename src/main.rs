@@ -4,6 +4,7 @@ mod config;
 mod ids;
 mod layout;
 mod paths;
+mod popup;
 mod protocol;
 mod pty;
 mod registry;
@@ -467,12 +468,20 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
             target,
             state,
             label,
+            source,
+            changed_at,
         } => {
             let socket = paths::socket_path();
             require_running_server(&socket)?;
             send_request(
                 &socket,
-                &protocol::encode_agent_event(&target, &state, &label),
+                &protocol::encode_agent_event(
+                    &target,
+                    &state,
+                    &label,
+                    source.as_deref(),
+                    changed_at,
+                ),
                 false,
             )?;
             Ok(())
