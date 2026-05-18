@@ -5167,8 +5167,8 @@ fn workspace_popup_model(
             repo_path: Some(record.path.clone()),
             target: Some(crate::popup::PopupTarget {
                 session: record.name.clone(),
-                window_index: None,
-                pane_index: None,
+                window_index: record.last_window,
+                pane_index: record.last_pane,
             }),
             state: crate::popup::PopupStateKind::Previous,
             source: crate::popup::PopupRowSource::Registry,
@@ -8766,12 +8766,16 @@ mod tests {
                     path: PathBuf::from("/tmp/previous-dev"),
                     state: "stopped".to_string(),
                     last_seen: 123,
+                    last_window: Some(1),
+                    last_pane: Some(2),
                 },
                 crate::registry::SessionRecord {
                     name: "live-dev".to_string(),
                     path: PathBuf::from("/tmp/live-dev"),
                     state: "detached".to_string(),
                     last_seen: 456,
+                    last_window: None,
+                    last_pane: None,
                 },
             ],
         };
@@ -8790,6 +8794,20 @@ mod tests {
             .expect("previous row");
         assert_eq!(previous.kind, crate::popup::PopupRowKind::DisabledItem);
         assert!(!previous.attachable);
+        assert_eq!(
+            previous
+                .target
+                .as_ref()
+                .and_then(|target| target.window_index),
+            Some(1)
+        );
+        assert_eq!(
+            previous
+                .target
+                .as_ref()
+                .and_then(|target| target.pane_index),
+            Some(2)
+        );
         let live = model
             .rows
             .iter()
@@ -8838,6 +8856,8 @@ mod tests {
                 path: repo_path.clone(),
                 state: "detached".to_string(),
                 last_seen: 456,
+                last_window: None,
+                last_pane: None,
             }],
         };
         let live_sessions = vec![LiveWorkspaceSession {
