@@ -2507,11 +2507,11 @@ struct PaneListEntry {
 }
 
 const ATTENTION_FIELD_SEPARATOR: char = '\u{1f}';
-const ATTENTION_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const ATTENTION_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.agent_source}\u{1f}#{pane.agent_changed_at}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
 const ACTIVE_WINDOW_INDEX_FORMAT: &str = "#{window.index}";
 const TREE_LIST_WINDOWS_FORMAT: &str =
     "#{window.index}\u{1f}#{window.active}\u{1f}#{window.name}\u{1f}#{window.panes}";
-const TREE_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
+const TREE_LIST_PANES_FORMAT: &str = "#{pane.index}\u{1f}#{pane.active}\u{1f}#{pane.state}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.agent_state}\u{1f}#{pane.agent_label}\u{1f}#{pane.agent_source}\u{1f}#{pane.agent_changed_at}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
 const DETAIL_STATUS_FORMAT: &str = "#{session.name}\u{1f}#{session.attached_count}\u{1f}#{session.created_at}\u{1f}#{window.index}\u{1f}#{window.name}\u{1f}#{window.count}\u{1f}#{pane.index}\u{1f}#{pane.id}\u{1f}#{pane.state}\u{1f}#{pane.pid}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.zoomed}\u{1f}#{window.zoomed_flag}\u{1f}#{pane.bell}\u{1f}#{pane.activity}\u{1f}#{pane.clipboard_blocked}\u{1f}#{pane.title}\u{1f}#{pane.cwd}";
 const WORKSPACE_LIST_SESSIONS_FORMAT: &str =
     "#{session.name}\u{1f}#{session.window_count}\u{1f}#{session.attached_count}";
@@ -2529,6 +2529,8 @@ struct PaneAttentionEntry {
     clipboard_blocked: usize,
     agent_state: String,
     agent_label: String,
+    agent_source: String,
+    agent_changed_at: Option<u64>,
     title: String,
     cwd: String,
 }
@@ -2550,6 +2552,8 @@ struct PaneTreeEntry {
     activity: bool,
     agent_state: String,
     agent_label: String,
+    agent_source: String,
+    agent_changed_at: Option<u64>,
     title: String,
     cwd: String,
 }
@@ -3931,6 +3935,8 @@ fn parse_pane_attention_listing_with_window(
             clipboard_blocked,
             agent_state,
             agent_label,
+            agent_source,
+            agent_changed_at,
             title,
             cwd,
         ] = fields.as_slice()
@@ -3953,6 +3959,11 @@ fn parse_pane_attention_listing_with_window(
             )?,
             agent_state: (*agent_state).to_string(),
             agent_label: (*agent_label).to_string(),
+            agent_source: (*agent_source).to_string(),
+            agent_changed_at: parse_optional_u64(
+                agent_changed_at,
+                "invalid attention agent changed_at",
+            )?,
             title: (*title).to_string(),
             cwd: (*cwd).to_string(),
         });
@@ -3972,6 +3983,16 @@ fn parse_optional_i32(value: &str, message: &str) -> io::Result<Option<i32>> {
     }
     value
         .parse::<i32>()
+        .map(Some)
+        .map_err(|_| io::Error::other(message))
+}
+
+fn parse_optional_u64(value: &str, message: &str) -> io::Result<Option<u64>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<u64>()
         .map(Some)
         .map_err(|_| io::Error::other(message))
 }
@@ -4070,7 +4091,7 @@ fn attention_popup_model(
             },
             title: format!("pane {}", entry.index),
             summary: attention_popup_summary(entry),
-            last_changed: None,
+            last_changed: entry.agent_changed_at,
             attachable: false,
         });
     }
@@ -4259,10 +4280,14 @@ fn tree_popup_model(session: &str, windows: &[WindowTreeEntry]) -> crate::popup:
                     pane_index: Some(pane.index),
                 }),
                 state: pane_tree_state(pane),
-                source: crate::popup::PopupRowSource::Mux,
+                source: if pane.agent_state.trim().is_empty() {
+                    crate::popup::PopupRowSource::Mux
+                } else {
+                    crate::popup::PopupRowSource::AgentEvent
+                },
                 title: format!("pane {}", pane.index),
                 summary: format!("{}  {}", pane.state, pane_tree_label(pane)),
-                last_changed: None,
+                last_changed: pane.agent_changed_at,
                 attachable: true,
             });
         }
@@ -4354,6 +4379,8 @@ fn parse_pane_tree_listing(listing: &str) -> io::Result<Vec<PaneTreeEntry>> {
             activity,
             agent_state,
             agent_label,
+            agent_source,
+            agent_changed_at,
             title,
             cwd,
         ] = fields.as_slice()
@@ -4368,6 +4395,11 @@ fn parse_pane_tree_listing(listing: &str) -> io::Result<Vec<PaneTreeEntry>> {
             activity: parse_bool_flag(activity, "invalid tree pane activity flag")?,
             agent_state: (*agent_state).to_string(),
             agent_label: (*agent_label).to_string(),
+            agent_source: (*agent_source).to_string(),
+            agent_changed_at: parse_optional_u64(
+                agent_changed_at,
+                "invalid tree pane agent changed_at",
+            )?,
             title: (*title).to_string(),
             cwd: (*cwd).to_string(),
         });
@@ -8722,6 +8754,8 @@ mod tests {
                     activity: false,
                     agent_state: String::new(),
                     agent_label: String::new(),
+                    agent_source: String::new(),
+                    agent_changed_at: None,
                     title: "shell".to_string(),
                     cwd: "/tmp/project".to_string(),
                 },
@@ -8733,6 +8767,8 @@ mod tests {
                     activity: false,
                     agent_state: String::new(),
                     agent_label: String::new(),
+                    agent_source: String::new(),
+                    agent_changed_at: None,
                     title: "tests".to_string(),
                     cwd: "/tmp/project".to_string(),
                 },
@@ -10235,7 +10271,7 @@ mod tests {
     fn parse_attention_entries_rejects_invalid_flags() {
         let sep = ATTENTION_FIELD_SEPARATOR;
         let listing = format!(
-            "0{sep}x{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}{sep}{sep}shell{sep}/tmp\n"
+            "0{sep}x{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}{sep}{sep}{sep}{sep}shell{sep}/tmp\n"
         );
 
         assert!(parse_pane_attention_listing(&listing).is_err());
@@ -10255,6 +10291,8 @@ mod tests {
             clipboard_blocked: 0,
             agent_state: String::new(),
             agent_label: String::new(),
+            agent_source: String::new(),
+            agent_changed_at: None,
             title: "shell".to_string(),
             cwd: "/tmp/project".to_string(),
         };
@@ -10270,6 +10308,8 @@ mod tests {
             clipboard_blocked: 2,
             agent_state: String::new(),
             agent_label: String::new(),
+            agent_source: String::new(),
+            agent_changed_at: None,
             title: "codex".to_string(),
             cwd: "/tmp/project".to_string(),
         };
@@ -10296,6 +10336,8 @@ mod tests {
             clipboard_blocked: 0,
             agent_state: String::new(),
             agent_label: String::new(),
+            agent_source: String::new(),
+            agent_changed_at: None,
             title: String::new(),
             cwd: "/tmp/project".to_string(),
         };

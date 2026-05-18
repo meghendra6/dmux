@@ -1391,6 +1391,8 @@ impl Window {
                     clipboard_blocked: pane.clipboard_blocked(),
                     agent_state: pane.agent_state(),
                     agent_label: pane.agent_label(),
+                    agent_source: pane.agent_source(),
+                    agent_changed_at: pane.agent_changed_at(),
                 })
             })
             .collect()
@@ -2015,6 +2017,8 @@ struct PaneDescription {
     clipboard_blocked: usize,
     agent_state: String,
     agent_label: String,
+    agent_source: String,
+    agent_changed_at: String,
 }
 
 struct IndexedPane {
@@ -2400,6 +2404,8 @@ struct Pane {
 struct PaneAgentEvent {
     state: String,
     label: String,
+    source: Option<String>,
+    changed_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2494,8 +2500,19 @@ impl Pane {
         self.clipboard_blocked.load(Ordering::SeqCst)
     }
 
-    fn set_agent_event(&self, state: String, label: String) {
-        *self.agent_event.lock().unwrap() = Some(PaneAgentEvent { state, label });
+    fn set_agent_event(
+        &self,
+        state: String,
+        label: String,
+        source: Option<String>,
+        changed_at: Option<u64>,
+    ) {
+        *self.agent_event.lock().unwrap() = Some(PaneAgentEvent {
+            state,
+            label,
+            source,
+            changed_at,
+        });
     }
 
     fn agent_state(&self) -> String {
@@ -2513,6 +2530,25 @@ impl Pane {
             .unwrap()
             .as_ref()
             .map(|event| event.label.clone())
+            .unwrap_or_default()
+    }
+
+    fn agent_source(&self) -> String {
+        self.agent_event
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|event| event.source.clone())
+            .unwrap_or_default()
+    }
+
+    fn agent_changed_at(&self) -> String {
+        self.agent_event
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|event| event.changed_at)
+            .map(|value| value.to_string())
             .unwrap_or_default()
     }
 
@@ -2736,7 +2772,17 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             target,
             state: event_state,
             label,
-        } => handle_agent_event(&state, &mut stream, &target, event_state, label),
+            source,
+            changed_at,
+        } => handle_agent_event(
+            &state,
+            &mut stream,
+            &target,
+            event_state,
+            label,
+            source,
+            changed_at,
+        ),
         Request::ListKeys { format } => handle_list_keys(&state, &mut stream, format.as_deref()),
         Request::BindKey { key, command } => handle_bind_key(&state, &mut stream, &key, &command),
         Request::UnbindKey { key } => handle_unbind_key(&state, &mut stream, &key),
@@ -3736,6 +3782,8 @@ fn format_pane_line(format: &str, pane: &PaneDescription) -> String {
         .replace("#{pane.clipboard_blocked}", &clipboard_blocked)
         .replace("#{pane.agent_state}", &pane.agent_state)
         .replace("#{pane.agent_label}", &pane.agent_label)
+        .replace("#{pane.agent_source}", &pane.agent_source)
+        .replace("#{pane.agent_changed_at}", &pane.agent_changed_at)
         .replace(
             "#{window.zoomed_flag}",
             if pane.window_zoomed { "1" } else { "0" },
@@ -3812,10 +3860,15 @@ fn handle_agent_event(
     target: &Target,
     event_state: String,
     label: String,
+    source: Option<String>,
+    changed_at: Option<u64>,
 ) -> io::Result<()> {
     if event_state.trim().is_empty()
         || event_state.chars().any(char::is_control)
         || label.chars().any(char::is_control)
+        || source
+            .as_deref()
+            .is_some_and(|source| source.chars().any(char::is_control))
     {
         write_err(stream, "invalid agent event")?;
         return Ok(());
@@ -3832,7 +3885,7 @@ fn handle_agent_event(
             return Ok(());
         }
     };
-    pane.set_agent_event(event_state, label);
+    pane.set_agent_event(event_state, label, source, changed_at);
     session.notify_attach_redraw_immediate();
     write_ok(stream)
 }

@@ -3607,6 +3607,52 @@ fn agent_event_marks_attention_without_terminal_scraping() {
 }
 
 #[test]
+fn agent_event_source_and_changed_at_feed_attention_popup() {
+    let socket = unique_socket("agent-event-source");
+    let session = format!("agent-event-source-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sleep", "30"],
+    ));
+
+    assert_success(&dmux(
+        &socket,
+        &[
+            "agent-event",
+            "-t",
+            &format!("{session}:0.0"),
+            "--state",
+            "ready",
+            "--label",
+            "review ready",
+            "--source",
+            "codex",
+            "--changed-at",
+            "123",
+        ],
+    ));
+    let panes = dmux(
+        &socket,
+        &[
+            "list-panes",
+            "-t",
+            &session,
+            "-F",
+            "#{pane.agent_state}\t#{pane.agent_label}\t#{pane.agent_source}\t#{pane.agent_changed_at}",
+        ],
+    );
+    assert_success(&panes);
+    let stdout = String::from_utf8_lossy(&panes.stdout);
+    assert!(
+        stdout.contains("ready\treview ready\tcodex\t123"),
+        "{stdout:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+}
+
+#[test]
 fn attention_popup_space_opens_read_only_peek() {
     let socket = unique_socket("attention-peek");
     let session = format!("attention-peek-{}", std::process::id());

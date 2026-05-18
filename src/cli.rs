@@ -172,6 +172,8 @@ pub enum Command {
         target: Target,
         state: String,
         label: String,
+        source: Option<String>,
+        changed_at: Option<u64>,
     },
     ListKeys {
         format: Option<String>,
@@ -2203,6 +2205,8 @@ fn parse_agent_event(args: Vec<String>) -> Result<Command, String> {
     let mut target = None;
     let mut state = None;
     let mut label = String::new();
+    let mut source = None;
+    let mut changed_at = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -2228,6 +2232,23 @@ fn parse_agent_event(args: Vec<String>) -> Result<Command, String> {
                 label = value.clone();
                 i += 2;
             }
+            "--source" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "agent-event requires text after --source".to_string())?;
+                source = Some(value.clone());
+                i += 2;
+            }
+            "--changed-at" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "agent-event requires unix seconds after --changed-at".to_string()
+                })?;
+                changed_at =
+                    Some(value.parse::<u64>().map_err(|_| {
+                        "agent-event --changed-at must be unix seconds".to_string()
+                    })?);
+                i += 2;
+            }
             value => return Err(format!("agent-event does not support argument {value:?}")),
         }
     }
@@ -2235,10 +2256,15 @@ fn parse_agent_event(args: Vec<String>) -> Result<Command, String> {
     let state = state.ok_or_else(|| "agent-event requires --state <state>".to_string())?;
     validate_agent_event_field("state", &state)?;
     validate_agent_event_field("label", &label)?;
+    if let Some(source) = source.as_deref() {
+        validate_agent_event_field("source", source)?;
+    }
     Ok(Command::AgentEvent {
         target: target.ok_or_else(|| "agent-event requires -t <target>".to_string())?,
         state,
         label,
+        source,
+        changed_at,
     })
 }
 
@@ -2484,6 +2510,40 @@ mod tests {
                 },
                 state: "waiting".to_string(),
                 label: "codex".to_string(),
+                source: None,
+                changed_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_agent_event_source_and_timestamp() {
+        assert_eq!(
+            parse_args([
+                "dmux",
+                "agent-event",
+                "-t",
+                "dev:0.1",
+                "--state",
+                "needs_input",
+                "--label",
+                "permission requested",
+                "--source",
+                "codex",
+                "--changed-at",
+                "123",
+            ])
+            .unwrap(),
+            Command::AgentEvent {
+                target: Target {
+                    session: "dev".to_string(),
+                    window: WindowTarget::Index(0),
+                    pane: PaneTarget::Index(1),
+                },
+                state: "needs_input".to_string(),
+                label: "permission requested".to_string(),
+                source: Some("codex".to_string()),
+                changed_at: Some(123),
             }
         );
     }
