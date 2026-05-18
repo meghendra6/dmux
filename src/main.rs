@@ -4,6 +4,7 @@ mod config;
 mod ids;
 mod layout;
 mod paths;
+mod popup;
 mod protocol;
 mod pty;
 mod registry;
