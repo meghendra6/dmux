@@ -4373,10 +4373,28 @@ fn workspace_popup_visible_model(
     state: &mut crate::popup::PopupState,
 ) -> io::Result<crate::popup::PopupModel> {
     let model = attach_workspace_registry_popup_model(socket)?;
+    Ok(workspace_popup_visible_model_from_model(&model, state))
+}
+
+fn workspace_popup_visible_model_from_model(
+    model: &crate::popup::PopupModel,
+    state: &mut crate::popup::PopupState,
+) -> crate::popup::PopupModel {
     let rows = crate::popup::filter_rows(&model.rows, &state.filter);
     let model = crate::popup::PopupModel::new(rows);
     state.ensure_selection(&model);
-    Ok(model)
+    model
+}
+
+fn render_workspace_popup_overlay_text(
+    socket: &Path,
+    state: &mut crate::popup::PopupState,
+) -> io::Result<PopupOverlayText> {
+    let model = workspace_popup_visible_model(socket, state)?;
+    Ok(PopupOverlayText {
+        title: "dmux workspaces",
+        content: crate::popup::render_popup_text(state, &model, None),
+    })
 }
 
 fn apply_workspace_popup_input_actions(
@@ -4864,19 +4882,14 @@ fn attach_popup_overlay_text_with_state(
             content: attach_detail_overlay_text(socket, session)?,
         })),
         AttachPopup::WorkspaceRegistry => {
-            let model = attach_workspace_registry_popup_model(socket)?;
-            let mut fallback_state;
-            let state = if let Some(state) = popup_state {
-                state
+            if let Some(state) = popup_state {
+                Ok(Some(render_workspace_popup_overlay_text(socket, state)?))
             } else {
-                fallback_state = crate::popup::PopupState::new(crate::popup::PopupMode::Workspace);
-                &mut fallback_state
-            };
-            state.ensure_selection(&model);
-            Ok(Some(PopupOverlayText {
-                title: "dmux workspaces",
-                content: crate::popup::render_popup_text(state, &model, None),
-            }))
+                let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Workspace);
+                Ok(Some(render_workspace_popup_overlay_text(
+                    socket, &mut state,
+                )?))
+            }
         }
     }
 }
@@ -8400,6 +8413,35 @@ mod tests {
             .expect("live row");
         assert_eq!(live.kind, crate::popup::PopupRowKind::Item);
         assert!(live.attachable);
+    }
+
+    #[test]
+    fn workspace_popup_filtered_render_hides_non_matching_rows() {
+        let registry = crate::registry::WorkspaceRegistry {
+            workspaces: Vec::new(),
+            sessions: Vec::new(),
+        };
+        let live_sessions = vec![
+            LiveWorkspaceSession {
+                name: "needle-session".to_string(),
+                window_count: 1,
+                attached_count: 0,
+            },
+            LiveWorkspaceSession {
+                name: "other-session".to_string(),
+                window_count: 1,
+                attached_count: 0,
+            },
+        ];
+        let model = workspace_popup_model(&registry, &live_sessions);
+        let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Workspace);
+        state.filter = "needle".to_string();
+
+        let visible = workspace_popup_visible_model_from_model(&model, &mut state);
+        let rendered = crate::popup::render_popup_text(&state, &visible, None);
+
+        assert!(rendered.contains("needle-session"), "{rendered}");
+        assert!(!rendered.contains("other-session"), "{rendered}");
     }
 
     #[test]
