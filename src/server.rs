@@ -1377,22 +1377,25 @@ impl Window {
         let window_zoomed = self.zoomed.is_some();
         (0..self.panes.len())
             .filter_map(|index| {
-                self.panes.get(index).map(|pane| PaneDescription {
-                    id: pane.id,
-                    index,
-                    active: index == self.panes.active_index(),
-                    zoomed: self.zoomed == Some(index),
-                    window_zoomed,
-                    process: pane.process_status(),
-                    cwd: pane.cwd(),
-                    title: pane.title(),
-                    bell: pane.bell(),
-                    activity: pane.activity(),
-                    clipboard_blocked: pane.clipboard_blocked(),
-                    agent_state: pane.agent_state(),
-                    agent_label: pane.agent_label(),
-                    agent_source: pane.agent_source(),
-                    agent_changed_at: pane.agent_changed_at(),
+                self.panes.get(index).map(|pane| {
+                    let agent_event = pane.agent_event_snapshot();
+                    PaneDescription {
+                        id: pane.id,
+                        index,
+                        active: index == self.panes.active_index(),
+                        zoomed: self.zoomed == Some(index),
+                        window_zoomed,
+                        process: pane.process_status(),
+                        cwd: pane.cwd(),
+                        title: pane.title(),
+                        bell: pane.bell(),
+                        activity: pane.activity(),
+                        clipboard_blocked: pane.clipboard_blocked(),
+                        agent_state: agent_event.state,
+                        agent_label: agent_event.label,
+                        agent_source: agent_event.source,
+                        agent_changed_at: agent_event.changed_at,
+                    }
                 })
             })
             .collect()
@@ -2408,6 +2411,14 @@ struct PaneAgentEvent {
     changed_at: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneAgentEventSnapshot {
+    state: String,
+    label: String,
+    source: String,
+    changed_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneProcessStatus {
     Running {
@@ -2515,41 +2526,26 @@ impl Pane {
         });
     }
 
-    fn agent_state(&self) -> String {
+    fn agent_event_snapshot(&self) -> PaneAgentEventSnapshot {
         self.agent_event
             .lock()
             .unwrap()
             .as_ref()
-            .map(|event| event.state.clone())
-            .unwrap_or_default()
-    }
-
-    fn agent_label(&self) -> String {
-        self.agent_event
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|event| event.label.clone())
-            .unwrap_or_default()
-    }
-
-    fn agent_source(&self) -> String {
-        self.agent_event
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|event| event.source.clone())
-            .unwrap_or_default()
-    }
-
-    fn agent_changed_at(&self) -> String {
-        self.agent_event
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|event| event.changed_at)
-            .map(|value| value.to_string())
-            .unwrap_or_default()
+            .map(|event| PaneAgentEventSnapshot {
+                state: event.state.clone(),
+                label: event.label.clone(),
+                source: event.source.clone().unwrap_or_default(),
+                changed_at: event
+                    .changed_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            })
+            .unwrap_or_else(|| PaneAgentEventSnapshot {
+                state: String::new(),
+                label: String::new(),
+                source: String::new(),
+                changed_at: String::new(),
+            })
     }
 
     fn clear_alerts(&self) {
@@ -6527,6 +6523,30 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn agent_event_snapshot_reads_one_record() {
+        let (pane, path) = test_pane();
+        pane.set_agent_event(
+            "ready".to_string(),
+            "review ready".to_string(),
+            Some("codex".to_string()),
+            Some(123),
+        );
+
+        let snapshot = pane.agent_event_snapshot();
+
+        assert_eq!(
+            snapshot,
+            PaneAgentEventSnapshot {
+                state: "ready".to_string(),
+                label: "review ready".to_string(),
+                source: "codex".to_string(),
+                changed_at: "123".to_string(),
+            }
+        );
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

@@ -3960,10 +3960,7 @@ fn parse_pane_attention_listing_with_window(
             agent_state: (*agent_state).to_string(),
             agent_label: (*agent_label).to_string(),
             agent_source: (*agent_source).to_string(),
-            agent_changed_at: parse_optional_u64(
-                agent_changed_at,
-                "invalid attention agent changed_at",
-            )?,
+            agent_changed_at: parse_optional_agent_changed_at(agent_changed_at),
             title: (*title).to_string(),
             cwd: (*cwd).to_string(),
         });
@@ -3987,14 +3984,11 @@ fn parse_optional_i32(value: &str, message: &str) -> io::Result<Option<i32>> {
         .map_err(|_| io::Error::other(message))
 }
 
-fn parse_optional_u64(value: &str, message: &str) -> io::Result<Option<u64>> {
-    if value.is_empty() {
-        return Ok(None);
+fn parse_optional_agent_changed_at(value: &str) -> Option<u64> {
+    if value.is_empty() || value == "#{pane.agent_changed_at}" {
+        return None;
     }
-    value
-        .parse::<u64>()
-        .map(Some)
-        .map_err(|_| io::Error::other(message))
+    value.parse::<u64>().ok()
 }
 
 fn parse_bool_flag(value: &str, message: &str) -> io::Result<bool> {
@@ -4396,10 +4390,7 @@ fn parse_pane_tree_listing(listing: &str) -> io::Result<Vec<PaneTreeEntry>> {
             agent_state: (*agent_state).to_string(),
             agent_label: (*agent_label).to_string(),
             agent_source: (*agent_source).to_string(),
-            agent_changed_at: parse_optional_u64(
-                agent_changed_at,
-                "invalid tree pane agent changed_at",
-            )?,
+            agent_changed_at: parse_optional_agent_changed_at(agent_changed_at),
             title: (*title).to_string(),
             cwd: (*cwd).to_string(),
         });
@@ -10275,6 +10266,32 @@ mod tests {
         );
 
         assert!(parse_pane_attention_listing(&listing).is_err());
+    }
+
+    #[test]
+    fn popup_parsers_treat_agent_changed_at_placeholder_as_absent() {
+        let sep = ATTENTION_FIELD_SEPARATOR;
+        let attention_listing = format!(
+            "0{sep}1{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}#{{pane.agent_changed_at}}{sep}shell{sep}/tmp\n"
+        );
+        let attention = parse_pane_attention_listing(&attention_listing).unwrap();
+
+        assert_eq!(attention[0].agent_changed_at, None);
+
+        let malformed_attention_listing = format!(
+            "0{sep}1{sep}running{sep}{sep}{sep}0{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}not-a-time{sep}shell{sep}/tmp\n"
+        );
+        let malformed_attention =
+            parse_pane_attention_listing(&malformed_attention_listing).unwrap();
+
+        assert_eq!(malformed_attention[0].agent_changed_at, None);
+
+        let tree_listing = format!(
+            "0{sep}1{sep}running{sep}0{sep}0{sep}ready{sep}review ready{sep}codex{sep}#{{pane.agent_changed_at}}{sep}shell{sep}/tmp\n"
+        );
+        let tree = parse_pane_tree_listing(&tree_listing).unwrap();
+
+        assert_eq!(tree[0].agent_changed_at, None);
     }
 
     #[test]
