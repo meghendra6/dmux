@@ -584,7 +584,8 @@ info line, and quick hints for prefix, help, command prompt, and focus.\n\
 \n\
 Session:\n\
   C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
-  C-b ! attention popup   C-b w tree popup   C-b i detail popup   C-b A workspaces\n\
+  C-b ! attention navigator   C-b w tree navigator   C-b i detail popup   C-b A workspaces\n\
+  popup: j/k move   Enter focus/attach   Space peek   Tab group   / filter   Esc close\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
@@ -613,7 +614,8 @@ CLI equivalents:\n\
 pub fn attach_help_overlay() -> &'static str {
     "Session:\n\
   C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
-  C-b ! attention popup\n\
+  C-b ! attention navigator   C-b w tree navigator   C-b i detail popup   C-b A workspaces\n\
+  popup: j/k move   Enter focus/attach   Space peek   Tab group   / filter   Esc close\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
@@ -2796,6 +2798,11 @@ mod tests {
         assert!(help.contains("C-b x"), "{help}");
         assert!(help.contains("C-b z"), "{help}");
         assert!(help.contains("C-b ?"), "{help}");
+        assert!(help.contains("attention navigator"), "{help}");
+        assert!(help.contains("tree navigator"), "{help}");
+        assert!(help.contains("popup: j/k move"), "{help}");
+        assert!(help.contains("Space peek"), "{help}");
+        assert!(help.contains("/ filter"), "{help}");
         assert!(help.contains("C-b o"), "{help}");
         assert!(help.contains("split-window"), "{help}");
         assert!(help.contains("semicolon-separated"), "{help}");
@@ -2811,6 +2818,9 @@ mod tests {
         assert!(help.contains("Session:"), "{help}");
         assert!(help.contains("Windows:"), "{help}");
         assert!(help.contains("Panes:"), "{help}");
+        assert!(help.contains("attention navigator"), "{help}");
+        assert!(help.contains("tree navigator"), "{help}");
+        assert!(help.contains("popup: j/k move"), "{help}");
         assert!(help.contains("Copy:"), "{help}");
         assert!(help.contains("Prompt examples:"), "{help}");
         assert!(help.contains(":split -h"), "{help}");
