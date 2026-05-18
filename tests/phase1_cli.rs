@@ -3277,11 +3277,71 @@ fn interactive_tree_popup_enter_selects_pane_for_input() {
     child.wait_for_stdout_contains_all(&["Enter: focus/attach"], "tree popup");
     child
         .stdin_mut("tree popup stdin")
-        .write_all(b"j\rselected-pane\n")
+        .write_all(b"j\r")
         .unwrap();
 
-    let captured = poll_capture(&socket, &session, "selected-pane");
+    let panes =
+        poll_list_panes_contains(&socket, &session, "#{pane.index}\t#{pane.active}", "1\t1");
+    assert!(panes.contains("1\t1"), "{panes:?}");
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"selected-pane\n")
+        .unwrap();
+
+    let target = format!("{session}:0.1");
+    let captured = poll_capture(&socket, &target, "selected-pane");
     assert!(captured.contains("selected-pane"), "{captured:?}");
+
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+}
+
+#[test]
+fn tree_popup_enter_does_not_forward_same_read_payload_after_filter() {
+    let socket = unique_socket("interactive-tree-filter-enter");
+    let session = format!("interactive-tree-filter-enter-{}", std::process::id());
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "cat"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-lc",
+            "cat",
+        ],
+    ));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &[]);
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02w")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["Enter: focus/attach"], "tree popup");
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"/pane\rj\rleaked-payload\n")
+        .unwrap();
+
+    let panes =
+        poll_list_panes_contains(&socket, &session, "#{pane.index}\t#{pane.active}", "1\t1");
+    assert!(panes.contains("1\t1"), "{panes:?}");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let target = format!("{session}:0.1");
+    let output = dmux(&socket, &["capture-pane", "-t", &target, "-p"]);
+    assert_success(&output);
+    let captured = String::from_utf8_lossy(&output.stdout);
+    assert!(!captured.contains("leaked-payload"), "{captured:?}");
 
     child
         .stdin_mut("tree popup stdin")

@@ -3078,7 +3078,6 @@ fn run_live_snapshot_attach(
                     if let (Some(state), Some(input_state)) =
                         (popup_state.as_mut(), popup_input_state.as_mut())
                     {
-                        let trailing = popup_plain_enter_trailing(&bytes, input_state);
                         let actions = popup_actions_for_input(&bytes, input_state);
                         match apply_tree_popup_input_actions(socket, session, state, &actions)? {
                             TreePopupInputResult::StayOpen => {}
@@ -3092,9 +3091,6 @@ fn run_live_snapshot_attach(
                                 popup_state = None;
                                 popup_input_state = None;
                                 pane_number_message = None;
-                                if let Some(trailing) = trailing {
-                                    forward_live_snapshot_input(stream, &trailing)?;
-                                }
                             }
                             TreePopupInputResult::Message(message) => {
                                 pane_number_message =
@@ -4131,34 +4127,56 @@ fn apply_tree_popup_input_actions(
     state: &mut crate::popup::PopupState,
     actions: &[PopupInputAction],
 ) -> io::Result<TreePopupInputResult> {
+    let mut model = tree_popup_visible_model(socket, session, state)?;
+    let mut model_dirty = false;
     for action in actions {
         match action {
             PopupInputAction::MoveUp => {
-                let model = tree_popup_visible_model(socket, session, state)?;
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
                 state.move_selection(&model, -1);
             }
             PopupInputAction::MoveDown => {
-                let model = tree_popup_visible_model(socket, session, state)?;
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
                 state.move_selection(&model, 1);
             }
             PopupInputAction::PageUp => {
-                let model = tree_popup_visible_model(socket, session, state)?;
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
                 state.move_selection(&model, -10);
             }
             PopupInputAction::PageDown => {
-                let model = tree_popup_visible_model(socket, session, state)?;
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
                 state.move_selection(&model, 10);
             }
             PopupInputAction::Home => {
-                let model = tree_popup_visible_model(socket, session, state)?;
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
                 state.selected = model.selectable_row_ids().first().cloned();
             }
             PopupInputAction::End => {
-                let model = tree_popup_visible_model(socket, session, state)?;
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
                 state.selected = model.selectable_row_ids().last().cloned();
             }
             PopupInputAction::Enter => {
-                let model = tree_popup_visible_model(socket, session, state)?;
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                }
                 let Some(row) = state.selected_row(&model) else {
                     return Ok(TreePopupInputResult::Message(
                         "row is not attachable".to_string(),
@@ -4175,6 +4193,7 @@ fn apply_tree_popup_input_actions(
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(TreePopupInputResult::Close);
                 }
+                model_dirty = true;
             }
             PopupInputAction::Close => return Ok(TreePopupInputResult::Close),
             PopupInputAction::FilterStart => {
@@ -4182,9 +4201,11 @@ fn apply_tree_popup_input_actions(
             }
             PopupInputAction::FilterPush(ch) => {
                 state.filter.push(*ch);
+                model_dirty = true;
             }
             PopupInputAction::FilterBackspace => {
                 state.filter.pop();
+                model_dirty = true;
             }
             PopupInputAction::FilterAccept => {
                 state.filter_mode = false;
@@ -4193,16 +4214,6 @@ fn apply_tree_popup_input_actions(
         }
     }
     Ok(TreePopupInputResult::StayOpen)
-}
-
-fn popup_plain_enter_trailing(input: &[u8], state: &PopupInputState) -> Option<Vec<u8>> {
-    if state.filter_mode {
-        return None;
-    }
-    input
-        .iter()
-        .position(|byte| matches!(byte, b'\r' | b'\n'))
-        .map(|index| input[index + 1..].to_vec())
 }
 
 fn attach_detail_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
@@ -4842,7 +4853,6 @@ where
                         if let (Some(state), Some(popup_decoder)) =
                             (popup_state.as_mut(), popup_input_state.as_mut())
                         {
-                            let trailing = popup_plain_enter_trailing(output, popup_decoder);
                             let popup_actions = popup_actions_for_input(output, popup_decoder);
                             match apply_tree_popup_input_actions(
                                 socket,
@@ -4864,13 +4874,12 @@ where
                                     )?;
                                 }
                                 TreePopupInputResult::Reconnect => {
-                                    let mut pending_input = trailing.unwrap_or_default();
-                                    pending_input.extend(raw_pending_input(
+                                    let pending_input = raw_pending_input(
                                         &actions[index + 1..],
                                         input_state.saw_prefix,
                                         RawPendingFocus::Preserve,
                                         &controls,
-                                    ));
+                                    );
                                     return Ok(RawAttachExit::Reconnect { pending_input });
                                 }
                                 TreePopupInputResult::Message(message) => {
