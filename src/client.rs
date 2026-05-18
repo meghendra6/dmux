@@ -4157,23 +4157,62 @@ fn attach_popup_overlay_text(
             title: "dmux help",
             content: attach_help_overlay_text(),
         })),
-        AttachPopup::Attention => Ok(Some(PopupOverlayText {
-            title: "dmux attention",
-            content: attach_attention_overlay_text(socket, session)?,
-        })),
-        AttachPopup::Tree => Ok(Some(PopupOverlayText {
-            title: "dmux tree",
-            content: attach_tree_overlay_text(socket, session)?,
-        })),
+        AttachPopup::Attention => {
+            let content = attach_attention_overlay_text(socket, session)?;
+            let model = legacy_popup_model(&content, crate::popup::PopupMode::Attention);
+            let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Attention);
+            state.ensure_selection(&model);
+            Ok(Some(PopupOverlayText {
+                title: "dmux attention",
+                content: crate::popup::render_popup_text(&state, &model, None),
+            }))
+        }
+        AttachPopup::Tree => {
+            let content = attach_tree_overlay_text(socket, session)?;
+            let model = legacy_popup_model(&content, crate::popup::PopupMode::Tree);
+            let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Tree);
+            state.ensure_selection(&model);
+            Ok(Some(PopupOverlayText {
+                title: "dmux tree",
+                content: crate::popup::render_popup_text(&state, &model, None),
+            }))
+        }
         AttachPopup::Detail => Ok(Some(PopupOverlayText {
             title: "dmux detail",
             content: attach_detail_overlay_text(socket, session)?,
         })),
-        AttachPopup::WorkspaceRegistry => Ok(Some(PopupOverlayText {
-            title: "dmux workspaces",
-            content: attach_workspace_registry_overlay_text(socket)?,
-        })),
+        AttachPopup::WorkspaceRegistry => {
+            let content = attach_workspace_registry_overlay_text(socket)?;
+            let model = legacy_popup_model(&content, crate::popup::PopupMode::Workspace);
+            let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Workspace);
+            state.ensure_selection(&model);
+            Ok(Some(PopupOverlayText {
+                title: "dmux workspaces",
+                content: crate::popup::render_popup_text(&state, &model, None),
+            }))
+        }
     }
+}
+
+fn legacy_popup_model(content: &str, mode: crate::popup::PopupMode) -> crate::popup::PopupModel {
+    let rows = content
+        .lines()
+        .enumerate()
+        .map(|(index, line)| crate::popup::PopupRow {
+            id: format!("legacy-{index}"),
+            kind: crate::popup::PopupRowKind::DisabledItem,
+            repo_path: None,
+            target: None,
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: line.to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+        })
+        .collect();
+    let _ = mode;
+    crate::popup::PopupModel::new(rows)
 }
 
 fn pane_index_exists(entries: &[PaneListEntry], index: usize) -> bool {

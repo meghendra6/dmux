@@ -223,6 +223,54 @@ pub fn filter_rows(rows: &[PopupRow], filter: &str) -> Vec<PopupRow> {
         .collect()
 }
 
+pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&str>) -> String {
+    let mut lines = Vec::new();
+    for row in &model.rows {
+        match row.kind {
+            PopupRowKind::Header => lines.push(row.title.clone()),
+            PopupRowKind::Item | PopupRowKind::DisabledItem => {
+                let selected = state.selected.as_deref() == Some(row.id.as_str());
+                let marker = if selected { ">" } else { " " };
+                let state_marker = state_marker(row.state);
+                let disabled = if row.kind == PopupRowKind::DisabledItem {
+                    " disabled"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "{} {} {:<10} {}{}",
+                    marker, state_marker, row.title, row.summary, disabled
+                ));
+            }
+        }
+    }
+    if let Some(peek) = peek {
+        lines.push(String::new());
+        lines.push("Peek".to_string());
+        lines.extend(peek.lines().map(str::to_string));
+    }
+    lines.push(String::new());
+    lines.push(
+        "Enter: focus/attach   Space: peek   Tab: group   /: filter   Esc: close".to_string(),
+    );
+    lines.join("\n")
+}
+
+pub fn state_marker(state: PopupStateKind) -> &'static str {
+    match state {
+        PopupStateKind::NeedsInput => "!",
+        PopupStateKind::Alert => "!",
+        PopupStateKind::Ready => "+",
+        PopupStateKind::Failed => "x",
+        PopupStateKind::Working => "*",
+        PopupStateKind::Completed => "+",
+        PopupStateKind::Idle => "-",
+        PopupStateKind::Detached => ".",
+        PopupStateKind::Previous => ".",
+        PopupStateKind::Stale => "x",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +329,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["h", "a"]
         );
+    }
+
+    #[test]
+    fn render_marks_selected_row_and_footer() {
+        let model = PopupModel::new(vec![
+            row("h", "Working", PopupRowKind::Header),
+            row("a", "alpha", PopupRowKind::Item),
+        ]);
+        let mut state = PopupState::new(PopupMode::Tree);
+        state.selected = Some("a".to_string());
+
+        let text = render_popup_text(&state, &model, None);
+
+        assert!(text.contains("Working"));
+        assert!(text.contains("> * alpha"));
+        assert!(text.contains("Enter: focus/attach"));
     }
 
     #[test]
