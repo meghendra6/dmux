@@ -1327,6 +1327,40 @@ struct RawAttachInputState {
     prompt_pending_since: Option<Instant>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PopupInputState {
+    mode: crate::popup::PopupMode,
+    filter_mode: bool,
+}
+
+impl PopupInputState {
+    fn new(mode: crate::popup::PopupMode) -> Self {
+        Self {
+            mode,
+            filter_mode: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PopupInputAction {
+    MoveUp,
+    MoveDown,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Enter,
+    TogglePeek,
+    ToggleGrouping,
+    FilterStart,
+    FilterPush(char),
+    FilterBackspace,
+    FilterAccept,
+    Escape,
+    Close,
+}
+
 #[derive(Debug, Clone)]
 struct LiveControls {
     prefix: u8,
@@ -1972,6 +2006,76 @@ fn translate_attach_input_with_state_with_controls(
 
     if !output.is_empty() {
         actions.push(AttachInputAction::Forward(output));
+    }
+    actions
+}
+
+fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<PopupInputAction> {
+    let mut actions = Vec::new();
+    let mut index = 0;
+    while index < input.len() {
+        match input[index] {
+            b'/' if !state.filter_mode => {
+                state.filter_mode = true;
+                actions.push(PopupInputAction::FilterStart);
+                index += 1;
+            }
+            b'\r' | b'\n' if state.filter_mode => {
+                state.filter_mode = false;
+                actions.push(PopupInputAction::FilterAccept);
+                index += 1;
+            }
+            b'\r' | b'\n' => {
+                actions.push(PopupInputAction::Enter);
+                index += 1;
+            }
+            b'\x1b' => {
+                if input.get(index..index + 3) == Some(b"\x1b[A") {
+                    actions.push(PopupInputAction::MoveUp);
+                    index += 3;
+                } else if input.get(index..index + 3) == Some(b"\x1b[B") {
+                    actions.push(PopupInputAction::MoveDown);
+                    index += 3;
+                } else if input.get(index..index + 3) == Some(b"\x1b[C") {
+                    actions.push(PopupInputAction::Enter);
+                    index += 3;
+                } else {
+                    actions.push(PopupInputAction::Escape);
+                    index += 1;
+                }
+            }
+            b'\t' if !state.filter_mode => {
+                actions.push(PopupInputAction::ToggleGrouping);
+                index += 1;
+            }
+            b' ' if !state.filter_mode => {
+                actions.push(PopupInputAction::TogglePeek);
+                index += 1;
+            }
+            b'j' if !state.filter_mode => {
+                actions.push(PopupInputAction::MoveDown);
+                index += 1;
+            }
+            b'k' if !state.filter_mode => {
+                actions.push(PopupInputAction::MoveUp);
+                index += 1;
+            }
+            b'q' if !state.filter_mode => {
+                actions.push(PopupInputAction::Close);
+                index += 1;
+            }
+            b'\x7f' if state.filter_mode => {
+                actions.push(PopupInputAction::FilterBackspace);
+                index += 1;
+            }
+            byte if state.filter_mode && (byte.is_ascii_graphic() || byte == b' ') => {
+                actions.push(PopupInputAction::FilterPush(byte as char));
+                index += 1;
+            }
+            _ => {
+                index += 1;
+            }
+        }
     }
     actions
 }
@@ -7202,6 +7306,46 @@ mod tests {
             ]
         );
         assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_popup_mode_consumes_navigation_keys() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Attention);
+
+        assert_eq!(
+            popup_actions_for_input(b"j", &mut state),
+            vec![PopupInputAction::MoveDown]
+        );
+        assert_eq!(
+            popup_actions_for_input(b"k", &mut state),
+            vec![PopupInputAction::MoveUp]
+        );
+        assert_eq!(
+            popup_actions_for_input(b"\r", &mut state),
+            vec![PopupInputAction::Enter]
+        );
+        assert_eq!(
+            popup_actions_for_input(b" ", &mut state),
+            vec![PopupInputAction::TogglePeek]
+        );
+    }
+
+    #[test]
+    fn popup_filter_mode_collects_text() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+
+        assert_eq!(
+            popup_actions_for_input(b"/api\x7f2\r", &mut state),
+            vec![
+                PopupInputAction::FilterStart,
+                PopupInputAction::FilterPush('a'),
+                PopupInputAction::FilterPush('p'),
+                PopupInputAction::FilterPush('i'),
+                PopupInputAction::FilterBackspace,
+                PopupInputAction::FilterPush('2'),
+                PopupInputAction::FilterAccept,
+            ]
+        );
     }
 
     #[test]
