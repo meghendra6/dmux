@@ -5191,9 +5191,9 @@ fn open_workspace_popup_row(
             "row has no workspace path".to_string(),
         ));
     };
-    if !row.id.starts_with("workspace:path:") {
+    if !row.id.starts_with("workspace:path:") && !row.id.starts_with("previous:") {
         return Ok(WorkspacePopupInputResult::Message(
-            "open is only available for registered workspace paths".to_string(),
+            "open is only available for registered paths or previous sessions".to_string(),
         ));
     }
     if !workspace_path.is_dir() {
@@ -5203,7 +5203,11 @@ fn open_workspace_popup_row(
     }
 
     let live_sessions = live_workspace_sessions(socket)?;
-    let session = workspace_session_name_for_path(workspace_path, &live_sessions);
+    let session = if row.id.starts_with("previous:") {
+        workspace_session_name_for_previous(row, workspace_path, &live_sessions)
+    } else {
+        workspace_session_name_for_path(workspace_path, &live_sessions)
+    };
     send_control_request(
         socket,
         &protocol::encode_new_in_cwd(&session, &[], workspace_path),
@@ -5218,7 +5222,23 @@ fn open_workspace_popup_row(
 }
 
 fn workspace_session_name_for_path(path: &Path, live_sessions: &[LiveWorkspaceSession]) -> String {
-    let base = workspace_session_base_name(path);
+    workspace_session_name_for_base(workspace_session_base_name(path), live_sessions)
+}
+
+fn workspace_session_name_for_previous(
+    row: &crate::popup::PopupRow,
+    path: &Path,
+    live_sessions: &[LiveWorkspaceSession],
+) -> String {
+    let base = row
+        .target
+        .as_ref()
+        .map(|target| workspace_session_name_base(&target.session))
+        .unwrap_or_else(|| workspace_session_base_name(path));
+    workspace_session_name_for_base(base, live_sessions)
+}
+
+fn workspace_session_name_for_base(base: String, live_sessions: &[LiveWorkspaceSession]) -> String {
     if !live_sessions.iter().any(|session| session.name == base) {
         return base;
     }
@@ -5240,6 +5260,10 @@ fn workspace_session_base_name(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("workspace")
         .trim();
+    workspace_session_name_base(name)
+}
+
+fn workspace_session_name_base(name: &str) -> String {
     let sanitized = name
         .chars()
         .map(|ch| {
@@ -9309,6 +9333,33 @@ mod tests {
         assert_eq!(
             workspace_session_name_for_path(std::path::Path::new("/tmp/bad:name"), &[]),
             "bad-name"
+        );
+
+        let previous = crate::popup::PopupRow {
+            id: "previous:api".to_string(),
+            kind: crate::popup::PopupRowKind::DisabledItem,
+            repo_path: Some(PathBuf::from("/tmp/fallback")),
+            target: Some(crate::popup::PopupTarget {
+                session: "api".to_string(),
+                window_index: None,
+                window_id: None,
+                pane_index: None,
+                pane_id: None,
+            }),
+            state: crate::popup::PopupStateKind::Previous,
+            source: crate::popup::PopupRowSource::Registry,
+            title: "api".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+        };
+        assert_eq!(
+            workspace_session_name_for_previous(
+                &previous,
+                std::path::Path::new("/tmp/fallback"),
+                &sessions,
+            ),
+            "api-3"
         );
     }
 
