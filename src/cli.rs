@@ -585,7 +585,7 @@ info line, and quick hints for prefix, help, command prompt, and focus.\n\
 Session:\n\
   C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
   C-b ! attention navigator   C-b w tree navigator   C-b i detail popup   C-b A workspaces\n\
-  popup: j/k move   Enter tree/workspace focus   Space peek   r reply   Tab group   / filter   Esc close\n\
+  popup: j/k move   Enter focus   o open workspace   Space peek   r reply   Tab group   / filter   Esc close\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
@@ -615,7 +615,7 @@ pub fn attach_help_overlay() -> &'static str {
     "Session:\n\
   C-b d detach / C-b D detach    C-b C-b send literal prefix    C-b ? toggle help\n\
   C-b ! attention navigator   C-b w tree navigator   C-b i detail popup   C-b A workspaces\n\
-  popup: j/k move   Enter tree/workspace focus   Space peek   r reply   Tab group   / filter   Esc close\n\
+  popup: j/k move   Enter focus   o open workspace   Space peek   r reply   Tab group   / filter   Esc close\n\
 Windows:\n\
   C-b c new window        C-b n/p next/previous window\n\
 Panes:\n\
@@ -2801,7 +2801,8 @@ mod tests {
         assert!(help.contains("attention navigator"), "{help}");
         assert!(help.contains("tree navigator"), "{help}");
         assert!(help.contains("popup: j/k move"), "{help}");
-        assert!(help.contains("Enter tree/workspace focus"), "{help}");
+        assert!(help.contains("Enter focus"), "{help}");
+        assert!(help.contains("o open workspace"), "{help}");
         assert!(help.contains("Space peek"), "{help}");
         assert!(help.contains("/ filter"), "{help}");
         assert!(help.contains("C-b o"), "{help}");

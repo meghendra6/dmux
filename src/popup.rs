@@ -370,7 +370,11 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
         PopupMode::Attention => {
             "Space: peek   r: reply   Tab: group   /: filter   Esc: close".to_string()
         }
-        PopupMode::Workspace | PopupMode::Tree => {
+        PopupMode::Workspace => {
+            "Enter: focus/attach   o: open   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
+                .to_string()
+        }
+        PopupMode::Tree => {
             "Enter: focus/attach   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
                 .to_string()
         }
@@ -533,6 +537,18 @@ mod tests {
 
         assert!(text.contains("Space: peek"));
         assert!(!text.contains("Enter: focus/attach"), "{text}");
+    }
+
+    #[test]
+    fn workspace_footer_shows_open_action() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.selected = Some("a".to_string());
+
+        let text = render_popup_text(&state, &model, None);
+
+        assert!(text.contains("Enter: focus/attach"), "{text}");
+        assert!(text.contains("o: open"), "{text}");
     }
 
     #[test]
