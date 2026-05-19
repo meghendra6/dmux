@@ -371,7 +371,7 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
             "Space: peek   r: reply   Tab: group   /: filter   Esc: close".to_string()
         }
         PopupMode::Workspace => {
-            "Enter: focus/attach   o: open   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
+            "Enter: focus/attach   o: open/reopen   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
                 .to_string()
         }
         PopupMode::Tree => {

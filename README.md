@@ -102,7 +102,8 @@ command-prompt workflows; the popup stays visible until closed. Interactive
 attach popups provide attention, current-session tree, and workspace navigation;
 `Enter` focuses or attaches from tree and workspace rows, `Space` opens
 read-only peek, `r` starts a one-line reply from peek to the selected pane, `o`
-opens a registered workspace path as a new session from the workspace popup,
+opens a registered workspace path or reopens a previous session record as a new
+session from the workspace popup,
 `Tab` toggles grouping, and `/` filters rows. Press `C-b :`
 for an attached command prompt that
 shows the typed command and controls (`Enter` run, Escape/`C-c` cancel,
@@ -164,8 +165,8 @@ active pane as the main pane; use `dmux attach --help` or
 Unzoomed multi-pane attach redraws from server change events and keeps a polling
 fallback for mixed-version daemons or missed events.
 
-Popup dispatch beyond registered workspace open, pin/rename, stop/delete, PR
-status, and worktree management are intentionally future slices.
+Popup dispatch beyond workspace open/reopen, pin/rename, stop/delete, PR status,
+and worktree management are intentionally future slices.
 
 `save-buffer` stores captured active-pane text in an in-memory buffer with a
 1 MiB per-buffer limit and a 50-buffer server limit. Use `-b` to name the

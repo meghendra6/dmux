@@ -3516,6 +3516,96 @@ fn workspace_popup_open_registered_path_creates_and_switches_session() {
 }
 
 #[test]
+fn workspace_popup_open_previous_session_record_recreates_and_switches_session() {
+    let socket = unique_socket("workspace-popup-reopen");
+    let registry_path = unique_temp_file("workspace-popup-reopen-registry");
+    let registry_env = registry_path.to_string_lossy().to_string();
+    let workspace_dir = unique_temp_file("workspace-popup-reopen-target");
+    std::fs::create_dir(&workspace_dir).expect("create workspace dir");
+    let workspace_path = workspace_dir.to_string_lossy().to_string();
+    let previous_session = format!("workspace-popup-reopen-prev-{}", std::process::id());
+    let source_session = format!("workspace-popup-reopen-source-{}", std::process::id());
+
+    let mut previous = Command::new(env!("CARGO_BIN_EXE_dmux"));
+    previous
+        .env("DEVMUX_SOCKET", &socket)
+        .env("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())
+        .current_dir(&workspace_dir)
+        .args([
+            "new",
+            "-d",
+            "-s",
+            &previous_session,
+            "--",
+            "sh",
+            "-lc",
+            "cat",
+        ]);
+    assert_success(&output_with_timeout(
+        previous,
+        "start previous workspace session",
+        Duration::from_secs(5),
+    ));
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &source_session, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    assert_success(&dmux_with_env(
+        &socket,
+        &["kill-session", "-t", &previous_session],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+
+    let mut child = spawn_attached_dmux_with_env(
+        &socket,
+        &["attach", "-t", &source_session],
+        &[],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    );
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02A")
+        .unwrap();
+    child.wait_for_stdout_contains_all(
+        &["Previous sessions", &previous_session],
+        "workspace previous session popup",
+    );
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(format!("/{previous_session}\ro").as_bytes())
+        .unwrap();
+
+    let switched = poll_list_sessions_contains(
+        &socket,
+        "#{session.name}\t#{session.attached_count}",
+        &format!("{previous_session}\t1"),
+    );
+    assert!(
+        switched.contains(&format!("{previous_session}\t1")),
+        "{switched:?}"
+    );
+
+    child
+        .stdin_mut("reopened workspace stdin")
+        .write_all(b"pwd\n")
+        .unwrap();
+    let captured = poll_capture(&socket, &previous_session, &workspace_path);
+    assert!(captured.contains(&workspace_path), "{captured:?}");
+
+    child
+        .stdin_mut("reopened workspace stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &source_session]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &previous_session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(registry_path);
+    let _ = std::fs::remove_dir(workspace_dir);
+}
+
+#[test]
 fn workspace_popup_tab_switches_to_repo_grouping() {
     let socket = unique_socket("workspace-popup-repo-grouping");
     let registry_path = unique_temp_file("workspace-popup-repo-grouping-registry");
