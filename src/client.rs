@@ -1418,6 +1418,7 @@ enum PopupInputAction {
     Home,
     End,
     Enter,
+    Open,
     TogglePeek,
     ToggleGrouping,
     ReplyStart,
@@ -2161,6 +2162,10 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
             }
             b' ' if !state.filter_mode => {
                 actions.push(PopupInputAction::TogglePeek);
+                index += 1;
+            }
+            b'o' if !state.filter_mode => {
+                actions.push(PopupInputAction::Open);
                 index += 1;
             }
             b'r' if !state.filter_mode => {
@@ -4816,6 +4821,7 @@ fn apply_attention_popup_input_actions(
                 state.selected = model.selectable_row_ids().last().cloned();
             }
             PopupInputAction::Enter => {}
+            PopupInputAction::Open => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(AttentionPopupInputResult::Close);
@@ -4944,6 +4950,7 @@ fn apply_tree_popup_input_actions(
                     }
                 };
             }
+            PopupInputAction::Open => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(TreePopupInputResult::Close);
@@ -5126,6 +5133,17 @@ fn apply_workspace_popup_input_actions(
                     }
                 };
             }
+            PopupInputAction::Open => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                }
+                let Some(row) = state.selected_row(&model) else {
+                    return Ok(WorkspacePopupInputResult::Message(
+                        "row has no workspace path".to_string(),
+                    ));
+                };
+                return open_workspace_popup_row(socket, row);
+            }
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(WorkspacePopupInputResult::Close);
@@ -5162,6 +5180,81 @@ fn apply_workspace_popup_input_actions(
         }
     }
     Ok(WorkspacePopupInputResult::StayOpen)
+}
+
+fn open_workspace_popup_row(
+    socket: &Path,
+    row: &crate::popup::PopupRow,
+) -> io::Result<WorkspacePopupInputResult> {
+    let Some(workspace_path) = row.repo_path.as_ref() else {
+        return Ok(WorkspacePopupInputResult::Message(
+            "row has no workspace path".to_string(),
+        ));
+    };
+    if !row.id.starts_with("workspace:path:") {
+        return Ok(WorkspacePopupInputResult::Message(
+            "open is only available for registered workspace paths".to_string(),
+        ));
+    }
+    if !workspace_path.is_dir() {
+        return Ok(WorkspacePopupInputResult::Message(
+            "workspace path is unavailable".to_string(),
+        ));
+    }
+
+    let live_sessions = live_workspace_sessions(socket)?;
+    let session = workspace_session_name_for_path(workspace_path, &live_sessions);
+    send_control_request(
+        socket,
+        &protocol::encode_new_in_cwd(&session, &[], workspace_path),
+    )?;
+    let _ = crate::registry::record_session(
+        &crate::paths::workspace_registry_path(),
+        workspace_path.clone(),
+        &session,
+        "live",
+    );
+    Ok(WorkspacePopupInputResult::SwitchSession { session })
+}
+
+fn workspace_session_name_for_path(path: &Path, live_sessions: &[LiveWorkspaceSession]) -> String {
+    let base = workspace_session_base_name(path);
+    if !live_sessions.iter().any(|session| session.name == base) {
+        return base;
+    }
+    for suffix in 2.. {
+        let candidate = format!("{base}-{suffix}");
+        if !live_sessions
+            .iter()
+            .any(|session| session.name == candidate)
+        {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn workspace_session_base_name(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace")
+        .trim();
+    let sanitized = name
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || ch == ':' {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    if sanitized.trim().is_empty() {
+        "workspace".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn attach_detail_overlay_text(socket: &Path, session: &str) -> io::Result<String> {
@@ -8999,6 +9092,10 @@ mod tests {
             popup_actions_for_input(b" ", &mut state),
             vec![PopupInputAction::TogglePeek]
         );
+        assert_eq!(
+            popup_actions_for_input(b"o", &mut state),
+            vec![PopupInputAction::Open]
+        );
     }
 
     #[test]
@@ -9187,6 +9284,31 @@ mod tests {
         assert!(
             !grouped.rows.iter().any(|row| row.title == "Live sessions"),
             "{grouped:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_session_name_uses_path_basename_and_avoids_live_collisions() {
+        let sessions = vec![
+            LiveWorkspaceSession {
+                name: "api".to_string(),
+                window_count: 1,
+                attached_count: 0,
+            },
+            LiveWorkspaceSession {
+                name: "api-2".to_string(),
+                window_count: 1,
+                attached_count: 0,
+            },
+        ];
+
+        assert_eq!(
+            workspace_session_name_for_path(std::path::Path::new("/tmp/api"), &sessions),
+            "api-3"
+        );
+        assert_eq!(
+            workspace_session_name_for_path(std::path::Path::new("/tmp/bad:name"), &[]),
+            "bad-name"
         );
     }
 
