@@ -3483,7 +3483,7 @@ fn workspace_popup_open_registered_path_creates_and_switches_session() {
     );
     child
         .stdin_mut("workspace popup stdin")
-        .write_all(b"o")
+        .write_all(b"/workspace-popup-open-target\ro")
         .unwrap();
 
     let switched = poll_list_sessions_contains(
