@@ -1179,6 +1179,29 @@ fn spawned_pane_advertises_dmux_env_vars() {
 }
 
 #[test]
+fn has_session_reports_existence_via_exit_code() {
+    let socket = unique_socket("has-session");
+    let session = format!("has-session-{}", std::process::id());
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "sleep 30"],
+    ));
+
+    // Existing session -> exit 0.
+    assert_success(&dmux(&socket, &["has-session", "-t", &session]));
+
+    // Missing session -> non-zero exit (tmux convention).
+    let missing = dmux(&socket, &["has-session", "-t", "no-such-session-xyz"]);
+    assert!(
+        !missing.status.success(),
+        "has-session on a missing session should exit non-zero"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn save_buffer_text_stores_literal_text_and_lists_preview() {
     let socket = unique_socket("save-buffer-text");
     let session = format!("save-buffer-text-{}", std::process::id());
