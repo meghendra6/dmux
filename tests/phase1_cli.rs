@@ -2824,6 +2824,32 @@ fn list_sessions_reports_created_session() {
 }
 
 #[test]
+fn list_sessions_json_format_emits_session_objects() {
+    let socket = unique_socket("list-json");
+    let session = format!("list-json-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let output = dmux(&socket, &["list-sessions", "--format", "json"]);
+    assert_success(&output);
+    let json = String::from_utf8_lossy(&output.stdout);
+    assert!(json.trim_start().starts_with('['), "{json:?}");
+    assert!(
+        json.contains(&format!("\"name\": \"{session}\"")),
+        "{json:?}"
+    );
+    assert!(json.contains("\"windows\":"), "{json:?}");
+    assert!(json.contains("\"attached_count\":"), "{json:?}");
+    assert!(json.contains("\"created_at\":"), "{json:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn dmux_without_args_creates_default_and_detaches() {
     let socket = unique_socket("open-default");
 

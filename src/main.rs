@@ -2,6 +2,7 @@ mod cli;
 mod client;
 mod config;
 mod ids;
+mod json;
 mod layout;
 mod paths;
 mod popup;
@@ -13,6 +14,12 @@ mod term;
 mod terminal_query;
 
 const DEFAULT_LIST_WINDOWS_FORMAT: &str = "#{window.index}\tid=#{window.id}\tname=#{window.name}\tactive=#{window.active}\tpanes=#{window.panes}";
+/// Reserved `-F`/`--format` value that selects JSON output instead of a format
+/// string (a bare `json` is never a useful `#{...}` format).
+const JSON_FORMAT_SELECTOR: &str = "json";
+/// Internal field-separated format requested from the server for JSON output;
+/// the unit separator keeps fields unambiguous across names with whitespace.
+const LIST_SESSIONS_JSON_FORMAT: &str = "#{session.name}\u{1f}#{session.window_count}\u{1f}#{session.attached_count}\u{1f}#{session.created_at}";
 const MAX_RUN_SHELL_OUTPUT_BYTES: usize = 64 * 1024;
 
 fn main() {
@@ -91,6 +98,12 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
         cli::Command::ListSessions { format } => {
             let socket = paths::socket_path();
             require_running_server(&socket)?;
+            if format.as_deref() == Some(JSON_FORMAT_SELECTOR) {
+                let request = protocol::encode_list_sessions(Some(LIST_SESSIONS_JSON_FORMAT));
+                let body = send_request(&socket, &request, false)?;
+                println!("{}", list_sessions_json(&String::from_utf8_lossy(&body)));
+                return Ok(());
+            }
             let request = protocol::encode_list_sessions(format.as_deref());
             let body = send_request(&socket, &request, false)?;
             print!("{}", String::from_utf8_lossy(&body));
@@ -926,9 +939,59 @@ fn read_line(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<Str
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
+/// Render the field-separated `LIST_SESSIONS_JSON_FORMAT` body as a JSON array
+/// of session objects. Each non-empty line is one session; missing trailing
+/// fields are treated as empty.
+fn list_sessions_json(body: &str) -> String {
+    let objects = body
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split('\u{1f}');
+            let name = fields.next().unwrap_or_default();
+            let windows = fields.next().unwrap_or_default();
+            let attached = fields.next().unwrap_or_default();
+            let created_at = fields.next().unwrap_or_default();
+            format!(
+                "  {{\"name\": {}, \"windows\": {}, \"attached_count\": {}, \"created_at\": {}}}",
+                json::json_string(name),
+                json::json_u64_or_string(windows),
+                json::json_u64_or_string(attached),
+                json::json_u64_or_string(created_at),
+            )
+        })
+        .collect::<Vec<_>>();
+    if objects.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[\n{}\n]", objects.join(",\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_sessions_json_builds_array_of_objects() {
+        let body = "dev\u{1f}2\u{1f}1\u{1f}1000\nwork\u{1f}1\u{1f}0\u{1f}2000\n";
+        let json = list_sessions_json(body);
+        assert_eq!(
+            json,
+            "[\n  {\"name\": \"dev\", \"windows\": 2, \"attached_count\": 1, \"created_at\": 1000},\n  {\"name\": \"work\", \"windows\": 1, \"attached_count\": 0, \"created_at\": 2000}\n]"
+        );
+    }
+
+    #[test]
+    fn list_sessions_json_handles_empty_and_quotes_names() {
+        assert_eq!(list_sessions_json(""), "[]");
+        let body = "a\"b\u{1f}0\u{1f}0\u{1f}0\n";
+        assert!(
+            list_sessions_json(body).contains("\"name\": \"a\\\"b\""),
+            "{}",
+            list_sessions_json(body)
+        );
+    }
 
     #[test]
     fn duplicate_default_create_error_is_ignorable_for_open_default() {
