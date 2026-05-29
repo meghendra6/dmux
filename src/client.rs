@@ -5539,9 +5539,52 @@ fn apply_tree_popup_input_actions(
             PopupInputAction::Open => {}
             PopupInputAction::Pin => {}
             PopupInputAction::MovePinUp | PopupInputAction::MovePinDown => {}
-            PopupInputAction::KillStart
-            | PopupInputAction::ConfirmYes
-            | PopupInputAction::ConfirmNo => {}
+            PopupInputAction::KillStart => {
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                let Some(row) = state.selected_row(&model) else {
+                    return Ok(TreePopupInputResult::Message("no row selected".to_string()));
+                };
+                match tree_popup_kill_target(row) {
+                    Ok(target) => {
+                        let pane = target
+                            .pane_index
+                            .map(|index| index.to_string())
+                            .unwrap_or_default();
+                        state.confirm_prompt = format!("kill pane {pane}?");
+                        state.confirm_target = Some(target);
+                        state.confirm_mode = true;
+                    }
+                    Err(message) => return Ok(TreePopupInputResult::Message(message)),
+                }
+            }
+            PopupInputAction::ConfirmYes => {
+                let Some(target) = state.confirm_target.take() else {
+                    state.confirm_mode = false;
+                    state.confirm_prompt.clear();
+                    continue;
+                };
+                state.confirm_mode = false;
+                state.confirm_prompt.clear();
+                let protocol_target = match popup_target_to_protocol(&target) {
+                    Ok(protocol_target) => protocol_target,
+                    Err(message) => return Ok(TreePopupInputResult::Message(message)),
+                };
+                send_control_request(socket, &protocol::encode_kill_pane_target(&protocol_target))?;
+                let pane = target
+                    .pane_index
+                    .map(|index| index.to_string())
+                    .unwrap_or_default();
+                return Ok(TreePopupInputResult::Message(format!("killed pane {pane}")));
+            }
+            PopupInputAction::ConfirmNo => {
+                state.confirm_mode = false;
+                state.confirm_prompt.clear();
+                state.confirm_target = None;
+                return Ok(TreePopupInputResult::Message("kill cancelled".to_string()));
+            }
             PopupInputAction::NewStart
             | PopupInputAction::NewPush(_)
             | PopupInputAction::NewBackspace
@@ -5585,6 +5628,22 @@ fn apply_tree_popup_input_actions(
         }
     }
     Ok(TreePopupInputResult::StayOpen)
+}
+
+/// Returns the kill target for the selected tree-popup row, or an error message
+/// when the row is not a killable pane. The tree popup's selectable rows are
+/// panes (window rows are headers); a pane carries both a window and pane id.
+fn tree_popup_kill_target(
+    row: &crate::popup::PopupRow,
+) -> Result<crate::popup::PopupTarget, String> {
+    let target = row
+        .target
+        .as_ref()
+        .ok_or_else(|| "row is not a pane".to_string())?;
+    if target.window_id.is_none() || target.pane_id.is_none() {
+        return Err("row is not a pane".to_string());
+    }
+    Ok(target.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10840,6 +10899,47 @@ mod tests {
         let mut path_row = live.clone();
         path_row.id = "workspace:path:/tmp/repo".to_string();
         assert!(workspace_popup_kill_target(&path_row).is_err());
+    }
+
+    #[test]
+    fn tree_popup_kill_target_requires_a_pane() {
+        let pane = crate::popup::PopupRow {
+            id: "dev:0:1".to_string(),
+            kind: crate::popup::PopupRowKind::Item,
+            repo_path: None,
+            target: Some(crate::popup::PopupTarget {
+                session: "dev".to_string(),
+                window_index: Some(0),
+                window_id: Some(10),
+                pane_index: Some(1),
+                pane_id: Some(21),
+            }),
+            state: crate::popup::PopupStateKind::Working,
+            source: crate::popup::PopupRowSource::Mux,
+            title: "pane 1".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: true,
+            pinned: false,
+        };
+        assert_eq!(tree_popup_kill_target(&pane).unwrap().pane_id, Some(21));
+
+        // A window row carries a window id but no pane id; it is not killable here.
+        let mut window = pane.clone();
+        window.id = "dev:0:window".to_string();
+        window.target = Some(crate::popup::PopupTarget {
+            session: "dev".to_string(),
+            window_index: Some(0),
+            window_id: Some(10),
+            pane_index: None,
+            pane_id: None,
+        });
+        assert!(tree_popup_kill_target(&window).is_err());
+
+        // A row without a target cannot be killed.
+        let mut empty = pane.clone();
+        empty.target = None;
+        assert!(tree_popup_kill_target(&empty).is_err());
     }
 
     #[test]

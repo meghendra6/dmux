@@ -3650,6 +3650,59 @@ fn interactive_tree_popup_enter_selects_pane_for_input() {
 }
 
 #[test]
+fn tree_popup_kill_confirmation_kills_selected_pane() {
+    let socket = unique_socket("tree-popup-kill");
+    let session = format!("tree-popup-kill-{}", std::process::id());
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "cat"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-lc",
+            "cat",
+        ],
+    ));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &[]);
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02w")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["Enter: focus/attach"], "tree popup");
+
+    // Move to the second pane, then confirm a kill with `x` followed by `y`.
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"jxy")
+        .unwrap();
+
+    let panes =
+        poll_list_panes_contains(&socket, &session, "#{pane.index}\t#{pane.active}", "0\t1");
+    assert_eq!(
+        panes.lines().count(),
+        1,
+        "expected one pane after kill: {panes:?}"
+    );
+    assert!(panes.contains("0\t1"), "{panes:?}");
+
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn tree_popup_enter_does_not_forward_same_read_payload_after_filter() {
     let socket = unique_socket("interactive-tree-filter-enter");
     let session = format!("interactive-tree-filter-enter-{}", std::process::id());
