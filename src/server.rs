@@ -422,6 +422,9 @@ struct Session {
     next_attach_event_id: AtomicUsize,
     next_attach_stream_id: AtomicUsize,
     next_attach_render_id: AtomicUsize,
+    /// The pane that currently holds focus, for synthesizing focus-in/out to
+    /// panes that requested focus reporting when the active pane changes.
+    focused_pane: Mutex<Option<Weak<Pane>>>,
 }
 
 impl Session {
@@ -461,7 +464,37 @@ impl Session {
             next_attach_event_id: AtomicUsize::new(0),
             next_attach_stream_id: AtomicUsize::new(0),
             next_attach_render_id: AtomicUsize::new(0),
+            focused_pane: Mutex::new(None),
         }
+    }
+
+    /// Synthesize focus-in/focus-out to panes that requested focus reporting
+    /// when the active pane changes. A no-op when the active pane is unchanged,
+    /// so it is safe to call after any potential switch. Callers must hold no
+    /// `windows`/pane lock (this acquires them internally).
+    fn sync_active_pane_focus(&self) {
+        let current = self.active_pane();
+        let mut focused = self.focused_pane.lock().unwrap();
+        let previous = focused.as_ref().and_then(Weak::upgrade);
+        let unchanged = match (&previous, &current) {
+            (Some(prev), Some(cur)) => Arc::ptr_eq(prev, cur),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return;
+        }
+        if let Some(prev) = &previous {
+            if prev.terminal.lock().unwrap().focus_reporting_enabled() {
+                let _ = prev.writer.lock().unwrap().write_all(b"\x1b[O");
+            }
+        }
+        if let Some(cur) = &current {
+            if cur.terminal.lock().unwrap().focus_reporting_enabled() {
+                let _ = cur.writer.lock().unwrap().write_all(b"\x1b[I");
+            }
+        }
+        *focused = current.as_ref().map(Arc::downgrade);
     }
 
     fn name(&self) -> String {
@@ -3812,6 +3845,7 @@ fn handle_zoom_pane(
     };
     session.resize_current_visible_panes()?;
 
+    session.sync_active_pane_focus();
     session.notify_attach_redraw_immediate();
     let result = write_ok(stream);
     session.reconnect_live_raw_pane_streams();
@@ -4340,6 +4374,7 @@ fn handle_select_pane(
     };
     session.resize_current_visible_panes()?;
 
+    session.sync_active_pane_focus();
     session.notify_attach_redraw_immediate();
     let result = write_ok(stream);
     session.reconnect_live_raw_pane_streams();
@@ -4639,6 +4674,7 @@ fn handle_select_window(
         return Ok(());
     }
 
+    session.sync_active_pane_focus();
     session.notify_attach_redraw_immediate();
     let result = write_ok(stream);
     session.reconnect_raw_attach_streams();
@@ -4700,6 +4736,7 @@ fn handle_cycle_window(
         return Ok(());
     }
 
+    session.sync_active_pane_focus();
     session.notify_attach_redraw_immediate();
     let result = write_ok(stream);
     session.reconnect_raw_attach_streams();
@@ -4736,6 +4773,7 @@ fn handle_kill_window(
         return Ok(());
     }
 
+    session.sync_active_pane_focus();
     session.notify_attach_redraw_immediate();
     let result = write_ok(stream);
     if reconnect_live_raw {
