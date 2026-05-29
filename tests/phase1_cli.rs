@@ -4109,6 +4109,66 @@ fn workspace_popup_new_session_creates_detached_session_without_switching() {
 }
 
 #[test]
+fn workspace_popup_rename_renames_selected_live_session() {
+    let socket = unique_socket("workspace-popup-rename");
+    let registry_path = unique_temp_file("workspace-popup-rename-registry");
+    let registry_env = registry_path.to_string_lossy().to_string();
+    let base = format!("workspace-popup-rename-base-{}", std::process::id());
+    let old_name = format!("workspace-popup-rename-old-{}", std::process::id());
+    let new_name = format!("renamed-{}", std::process::id());
+    // A short, stable token that matches only the target session row.
+    let filter_token = "workspace-popup-rename-old";
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &base, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &old_name, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+
+    let mut child = spawn_attached_dmux_with_env(
+        &socket,
+        &["attach", "-t", &base],
+        &[],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    );
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02A")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["dmux workspaces", filter_token], "workspace popup");
+
+    // Filter to the target session, then `R` + a new name + Enter.
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(format!("/{filter_token}\rR{new_name}\r").as_bytes())
+        .unwrap();
+
+    let listed = poll_list_sessions_contains(&socket, "#{session.name}", &new_name);
+    assert!(
+        listed.lines().any(|line| line == new_name),
+        "session should be renamed: {listed:?}"
+    );
+    assert!(
+        !listed.lines().any(|line| line == old_name),
+        "old session name should be gone after rename: {listed:?}"
+    );
+
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &base]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &new_name]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(registry_path);
+}
+
+#[test]
 fn workspace_popup_tab_switches_to_repo_grouping() {
     let socket = unique_socket("workspace-popup-repo-grouping");
     let registry_path = unique_temp_file("workspace-popup-repo-grouping-registry");

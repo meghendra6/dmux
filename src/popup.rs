@@ -88,6 +88,9 @@ pub struct PopupState {
     pub new_mode: bool,
     pub new_text: String,
     pub new_path: Option<PathBuf>,
+    pub rename_mode: bool,
+    pub rename_text: String,
+    pub rename_target: Option<PopupTarget>,
 }
 
 impl PopupState {
@@ -109,6 +112,9 @@ impl PopupState {
             new_mode: false,
             new_text: String::new(),
             new_path: None,
+            rename_mode: false,
+            rename_text: String::new(),
+            rename_target: None,
         }
     }
 
@@ -134,6 +140,11 @@ impl PopupState {
             self.new_mode = false;
             self.new_text.clear();
             self.new_path = None;
+            PopupCloseResult::StayOpen
+        } else if self.rename_mode {
+            self.rename_mode = false;
+            self.rename_text.clear();
+            self.rename_target = None;
             PopupCloseResult::StayOpen
         } else if self.peek {
             self.peek = false;
@@ -398,13 +409,17 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
         lines.push(String::new());
         lines.push(format!("New session: {}", state.new_text));
     }
+    if state.rename_mode {
+        lines.push(String::new());
+        lines.push(format!("Rename: {}", state.rename_text));
+    }
     lines.push(String::new());
     lines.push(match state.mode {
         PopupMode::Attention => {
             "Space: peek   r: reply   Tab: group   /: filter   Esc: close".to_string()
         }
         PopupMode::Workspace => {
-            "Enter: focus/attach   o: open/reopen   n: new   x: kill   p: pin   J/K: reorder   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
+            "Enter: focus/attach   o: open/reopen   n: new   R: rename   x: kill   p: pin   J/K: reorder   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
                 .to_string()
         }
         PopupMode::Tree => {
@@ -687,6 +702,41 @@ mod tests {
 
         assert!(text.contains("New session: api"), "{text}");
         assert!(text.contains("n: new"), "{text}");
+    }
+
+    #[test]
+    fn escape_cancels_rename_before_closing_popup() {
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.rename_mode = true;
+        state.rename_text = "api".to_string();
+        state.rename_target = Some(PopupTarget {
+            session: "dev".to_string(),
+            window_index: None,
+            window_id: None,
+            pane_index: None,
+            pane_id: None,
+        });
+
+        assert_eq!(state.close_or_clear(), PopupCloseResult::StayOpen);
+        assert!(!state.rename_mode);
+        assert!(state.rename_text.is_empty());
+        assert!(state.rename_target.is_none());
+
+        assert_eq!(state.close_or_clear(), PopupCloseResult::Close);
+    }
+
+    #[test]
+    fn render_shows_rename_prompt_when_renaming() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.selected = Some("a".to_string());
+        state.rename_mode = true;
+        state.rename_text = "renamed".to_string();
+
+        let text = render_popup_text(&state, &model, None);
+
+        assert!(text.contains("Rename: renamed"), "{text}");
+        assert!(text.contains("R: rename"), "{text}");
     }
 
     #[test]

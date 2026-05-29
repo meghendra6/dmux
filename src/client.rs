@@ -1423,6 +1423,7 @@ struct PopupInputState {
     reply_mode: bool,
     confirm_mode: bool,
     new_mode: bool,
+    rename_mode: bool,
     escape_pending: Vec<u8>,
 }
 
@@ -1434,6 +1435,7 @@ impl PopupInputState {
             reply_mode: false,
             confirm_mode: false,
             new_mode: false,
+            rename_mode: false,
             escape_pending: Vec::new(),
         }
     }
@@ -1465,6 +1467,10 @@ enum PopupInputAction {
     NewPush(char),
     NewBackspace,
     NewSubmit,
+    RenameStart,
+    RenamePush(char),
+    RenameBackspace,
+    RenameSubmit,
     FilterStart,
     FilterPush(char),
     FilterBackspace,
@@ -2277,6 +2283,32 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
             }
             continue;
         }
+        if state.rename_mode {
+            match bytes[index] {
+                b'\r' | b'\n' => {
+                    state.rename_mode = false;
+                    actions.push(PopupInputAction::RenameSubmit);
+                    index += 1;
+                }
+                b'\x1b' => {
+                    state.rename_mode = false;
+                    actions.push(PopupInputAction::Escape);
+                    index += 1;
+                }
+                b'\x7f' => {
+                    actions.push(PopupInputAction::RenameBackspace);
+                    index += 1;
+                }
+                byte if byte.is_ascii_graphic() || byte == b' ' => {
+                    actions.push(PopupInputAction::RenamePush(byte as char));
+                    index += 1;
+                }
+                _ => {
+                    index += 1;
+                }
+            }
+            continue;
+        }
         match bytes[index] {
             b'/' if !state.filter_mode => {
                 state.filter_mode = true;
@@ -2344,6 +2376,11 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
             b'n' if !state.filter_mode => {
                 state.new_mode = true;
                 actions.push(PopupInputAction::NewStart);
+                index += 1;
+            }
+            b'R' if !state.filter_mode => {
+                state.rename_mode = true;
+                actions.push(PopupInputAction::RenameStart);
                 index += 1;
             }
             b'j' if !state.filter_mode => {
@@ -5161,6 +5198,7 @@ fn sync_popup_input_state(
     input_state.reply_mode = popup_state.reply_mode;
     input_state.confirm_mode = popup_state.confirm_mode;
     input_state.new_mode = popup_state.new_mode;
+    input_state.rename_mode = popup_state.rename_mode;
 }
 
 fn popup_reply_target(
@@ -5366,6 +5404,10 @@ fn apply_attention_popup_input_actions(
             | PopupInputAction::NewPush(_)
             | PopupInputAction::NewBackspace
             | PopupInputAction::NewSubmit => {}
+            PopupInputAction::RenameStart
+            | PopupInputAction::RenamePush(_)
+            | PopupInputAction::RenameBackspace
+            | PopupInputAction::RenameSubmit => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(AttentionPopupInputResult::Close);
@@ -5504,6 +5546,10 @@ fn apply_tree_popup_input_actions(
             | PopupInputAction::NewPush(_)
             | PopupInputAction::NewBackspace
             | PopupInputAction::NewSubmit => {}
+            PopupInputAction::RenameStart
+            | PopupInputAction::RenamePush(_)
+            | PopupInputAction::RenameBackspace
+            | PopupInputAction::RenameSubmit => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(TreePopupInputResult::Close);
@@ -5779,6 +5825,20 @@ fn apply_workspace_popup_input_actions(
                     return Ok(WorkspacePopupInputResult::Message(message));
                 }
             }
+            PopupInputAction::RenameStart
+            | PopupInputAction::RenamePush(_)
+            | PopupInputAction::RenameBackspace
+            | PopupInputAction::RenameSubmit => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                    model_dirty = false;
+                }
+                if let Some(message) =
+                    apply_workspace_popup_rename_action(socket, state, &model, action)?
+                {
+                    return Ok(WorkspacePopupInputResult::Message(message));
+                }
+            }
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(WorkspacePopupInputResult::Close);
@@ -5914,6 +5974,90 @@ fn apply_workspace_popup_new_session_action(
                 "live",
             );
             Ok(Some(format!("created {session}")))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Returns the rename target for the selected workspace row, or an error
+/// message when the row cannot be renamed. Scoped to live session rows, like
+/// kill: previous records have no running session, and registered paths are
+/// not sessions.
+fn workspace_popup_rename_target(
+    row: &crate::popup::PopupRow,
+) -> Result<crate::popup::PopupTarget, String> {
+    if !row.id.starts_with("live:") {
+        return Err("only live sessions can be renamed".to_string());
+    }
+    let target = row
+        .target
+        .as_ref()
+        .ok_or_else(|| "row has no session".to_string())?;
+    Ok(target.clone())
+}
+
+/// Drives the rename naming sub-mode for the workspace popup. On submit it
+/// renames the captured live session (RENAME_SESSION) and surfaces the server's
+/// validation/collision error as a message rather than failing the attach.
+/// Returns `Some(message)` to surface to the user, or `None` to keep collecting
+/// input.
+fn apply_workspace_popup_rename_action(
+    socket: &Path,
+    state: &mut crate::popup::PopupState,
+    model: &crate::popup::PopupModel,
+    action: &PopupInputAction,
+) -> io::Result<Option<String>> {
+    match action {
+        PopupInputAction::RenameStart => {
+            let Some(row) = state.selected_row(model) else {
+                return Ok(Some("no row selected".to_string()));
+            };
+            match workspace_popup_rename_target(row) {
+                Ok(target) => {
+                    state.rename_mode = true;
+                    state.rename_text.clear();
+                    state.rename_target = Some(target);
+                    Ok(None)
+                }
+                Err(message) => Ok(Some(message)),
+            }
+        }
+        PopupInputAction::RenamePush(ch) => {
+            if state.rename_mode && state.rename_text.len() < 256 {
+                state.rename_text.push(*ch);
+            }
+            Ok(None)
+        }
+        PopupInputAction::RenameBackspace => {
+            if state.rename_mode {
+                state.rename_text.pop();
+            }
+            Ok(None)
+        }
+        PopupInputAction::RenameSubmit => {
+            if !state.rename_mode {
+                return Ok(None);
+            }
+            let new_name = state.rename_text.trim().to_string();
+            let target = state.rename_target.take();
+            state.rename_mode = false;
+            state.rename_text.clear();
+            let Some(target) = target else {
+                return Ok(Some("rename target disappeared".to_string()));
+            };
+            if new_name.is_empty() {
+                return Ok(Some("rename cancelled".to_string()));
+            }
+            if new_name == target.session {
+                return Ok(Some(format!("session is already named {new_name}")));
+            }
+            match send_control_request(
+                socket,
+                &protocol::encode_rename_session(&target.session, &new_name),
+            ) {
+                Ok(_) => Ok(Some(format!("renamed to {new_name}"))),
+                Err(error) => Ok(Some(error.to_string())),
+            }
         }
         _ => Ok(None),
     }
@@ -10758,6 +10902,64 @@ mod tests {
         // A registered path row with no recorded path cannot host a new session.
         path_row.repo_path = None;
         assert!(workspace_popup_new_session_path(&path_row).is_err());
+    }
+
+    #[test]
+    fn popup_rename_mode_collects_text_until_submit() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+
+        assert_eq!(
+            popup_actions_for_input(b"Rapi\x7f!\r", &mut state),
+            vec![
+                PopupInputAction::RenameStart,
+                PopupInputAction::RenamePush('a'),
+                PopupInputAction::RenamePush('p'),
+                PopupInputAction::RenamePush('i'),
+                PopupInputAction::RenameBackspace,
+                PopupInputAction::RenamePush('!'),
+                PopupInputAction::RenameSubmit,
+            ]
+        );
+        assert!(!state.rename_mode);
+
+        // Escape cancels renaming instead of submitting.
+        assert_eq!(
+            popup_actions_for_input(b"R\x1b", &mut state),
+            vec![PopupInputAction::RenameStart, PopupInputAction::Escape]
+        );
+        assert!(!state.rename_mode);
+    }
+
+    #[test]
+    fn workspace_popup_rename_target_scopes_to_live_sessions() {
+        let live = crate::popup::PopupRow {
+            id: "live:dev".to_string(),
+            kind: crate::popup::PopupRowKind::Item,
+            repo_path: None,
+            target: Some(crate::popup::PopupTarget {
+                session: "dev".to_string(),
+                window_index: None,
+                window_id: None,
+                pane_index: None,
+                pane_id: None,
+            }),
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: "dev".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: true,
+            pinned: false,
+        };
+        assert_eq!(workspace_popup_rename_target(&live).unwrap().session, "dev");
+
+        let mut previous = live.clone();
+        previous.id = "previous:dev".to_string();
+        assert!(workspace_popup_rename_target(&previous).is_err());
+
+        let mut path_row = live.clone();
+        path_row.id = "workspace:path:/tmp/repo".to_string();
+        assert!(workspace_popup_rename_target(&path_row).is_err());
     }
 
     #[test]
