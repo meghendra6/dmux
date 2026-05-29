@@ -5592,7 +5592,17 @@ fn apply_tree_popup_input_actions(
             PopupInputAction::RenameStart
             | PopupInputAction::RenamePush(_)
             | PopupInputAction::RenameBackspace
-            | PopupInputAction::RenameSubmit => {}
+            | PopupInputAction::RenameSubmit => {
+                if model_dirty {
+                    model = tree_popup_visible_model(socket, session, state)?;
+                    model_dirty = false;
+                }
+                if let Some(message) =
+                    apply_tree_popup_rename_action(socket, state, &model, action)?
+                {
+                    return Ok(TreePopupInputResult::Message(message));
+                }
+            }
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(TreePopupInputResult::Close);
@@ -5644,6 +5654,93 @@ fn tree_popup_kill_target(
         return Err("row is not a pane".to_string());
     }
     Ok(target.clone())
+}
+
+/// Returns the rename target (the window of the selected pane) for the tree
+/// popup, or an error message when the row has no window. Tree window rows are
+/// headers, so renaming targets the selected pane's window by id.
+fn tree_popup_rename_target(
+    row: &crate::popup::PopupRow,
+) -> Result<crate::popup::PopupTarget, String> {
+    let target = row
+        .target
+        .as_ref()
+        .ok_or_else(|| "row has no window".to_string())?;
+    if target.window_id.is_none() {
+        return Err("row has no window".to_string());
+    }
+    Ok(target.clone())
+}
+
+/// Drives the rename naming sub-mode for the tree popup. On submit it renames
+/// the captured window (RENAME_WINDOW by id) and surfaces the server's
+/// validation/collision error as a message rather than failing the attach.
+/// Returns `Some(message)` to surface to the user, or `None` to keep collecting
+/// input.
+fn apply_tree_popup_rename_action(
+    socket: &Path,
+    state: &mut crate::popup::PopupState,
+    model: &crate::popup::PopupModel,
+    action: &PopupInputAction,
+) -> io::Result<Option<String>> {
+    match action {
+        PopupInputAction::RenameStart => {
+            let Some(row) = state.selected_row(model) else {
+                return Ok(Some("no row selected".to_string()));
+            };
+            match tree_popup_rename_target(row) {
+                Ok(target) => {
+                    state.rename_mode = true;
+                    state.rename_text.clear();
+                    state.rename_target = Some(target);
+                    Ok(None)
+                }
+                Err(message) => Ok(Some(message)),
+            }
+        }
+        PopupInputAction::RenamePush(ch) => {
+            if state.rename_mode && state.rename_text.len() < 256 {
+                state.rename_text.push(*ch);
+            }
+            Ok(None)
+        }
+        PopupInputAction::RenameBackspace => {
+            if state.rename_mode {
+                state.rename_text.pop();
+            }
+            Ok(None)
+        }
+        PopupInputAction::RenameSubmit => {
+            if !state.rename_mode {
+                return Ok(None);
+            }
+            let new_name = state.rename_text.trim().to_string();
+            let target = state.rename_target.take();
+            state.rename_mode = false;
+            state.rename_text.clear();
+            let Some(target) = target else {
+                return Ok(Some("rename target disappeared".to_string()));
+            };
+            let Some(window_id) = target.window_id else {
+                return Ok(Some("row has no window".to_string()));
+            };
+            if new_name.is_empty() {
+                return Ok(Some("rename cancelled".to_string()));
+            }
+            match send_control_request(
+                socket,
+                &protocol::encode_rename_window(
+                    &target.session,
+                    protocol::WindowTarget::Id(window_id),
+                    &new_name,
+                ),
+            ) {
+                Ok(_) => Ok(Some(format!("renamed window to {new_name}"))),
+                Err(error) => Ok(Some(error.to_string())),
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10940,6 +11037,46 @@ mod tests {
         let mut empty = pane.clone();
         empty.target = None;
         assert!(tree_popup_kill_target(&empty).is_err());
+    }
+
+    #[test]
+    fn tree_popup_rename_target_requires_a_window() {
+        let pane = crate::popup::PopupRow {
+            id: "dev:0:1".to_string(),
+            kind: crate::popup::PopupRowKind::Item,
+            repo_path: None,
+            target: Some(crate::popup::PopupTarget {
+                session: "dev".to_string(),
+                window_index: Some(0),
+                window_id: Some(10),
+                pane_index: Some(1),
+                pane_id: Some(21),
+            }),
+            state: crate::popup::PopupStateKind::Working,
+            source: crate::popup::PopupRowSource::Mux,
+            title: "pane 1".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: true,
+            pinned: false,
+        };
+        // A pane row carries its window id, so renaming targets that window.
+        assert_eq!(tree_popup_rename_target(&pane).unwrap().window_id, Some(10));
+
+        // A row whose target has no window id cannot be renamed.
+        let mut no_window = pane.clone();
+        no_window.target = Some(crate::popup::PopupTarget {
+            session: "dev".to_string(),
+            window_index: None,
+            window_id: None,
+            pane_index: None,
+            pane_id: None,
+        });
+        assert!(tree_popup_rename_target(&no_window).is_err());
+
+        let mut empty = pane.clone();
+        empty.target = None;
+        assert!(tree_popup_rename_target(&empty).is_err());
     }
 
     #[test]

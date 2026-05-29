@@ -423,7 +423,7 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
                 .to_string()
         }
         PopupMode::Tree => {
-            "Enter: focus/attach   x: kill   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
+            "Enter: focus/attach   R: rename window   x: kill   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
                 .to_string()
         }
     });
@@ -623,6 +623,17 @@ mod tests {
         let text = render_popup_text(&state, &model, None);
 
         assert!(text.contains("x: kill"), "{text}");
+    }
+
+    #[test]
+    fn tree_footer_shows_rename_window_action() {
+        let model = PopupModel::new(vec![row("a", "pane 0", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Tree);
+        state.selected = Some("a".to_string());
+
+        let text = render_popup_text(&state, &model, None);
+
+        assert!(text.contains("R: rename window"), "{text}");
     }
 
     #[test]
