@@ -62,6 +62,7 @@ pub struct PopupRow {
     pub summary: String,
     pub last_changed: Option<u64>,
     pub attachable: bool,
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +333,7 @@ fn header_row(
         summary: String::new(),
         last_changed: None,
         attachable: false,
+        pinned: false,
     }
 }
 
@@ -349,9 +351,10 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
                 } else {
                     ""
                 };
+                let pinned = if row.pinned { " pinned" } else { "" };
                 lines.push(format!(
-                    "{} {} {:<10} {}{}",
-                    marker, state_marker, row.title, row.summary, disabled
+                    "{} {} {:<10} {}{}{}",
+                    marker, state_marker, row.title, row.summary, pinned, disabled
                 ));
             }
         }
@@ -371,7 +374,7 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
             "Space: peek   r: reply   Tab: group   /: filter   Esc: close".to_string()
         }
         PopupMode::Workspace => {
-            "Enter: focus/attach   o: open/reopen   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
+            "Enter: focus/attach   o: open/reopen   p: pin   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
                 .to_string()
         }
         PopupMode::Tree => {
@@ -447,6 +450,7 @@ mod tests {
             summary: String::new(),
             last_changed: None,
             attachable: kind == PopupRowKind::Item,
+            pinned: false,
         }
     }
 
@@ -525,6 +529,20 @@ mod tests {
         assert!(text.contains("Working"));
         assert!(text.contains("> * alpha"));
         assert!(text.contains("Enter: focus/attach"));
+    }
+
+    #[test]
+    fn render_marks_pinned_rows() {
+        let mut pinned = row("a", "alpha", PopupRowKind::Item);
+        pinned.pinned = true;
+        let model = PopupModel::new(vec![pinned]);
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.selected = Some("a".to_string());
+
+        let text = render_popup_text(&state, &model, None);
+
+        assert!(text.contains("alpha"), "{text}");
+        assert!(text.contains("pinned"), "{text}");
     }
 
     #[test]

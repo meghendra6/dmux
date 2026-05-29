@@ -23,6 +23,18 @@ pub struct SessionRecord {
 pub struct WorkspaceRegistry {
     pub workspaces: Vec<WorkspaceRecord>,
     pub sessions: Vec<SessionRecord>,
+    pub pinned_workspaces: Vec<PathBuf>,
+    pub pinned_sessions: Vec<String>,
+}
+
+impl WorkspaceRegistry {
+    pub fn is_workspace_pinned(&self, path: &Path) -> bool {
+        self.pinned_workspaces.iter().any(|pinned| pinned == path)
+    }
+
+    pub fn is_session_pinned(&self, name: &str) -> bool {
+        self.pinned_sessions.iter().any(|pinned| pinned == name)
+    }
 }
 
 pub fn load(path: &Path) -> io::Result<WorkspaceRegistry> {
@@ -108,6 +120,33 @@ pub fn mark_session_stopped(path: &Path, session: &str) -> io::Result<()> {
     Ok(())
 }
 
+pub fn toggle_workspace_pin(path: &Path, workspace: PathBuf) -> io::Result<bool> {
+    let mut registry = load(path)?;
+    let workspace = normalize_path(workspace);
+    let pinned = toggle_membership(&mut registry.pinned_workspaces, workspace);
+    registry.pinned_workspaces.sort();
+    save(path, &registry)?;
+    Ok(pinned)
+}
+
+pub fn toggle_session_pin(path: &Path, session: &str) -> io::Result<bool> {
+    let mut registry = load(path)?;
+    let pinned = toggle_membership(&mut registry.pinned_sessions, session.to_string());
+    registry.pinned_sessions.sort();
+    save(path, &registry)?;
+    Ok(pinned)
+}
+
+fn toggle_membership<T: PartialEq>(items: &mut Vec<T>, value: T) -> bool {
+    if let Some(position) = items.iter().position(|item| *item == value) {
+        items.remove(position);
+        false
+    } else {
+        items.push(value);
+        true
+    }
+}
+
 fn upsert_workspace(registry: &mut WorkspaceRegistry, path: PathBuf) {
     if !registry.workspaces.iter().any(|record| record.path == path) {
         registry.workspaces.push(WorkspaceRecord { path });
@@ -150,6 +189,12 @@ fn parse(contents: &str) -> io::Result<WorkspaceRegistry> {
                     .sessions
                     .push(parse_session_record(rest, line_index + 1)?);
             }
+            ["pin-workspace", path] => registry
+                .pinned_workspaces
+                .push(decode_path_field(path, line_index + 1)?),
+            ["pin-session", name] => registry
+                .pinned_sessions
+                .push(decode_text_field(name, line_index + 1)?),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -164,6 +209,10 @@ fn parse(contents: &str) -> io::Result<WorkspaceRegistry> {
     registry
         .sessions
         .sort_by(|left, right| left.name.cmp(&right.name));
+    registry.pinned_workspaces.sort();
+    registry.pinned_workspaces.dedup();
+    registry.pinned_sessions.sort();
+    registry.pinned_sessions.dedup();
     Ok(registry)
 }
 
@@ -246,6 +295,12 @@ fn render(registry: &WorkspaceRegistry) -> String {
             render_optional_usize(session.last_pane)
         ));
     }
+    for path in &registry.pinned_workspaces {
+        lines.push(format!("pin-workspace\t{}", encode_path(path)));
+    }
+    for name in &registry.pinned_sessions {
+        lines.push(format!("pin-session\t{}", encode_text(name)));
+    }
     lines.push(String::new());
     lines.join("\n")
 }
@@ -323,6 +378,7 @@ mod tests {
                 last_window: None,
                 last_pane: None,
             }],
+            ..Default::default()
         };
 
         assert_eq!(parse(&render(&registry)).unwrap(), registry);
@@ -342,6 +398,7 @@ mod tests {
                 last_window: Some(1),
                 last_pane: Some(2),
             }],
+            ..Default::default()
         };
 
         assert_eq!(parse(&render(&registry)).unwrap(), registry);
@@ -361,9 +418,48 @@ mod tests {
                 last_window: Some(1),
                 last_pane: None,
             }],
+            ..Default::default()
         };
 
         assert_eq!(parse(&render(&registry)).unwrap(), registry);
+    }
+
+    #[test]
+    fn registry_round_trips_pins() {
+        let registry = WorkspaceRegistry {
+            workspaces: vec![WorkspaceRecord {
+                path: PathBuf::from("/tmp/project"),
+            }],
+            sessions: Vec::new(),
+            pinned_workspaces: vec![PathBuf::from("/tmp/project")],
+            pinned_sessions: vec!["dev".to_string()],
+        };
+
+        assert_eq!(parse(&render(&registry)).unwrap(), registry);
+    }
+
+    #[test]
+    fn toggle_pins_persist_and_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "dmux-pin-test-{}-{:?}.tsv",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(toggle_workspace_pin(&path, PathBuf::from("/tmp/project")).unwrap());
+        assert!(toggle_session_pin(&path, "dev").unwrap());
+
+        let loaded = load(&path).unwrap();
+        assert!(loaded.is_workspace_pinned(Path::new("/tmp/project")));
+        assert!(loaded.is_session_pinned("dev"));
+
+        assert!(!toggle_workspace_pin(&path, PathBuf::from("/tmp/project")).unwrap());
+        let loaded = load(&path).unwrap();
+        assert!(!loaded.is_workspace_pinned(Path::new("/tmp/project")));
+        assert!(loaded.is_session_pinned("dev"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -386,6 +482,7 @@ mod tests {
                     last_window: None,
                     last_pane: None,
                 }],
+                ..Default::default()
             }
         );
     }

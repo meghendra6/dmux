@@ -1419,6 +1419,7 @@ enum PopupInputAction {
     End,
     Enter,
     Open,
+    Pin,
     TogglePeek,
     ToggleGrouping,
     ReplyStart,
@@ -2166,6 +2167,10 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
             }
             b'o' if !state.filter_mode => {
                 actions.push(PopupInputAction::Open);
+                index += 1;
+            }
+            b'p' if !state.filter_mode => {
+                actions.push(PopupInputAction::Pin);
                 index += 1;
             }
             b'r' if !state.filter_mode => {
@@ -4088,6 +4093,7 @@ fn attention_popup_model(
         summary: String::new(),
         last_changed: None,
         attachable: false,
+        pinned: false,
     }];
 
     if entries.is_empty() {
@@ -4102,6 +4108,7 @@ fn attention_popup_model(
             summary: String::new(),
             last_changed: None,
             attachable: false,
+            pinned: false,
         });
         return crate::popup::PopupModel::new(rows);
     }
@@ -4122,6 +4129,7 @@ fn attention_popup_model(
             summary: String::new(),
             last_changed: None,
             attachable: false,
+            pinned: false,
         });
     }
 
@@ -4155,6 +4163,7 @@ fn attention_popup_model(
             summary: attention_popup_summary(entry),
             last_changed: entry.agent_changed_at,
             attachable: false,
+            pinned: false,
         });
     }
 
@@ -4285,6 +4294,7 @@ fn tree_popup_model(session: &str, windows: &[WindowTreeEntry]) -> crate::popup:
         summary: String::new(),
         last_changed: None,
         attachable: false,
+        pinned: false,
     }];
 
     if windows.is_empty() {
@@ -4299,6 +4309,7 @@ fn tree_popup_model(session: &str, windows: &[WindowTreeEntry]) -> crate::popup:
             summary: String::new(),
             last_changed: None,
             attachable: false,
+            pinned: false,
         });
         return crate::popup::PopupModel::new(rows);
     }
@@ -4332,6 +4343,7 @@ fn tree_popup_model(session: &str, windows: &[WindowTreeEntry]) -> crate::popup:
             summary: String::new(),
             last_changed: None,
             attachable: false,
+            pinned: false,
         });
         for pane in &window.panes {
             rows.push(crate::popup::PopupRow {
@@ -4355,6 +4367,7 @@ fn tree_popup_model(session: &str, windows: &[WindowTreeEntry]) -> crate::popup:
                 summary: format!("{}  {}", pane.state, pane_tree_label(pane)),
                 last_changed: pane.agent_changed_at,
                 attachable: true,
+                pinned: false,
             });
         }
     }
@@ -4822,6 +4835,7 @@ fn apply_attention_popup_input_actions(
             }
             PopupInputAction::Enter => {}
             PopupInputAction::Open => {}
+            PopupInputAction::Pin => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(AttentionPopupInputResult::Close);
@@ -4951,6 +4965,7 @@ fn apply_tree_popup_input_actions(
                 };
             }
             PopupInputAction::Open => {}
+            PopupInputAction::Pin => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(TreePopupInputResult::Close);
@@ -5144,6 +5159,17 @@ fn apply_workspace_popup_input_actions(
                 };
                 return open_workspace_popup_row(socket, row);
             }
+            PopupInputAction::Pin => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                }
+                let Some(row) = state.selected_row(&model) else {
+                    return Ok(WorkspacePopupInputResult::Message(
+                        "no row selected".to_string(),
+                    ));
+                };
+                return toggle_workspace_popup_row_pin(row);
+            }
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(WorkspacePopupInputResult::Close);
@@ -5219,6 +5245,47 @@ fn open_workspace_popup_row(
         "live",
     );
     Ok(WorkspacePopupInputResult::SwitchSession { session })
+}
+
+fn toggle_workspace_popup_row_pin(
+    row: &crate::popup::PopupRow,
+) -> io::Result<WorkspacePopupInputResult> {
+    let registry_path = crate::paths::workspace_registry_path();
+    if row.id.starts_with("workspace:path:") {
+        let Some(path) = row.repo_path.as_ref() else {
+            return Ok(WorkspacePopupInputResult::Message(
+                "row has no workspace path".to_string(),
+            ));
+        };
+        let pinned = crate::registry::toggle_workspace_pin(&registry_path, path.clone())?;
+        Ok(WorkspacePopupInputResult::Message(pin_status_message(
+            pinned,
+            &path.display().to_string(),
+        )))
+    } else if row.id.starts_with("live:") || row.id.starts_with("previous:") {
+        let Some(target) = row.target.as_ref() else {
+            return Ok(WorkspacePopupInputResult::Message(
+                "row has no session".to_string(),
+            ));
+        };
+        let pinned = crate::registry::toggle_session_pin(&registry_path, &target.session)?;
+        Ok(WorkspacePopupInputResult::Message(pin_status_message(
+            pinned,
+            &target.session,
+        )))
+    } else {
+        Ok(WorkspacePopupInputResult::Message(
+            "only workspaces and sessions can be pinned".to_string(),
+        ))
+    }
+}
+
+fn pin_status_message(pinned: bool, label: &str) -> String {
+    if pinned {
+        format!("pinned {label}")
+    } else {
+        format!("unpinned {label}")
+    }
 }
 
 fn workspace_session_name_for_path(path: &Path, live_sessions: &[LiveWorkspaceSession]) -> String {
@@ -5459,6 +5526,7 @@ fn workspace_popup_model(
         summary: String::new(),
         last_changed: None,
         attachable: false,
+        pinned: false,
     }];
 
     rows.push(crate::popup::PopupRow {
@@ -5472,6 +5540,7 @@ fn workspace_popup_model(
         summary: String::new(),
         last_changed: None,
         attachable: false,
+        pinned: false,
     });
     if registry.workspaces.is_empty() {
         rows.push(workspace_disabled_row(
@@ -5479,14 +5548,23 @@ fn workspace_popup_model(
             "none",
             "",
             None,
+            false,
         ));
     } else {
-        rows.extend(registry.workspaces.iter().map(|record| {
+        let mut workspaces = registry.workspaces.clone();
+        workspaces.sort_by(|left, right| {
+            registry
+                .is_workspace_pinned(&right.path)
+                .cmp(&registry.is_workspace_pinned(&left.path))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        rows.extend(workspaces.iter().map(|record| {
             workspace_disabled_row(
                 &format!("workspace:path:{}", record.path.display()),
                 &record.path.display().to_string(),
                 "",
                 Some(record.path.clone()),
+                registry.is_workspace_pinned(&record.path),
             )
         }));
     }
@@ -5502,11 +5580,18 @@ fn workspace_popup_model(
         summary: String::new(),
         last_changed: None,
         attachable: false,
+        pinned: false,
     });
     if live_sessions.is_empty() {
-        rows.push(workspace_disabled_row("live:none", "none", "", None));
+        rows.push(workspace_disabled_row("live:none", "none", "", None, false));
     } else {
-        rows.extend(live_sessions.iter().map(|session| {
+        let mut live = live_sessions.to_vec();
+        live.sort_by(|left, right| {
+            registry
+                .is_session_pinned(&right.name)
+                .cmp(&registry.is_session_pinned(&left.name))
+        });
+        rows.extend(live.iter().map(|session| {
             let repo_path = registry
                 .sessions
                 .iter()
@@ -5536,6 +5621,7 @@ fn workspace_popup_model(
                 ),
                 last_changed: None,
                 attachable: true,
+                pinned: registry.is_session_pinned(&session.name),
             }
         }));
     }
@@ -5551,8 +5637,9 @@ fn workspace_popup_model(
         summary: String::new(),
         last_changed: None,
         attachable: false,
+        pinned: false,
     });
-    let previous = registry
+    let mut previous = registry
         .sessions
         .iter()
         .filter(|record| {
@@ -5561,8 +5648,19 @@ fn workspace_popup_model(
                 .any(|session| session.name == record.name)
         })
         .collect::<Vec<_>>();
+    previous.sort_by(|left, right| {
+        registry
+            .is_session_pinned(&right.name)
+            .cmp(&registry.is_session_pinned(&left.name))
+    });
     if previous.is_empty() {
-        rows.push(workspace_disabled_row("previous:none", "none", "", None));
+        rows.push(workspace_disabled_row(
+            "previous:none",
+            "none",
+            "",
+            None,
+            false,
+        ));
     } else {
         rows.extend(previous.into_iter().map(|record| crate::popup::PopupRow {
             id: format!("previous:{}", record.name),
@@ -5581,6 +5679,7 @@ fn workspace_popup_model(
             summary: format!("{} {}", record.state, record.path.display()),
             last_changed: Some(record.last_seen),
             attachable: false,
+            pinned: registry.is_session_pinned(&record.name),
         }));
     }
 
@@ -5592,6 +5691,7 @@ fn workspace_disabled_row(
     title: &str,
     summary: &str,
     repo_path: Option<PathBuf>,
+    pinned: bool,
 ) -> crate::popup::PopupRow {
     crate::popup::PopupRow {
         id: id.to_string(),
@@ -5604,6 +5704,7 @@ fn workspace_disabled_row(
         summary: summary.to_string(),
         last_changed: None,
         attachable: false,
+        pinned,
     }
 }
 
@@ -9200,6 +9301,7 @@ mod tests {
                     last_pane: None,
                 },
             ],
+            ..Default::default()
         };
         let live_sessions = vec![LiveWorkspaceSession {
             name: "live-dev".to_string(),
@@ -9240,10 +9342,88 @@ mod tests {
     }
 
     #[test]
+    fn workspace_popup_model_sorts_pinned_workspaces_first_and_marks_them() {
+        let registry = crate::registry::WorkspaceRegistry {
+            workspaces: vec![
+                crate::registry::WorkspaceRecord {
+                    path: PathBuf::from("/tmp/aaa"),
+                },
+                crate::registry::WorkspaceRecord {
+                    path: PathBuf::from("/tmp/zzz"),
+                },
+            ],
+            pinned_workspaces: vec![PathBuf::from("/tmp/zzz")],
+            ..Default::default()
+        };
+
+        let model = workspace_popup_model(&registry, &[]);
+
+        let paths = model
+            .rows
+            .iter()
+            .filter(|row| row.id.starts_with("workspace:path:"))
+            .map(|row| (row.repo_path.clone().unwrap(), row.pinned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                (PathBuf::from("/tmp/zzz"), true),
+                (PathBuf::from("/tmp/aaa"), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_popup_model_sorts_pinned_sessions_first_and_marks_them() {
+        let registry = crate::registry::WorkspaceRegistry {
+            pinned_sessions: vec!["zeta".to_string()],
+            ..Default::default()
+        };
+        let live_sessions = vec![
+            LiveWorkspaceSession {
+                name: "alpha".to_string(),
+                window_count: 1,
+                attached_count: 0,
+            },
+            LiveWorkspaceSession {
+                name: "zeta".to_string(),
+                window_count: 1,
+                attached_count: 0,
+            },
+        ];
+
+        let model = workspace_popup_model(&registry, &live_sessions);
+
+        let live = model
+            .rows
+            .iter()
+            .filter(|row| row.id.starts_with("live:"))
+            .map(|row| (row.id.clone(), row.pinned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            live,
+            vec![
+                ("live:zeta".to_string(), true),
+                ("live:alpha".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn popup_pin_key_maps_to_pin_action() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+        assert_eq!(
+            popup_actions_for_input(b"p", &mut state),
+            vec![PopupInputAction::Pin]
+        );
+    }
+
+    #[test]
     fn workspace_popup_filtered_render_hides_non_matching_rows() {
         let registry = crate::registry::WorkspaceRegistry {
             workspaces: Vec::new(),
             sessions: Vec::new(),
+            ..Default::default()
         };
         let live_sessions = vec![
             LiveWorkspaceSession {
@@ -9281,6 +9461,7 @@ mod tests {
                 last_window: None,
                 last_pane: None,
             }],
+            ..Default::default()
         };
         let live_sessions = vec![LiveWorkspaceSession {
             name: "live-dev".to_string(),
@@ -9352,6 +9533,7 @@ mod tests {
             summary: String::new(),
             last_changed: None,
             attachable: false,
+            pinned: false,
         };
         assert_eq!(
             workspace_session_name_for_previous(
@@ -9472,6 +9654,7 @@ mod tests {
                 summary: String::new(),
                 last_changed: None,
                 attachable: false,
+                pinned: false,
             },
             crate::popup::PopupRow {
                 id: "b".to_string(),
@@ -9490,6 +9673,7 @@ mod tests {
                 summary: String::new(),
                 last_changed: None,
                 attachable: false,
+                pinned: false,
             },
         ]);
         let mut state = crate::popup::PopupState::new(crate::popup::PopupMode::Attention);
