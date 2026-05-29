@@ -350,15 +350,18 @@ pub fn encode_attach_layout_frame(session: &str) -> String {
 pub struct ActiveTerminalModes {
     pub bracketed_paste: bool,
     pub focus_reporting: bool,
+    /// xterm `modifyOtherKeys` (resource 4) requested by the active pane.
+    pub modify_other_keys: bool,
 }
 
 /// Render the active-mode payload that follows the `ACTIVE_MODES\t` label in an
 /// attach layout snapshot. Keys are `key=value` pairs separated by tabs.
 pub fn encode_active_modes(modes: ActiveTerminalModes) -> String {
     format!(
-        "bracketed_paste={}\tfocus={}",
+        "bracketed_paste={}\tfocus={}\tmok={}",
         u8::from(modes.bracketed_paste),
-        u8::from(modes.focus_reporting)
+        u8::from(modes.focus_reporting),
+        u8::from(modes.modify_other_keys)
     )
 }
 
@@ -372,6 +375,7 @@ pub fn parse_active_modes(payload: &str) -> ActiveTerminalModes {
             match key {
                 "bracketed_paste" => modes.bracketed_paste = value == "1",
                 "focus" => modes.focus_reporting = value == "1",
+                "mok" => modes.modify_other_keys = value == "1",
                 _ => {}
             }
         }
@@ -2003,11 +2007,14 @@ mod tests {
     fn active_modes_round_trip() {
         for bracketed_paste in [false, true] {
             for focus_reporting in [false, true] {
-                let modes = ActiveTerminalModes {
-                    bracketed_paste,
-                    focus_reporting,
-                };
-                assert_eq!(parse_active_modes(&encode_active_modes(modes)), modes);
+                for modify_other_keys in [false, true] {
+                    let modes = ActiveTerminalModes {
+                        bracketed_paste,
+                        focus_reporting,
+                        modify_other_keys,
+                    };
+                    assert_eq!(parse_active_modes(&encode_active_modes(modes)), modes);
+                }
             }
         }
     }
@@ -2015,15 +2022,16 @@ mod tests {
     #[test]
     fn parse_active_modes_reads_known_keys_ignores_unknown_and_defaults_missing() {
         assert_eq!(
-            parse_active_modes("focus=1\tbracketed_paste=1\textkeys=kitty:5"),
+            parse_active_modes("focus=1\tbracketed_paste=1\tmok=1\tkitty=5"),
             ActiveTerminalModes {
                 bracketed_paste: true,
                 focus_reporting: true,
+                modify_other_keys: true,
             }
         );
         assert_eq!(parse_active_modes(""), ActiveTerminalModes::default());
         assert_eq!(
-            parse_active_modes("extkeys=1"),
+            parse_active_modes("kitty=1"),
             ActiveTerminalModes::default()
         );
     }

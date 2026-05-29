@@ -19,6 +19,11 @@ const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
 const DISABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004l";
 const ENABLE_FOCUS_REPORTING: &[u8] = b"\x1b[?1004h";
 const DISABLE_FOCUS_REPORTING: &[u8] = b"\x1b[?1004l";
+// Cap the outer terminal at modifyOtherKeys level 1: it disambiguates modified
+// "other" keys (Shift+Enter, etc.) without re-encoding keys that already have a
+// unique sequence, so dmux's own prefix (C-b) and bindings are unaffected.
+const ENABLE_MODIFY_OTHER_KEYS: &[u8] = b"\x1b[>4;1m";
+const DISABLE_MODIFY_OTHER_KEYS: &[u8] = b"\x1b[>4;0m";
 const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l";
 const EXIT_ALTERNATE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?1049l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
@@ -3209,11 +3214,13 @@ fn run_live_snapshot_attach(
     let mut mouse_mode = None;
     let mut bracketed_paste_mode: Option<BracketedPasteGuard> = None;
     let mut focus_reporting_mode: Option<FocusReportingGuard> = None;
+    let mut modify_other_keys_mode: Option<ModifyOtherKeysGuard> = None;
     sync_live_outer_terminal_modes(
         &mouse_focus_enabled,
         &mut mouse_mode,
         &mut bracketed_paste_mode,
         &mut focus_reporting_mode,
+        &mut modify_other_keys_mode,
         &frame,
     )?;
     let mut last_redraw = Instant::now();
@@ -3273,6 +3280,7 @@ fn run_live_snapshot_attach(
                                 &mut mouse_mode,
                                 &mut bracketed_paste_mode,
                                 &mut focus_reporting_mode,
+                                &mut modify_other_keys_mode,
                                 &frame,
                             )?;
                             reset_live_render_output_state(&mut render_output_state);
@@ -3320,6 +3328,7 @@ fn run_live_snapshot_attach(
                                 &mut mouse_mode,
                                 &mut bracketed_paste_mode,
                                 &mut focus_reporting_mode,
+                                &mut modify_other_keys_mode,
                                 &frame,
                             )?;
                             reset_live_render_output_state(&mut render_output_state);
@@ -3376,6 +3385,7 @@ fn run_live_snapshot_attach(
                                 &mut mouse_mode,
                                 &mut bracketed_paste_mode,
                                 &mut focus_reporting_mode,
+                                &mut modify_other_keys_mode,
                                 &frame,
                             )?;
                             reset_live_render_output_state(&mut render_output_state);
@@ -3404,6 +3414,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3438,6 +3449,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3464,6 +3476,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3489,6 +3502,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3517,6 +3531,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3564,6 +3579,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3587,6 +3603,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3613,6 +3630,7 @@ fn run_live_snapshot_attach(
                     &mut mouse_mode,
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
+                    &mut modify_other_keys_mode,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3637,6 +3655,7 @@ fn run_live_snapshot_attach(
                     &mut mouse_mode,
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
+                    &mut modify_other_keys_mode,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3670,6 +3689,7 @@ fn run_live_snapshot_attach(
                     &mut mouse_mode,
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
+                    &mut modify_other_keys_mode,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3701,6 +3721,7 @@ fn run_live_snapshot_attach(
                     &mut mouse_mode,
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
+                    &mut modify_other_keys_mode,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3725,6 +3746,7 @@ fn run_live_snapshot_attach(
                     &mut mouse_mode,
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
+                    &mut modify_other_keys_mode,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3758,6 +3780,7 @@ fn run_live_snapshot_attach(
                     &mut mouse_mode,
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
+                    &mut modify_other_keys_mode,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3780,6 +3803,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3801,6 +3825,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3824,6 +3849,7 @@ fn run_live_snapshot_attach(
                             &mut mouse_mode,
                             &mut bracketed_paste_mode,
                             &mut focus_reporting_mode,
+                            &mut modify_other_keys_mode,
                             &frame,
                         )?;
                         reset_live_render_output_state(&mut render_output_state);
@@ -3850,6 +3876,7 @@ fn run_live_snapshot_attach(
                     &mut mouse_mode,
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
+                    &mut modify_other_keys_mode,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3871,6 +3898,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3895,6 +3923,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     if command_prompt_message.is_some()
@@ -3914,6 +3943,7 @@ fn run_live_snapshot_attach(
                             &mut mouse_mode,
                             &mut bracketed_paste_mode,
                             &mut focus_reporting_mode,
+                            &mut modify_other_keys_mode,
                             &frame,
                         )?;
                         reset_live_render_output_state(&mut render_output_state);
@@ -3993,6 +4023,7 @@ fn run_live_snapshot_attach(
                         &mut mouse_mode,
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
+                        &mut modify_other_keys_mode,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -4063,16 +4094,36 @@ fn sync_live_focus_reporting(
     Ok(())
 }
 
+/// Reconcile the outer terminal's modifyOtherKeys mode to match the active
+/// pane. The outer terminal is capped at level 1 (see `ENABLE_MODIFY_OTHER_KEYS`),
+/// so modified "other" keys such as Shift+Enter arrive as `\x1b[27;mod;code~`
+/// and are forwarded verbatim to the pane, while dmux's own keys are unchanged.
+fn sync_live_modify_other_keys(
+    modify_other_keys_mode: &mut Option<ModifyOtherKeysGuard>,
+    frame: &LiveSnapshotFrame,
+) -> io::Result<()> {
+    if frame.active_modes.modify_other_keys {
+        if modify_other_keys_mode.is_none() {
+            *modify_other_keys_mode = Some(ModifyOtherKeysGuard::enable()?);
+        }
+    } else {
+        *modify_other_keys_mode = None;
+    }
+    Ok(())
+}
+
 fn sync_live_outer_terminal_modes(
     mouse_focus_enabled: &AtomicBool,
     mouse_mode: &mut Option<MouseModeGuard>,
     bracketed_paste_mode: &mut Option<BracketedPasteGuard>,
     focus_reporting_mode: &mut Option<FocusReportingGuard>,
+    modify_other_keys_mode: &mut Option<ModifyOtherKeysGuard>,
     frame: &LiveSnapshotFrame,
 ) -> io::Result<()> {
     sync_live_mouse_mode(mouse_focus_enabled, mouse_mode, frame)?;
     sync_live_bracketed_paste(bracketed_paste_mode, frame)?;
-    sync_live_focus_reporting(focus_reporting_mode, frame)
+    sync_live_focus_reporting(focus_reporting_mode, frame)?;
+    sync_live_modify_other_keys(modify_other_keys_mode, frame)
 }
 
 fn forward_live_snapshot_input(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
@@ -8236,6 +8287,25 @@ impl Drop for FocusReportingGuard {
     }
 }
 
+struct ModifyOtherKeysGuard;
+
+impl ModifyOtherKeysGuard {
+    fn enable() -> io::Result<Self> {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(ENABLE_MODIFY_OTHER_KEYS)?;
+        stdout.flush()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ModifyOtherKeysGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(DISABLE_MODIFY_OTHER_KEYS);
+        let _ = stdout.flush();
+    }
+}
+
 impl RawModeGuard {
     fn enable() -> Self {
         if !stdin_is_tty() {
@@ -8898,6 +8968,25 @@ mod tests {
             vec![LiveSnapshotInputAction::Forward(b"hello\n".to_vec())]
         );
         assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_forwards_modify_other_keys_encoding() {
+        let mut state = LiveSnapshotInputState::default();
+
+        // Shift+Enter under modifyOtherKeys: CSI 27 ; 2 ; 13 ~. It must reach the
+        // pane verbatim, and the prefix (C-b) must still be recognized rather
+        // than forwarded, so the two never get confused.
+        let actions = translate_live_snapshot_input(b"\x1b[27;2;13~", &mut state);
+        assert_eq!(
+            actions,
+            vec![LiveSnapshotInputAction::Forward(b"\x1b[27;2;13~".to_vec())]
+        );
+        assert!(!state.saw_prefix);
+
+        let actions = translate_live_snapshot_input(b"\x02", &mut state);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(state.saw_prefix);
     }
 
     #[test]

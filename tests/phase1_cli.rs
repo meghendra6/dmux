@@ -1008,6 +1008,36 @@ fn attach_enables_focus_reporting_when_active_pane_requests_it() {
 }
 
 #[test]
+fn attach_enables_modify_other_keys_when_active_pane_requests_it() {
+    let socket = unique_socket("attach-modify-other-keys");
+    let session = format!("attach-modify-other-keys-{}", std::process::id());
+    let command = "printf '\\033[>4;1mmok-ready\\n'; sleep 30";
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", command],
+    ));
+    // Gate on the pane processing the CSI > 4 ; 1 m before attaching so the
+    // first frame already carries mok=1 (no attach race).
+    let ready = poll_capture(&socket, &session, "mok-ready");
+    assert!(ready.contains("mok-ready"), "{ready:?}");
+
+    let mut child = spawn_attached_dmux_with_env(&socket, &["attach", "-t", &session], &[], &[]);
+    child.wait_for_stdout_contains_all(
+        &["\u{1b}[>4;1m"],
+        "modifyOtherKeys enabled on outer terminal",
+    );
+
+    child
+        .stdin_mut("modify other keys detach")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn save_buffer_text_stores_literal_text_and_lists_preview() {
     let socket = unique_socket("save-buffer-text");
     let session = format!("save-buffer-text-{}", std::process::id());
