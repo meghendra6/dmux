@@ -10,6 +10,7 @@ pub struct TerminalState {
     cursor_visible: bool,
     bracketed_paste: bool,
     focus_reporting: bool,
+    modify_other_keys: bool,
     synchronized_output: bool,
     scrollback: Scrollback,
     parser: vte::Parser,
@@ -48,6 +49,7 @@ impl TerminalState {
             cursor_visible: true,
             bracketed_paste: false,
             focus_reporting: false,
+            modify_other_keys: false,
             synchronized_output: false,
             scrollback: Scrollback::new(max_scrollback_lines),
             parser: vte::Parser::new(),
@@ -116,6 +118,10 @@ impl TerminalState {
 
     pub fn focus_reporting_enabled(&self) -> bool {
         self.focus_reporting
+    }
+
+    pub fn modify_other_keys_enabled(&self) -> bool {
+        self.modify_other_keys
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -198,6 +204,7 @@ impl TerminalState {
         self.cursor_visible = true;
         self.bracketed_paste = false;
         self.focus_reporting = false;
+        self.modify_other_keys = false;
         if self.synchronized_output {
             self.changes.synchronized_output_finished = true;
         }
@@ -297,6 +304,7 @@ impl vte::Perform for TerminalState {
         }
 
         match action {
+            'm' if intermediates.contains(&b'>') => self.apply_modify_other_keys(params),
             'm' => self.apply_sgr(params),
             'J' => {
                 let style = self.style;
@@ -461,6 +469,16 @@ impl vte::Perform for TerminalState {
 }
 
 impl TerminalState {
+    /// Handle `CSI > Pp ; Pv m`. We only track resource 4 (xterm
+    /// modifyOtherKeys); a value greater than zero enables it. Other `>` SGR
+    /// resources are ignored.
+    fn apply_modify_other_keys(&mut self, params: &vte::Params) {
+        let values = flat_params(params);
+        if values.first().copied() == Some(4) {
+            self.modify_other_keys = values.get(1).copied().unwrap_or(0) > 0;
+        }
+    }
+
     fn apply_private_modes(&mut self, params: &vte::Params, enabled: bool) {
         for mode in flat_params(params) {
             match (mode, enabled) {
@@ -1682,6 +1700,28 @@ mod tests {
         assert!(state.focus_reporting_enabled());
         state.apply_bytes(b"\x1b[?1004l");
         assert!(!state.focus_reporting_enabled());
+    }
+
+    #[test]
+    fn csi_gt_4_tracks_modify_other_keys() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        assert!(!state.modify_other_keys_enabled());
+        state.apply_bytes(b"\x1b[>4;1m");
+        assert!(state.modify_other_keys_enabled());
+        state.apply_bytes(b"\x1b[>4;2m");
+        assert!(state.modify_other_keys_enabled());
+        state.apply_bytes(b"\x1b[>4;0m");
+        assert!(!state.modify_other_keys_enabled());
+    }
+
+    #[test]
+    fn plain_sgr_does_not_set_modify_other_keys() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        // A normal SGR color sequence must not be mistaken for modifyOtherKeys.
+        state.apply_bytes(b"\x1b[4m");
+        assert!(!state.modify_other_keys_enabled());
     }
 
     #[test]
