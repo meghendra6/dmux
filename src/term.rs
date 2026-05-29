@@ -11,6 +11,8 @@ pub struct TerminalState {
     bracketed_paste: bool,
     focus_reporting: bool,
     modify_other_keys: bool,
+    kitty_keyboard_flags: u16,
+    kitty_keyboard_stack: Vec<u16>,
     synchronized_output: bool,
     scrollback: Scrollback,
     parser: vte::Parser,
@@ -30,6 +32,9 @@ pub struct TerminalChanges {
     pub synchronized_output_started: bool,
     pub synchronized_output_finished: bool,
     pub synchronized_output_active: bool,
+    /// Bytes to write back to the pane in response to a kitty keyboard query
+    /// (`CSI ? u`), reported so the server can answer on the pane's PTY.
+    pub kitty_query_reply: Option<String>,
 }
 
 impl TerminalChanges {
@@ -50,6 +55,8 @@ impl TerminalState {
             bracketed_paste: false,
             focus_reporting: false,
             modify_other_keys: false,
+            kitty_keyboard_flags: 0,
+            kitty_keyboard_stack: Vec::new(),
             synchronized_output: false,
             scrollback: Scrollback::new(max_scrollback_lines),
             parser: vte::Parser::new(),
@@ -122,6 +129,11 @@ impl TerminalState {
 
     pub fn modify_other_keys_enabled(&self) -> bool {
         self.modify_other_keys
+    }
+
+    /// Current effective kitty keyboard protocol flags (0 when disabled).
+    pub fn kitty_keyboard_flags(&self) -> u16 {
+        self.kitty_keyboard_flags
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -205,6 +217,8 @@ impl TerminalState {
         self.bracketed_paste = false;
         self.focus_reporting = false;
         self.modify_other_keys = false;
+        self.kitty_keyboard_flags = 0;
+        self.kitty_keyboard_stack.clear();
         if self.synchronized_output {
             self.changes.synchronized_output_finished = true;
         }
@@ -306,6 +320,10 @@ impl vte::Perform for TerminalState {
         match action {
             'm' if intermediates.contains(&b'>') => self.apply_modify_other_keys(params),
             'm' => self.apply_sgr(params),
+            'u' if intermediates.contains(&b'>') => self.push_kitty_keyboard(params),
+            'u' if intermediates.contains(&b'=') => self.set_kitty_keyboard(params),
+            'u' if intermediates.contains(&b'<') => self.pop_kitty_keyboard(params),
+            'u' if intermediates.contains(&b'?') => self.query_kitty_keyboard(),
             'J' => {
                 let style = self.style;
                 match first_param(params, 0) {
@@ -477,6 +495,31 @@ impl TerminalState {
         if values.first().copied() == Some(4) {
             self.modify_other_keys = values.get(1).copied().unwrap_or(0) > 0;
         }
+    }
+
+    /// `CSI > flags u`: push the current flags and switch to the new ones.
+    fn push_kitty_keyboard(&mut self, params: &vte::Params) {
+        let flags = first_param(params, 0) as u16;
+        self.kitty_keyboard_stack.push(self.kitty_keyboard_flags);
+        self.kitty_keyboard_flags = flags;
+    }
+
+    /// `CSI = flags ; mode u`: set the current flags in place.
+    fn set_kitty_keyboard(&mut self, params: &vte::Params) {
+        self.kitty_keyboard_flags = first_param(params, 0) as u16;
+    }
+
+    /// `CSI < number u`: pop `number` (default 1) entries off the stack.
+    fn pop_kitty_keyboard(&mut self, params: &vte::Params) {
+        let count = first_param(params, 1).max(1);
+        for _ in 0..count {
+            self.kitty_keyboard_flags = self.kitty_keyboard_stack.pop().unwrap_or(0);
+        }
+    }
+
+    /// `CSI ? u`: report the current flags back to the pane.
+    fn query_kitty_keyboard(&mut self) {
+        self.changes.kitty_query_reply = Some(format!("\x1b[?{}u", self.kitty_keyboard_flags));
     }
 
     fn apply_private_modes(&mut self, params: &vte::Params, enabled: bool) {
@@ -1722,6 +1765,41 @@ mod tests {
         // A normal SGR color sequence must not be mistaken for modifyOtherKeys.
         state.apply_bytes(b"\x1b[4m");
         assert!(!state.modify_other_keys_enabled());
+    }
+
+    #[test]
+    fn kitty_keyboard_push_set_and_pop_track_flags() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        assert_eq!(state.kitty_keyboard_flags(), 0);
+        state.apply_bytes(b"\x1b[>1u");
+        assert_eq!(state.kitty_keyboard_flags(), 1);
+        state.apply_bytes(b"\x1b[>5u");
+        assert_eq!(state.kitty_keyboard_flags(), 5);
+        state.apply_bytes(b"\x1b[=3u");
+        assert_eq!(state.kitty_keyboard_flags(), 3);
+        state.apply_bytes(b"\x1b[<1u");
+        assert_eq!(state.kitty_keyboard_flags(), 1);
+        state.apply_bytes(b"\x1b[<9u");
+        assert_eq!(state.kitty_keyboard_flags(), 0);
+    }
+
+    #[test]
+    fn kitty_keyboard_query_reports_current_flags() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        state.apply_bytes(b"\x1b[>5u");
+        let changes = state.apply_bytes(b"\x1b[?u");
+        assert_eq!(changes.kitty_query_reply.as_deref(), Some("\x1b[?5u"));
+    }
+
+    #[test]
+    fn plain_csi_u_without_marker_is_ignored() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        // A bare CSI u (no >/=/</? marker) must not touch kitty flags.
+        state.apply_bytes(b"\x1b[13u");
+        assert_eq!(state.kitty_keyboard_flags(), 0);
     }
 
     #[test]

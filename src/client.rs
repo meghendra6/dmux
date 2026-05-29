@@ -1599,6 +1599,71 @@ enum ParsedInputKey {
     Incomplete,
 }
 
+/// If `input` begins with the kitty (`CSI code;mod[:event] u`) or
+/// modifyOtherKeys (`CSI 27;mod;code ~`) press-encoding of the dmux prefix,
+/// return the byte length of that sequence. Only meaningful for a Ctrl+letter
+/// prefix, which is the only kind the legacy byte check (0x01..=0x1a) can't see
+/// once the active pane has enabled an extended-key protocol.
+fn extended_prefix_len(input: &[u8], prefix: u8) -> Option<usize> {
+    if !(1..=26).contains(&prefix) {
+        return None;
+    }
+    let letter = u32::from(prefix) + 96; // 0x02 (C-b) -> 'b' (98)
+    let rest = input.strip_prefix(b"\x1b[")?;
+    let terminator = rest.iter().position(|byte| (0x40..=0x7e).contains(byte))?;
+    let body = std::str::from_utf8(&rest[..terminator]).ok()?;
+    let matches = match rest[terminator] {
+        b'u' => kitty_sequence_is_ctrl_letter(body, letter),
+        b'~' => modify_other_keys_sequence_is_ctrl_letter(body, letter),
+        _ => false,
+    };
+    matches.then_some(2 + terminator + 1)
+}
+
+fn kitty_sequence_is_ctrl_letter(body: &str, letter: u32) -> bool {
+    // <code>[:alternates][;<modifier>[:<event>]]
+    let (main, event) = match body.rsplit_once(':') {
+        Some((head, tail)) if tail.bytes().all(|b| b.is_ascii_digit()) && head.contains(';') => {
+            (head, Some(tail))
+        }
+        _ => (body, None),
+    };
+    if event == Some("3") {
+        return false; // key release, not a prefix press
+    }
+    let (key_part, modifier_part) = main.rsplit_once(';').unwrap_or((main, "1"));
+    let Some(modifier) = modifier_part
+        .parse::<u8>()
+        .ok()
+        .and_then(|m| m.checked_sub(1))
+    else {
+        return false;
+    };
+    let codepoint = key_part
+        .split(':')
+        .next()
+        .and_then(|f| f.parse::<u32>().ok());
+    codepoint == Some(letter) && modifier == 0b0000_0100
+}
+
+fn modify_other_keys_sequence_is_ctrl_letter(body: &str, letter: u32) -> bool {
+    // 27;<modifier>;<code>
+    let Some(rest) = body.strip_prefix("27;") else {
+        return false;
+    };
+    let Some((modifier_part, code_part)) = rest.split_once(';') else {
+        return false;
+    };
+    let Some(modifier) = modifier_part
+        .parse::<u8>()
+        .ok()
+        .and_then(|m| m.checked_sub(1))
+    else {
+        return false;
+    };
+    code_part.parse::<u32>().ok() == Some(letter) && modifier == 0b0000_0100
+}
+
 fn parse_input_key(input: &[u8]) -> ParsedInputKey {
     let Some(byte) = input.first().copied() else {
         return ParsedInputKey::Incomplete;
@@ -2297,6 +2362,7 @@ fn translate_live_snapshot_input_with_mouse(
         input,
         state,
         mouse_focus_enabled,
+        false,
         &LiveControls::default(),
     )
 }
@@ -2305,6 +2371,7 @@ fn translate_live_snapshot_input_with_mouse_and_controls(
     input: &[u8],
     state: &mut LiveSnapshotInputState,
     mouse_focus_enabled: bool,
+    extended_keys_active: bool,
     controls: &LiveControls,
 ) -> Vec<LiveSnapshotInputAction> {
     let mut bytes = Vec::new();
@@ -2471,6 +2538,18 @@ fn translate_live_snapshot_input_with_mouse_and_controls(
                     state.mouse_pending.extend_from_slice(&bytes[offset..]);
                     break;
                 }
+            }
+        }
+
+        if extended_keys_active && byte == 0x1b {
+            if let Some(consumed) = extended_prefix_len(&bytes[offset..], controls.prefix) {
+                // The active pane enabled an extended-key protocol, so the
+                // prefix arrives re-encoded (e.g. C-b as `CSI 98;5u`). Consume it
+                // as the prefix; every other key falls through and is forwarded
+                // to the pane verbatim in its extended encoding.
+                state.saw_prefix = true;
+                offset += consumed;
+                continue;
             }
         }
 
@@ -2758,6 +2837,7 @@ fn spawn_live_snapshot_input_thread(
     socket: PathBuf,
     session: String,
     mouse_focus_enabled: Arc<AtomicBool>,
+    extended_keys_active: Arc<AtomicBool>,
     input_active: Arc<AtomicBool>,
     initial_input: Vec<u8>,
     sender: mpsc::Sender<LiveSnapshotInputEvent>,
@@ -2772,6 +2852,7 @@ fn spawn_live_snapshot_input_thread(
             &initial_input,
             &mut input_state,
             mouse_enabled,
+            extended_keys_active.load(Ordering::SeqCst),
             &controls,
         );
         if !send_live_snapshot_input_actions(
@@ -2781,6 +2862,7 @@ fn spawn_live_snapshot_input_thread(
             &mut stdin,
             &mut input_state,
             &mouse_focus_enabled,
+            &extended_keys_active,
             &mut controls,
             actions,
         ) {
@@ -2799,6 +2881,7 @@ fn spawn_live_snapshot_input_thread(
                     &mut stdin,
                     &mut input_state,
                     &mouse_focus_enabled,
+                    &extended_keys_active,
                     &mut controls,
                     vec![action],
                 ) {
@@ -2843,6 +2926,7 @@ fn spawn_live_snapshot_input_thread(
                 &buf[..n],
                 &mut input_state,
                 mouse_enabled,
+                extended_keys_active.load(Ordering::SeqCst),
                 &controls,
             );
             if !send_live_snapshot_input_actions(
@@ -2852,6 +2936,7 @@ fn spawn_live_snapshot_input_thread(
                 &mut stdin,
                 &mut input_state,
                 &mouse_focus_enabled,
+                &extended_keys_active,
                 &mut controls,
                 actions,
             ) {
@@ -2868,6 +2953,7 @@ fn send_live_snapshot_input_actions<R: Read>(
     stdin: &mut R,
     input_state: &mut LiveSnapshotInputState,
     mouse_focus_enabled: &Arc<AtomicBool>,
+    extended_keys_active: &Arc<AtomicBool>,
     controls: &mut LiveControls,
     actions: Vec<LiveSnapshotInputAction>,
 ) -> bool {
@@ -2909,6 +2995,7 @@ fn send_live_snapshot_input_actions<R: Read>(
                         &trailing_input,
                         input_state,
                         mouse_enabled,
+                        extended_keys_active.load(Ordering::SeqCst),
                         controls,
                     );
                     if !send_live_snapshot_input_actions(
@@ -2918,6 +3005,7 @@ fn send_live_snapshot_input_actions<R: Read>(
                         stdin,
                         input_state,
                         mouse_focus_enabled,
+                        extended_keys_active,
                         controls,
                         actions,
                     ) {
@@ -3195,12 +3283,14 @@ fn run_live_snapshot_attach(
     on_resize: &mut impl FnMut(PtySize) -> io::Result<()>,
 ) -> io::Result<LiveAttachExit> {
     let mouse_focus_enabled = Arc::new(AtomicBool::new(false));
+    let extended_keys_active = Arc::new(AtomicBool::new(false));
     let input_active = Arc::new(AtomicBool::new(true));
     let (sender, input) = mpsc::channel();
     spawn_live_snapshot_input_thread(
         socket.to_path_buf(),
         session.to_string(),
         Arc::clone(&mouse_focus_enabled),
+        Arc::clone(&extended_keys_active),
         Arc::clone(&input_active),
         initial_input,
         sender.clone(),
@@ -3215,12 +3305,15 @@ fn run_live_snapshot_attach(
     let mut bracketed_paste_mode: Option<BracketedPasteGuard> = None;
     let mut focus_reporting_mode: Option<FocusReportingGuard> = None;
     let mut modify_other_keys_mode: Option<ModifyOtherKeysGuard> = None;
+    let mut kitty_keyboard_mode: Option<KittyKeyboardGuard> = None;
     sync_live_outer_terminal_modes(
         &mouse_focus_enabled,
         &mut mouse_mode,
         &mut bracketed_paste_mode,
         &mut focus_reporting_mode,
         &mut modify_other_keys_mode,
+        &mut kitty_keyboard_mode,
+        &extended_keys_active,
         &frame,
     )?;
     let mut last_redraw = Instant::now();
@@ -3281,6 +3374,8 @@ fn run_live_snapshot_attach(
                                 &mut bracketed_paste_mode,
                                 &mut focus_reporting_mode,
                                 &mut modify_other_keys_mode,
+                                &mut kitty_keyboard_mode,
+                                &extended_keys_active,
                                 &frame,
                             )?;
                             reset_live_render_output_state(&mut render_output_state);
@@ -3329,6 +3424,8 @@ fn run_live_snapshot_attach(
                                 &mut bracketed_paste_mode,
                                 &mut focus_reporting_mode,
                                 &mut modify_other_keys_mode,
+                                &mut kitty_keyboard_mode,
+                                &extended_keys_active,
                                 &frame,
                             )?;
                             reset_live_render_output_state(&mut render_output_state);
@@ -3386,6 +3483,8 @@ fn run_live_snapshot_attach(
                                 &mut bracketed_paste_mode,
                                 &mut focus_reporting_mode,
                                 &mut modify_other_keys_mode,
+                                &mut kitty_keyboard_mode,
+                                &extended_keys_active,
                                 &frame,
                             )?;
                             reset_live_render_output_state(&mut render_output_state);
@@ -3415,6 +3514,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3450,6 +3551,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3477,6 +3580,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3503,6 +3608,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3532,6 +3639,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3580,6 +3689,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3604,6 +3715,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3631,6 +3744,8 @@ fn run_live_snapshot_attach(
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
                     &mut modify_other_keys_mode,
+                    &mut kitty_keyboard_mode,
+                    &extended_keys_active,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3656,6 +3771,8 @@ fn run_live_snapshot_attach(
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
                     &mut modify_other_keys_mode,
+                    &mut kitty_keyboard_mode,
+                    &extended_keys_active,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3690,6 +3807,8 @@ fn run_live_snapshot_attach(
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
                     &mut modify_other_keys_mode,
+                    &mut kitty_keyboard_mode,
+                    &extended_keys_active,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3722,6 +3841,8 @@ fn run_live_snapshot_attach(
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
                     &mut modify_other_keys_mode,
+                    &mut kitty_keyboard_mode,
+                    &extended_keys_active,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3747,6 +3868,8 @@ fn run_live_snapshot_attach(
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
                     &mut modify_other_keys_mode,
+                    &mut kitty_keyboard_mode,
+                    &extended_keys_active,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3781,6 +3904,8 @@ fn run_live_snapshot_attach(
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
                     &mut modify_other_keys_mode,
+                    &mut kitty_keyboard_mode,
+                    &extended_keys_active,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3804,6 +3929,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3826,6 +3953,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3850,6 +3979,8 @@ fn run_live_snapshot_attach(
                             &mut bracketed_paste_mode,
                             &mut focus_reporting_mode,
                             &mut modify_other_keys_mode,
+                            &mut kitty_keyboard_mode,
+                            &extended_keys_active,
                             &frame,
                         )?;
                         reset_live_render_output_state(&mut render_output_state);
@@ -3877,6 +4008,8 @@ fn run_live_snapshot_attach(
                     &mut bracketed_paste_mode,
                     &mut focus_reporting_mode,
                     &mut modify_other_keys_mode,
+                    &mut kitty_keyboard_mode,
+                    &extended_keys_active,
                     &frame,
                 )?;
                 reset_live_render_output_state(&mut render_output_state);
@@ -3899,6 +4032,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -3924,6 +4059,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     if command_prompt_message.is_some()
@@ -3944,6 +4081,8 @@ fn run_live_snapshot_attach(
                             &mut bracketed_paste_mode,
                             &mut focus_reporting_mode,
                             &mut modify_other_keys_mode,
+                            &mut kitty_keyboard_mode,
+                            &extended_keys_active,
                             &frame,
                         )?;
                         reset_live_render_output_state(&mut render_output_state);
@@ -4024,6 +4163,8 @@ fn run_live_snapshot_attach(
                         &mut bracketed_paste_mode,
                         &mut focus_reporting_mode,
                         &mut modify_other_keys_mode,
+                        &mut kitty_keyboard_mode,
+                        &extended_keys_active,
                         &frame,
                     )?;
                     reset_live_render_output_state(&mut render_output_state);
@@ -4112,18 +4253,47 @@ fn sync_live_modify_other_keys(
     Ok(())
 }
 
+/// Reconcile the outer terminal's kitty keyboard flags to match the active
+/// pane. On a flag change we pop the old push and push the new flags, so the
+/// outer terminal encodes keys exactly as the active pane requested.
+fn sync_live_kitty_keyboard(
+    kitty_keyboard_mode: &mut Option<KittyKeyboardGuard>,
+    frame: &LiveSnapshotFrame,
+) -> io::Result<()> {
+    let want = frame.active_modes.kitty_keyboard_flags;
+    let have = kitty_keyboard_mode.as_ref().map(|guard| guard.flags);
+    if have != (want > 0).then_some(want) {
+        // Drop first so the old flags are popped before the new push.
+        *kitty_keyboard_mode = None;
+        if want > 0 {
+            *kitty_keyboard_mode = Some(KittyKeyboardGuard::enable(want)?);
+        }
+    }
+    Ok(())
+}
+
 fn sync_live_outer_terminal_modes(
     mouse_focus_enabled: &AtomicBool,
     mouse_mode: &mut Option<MouseModeGuard>,
     bracketed_paste_mode: &mut Option<BracketedPasteGuard>,
     focus_reporting_mode: &mut Option<FocusReportingGuard>,
     modify_other_keys_mode: &mut Option<ModifyOtherKeysGuard>,
+    kitty_keyboard_mode: &mut Option<KittyKeyboardGuard>,
+    extended_keys_active: &AtomicBool,
     frame: &LiveSnapshotFrame,
 ) -> io::Result<()> {
     sync_live_mouse_mode(mouse_focus_enabled, mouse_mode, frame)?;
     sync_live_bracketed_paste(bracketed_paste_mode, frame)?;
     sync_live_focus_reporting(focus_reporting_mode, frame)?;
-    sync_live_modify_other_keys(modify_other_keys_mode, frame)
+    sync_live_modify_other_keys(modify_other_keys_mode, frame)?;
+    sync_live_kitty_keyboard(kitty_keyboard_mode, frame)?;
+    // Tell the input thread whether to decode the extended-key encoding of the
+    // dmux prefix. False (the common case) leaves the input path byte-identical.
+    extended_keys_active.store(
+        frame.active_modes.modify_other_keys || frame.active_modes.kitty_keyboard_flags > 0,
+        Ordering::SeqCst,
+    );
+    Ok(())
 }
 
 fn forward_live_snapshot_input(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
@@ -8306,6 +8476,30 @@ impl Drop for ModifyOtherKeysGuard {
     }
 }
 
+/// Pushes the active pane's kitty keyboard flags onto the outer terminal with
+/// `CSI > flags u` and pops them with `CSI < u` on drop, so the outer terminal
+/// encodes keys the way the active pane expects only while attached.
+struct KittyKeyboardGuard {
+    flags: u16,
+}
+
+impl KittyKeyboardGuard {
+    fn enable(flags: u16) -> io::Result<Self> {
+        let mut stdout = io::stdout().lock();
+        write!(stdout, "\x1b[>{flags}u")?;
+        stdout.flush()?;
+        Ok(Self { flags })
+    }
+}
+
+impl Drop for KittyKeyboardGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(b"\x1b[<u");
+        let _ = stdout.flush();
+    }
+}
+
 impl RawModeGuard {
     fn enable() -> Self {
         if !stdin_is_tty() {
@@ -8990,6 +9184,78 @@ mod tests {
     }
 
     #[test]
+    fn extended_prefix_len_recognizes_kitty_and_mok_ctrl_b() {
+        // C-b is the default prefix (0x02 -> 'b' = codepoint 98, ctrl = mod 5).
+        assert_eq!(extended_prefix_len(b"\x1b[98;5u", 0x02), Some(7));
+        assert_eq!(extended_prefix_len(b"\x1b[98;5:1u", 0x02), Some(9)); // explicit press
+        assert_eq!(extended_prefix_len(b"\x1b[27;5;98~", 0x02), Some(10)); // modifyOtherKeys
+        // Trailing bytes after the sequence are not consumed.
+        assert_eq!(extended_prefix_len(b"\x1b[98;5urest", 0x02), Some(7));
+    }
+
+    #[test]
+    fn extended_prefix_len_rejects_non_prefix_sequences() {
+        // Shift+Enter (codepoint 13, shift) is not the prefix.
+        assert_eq!(extended_prefix_len(b"\x1b[13;2u", 0x02), None);
+        // Key release of C-b must not count as a prefix press.
+        assert_eq!(extended_prefix_len(b"\x1b[98;5:3u", 0x02), None);
+        // Plain C-b without ctrl modifier (shift only) is not the prefix.
+        assert_eq!(extended_prefix_len(b"\x1b[98;2u", 0x02), None);
+        // A different ctrl letter is not the C-b prefix.
+        assert_eq!(extended_prefix_len(b"\x1b[97;5u", 0x02), None);
+        // Incomplete sequence yields no match (caller buffers and retries).
+        assert_eq!(extended_prefix_len(b"\x1b[98;5", 0x02), None);
+    }
+
+    #[test]
+    fn live_snapshot_input_recognizes_kitty_prefix_only_when_extended_active() {
+        let controls = LiveControls::default();
+
+        // With extended keys active, the kitty-encoded prefix sets saw_prefix and
+        // is consumed (not forwarded), while Shift+Enter forwards verbatim.
+        let mut state = LiveSnapshotInputState::default();
+        let actions = translate_live_snapshot_input_with_mouse_and_controls(
+            b"\x1b[98;5u",
+            &mut state,
+            true,
+            true,
+            &controls,
+        );
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(state.saw_prefix);
+
+        let mut state = LiveSnapshotInputState::default();
+        let actions = translate_live_snapshot_input_with_mouse_and_controls(
+            b"\x1b[13;2u",
+            &mut state,
+            true,
+            true,
+            &controls,
+        );
+        assert_eq!(
+            actions,
+            vec![LiveSnapshotInputAction::Forward(b"\x1b[13;2u".to_vec())]
+        );
+        assert!(!state.saw_prefix);
+
+        // With extended keys inactive (the default), the same bytes are forwarded
+        // verbatim and never mistaken for the prefix.
+        let mut state = LiveSnapshotInputState::default();
+        let actions = translate_live_snapshot_input_with_mouse_and_controls(
+            b"\x1b[98;5u",
+            &mut state,
+            true,
+            false,
+            &controls,
+        );
+        assert_eq!(
+            actions,
+            vec![LiveSnapshotInputAction::Forward(b"\x1b[98;5u".to_vec())]
+        );
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
     fn live_snapshot_input_emits_mouse_press_and_trailing_bytes() {
         let mut state = LiveSnapshotInputState::default();
 
@@ -9214,7 +9480,7 @@ mod tests {
 
         assert_eq!(
             translate_live_snapshot_input_with_mouse_and_controls(
-                b"\x02m", &mut state, true, &controls
+                b"\x02m", &mut state, true, false, &controls
             ),
             vec![LiveSnapshotInputAction::Forward(b"\x02m".to_vec())]
         );
@@ -9223,6 +9489,7 @@ mod tests {
                 b"\x01mrest",
                 &mut state,
                 true,
+                false,
                 &controls
             ),
             vec![LiveSnapshotInputAction::EnterCopyMode {
@@ -9244,7 +9511,7 @@ mod tests {
 
         assert_eq!(
             translate_live_snapshot_input_with_mouse_and_controls(
-                b"\x01x", &mut state, true, &controls
+                b"\x01x", &mut state, true, false, &controls
             ),
             vec![LiveSnapshotInputAction::Forward(vec![0x01])]
         );
@@ -9257,7 +9524,7 @@ mod tests {
 
         assert_eq!(
             translate_live_snapshot_input_with_mouse_and_controls(
-                b"\x02d", &mut state, true, &controls
+                b"\x02d", &mut state, true, false, &controls
             ),
             vec![LiveSnapshotInputAction::Forward(b"\x02d".to_vec())]
         );
@@ -9266,6 +9533,7 @@ mod tests {
                 b"\x02\x02",
                 &mut state,
                 true,
+                false,
                 &controls
             ),
             vec![LiveSnapshotInputAction::Forward(b"\x02\x02".to_vec())]
@@ -9478,6 +9746,7 @@ mod tests {
             b"\x02:set-option prefix C-a\n\x01%",
             &mut state,
             true,
+            false,
             &controls,
         );
 
@@ -9501,6 +9770,7 @@ mod tests {
                 b"\x01%",
                 &mut state,
                 true,
+                false,
                 &updated_controls,
             ),
             vec![LiveSnapshotInputAction::PaneCommand(

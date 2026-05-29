@@ -352,16 +352,20 @@ pub struct ActiveTerminalModes {
     pub focus_reporting: bool,
     /// xterm `modifyOtherKeys` (resource 4) requested by the active pane.
     pub modify_other_keys: bool,
+    /// Current kitty keyboard protocol flags requested by the active pane
+    /// (0 when disabled).
+    pub kitty_keyboard_flags: u16,
 }
 
 /// Render the active-mode payload that follows the `ACTIVE_MODES\t` label in an
 /// attach layout snapshot. Keys are `key=value` pairs separated by tabs.
 pub fn encode_active_modes(modes: ActiveTerminalModes) -> String {
     format!(
-        "bracketed_paste={}\tfocus={}\tmok={}",
+        "bracketed_paste={}\tfocus={}\tmok={}\tkitty={}",
         u8::from(modes.bracketed_paste),
         u8::from(modes.focus_reporting),
-        u8::from(modes.modify_other_keys)
+        u8::from(modes.modify_other_keys),
+        modes.kitty_keyboard_flags
     )
 }
 
@@ -376,6 +380,7 @@ pub fn parse_active_modes(payload: &str) -> ActiveTerminalModes {
                 "bracketed_paste" => modes.bracketed_paste = value == "1",
                 "focus" => modes.focus_reporting = value == "1",
                 "mok" => modes.modify_other_keys = value == "1",
+                "kitty" => modes.kitty_keyboard_flags = value.parse().unwrap_or(0),
                 _ => {}
             }
         }
@@ -2008,12 +2013,15 @@ mod tests {
         for bracketed_paste in [false, true] {
             for focus_reporting in [false, true] {
                 for modify_other_keys in [false, true] {
-                    let modes = ActiveTerminalModes {
-                        bracketed_paste,
-                        focus_reporting,
-                        modify_other_keys,
-                    };
-                    assert_eq!(parse_active_modes(&encode_active_modes(modes)), modes);
+                    for kitty_keyboard_flags in [0u16, 1, 5, 29] {
+                        let modes = ActiveTerminalModes {
+                            bracketed_paste,
+                            focus_reporting,
+                            modify_other_keys,
+                            kitty_keyboard_flags,
+                        };
+                        assert_eq!(parse_active_modes(&encode_active_modes(modes)), modes);
+                    }
                 }
             }
         }
@@ -2027,11 +2035,12 @@ mod tests {
                 bracketed_paste: true,
                 focus_reporting: true,
                 modify_other_keys: true,
+                kitty_keyboard_flags: 5,
             }
         );
         assert_eq!(parse_active_modes(""), ActiveTerminalModes::default());
         assert_eq!(
-            parse_active_modes("kitty=1"),
+            parse_active_modes("unknown=1"),
             ActiveTerminalModes::default()
         );
     }
