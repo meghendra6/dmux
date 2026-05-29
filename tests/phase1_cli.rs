@@ -948,6 +948,59 @@ fn paste_buffer_wraps_text_when_pane_enables_bracketed_paste() {
 }
 
 #[test]
+fn pane_switch_synthesizes_focus_events_for_focus_reporting_pane() {
+    let socket = unique_socket("focus-switch");
+    let session = format!("focus-switch-{}", std::process::id());
+    let file = unique_temp_file("focus-switch");
+    let _ = std::fs::remove_file(&file);
+    // Pane 0 enables focus reporting and records every byte it receives.
+    let a_cmd = format!(
+        "printf '\\033[?1004hfocus-a-ready\\n'; stty raw -echo; cat > {}",
+        file.display()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", &a_cmd],
+    ));
+    let ready = poll_capture(&socket, &session, "focus-a-ready");
+    assert!(ready.contains("focus-a-ready"), "{ready:?}");
+    // Pane 1 is a plain pane that does not request focus reporting.
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-h",
+            "--",
+            "sh",
+            "-c",
+            "sleep 30",
+        ],
+    ));
+
+    // Select pane 0 (A): it becomes active and, having requested focus
+    // reporting, receives focus-in (ESC [ I).
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert!(
+        poll_file_contains(&file, "\u{1b}[I"),
+        "focus-in not delivered to focus-reporting pane"
+    );
+
+    // Select pane 1 (B): A loses focus and receives focus-out (ESC [ O).
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "1"]));
+    assert!(
+        poll_file_contains(&file, "\u{1b}[O"),
+        "focus-out not delivered to focus-reporting pane"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn attach_enables_bracketed_paste_when_active_pane_requests_it() {
     let socket = unique_socket("attach-bracketed-paste");
     let session = format!("attach-bracketed-paste-{}", std::process::id());
