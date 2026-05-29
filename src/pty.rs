@@ -3,8 +3,20 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::raw::{c_char, c_int, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// The server's control socket path, captured once at startup so forked PTY
+/// children can advertise it (and their pane id) via the `DMUX` environment
+/// variable. Set before any fork, so children inherit it.
+static SOCKET_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the server's socket path for child-environment advertisement.
+/// Call once at server startup, before spawning any pane.
+pub fn set_socket_path(path: PathBuf) {
+    let _ = SOCKET_PATH.set(path);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
@@ -31,6 +43,7 @@ pub struct SpawnSpec {
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub size: PtySize,
+    pub pane_id: usize,
 }
 
 impl SpawnSpec {
@@ -46,8 +59,21 @@ impl SpawnSpec {
             command,
             cwd,
             size: PtySize { cols: 80, rows: 24 },
+            pane_id: 0,
         }
     }
+}
+
+/// Environment variables that identify the multiplexer and the pane to the
+/// child, mirroring tmux's `$TMUX`/`$TMUX_PANE`. Shell-integration scripts and
+/// agent hooks use these to detect that they run inside dmux and which pane
+/// they own. Pure so it can be unit-tested without a fork.
+fn pane_identity_env(pane_id: usize, socket: Option<&Path>) -> Vec<(&'static str, String)> {
+    let mut vars = vec![("DMUX_PANE", format!("%{pane_id}"))];
+    if let Some(socket) = socket {
+        vars.push(("DMUX", format!("{},%{pane_id}", socket.display())));
+    }
+    vars
 }
 
 pub struct PtyProcess {
@@ -226,7 +252,7 @@ pub fn resize(master: &File, size: PtySize) -> io::Result<()> {
 
 fn child_exec(spec: &SpawnSpec) -> ! {
     let _ = std::env::set_current_dir(&spec.cwd);
-    configure_child_terminal_environment();
+    configure_child_terminal_environment(spec);
 
     let args = spec
         .command
@@ -252,13 +278,18 @@ fn child_exec(spec: &SpawnSpec) -> ! {
     }
 }
 
-fn configure_child_terminal_environment() {
+fn configure_child_terminal_environment(spec: &SpawnSpec) {
     // The PTY child should see dmux's terminal capabilities, not the launching
     // process's terminal. A weak inherited TERM such as "dumb" causes full-screen
     // programs to choose degraded color output.
     unsafe {
         std::env::set_var("TERM", "xterm-256color");
         std::env::set_var("COLORTERM", "truecolor");
+    }
+    for (key, value) in pane_identity_env(spec.pane_id, SOCKET_PATH.get().map(PathBuf::as_path)) {
+        unsafe {
+            std::env::set_var(key, value);
+        }
     }
 }
 
@@ -332,5 +363,24 @@ mod tests {
             PtySize::new(80, 24).unwrap(),
             PtySize { cols: 80, rows: 24 }
         );
+    }
+
+    #[test]
+    fn pane_identity_env_advertises_pane_and_socket() {
+        let socket = PathBuf::from("/tmp/dmux.sock");
+        let vars = pane_identity_env(3, Some(&socket));
+        assert_eq!(
+            vars,
+            vec![
+                ("DMUX_PANE", "%3".to_string()),
+                ("DMUX", "/tmp/dmux.sock,%3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn pane_identity_env_omits_socket_when_unknown() {
+        let vars = pane_identity_env(0, None);
+        assert_eq!(vars, vec![("DMUX_PANE", "%0".to_string())]);
     }
 }

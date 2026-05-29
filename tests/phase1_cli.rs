@@ -1097,6 +1097,35 @@ fn kitty_keyboard_query_is_answered_on_the_pane() {
 }
 
 #[test]
+fn spawned_pane_advertises_dmux_env_vars() {
+    let socket = unique_socket("pane-env");
+    let session = format!("pane-env-{}", std::process::id());
+    let file = unique_temp_file("pane-env");
+    let _ = std::fs::remove_file(&file);
+    let command = format!(
+        "printf 'pane=%s dmux=%s\\n' \"$DMUX_PANE\" \"$DMUX\" > {}; sleep 30",
+        file.display()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", &command],
+    ));
+
+    // The child shell sees DMUX_PANE=%<id> and DMUX=<socket>,%<id>.
+    assert!(poll_file_contains(&file, "pane=%"), "DMUX_PANE not set");
+    let contents = std::fs::read_to_string(&file).unwrap_or_default();
+    assert!(
+        contents.contains(&format!("dmux={}", socket.display())),
+        "DMUX missing socket path: {contents:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn save_buffer_text_stores_literal_text_and_lists_preview() {
     let socket = unique_socket("save-buffer-text");
     let session = format!("save-buffer-text-{}", std::process::id());

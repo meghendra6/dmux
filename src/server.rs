@@ -96,6 +96,10 @@ pub fn run(socket_path: PathBuf) -> io::Result<()> {
         std::fs::remove_file(&socket_path)?;
     }
 
+    // Record the socket so PTY children can advertise it via $DMUX (set before
+    // any pane is spawned/forked).
+    pty::set_socket_path(socket_path.clone());
+
     let listener = UnixListener::bind(&socket_path)?;
     let state = Arc::new(ServerState {
         sessions: Mutex::new(HashMap::new()),
@@ -2902,6 +2906,7 @@ fn spawn_pane(
 ) -> io::Result<Arc<Pane>> {
     let mut spec = SpawnSpec::new(session_name, command, cwd);
     spec.size = size;
+    spec.pane_id = id.as_usize();
     let process = pty::spawn(&spec)?;
     let reader = process.master.try_clone()?;
     let pane = Arc::new(Pane {
