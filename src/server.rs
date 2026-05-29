@@ -4936,6 +4936,7 @@ fn session_active_terminal_modes(session: &Session) -> crate::protocol::ActiveTe
         bracketed_paste: terminal.bracketed_paste_enabled(),
         focus_reporting: terminal.focus_reporting_enabled(),
         modify_other_keys: terminal.modify_other_keys_enabled(),
+        kitty_keyboard_flags: terminal.kitty_keyboard_flags(),
     }
 }
 
@@ -6142,6 +6143,9 @@ fn publish_pane_output(pane: &Arc<Pane>, bytes: &[u8]) {
     }
     append_history(&pane.raw_history, bytes);
     let terminal_changes = pane.terminal.lock().unwrap().apply_bytes(bytes);
+    if let Some(reply) = terminal_changes.kitty_query_reply.as_ref() {
+        let _ = pane.writer.lock().unwrap().write_all(reply.as_bytes());
+    }
     if let Some(cwd) = terminal_changes.cwd.as_ref().filter(|cwd| cwd.is_dir()) {
         pane.set_cwd(cwd.clone());
     }
@@ -8166,6 +8170,7 @@ mod tests {
             bracketed_paste: true,
             focus_reporting: true,
             modify_other_keys: true,
+            kitty_keyboard_flags: 5,
         };
         let body = String::from_utf8(format_attach_layout_snapshot_body(&snapshot, modes)).unwrap();
 
@@ -8174,7 +8179,7 @@ mod tests {
             "REGIONS\t2\n\
 REGION\t0\t0\t1\t0\t4\n\
 REGION\t1\t0\t1\t7\t12\n\
-ACTIVE_MODES\tbracketed_paste=1\tfocus=1\tmok=1\n\
+ACTIVE_MODES\tbracketed_paste=1\tfocus=1\tmok=1\tkitty=5\n\
 SNAPSHOT\t14\n\
 left | right\r\n"
         );

@@ -1038,6 +1038,65 @@ fn attach_enables_modify_other_keys_when_active_pane_requests_it() {
 }
 
 #[test]
+fn attach_enables_kitty_keyboard_when_active_pane_requests_it() {
+    let socket = unique_socket("attach-kitty-keyboard");
+    let session = format!("attach-kitty-keyboard-{}", std::process::id());
+    let command = "printf '\\033[>1ukitty-ready\\n'; sleep 30";
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", command],
+    ));
+    // Gate on the pane pushing CSI > 1 u before attaching so the first frame
+    // already carries kitty=1 (no attach race).
+    let ready = poll_capture(&socket, &session, "kitty-ready");
+    assert!(ready.contains("kitty-ready"), "{ready:?}");
+
+    let mut child = spawn_attached_dmux_with_env(&socket, &["attach", "-t", &session], &[], &[]);
+    child.wait_for_stdout_contains_all(&["\u{1b}[>1u"], "kitty keyboard enabled on outer terminal");
+
+    child
+        .stdin_mut("kitty keyboard detach")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn kitty_keyboard_query_is_answered_on_the_pane() {
+    let socket = unique_socket("kitty-query");
+    let session = format!("kitty-query-{}", std::process::id());
+    let file = unique_temp_file("kitty-query-reply");
+    let _ = std::fs::remove_file(&file);
+    // Raw mode so the reply (which has no newline) is delivered byte-wise to
+    // `cat`; push flags 5, query, then capture the server's reply (written to
+    // the pane's stdin) into a file. `cat` does not echo it back, so there is
+    // no query feedback loop.
+    let command = format!(
+        "stty raw -echo; printf '\\033[>5u\\033[?u'; cat > {}",
+        file.display()
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", &command],
+    ));
+
+    // The server answers CSI ? u with the current flags (CSI ? 5 u) on the
+    // pane's PTY without requiring an attached client.
+    assert!(
+        poll_file_contains(&file, "\u{1b}[?5u"),
+        "kitty query was not answered on the pane"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn save_buffer_text_stores_literal_text_and_lists_preview() {
     let socket = unique_socket("save-buffer-text");
     let session = format!("save-buffer-text-{}", std::process::id());
