@@ -9,6 +9,7 @@ pub struct TerminalState {
     use_alternate_screen: bool,
     cursor_visible: bool,
     bracketed_paste: bool,
+    focus_reporting: bool,
     synchronized_output: bool,
     scrollback: Scrollback,
     parser: vte::Parser,
@@ -46,6 +47,7 @@ impl TerminalState {
             use_alternate_screen: false,
             cursor_visible: true,
             bracketed_paste: false,
+            focus_reporting: false,
             synchronized_output: false,
             scrollback: Scrollback::new(max_scrollback_lines),
             parser: vte::Parser::new(),
@@ -110,6 +112,10 @@ impl TerminalState {
 
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.bracketed_paste
+    }
+
+    pub fn focus_reporting_enabled(&self) -> bool {
+        self.focus_reporting
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -191,6 +197,7 @@ impl TerminalState {
         self.use_alternate_screen = false;
         self.cursor_visible = true;
         self.bracketed_paste = false;
+        self.focus_reporting = false;
         if self.synchronized_output {
             self.changes.synchronized_output_finished = true;
         }
@@ -463,6 +470,8 @@ impl TerminalState {
                 (25, false) => self.cursor_visible = false,
                 (2004, true) => self.bracketed_paste = true,
                 (2004, false) => self.bracketed_paste = false,
+                (1004, true) => self.focus_reporting = true,
+                (1004, false) => self.focus_reporting = false,
                 (2026, true) => {
                     if !self.synchronized_output {
                         self.changes.synchronized_output_started = true;
@@ -1662,6 +1671,17 @@ mod tests {
         assert!(state.bracketed_paste_enabled());
         state.apply_bytes(b"\x1b[?2004l");
         assert!(!state.bracketed_paste_enabled());
+    }
+
+    #[test]
+    fn private_mode_tracks_focus_reporting() {
+        let mut state = TerminalState::new(20, 3, 100);
+
+        assert!(!state.focus_reporting_enabled());
+        state.apply_bytes(b"\x1b[?1004h");
+        assert!(state.focus_reporting_enabled());
+        state.apply_bytes(b"\x1b[?1004l");
+        assert!(!state.focus_reporting_enabled());
     }
 
     #[test]
