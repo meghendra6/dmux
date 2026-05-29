@@ -948,6 +948,36 @@ fn paste_buffer_wraps_text_when_pane_enables_bracketed_paste() {
 }
 
 #[test]
+fn attach_enables_bracketed_paste_when_active_pane_requests_it() {
+    let socket = unique_socket("attach-bracketed-paste");
+    let session = format!("attach-bracketed-paste-{}", std::process::id());
+    let command = "printf '\\033[?2004hbracketed-ready\\n'; sleep 30";
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", command],
+    ));
+    // Gate on the pane processing the DECSET before attaching so the first
+    // frame already carries bracketed_paste=1 (no attach race).
+    let ready = poll_capture(&socket, &session, "bracketed-ready");
+    assert!(ready.contains("bracketed-ready"), "{ready:?}");
+
+    let mut child = spawn_attached_dmux_with_env(&socket, &["attach", "-t", &session], &[], &[]);
+    child.wait_for_stdout_contains_all(
+        &["\u{1b}[?2004h"],
+        "bracketed paste enabled on outer terminal",
+    );
+
+    child
+        .stdin_mut("bracketed paste detach")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn save_buffer_text_stores_literal_text_and_lists_preview() {
     let socket = unique_socket("save-buffer-text");
     let session = format!("save-buffer-text-{}", std::process::id());

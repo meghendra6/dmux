@@ -4927,6 +4927,15 @@ fn handle_attach_snapshot(
     Ok(())
 }
 
+fn session_active_terminal_modes(session: &Session) -> crate::protocol::ActiveTerminalModes {
+    crate::protocol::ActiveTerminalModes {
+        bracketed_paste: session
+            .active_pane()
+            .map(|pane| pane.terminal.lock().unwrap().bracketed_paste_enabled())
+            .unwrap_or(false),
+    }
+}
+
 fn handle_attach_layout_snapshot(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
@@ -4941,7 +4950,8 @@ fn handle_attach_layout_snapshot(
 
     write_ok(stream)?;
     if let Some(snapshot) = attach_pane_snapshot_with_regions(&session) {
-        stream.write_all(&format_attach_layout_snapshot_body(&snapshot))?;
+        let modes = session_active_terminal_modes(&session);
+        stream.write_all(&format_attach_layout_snapshot_body(&snapshot, modes))?;
     }
     Ok(())
 }
@@ -4960,7 +4970,8 @@ fn handle_attach_layout_frame(
 
     write_ok(stream)?;
     if let Some(frame) = attach_pane_frame_with_regions(&session) {
-        stream.write_all(&format_attach_layout_snapshot_body(&frame))?;
+        let modes = session_active_terminal_modes(&session);
+        stream.write_all(&format_attach_layout_snapshot_body(&frame, modes))?;
     }
     Ok(())
 }
@@ -5102,7 +5113,10 @@ fn render_attach_pane_snapshot_with_regions_for_size(
     }
 }
 
-fn format_attach_layout_snapshot_body(snapshot: &RenderedAttachSnapshot) -> Vec<u8> {
+fn format_attach_layout_snapshot_body(
+    snapshot: &RenderedAttachSnapshot,
+    modes: crate::protocol::ActiveTerminalModes,
+) -> Vec<u8> {
     let mut output = String::new();
     output.push_str("REGIONS\t");
     output.push_str(&snapshot.regions.len().to_string());
@@ -5120,6 +5134,9 @@ fn format_attach_layout_snapshot_body(snapshot: &RenderedAttachSnapshot) -> Vec<
         output.push_str(&region.col_end.to_string());
         output.push('\n');
     }
+    output.push_str("ACTIVE_MODES\t");
+    output.push_str(&crate::protocol::encode_active_modes(modes));
+    output.push('\n');
     output.push_str("SNAPSHOT\t");
     output.push_str(&snapshot.text.as_bytes().len().to_string());
     output.push('\n');
@@ -5148,11 +5165,13 @@ fn format_attach_render_stream_frame(session: &Session) -> Option<Vec<u8>> {
         .map(|size| usize::from(size.rows).saturating_sub(header_rows + footer_lines.len()))
         .unwrap_or(usize::MAX);
     let snapshot = attach_pane_frame_with_regions(session)?;
+    let modes = session_active_terminal_modes(session);
     Some(format_attach_render_frame_body_with_ui_lines(
         &header_lines,
         &footer_lines,
         &snapshot,
         snapshot_rows,
+        modes,
     ))
 }
 
@@ -5173,7 +5192,22 @@ fn format_attach_render_frame_body_with_header_lines(
     snapshot: &RenderedAttachSnapshot,
     snapshot_rows: usize,
 ) -> Vec<u8> {
-    format_attach_render_frame_body_with_ui_lines(header_lines, &[], snapshot, snapshot_rows)
+    format_attach_render_frame_body_with_header_lines_and_modes(
+        header_lines,
+        snapshot,
+        snapshot_rows,
+        crate::protocol::ActiveTerminalModes::default(),
+    )
+}
+
+#[cfg(test)]
+fn format_attach_render_frame_body_with_header_lines_and_modes(
+    header_lines: &[String],
+    snapshot: &RenderedAttachSnapshot,
+    snapshot_rows: usize,
+    modes: crate::protocol::ActiveTerminalModes,
+) -> Vec<u8> {
+    format_attach_render_frame_body_with_ui_lines(header_lines, &[], snapshot, snapshot_rows, modes)
 }
 
 fn format_attach_render_frame_body_with_ui_lines(
@@ -5181,6 +5215,7 @@ fn format_attach_render_frame_body_with_ui_lines(
     footer_lines: &[String],
     snapshot: &RenderedAttachSnapshot,
     snapshot_rows: usize,
+    modes: crate::protocol::ActiveTerminalModes,
 ) -> Vec<u8> {
     let mut output = Vec::new();
     output.extend_from_slice(CURSOR_HOME);
@@ -5218,6 +5253,9 @@ fn format_attach_render_frame_body_with_ui_lines(
         header.push_str(&region.col_end.to_string());
         header.push('\n');
     }
+    header.push_str("ACTIVE_MODES\t");
+    header.push_str(&crate::protocol::encode_active_modes(modes));
+    header.push('\n');
     header.push_str("OUTPUT\t");
     header.push_str(&output.len().to_string());
     header.push('\n');
@@ -8121,13 +8159,17 @@ mod tests {
             cursor: None,
         };
 
-        let body = String::from_utf8(format_attach_layout_snapshot_body(&snapshot)).unwrap();
+        let modes = crate::protocol::ActiveTerminalModes {
+            bracketed_paste: true,
+        };
+        let body = String::from_utf8(format_attach_layout_snapshot_body(&snapshot, modes)).unwrap();
 
         assert_eq!(
             body,
             "REGIONS\t2\n\
 REGION\t0\t0\t1\t0\t4\n\
 REGION\t1\t0\t1\t7\t12\n\
+ACTIVE_MODES\tbracketed_paste=1\n\
 SNAPSHOT\t14\n\
 left | right\r\n"
         );
@@ -8251,6 +8293,7 @@ left | right\r\n"
             &["pane 0 │ clients 1 │ C-b ? help".to_string()],
             &snapshot,
             1,
+            crate::protocol::ActiveTerminalModes::default(),
         ))
         .expect("render frame utf8");
 

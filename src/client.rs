@@ -15,6 +15,8 @@ static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
 static MOUSE_MODE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 const ENABLE_MOUSE_MODE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const DISABLE_MOUSE_MODE: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
+const DISABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004l";
 const ENTER_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h\x1b[?25l";
 const EXIT_ALTERNATE_SCREEN: &[u8] = b"\x1b[?25h\x1b[?1049l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
@@ -134,12 +136,14 @@ struct AttachPaneRegion {
 struct AttachLayoutSnapshotResponse {
     snapshot: Vec<u8>,
     regions: Vec<AttachPaneRegion>,
+    active_modes: protocol::ActiveTerminalModes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveSnapshotFrame {
     regions: Vec<AttachPaneRegion>,
     header_rows: usize,
+    active_modes: protocol::ActiveTerminalModes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +151,7 @@ struct AttachRenderFrame {
     output: Vec<u8>,
     regions: Vec<AttachPaneRegion>,
     header_rows: usize,
+    active_modes: protocol::ActiveTerminalModes,
 }
 
 #[derive(Debug, Default)]
@@ -473,6 +478,7 @@ fn read_attach_layout_snapshot(
             Ok(AttachLayoutSnapshotResponse {
                 snapshot,
                 regions: Vec::new(),
+                active_modes: protocol::ActiveTerminalModes::default(),
             })
         }
         Err(error) => Err(error),
@@ -532,8 +538,13 @@ fn parse_attach_render_frame_body(body: &[u8]) -> io::Result<AttachRenderFrame> 
         regions.push(parse_attach_pane_region(line)?);
     }
 
-    let output = read_body_line(body, &mut cursor)?;
-    let Some(len) = output.strip_prefix("OUTPUT\t") else {
+    let mut active_modes = protocol::ActiveTerminalModes::default();
+    let mut line = read_body_line(body, &mut cursor)?;
+    if let Some(payload) = line.strip_prefix("ACTIVE_MODES\t") {
+        active_modes = protocol::parse_active_modes(payload);
+        line = read_body_line(body, &mut cursor)?;
+    }
+    let Some(len) = line.strip_prefix("OUTPUT\t") else {
         return Err(io::Error::other("missing render output header"));
     };
     let len = len
@@ -551,6 +562,7 @@ fn parse_attach_render_frame_body(body: &[u8]) -> io::Result<AttachRenderFrame> 
         output: body[cursor..cursor + len].to_vec(),
         regions,
         header_rows,
+        active_modes,
     })
 }
 
@@ -574,8 +586,13 @@ fn parse_attach_layout_snapshot_response(body: &[u8]) -> io::Result<AttachLayout
         regions.push(parse_attach_pane_region(line)?);
     }
 
-    let snapshot = read_body_line(body, &mut cursor)?;
-    let Some(len) = snapshot.strip_prefix("SNAPSHOT\t") else {
+    let mut active_modes = protocol::ActiveTerminalModes::default();
+    let mut line = read_body_line(body, &mut cursor)?;
+    if let Some(payload) = line.strip_prefix("ACTIVE_MODES\t") {
+        active_modes = protocol::parse_active_modes(payload);
+        line = read_body_line(body, &mut cursor)?;
+    }
+    let Some(len) = line.strip_prefix("SNAPSHOT\t") else {
         return Err(io::Error::other("missing snapshot header"));
     };
     let len = len
@@ -592,6 +609,7 @@ fn parse_attach_layout_snapshot_response(body: &[u8]) -> io::Result<AttachLayout
     Ok(AttachLayoutSnapshotResponse {
         snapshot: body[cursor..cursor + len].to_vec(),
         regions,
+        active_modes,
     })
 }
 
@@ -739,6 +757,7 @@ fn write_live_frame_to_stdout(
     Ok(LiveSnapshotFrame {
         regions: snapshot.regions.clone(),
         header_rows,
+        active_modes: snapshot.active_modes,
     })
 }
 
@@ -3186,7 +3205,13 @@ fn run_live_snapshot_attach(
     let _screen_guard = AlternateScreenGuard::enter()?;
     let mut frame = write_initial_live_snapshot_frame(socket, session)?;
     let mut mouse_mode = None;
-    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+    let mut bracketed_paste_mode: Option<BracketedPasteGuard> = None;
+    sync_live_outer_terminal_modes(
+        &mouse_focus_enabled,
+        &mut mouse_mode,
+        &mut bracketed_paste_mode,
+        &frame,
+    )?;
     let mut last_redraw = Instant::now();
     let mut redraw_paused = false;
     let mut event_stream_active = false;
@@ -3239,7 +3264,12 @@ fn run_live_snapshot_attach(
                                 active_popup,
                                 popup_state.as_mut(),
                             )?;
-                            sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                            sync_live_outer_terminal_modes(
+                                &mouse_focus_enabled,
+                                &mut mouse_mode,
+                                &mut bracketed_paste_mode,
+                                &frame,
+                            )?;
                             reset_live_render_output_state(&mut render_output_state);
                             last_redraw = Instant::now();
                             pending_input_repaint_deadline = None;
@@ -3280,7 +3310,12 @@ fn run_live_snapshot_attach(
                                 active_popup,
                                 popup_state.as_mut(),
                             )?;
-                            sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                            sync_live_outer_terminal_modes(
+                                &mouse_focus_enabled,
+                                &mut mouse_mode,
+                                &mut bracketed_paste_mode,
+                                &frame,
+                            )?;
                             reset_live_render_output_state(&mut render_output_state);
                             last_redraw = Instant::now();
                             pending_input_repaint_deadline = None;
@@ -3330,7 +3365,12 @@ fn run_live_snapshot_attach(
                                 active_popup,
                                 popup_state.as_mut(),
                             )?;
-                            sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                            sync_live_outer_terminal_modes(
+                                &mouse_focus_enabled,
+                                &mut mouse_mode,
+                                &mut bracketed_paste_mode,
+                                &frame,
+                            )?;
                             reset_live_render_output_state(&mut render_output_state);
                             last_redraw = Instant::now();
                             pending_input_repaint_deadline = None;
@@ -3352,7 +3392,12 @@ fn run_live_snapshot_attach(
                         active_popup,
                         popup_state.as_mut(),
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                     last_redraw = Instant::now();
                     pending_input_repaint_deadline = None;
@@ -3380,7 +3425,12 @@ fn run_live_snapshot_attach(
                         active_popup,
                         popup_state.as_mut(),
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                 }
                 last_redraw = Instant::now();
@@ -3400,7 +3450,12 @@ fn run_live_snapshot_attach(
                         active_popup,
                         popup_state.as_mut(),
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                 }
                 last_redraw = Instant::now();
@@ -3419,7 +3474,12 @@ fn run_live_snapshot_attach(
                         command_prompt_message.as_deref(),
                         active_popup,
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                 }
                 last_redraw = Instant::now();
@@ -3441,7 +3501,12 @@ fn run_live_snapshot_attach(
                         command_prompt_message.as_deref(),
                         active_popup,
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                 }
                 last_redraw = Instant::now();
@@ -3482,7 +3547,12 @@ fn run_live_snapshot_attach(
                         command_prompt_message.as_deref(),
                         active_popup,
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                 }
                 last_redraw = Instant::now();
@@ -3499,7 +3569,12 @@ fn run_live_snapshot_attach(
                         command_prompt_message.as_deref(),
                         active_popup,
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                 }
                 last_redraw = Instant::now();
@@ -3519,7 +3594,12 @@ fn run_live_snapshot_attach(
                     command_prompt_message.as_deref(),
                     active_popup,
                 )?;
-                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                sync_live_outer_terminal_modes(
+                    &mouse_focus_enabled,
+                    &mut mouse_mode,
+                    &mut bracketed_paste_mode,
+                    &frame,
+                )?;
                 reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
@@ -3537,7 +3617,12 @@ fn run_live_snapshot_attach(
                     command_prompt_message.as_deref(),
                     active_popup,
                 )?;
-                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                sync_live_outer_terminal_modes(
+                    &mouse_focus_enabled,
+                    &mut mouse_mode,
+                    &mut bracketed_paste_mode,
+                    &frame,
+                )?;
                 reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
@@ -3564,7 +3649,12 @@ fn run_live_snapshot_attach(
                     active_popup,
                     popup_state.as_mut(),
                 )?;
-                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                sync_live_outer_terminal_modes(
+                    &mouse_focus_enabled,
+                    &mut mouse_mode,
+                    &mut bracketed_paste_mode,
+                    &frame,
+                )?;
                 reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
@@ -3589,7 +3679,12 @@ fn run_live_snapshot_attach(
                     active_popup,
                     popup_state.as_mut(),
                 )?;
-                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                sync_live_outer_terminal_modes(
+                    &mouse_focus_enabled,
+                    &mut mouse_mode,
+                    &mut bracketed_paste_mode,
+                    &frame,
+                )?;
                 reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
@@ -3607,7 +3702,12 @@ fn run_live_snapshot_attach(
                     command_prompt_message.as_deref(),
                     active_popup,
                 )?;
-                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                sync_live_outer_terminal_modes(
+                    &mouse_focus_enabled,
+                    &mut mouse_mode,
+                    &mut bracketed_paste_mode,
+                    &frame,
+                )?;
                 reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
@@ -3634,7 +3734,12 @@ fn run_live_snapshot_attach(
                     active_popup,
                     popup_state.as_mut(),
                 )?;
-                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                sync_live_outer_terminal_modes(
+                    &mouse_focus_enabled,
+                    &mut mouse_mode,
+                    &mut bracketed_paste_mode,
+                    &frame,
+                )?;
                 reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
@@ -3650,7 +3755,12 @@ fn run_live_snapshot_attach(
                         command_prompt_message.as_deref(),
                         active_popup,
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                 }
                 last_redraw = Instant::now();
@@ -3665,7 +3775,12 @@ fn run_live_snapshot_attach(
                         command_prompt_message.as_deref(),
                         active_popup,
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                     last_redraw = Instant::now();
                 }
@@ -3682,7 +3797,12 @@ fn run_live_snapshot_attach(
                             command_prompt_message.as_deref(),
                             active_popup,
                         )?;
-                        sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                        sync_live_outer_terminal_modes(
+                            &mouse_focus_enabled,
+                            &mut mouse_mode,
+                            &mut bracketed_paste_mode,
+                            &frame,
+                        )?;
                         reset_live_render_output_state(&mut render_output_state);
                     }
                     last_redraw = Instant::now();
@@ -3702,7 +3822,12 @@ fn run_live_snapshot_attach(
                     command_prompt_message.as_deref(),
                     active_popup,
                 )?;
-                sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                sync_live_outer_terminal_modes(
+                    &mouse_focus_enabled,
+                    &mut mouse_mode,
+                    &mut bracketed_paste_mode,
+                    &frame,
+                )?;
                 reset_live_render_output_state(&mut render_output_state);
                 last_redraw = Instant::now();
             }
@@ -3717,7 +3842,12 @@ fn run_live_snapshot_attach(
                         command_prompt_message.as_deref(),
                         active_popup,
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                     last_redraw = Instant::now();
                     pending_input_repaint_deadline = None;
@@ -3733,8 +3863,14 @@ fn run_live_snapshot_attach(
                     frame = LiveSnapshotFrame {
                         regions: render_frame.regions.clone(),
                         header_rows: render_frame.header_rows,
+                        active_modes: render_frame.active_modes,
                     };
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     if command_prompt_message.is_some()
                         || pane_number_message
                             .as_ref()
@@ -3747,7 +3883,12 @@ fn run_live_snapshot_attach(
                             command_prompt_message.as_deref(),
                             active_popup,
                         )?;
-                        sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                        sync_live_outer_terminal_modes(
+                            &mouse_focus_enabled,
+                            &mut mouse_mode,
+                            &mut bracketed_paste_mode,
+                            &frame,
+                        )?;
                         reset_live_render_output_state(&mut render_output_state);
                     } else {
                         if command_prompt_message.is_none() && active_popup == AttachPopup::None {
@@ -3820,7 +3961,12 @@ fn run_live_snapshot_attach(
                         command_prompt_message.as_deref(),
                         active_popup,
                     )?;
-                    sync_live_mouse_mode(&mouse_focus_enabled, &mut mouse_mode, &frame)?;
+                    sync_live_outer_terminal_modes(
+                        &mouse_focus_enabled,
+                        &mut mouse_mode,
+                        &mut bracketed_paste_mode,
+                        &frame,
+                    )?;
                     reset_live_render_output_state(&mut render_output_state);
                     last_redraw = Instant::now();
                     pending_input_repaint_deadline = None;
@@ -3851,6 +3997,35 @@ fn sync_live_mouse_mode(
         *mouse_mode = None;
     }
     Ok(())
+}
+
+/// Reconcile the outer terminal's bracketed-paste mode to match what the active
+/// pane has requested. Enabling 2004 on the outer terminal only while the active
+/// pane wants it means real pastes arrive wrapped in `\x1b[200~`…`\x1b[201~`
+/// exactly when the pane can interpret them, so input is still forwarded
+/// verbatim with no marker stripping.
+fn sync_live_bracketed_paste(
+    bracketed_paste_mode: &mut Option<BracketedPasteGuard>,
+    frame: &LiveSnapshotFrame,
+) -> io::Result<()> {
+    if frame.active_modes.bracketed_paste {
+        if bracketed_paste_mode.is_none() {
+            *bracketed_paste_mode = Some(BracketedPasteGuard::enable()?);
+        }
+    } else {
+        *bracketed_paste_mode = None;
+    }
+    Ok(())
+}
+
+fn sync_live_outer_terminal_modes(
+    mouse_focus_enabled: &AtomicBool,
+    mouse_mode: &mut Option<MouseModeGuard>,
+    bracketed_paste_mode: &mut Option<BracketedPasteGuard>,
+    frame: &LiveSnapshotFrame,
+) -> io::Result<()> {
+    sync_live_mouse_mode(mouse_focus_enabled, mouse_mode, frame)?;
+    sync_live_bracketed_paste(bracketed_paste_mode, frame)
 }
 
 fn forward_live_snapshot_input(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
@@ -7976,6 +8151,25 @@ impl Drop for MouseModeGuard {
     }
 }
 
+struct BracketedPasteGuard;
+
+impl BracketedPasteGuard {
+    fn enable() -> io::Result<Self> {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(ENABLE_BRACKETED_PASTE)?;
+        stdout.flush()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for BracketedPasteGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(DISABLE_BRACKETED_PASTE);
+        let _ = stdout.flush();
+    }
+}
+
 impl RawModeGuard {
     fn enable() -> Self {
         if !stdin_is_tty() {
@@ -8195,6 +8389,21 @@ mod tests {
                 col_end: 6,
             }]
         );
+        assert_eq!(
+            parsed.active_modes,
+            protocol::ActiveTerminalModes::default()
+        );
+    }
+
+    #[test]
+    fn parses_attach_layout_snapshot_response_with_active_modes() {
+        let parsed = parse_attach_layout_snapshot_response(
+            b"REGIONS\t0\nACTIVE_MODES\tbracketed_paste=1\nSNAPSHOT\t3\nabc",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.snapshot, b"abc");
+        assert!(parsed.active_modes.bracketed_paste);
     }
 
     #[test]
@@ -8220,6 +8429,18 @@ mod tests {
                 col_end: 6,
             }]
         );
+        assert_eq!(frame.active_modes, protocol::ActiveTerminalModes::default());
+    }
+
+    #[test]
+    fn parses_attach_render_frame_active_modes_before_output() {
+        let frame = parse_attach_render_frame_body(
+            b"HEADER_ROWS\t0\nREGIONS\t0\nACTIVE_MODES\tbracketed_paste=1\nOUTPUT\t3\nabc",
+        )
+        .unwrap();
+
+        assert_eq!(frame.output, b"abc");
+        assert!(frame.active_modes.bracketed_paste);
     }
 
     #[test]
@@ -8251,6 +8472,7 @@ mod tests {
                 col_end: 10,
             }],
             header_rows: 1,
+            active_modes: protocol::ActiveTerminalModes::default(),
         }
     }
 
@@ -8360,6 +8582,7 @@ mod tests {
             output: b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Knew".to_vec(),
             regions: Vec::new(),
             header_rows: 1,
+            active_modes: protocol::ActiveTerminalModes::default(),
         };
         let _ = diff_live_render_output(&first, &mut state);
 
