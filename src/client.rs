@@ -1446,6 +1446,8 @@ enum PopupInputAction {
     Enter,
     Open,
     Pin,
+    MovePinUp,
+    MovePinDown,
     TogglePeek,
     ToggleGrouping,
     ReplyStart,
@@ -2262,6 +2264,14 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
             }
             b'p' if !state.filter_mode => {
                 actions.push(PopupInputAction::Pin);
+                index += 1;
+            }
+            b'K' if !state.filter_mode => {
+                actions.push(PopupInputAction::MovePinUp);
+                index += 1;
+            }
+            b'J' if !state.filter_mode => {
+                actions.push(PopupInputAction::MovePinDown);
                 index += 1;
             }
             b'r' if !state.filter_mode => {
@@ -5279,6 +5289,7 @@ fn apply_attention_popup_input_actions(
             PopupInputAction::Enter => {}
             PopupInputAction::Open => {}
             PopupInputAction::Pin => {}
+            PopupInputAction::MovePinUp | PopupInputAction::MovePinDown => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(AttentionPopupInputResult::Close);
@@ -5409,6 +5420,7 @@ fn apply_tree_popup_input_actions(
             }
             PopupInputAction::Open => {}
             PopupInputAction::Pin => {}
+            PopupInputAction::MovePinUp | PopupInputAction::MovePinDown => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(TreePopupInputResult::Close);
@@ -5613,6 +5625,22 @@ fn apply_workspace_popup_input_actions(
                 };
                 return toggle_workspace_popup_row_pin(row);
             }
+            PopupInputAction::MovePinUp | PopupInputAction::MovePinDown => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                }
+                let up = matches!(action, PopupInputAction::MovePinUp);
+                let Some(row) = state.selected_row(&model) else {
+                    return Ok(WorkspacePopupInputResult::Message(
+                        "no row selected".to_string(),
+                    ));
+                };
+                if let Some(message) = move_workspace_popup_row_pin(row, up) {
+                    return Ok(WorkspacePopupInputResult::Message(message));
+                }
+                // The pin order changed on disk; refresh on the next render.
+                model_dirty = true;
+            }
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(WorkspacePopupInputResult::Close);
@@ -5728,6 +5756,28 @@ fn pin_status_message(pinned: bool, label: &str) -> String {
         format!("pinned {label}")
     } else {
         format!("unpinned {label}")
+    }
+}
+
+/// Move the selected pinned row one slot earlier (`up`) or later within its
+/// pin group. Returns `Some(message)` only when the row cannot be reordered;
+/// a successful (or no-op-on-unpinned) move returns `None` so the caller just
+/// re-renders.
+fn move_workspace_popup_row_pin(row: &crate::popup::PopupRow, up: bool) -> Option<String> {
+    let registry_path = crate::paths::workspace_registry_path();
+    if row.id.starts_with("workspace:path:") {
+        if let Some(path) = row.repo_path.as_ref() {
+            let _ = crate::registry::move_workspace_pin(&registry_path, path.clone(), up);
+        }
+        None
+    } else if row.id.starts_with("live:") || row.id.starts_with("previous:") {
+        let Some(target) = row.target.as_ref() else {
+            return Some("row has no session".to_string());
+        };
+        let _ = crate::registry::move_session_pin(&registry_path, &target.session, up);
+        None
+    } else {
+        Some("only workspaces and sessions can be reordered".to_string())
     }
 }
 
@@ -5996,9 +6046,14 @@ fn workspace_popup_model(
     } else {
         let mut workspaces = registry.workspaces.clone();
         workspaces.sort_by(|left, right| {
-            registry
-                .is_workspace_pinned(&right.path)
-                .cmp(&registry.is_workspace_pinned(&left.path))
+            let left_rank = registry
+                .workspace_pin_rank(&left.path)
+                .unwrap_or(usize::MAX);
+            let right_rank = registry
+                .workspace_pin_rank(&right.path)
+                .unwrap_or(usize::MAX);
+            left_rank
+                .cmp(&right_rank)
                 .then_with(|| left.path.cmp(&right.path))
         });
         rows.extend(workspaces.iter().map(|record| {
@@ -6029,10 +6084,10 @@ fn workspace_popup_model(
         rows.push(workspace_disabled_row("live:none", "none", "", None, false));
     } else {
         let mut live = live_sessions.to_vec();
-        live.sort_by(|left, right| {
+        live.sort_by_key(|session| {
             registry
-                .is_session_pinned(&right.name)
-                .cmp(&registry.is_session_pinned(&left.name))
+                .session_pin_rank(&session.name)
+                .unwrap_or(usize::MAX)
         });
         rows.extend(live.iter().map(|session| {
             let repo_path = registry
@@ -6091,10 +6146,10 @@ fn workspace_popup_model(
                 .any(|session| session.name == record.name)
         })
         .collect::<Vec<_>>();
-    previous.sort_by(|left, right| {
+    previous.sort_by_key(|record| {
         registry
-            .is_session_pinned(&right.name)
-            .cmp(&registry.is_session_pinned(&left.name))
+            .session_pin_rank(&record.name)
+            .unwrap_or(usize::MAX)
     });
     if previous.is_empty() {
         rows.push(workspace_disabled_row(
@@ -10063,6 +10118,57 @@ mod tests {
         assert_eq!(
             popup_actions_for_input(b"p", &mut state),
             vec![PopupInputAction::Pin]
+        );
+    }
+
+    #[test]
+    fn workspace_popup_model_orders_pinned_workspaces_by_pin_rank() {
+        // Pin order [zzz, aaa] must win over alphabetical order.
+        let registry = crate::registry::WorkspaceRegistry {
+            workspaces: vec![
+                crate::registry::WorkspaceRecord {
+                    path: PathBuf::from("/tmp/aaa"),
+                },
+                crate::registry::WorkspaceRecord {
+                    path: PathBuf::from("/tmp/mmm"),
+                },
+                crate::registry::WorkspaceRecord {
+                    path: PathBuf::from("/tmp/zzz"),
+                },
+            ],
+            pinned_workspaces: vec![PathBuf::from("/tmp/zzz"), PathBuf::from("/tmp/aaa")],
+            ..Default::default()
+        };
+
+        let model = workspace_popup_model(&registry, &[]);
+
+        let paths = model
+            .rows
+            .iter()
+            .filter(|row| row.id.starts_with("workspace:path:"))
+            .map(|row| row.repo_path.clone().unwrap())
+            .collect::<Vec<_>>();
+        // Pinned in pin-rank order (zzz, aaa), then unpinned alphabetically (mmm).
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/tmp/zzz"),
+                PathBuf::from("/tmp/aaa"),
+                PathBuf::from("/tmp/mmm"),
+            ]
+        );
+    }
+
+    #[test]
+    fn popup_reorder_keys_map_to_move_pin_actions() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+        assert_eq!(
+            popup_actions_for_input(b"K", &mut state),
+            vec![PopupInputAction::MovePinUp]
+        );
+        assert_eq!(
+            popup_actions_for_input(b"J", &mut state),
+            vec![PopupInputAction::MovePinDown]
         );
     }
 

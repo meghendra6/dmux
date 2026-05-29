@@ -29,11 +29,25 @@ pub struct WorkspaceRegistry {
 
 impl WorkspaceRegistry {
     pub fn is_workspace_pinned(&self, path: &Path) -> bool {
-        self.pinned_workspaces.iter().any(|pinned| pinned == path)
+        self.workspace_pin_rank(path).is_some()
     }
 
     pub fn is_session_pinned(&self, name: &str) -> bool {
-        self.pinned_sessions.iter().any(|pinned| pinned == name)
+        self.session_pin_rank(name).is_some()
+    }
+
+    /// Position of a workspace within the pin order, or `None` when unpinned.
+    /// Pinned rows render in this order; unpinned rows keep their natural order.
+    pub fn workspace_pin_rank(&self, path: &Path) -> Option<usize> {
+        self.pinned_workspaces
+            .iter()
+            .position(|pinned| pinned == path)
+    }
+
+    pub fn session_pin_rank(&self, name: &str) -> Option<usize> {
+        self.pinned_sessions
+            .iter()
+            .position(|pinned| pinned == name)
     }
 }
 
@@ -123,8 +137,9 @@ pub fn mark_session_stopped(path: &Path, session: &str) -> io::Result<()> {
 pub fn toggle_workspace_pin(path: &Path, workspace: PathBuf) -> io::Result<bool> {
     let mut registry = load(path)?;
     let workspace = normalize_path(workspace);
+    // Pin order is meaningful (it drives row ordering), so a newly pinned entry
+    // appends to the end rather than sorting.
     let pinned = toggle_membership(&mut registry.pinned_workspaces, workspace);
-    registry.pinned_workspaces.sort();
     save(path, &registry)?;
     Ok(pinned)
 }
@@ -132,9 +147,28 @@ pub fn toggle_workspace_pin(path: &Path, workspace: PathBuf) -> io::Result<bool>
 pub fn toggle_session_pin(path: &Path, session: &str) -> io::Result<bool> {
     let mut registry = load(path)?;
     let pinned = toggle_membership(&mut registry.pinned_sessions, session.to_string());
-    registry.pinned_sessions.sort();
     save(path, &registry)?;
     Ok(pinned)
+}
+
+/// Move a pinned workspace one slot earlier (`up`) or later in the pin order.
+/// No-op when the workspace is not pinned or is already at the boundary.
+pub fn move_workspace_pin(path: &Path, workspace: PathBuf, up: bool) -> io::Result<()> {
+    let mut registry = load(path)?;
+    let workspace = normalize_path(workspace);
+    if move_in_order(&mut registry.pinned_workspaces, &workspace, up) {
+        save(path, &registry)?;
+    }
+    Ok(())
+}
+
+pub fn move_session_pin(path: &Path, session: &str, up: bool) -> io::Result<()> {
+    let mut registry = load(path)?;
+    let session = session.to_string();
+    if move_in_order(&mut registry.pinned_sessions, &session, up) {
+        save(path, &registry)?;
+    }
+    Ok(())
 }
 
 fn toggle_membership<T: PartialEq>(items: &mut Vec<T>, value: T) -> bool {
@@ -144,6 +178,26 @@ fn toggle_membership<T: PartialEq>(items: &mut Vec<T>, value: T) -> bool {
     } else {
         items.push(value);
         true
+    }
+}
+
+/// Swap `value` with its neighbour in the requested direction. Returns whether
+/// the order changed.
+fn move_in_order<T: PartialEq>(items: &mut [T], value: &T, up: bool) -> bool {
+    let Some(index) = items.iter().position(|item| item == value) else {
+        return false;
+    };
+    let target = if up {
+        index.checked_sub(1)
+    } else {
+        (index + 1 < items.len()).then_some(index + 1)
+    };
+    match target {
+        Some(target) => {
+            items.swap(index, target);
+            true
+        }
+        None => false,
     }
 }
 
@@ -209,11 +263,21 @@ fn parse(contents: &str) -> io::Result<WorkspaceRegistry> {
     registry
         .sessions
         .sort_by(|left, right| left.name.cmp(&right.name));
-    registry.pinned_workspaces.sort();
-    registry.pinned_workspaces.dedup();
-    registry.pinned_sessions.sort();
-    registry.pinned_sessions.dedup();
+    // Pin order is preserved as written; only drop duplicates, keeping the
+    // first occurrence so the order stays stable.
+    dedup_preserving_order(&mut registry.pinned_workspaces);
+    dedup_preserving_order(&mut registry.pinned_sessions);
     Ok(registry)
+}
+
+fn dedup_preserving_order<T: PartialEq + Clone>(items: &mut Vec<T>) {
+    let mut result: Vec<T> = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        if !result.contains(item) {
+            result.push(item.clone());
+        }
+    }
+    *items = result;
 }
 
 fn parse_session_record(fields: &[&str], line_number: usize) -> io::Result<SessionRecord> {
@@ -458,6 +522,61 @@ mod tests {
         let loaded = load(&path).unwrap();
         assert!(!loaded.is_workspace_pinned(Path::new("/tmp/project")));
         assert!(loaded.is_session_pinned("dev"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pins_preserve_insertion_order_and_expose_rank() {
+        let registry = parse(&render(&WorkspaceRegistry {
+            pinned_sessions: vec!["zeta".to_string(), "alpha".to_string()],
+            ..Default::default()
+        }))
+        .unwrap();
+
+        // Order is preserved (not alphabetised) and rank reflects it.
+        assert_eq!(registry.pinned_sessions, vec!["zeta", "alpha"]);
+        assert_eq!(registry.session_pin_rank("zeta"), Some(0));
+        assert_eq!(registry.session_pin_rank("alpha"), Some(1));
+        assert_eq!(registry.session_pin_rank("missing"), None);
+    }
+
+    #[test]
+    fn move_session_pin_swaps_with_neighbour_and_clamps() {
+        let path = std::env::temp_dir().join(format!(
+            "dmux-pin-move-{}-{:?}.tsv",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        toggle_session_pin(&path, "first").unwrap();
+        toggle_session_pin(&path, "second").unwrap();
+        assert_eq!(
+            load(&path).unwrap().pinned_sessions,
+            vec!["first", "second"]
+        );
+
+        // Move "second" up past "first".
+        move_session_pin(&path, "second", true).unwrap();
+        assert_eq!(
+            load(&path).unwrap().pinned_sessions,
+            vec!["second", "first"]
+        );
+
+        // Moving the top entry up is a no-op (clamped at the boundary).
+        move_session_pin(&path, "second", true).unwrap();
+        assert_eq!(
+            load(&path).unwrap().pinned_sessions,
+            vec!["second", "first"]
+        );
+
+        // Unpinned entries cannot be moved.
+        move_session_pin(&path, "missing", true).unwrap();
+        assert_eq!(
+            load(&path).unwrap().pinned_sessions,
+            vec!["second", "first"]
+        );
 
         let _ = std::fs::remove_file(&path);
     }
