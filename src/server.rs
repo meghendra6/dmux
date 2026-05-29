@@ -843,6 +843,10 @@ impl Session {
         Ok(())
     }
 
+    fn move_window(&self, src: usize, dst: usize) -> Result<(), String> {
+        self.windows.lock().unwrap().move_window(src, dst)
+    }
+
     fn select_previous_window(&self) -> Result<(), String> {
         self.windows.lock().unwrap().select_previous()?;
         self.clear_active_pane_alerts();
@@ -1629,6 +1633,27 @@ impl WindowSet {
             return Err("missing window".to_string());
         }
         self.active = (self.active + 1) % self.windows.len();
+        Ok(())
+    }
+
+    /// Move the window at `src` to position `dst` (clamped to the last slot),
+    /// preserving which window is active.
+    fn move_window(&mut self, src: usize, dst: usize) -> Result<(), String> {
+        if src >= self.windows.len() {
+            return Err("missing window".to_string());
+        }
+        let dst = dst.min(self.windows.len() - 1);
+        if src == dst {
+            return Ok(());
+        }
+        let active_id = self.windows[self.active].id;
+        let window = self.windows.remove(src);
+        self.windows.insert(dst, window);
+        self.active = self
+            .windows
+            .iter()
+            .position(|window| window.id == active_id)
+            .unwrap_or(0);
         Ok(())
     }
 
@@ -2779,6 +2804,9 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         }
         Request::SelectWindow { session, target } => {
             handle_select_window(&state, &mut stream, &session, target)
+        }
+        Request::MoveWindow { session, src, dst } => {
+            handle_move_window(&state, &mut stream, &session, src, dst)
         }
         Request::RenameWindow {
             session,
@@ -4680,6 +4708,29 @@ fn handle_select_window(
     let result = write_ok(stream);
     session.reconnect_raw_attach_streams();
     result
+}
+
+fn handle_move_window(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    src: usize,
+    dst: usize,
+) -> io::Result<()> {
+    let session = resolve_session(state, name);
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    if let Err(message) = session.move_window(src, dst) {
+        write_err(stream, &message)?;
+        return Ok(());
+    }
+
+    session.notify_attach_redraw_immediate();
+    write_ok(stream)
 }
 
 fn handle_rename_window(

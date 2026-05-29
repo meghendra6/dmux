@@ -138,6 +138,11 @@ pub enum Command {
         session: String,
         target: WindowTarget,
     },
+    MoveWindow {
+        session: String,
+        src: usize,
+        dst: usize,
+    },
     RenameWindow {
         session: String,
         target: WindowTarget,
@@ -276,6 +281,7 @@ where
         "list-windows" => parse_list_windows(args, "list-windows"),
         "list-tabs" => parse_list_windows(args, "list-tabs"),
         "select-window" => parse_select_window(args, "select-window", "-w", &["-w"], "--window-id"),
+        "move-window" => parse_move_window(args),
         "select-tab" => {
             parse_select_window(args, "select-tab", "-i", &["-i", "--index"], "--tab-id")
         }
@@ -1832,6 +1838,51 @@ fn parse_list_windows(args: Vec<String>, command_name: &str) -> Result<Command, 
     Ok(Command::ListWindows {
         session: session.ok_or_else(|| format!("{command_name} requires -t <session>"))?,
         format,
+    })
+}
+
+fn parse_move_window(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut src = None;
+    let mut dst = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                session = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| "move-window requires a session name after -t".to_string())?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "-w" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "move-window requires a window index after -w".to_string())?;
+                src =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        "move-window -w must be a non-negative integer".to_string()
+                    })?);
+                i += 2;
+            }
+            "-i" => {
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "move-window requires a destination index after -i".to_string()
+                })?;
+                dst =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        "move-window -i must be a non-negative integer".to_string()
+                    })?);
+                i += 2;
+            }
+            value => return Err(format!("move-window does not support argument {value:?}")),
+        }
+    }
+    Ok(Command::MoveWindow {
+        session: session.ok_or_else(|| "move-window requires -t <session>".to_string())?,
+        src: src.ok_or_else(|| "move-window requires -w <window-index>".to_string())?,
+        dst: dst.ok_or_else(|| "move-window requires -i <destination-index>".to_string())?,
     })
 }
 
