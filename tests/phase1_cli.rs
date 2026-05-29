@@ -2022,6 +2022,28 @@ fn poll_list_panes_contains(
     last
 }
 
+fn poll_list_windows_contains(
+    socket: &std::path::Path,
+    session: &str,
+    format: &str,
+    needle: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(socket, &["list-windows", "-t", session, "-F", format]);
+        assert_success(&output);
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if last.contains(needle) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
+}
+
 fn poll_list_sessions_contains(socket: &std::path::Path, format: &str, needle: &str) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut last = String::new();
@@ -3692,6 +3714,44 @@ fn tree_popup_kill_confirmation_kills_selected_pane() {
         "expected one pane after kill: {panes:?}"
     );
     assert!(panes.contains("0\t1"), "{panes:?}");
+
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn tree_popup_rename_renames_selected_panes_window() {
+    let socket = unique_socket("tree-popup-rename");
+    let session = format!("tree-popup-rename-{}", std::process::id());
+    let new_window = format!("renamed-win-{}", std::process::id());
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "cat"],
+    ));
+
+    let mut child = spawn_attached_to_session(&socket, &session, &[]);
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(b"\x02w")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["Enter: focus/attach"], "tree popup");
+
+    // `R` on the selected pane renames that pane's window.
+    child
+        .stdin_mut("tree popup stdin")
+        .write_all(format!("R{new_window}\r").as_bytes())
+        .unwrap();
+
+    let windows = poll_list_windows_contains(&socket, &session, "#{window.name}", &new_window);
+    assert!(
+        windows.lines().any(|line| line == new_window),
+        "window should be renamed: {windows:?}"
+    );
 
     child
         .stdin_mut("tree popup stdin")
