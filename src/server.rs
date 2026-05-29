@@ -4928,11 +4928,13 @@ fn handle_attach_snapshot(
 }
 
 fn session_active_terminal_modes(session: &Session) -> crate::protocol::ActiveTerminalModes {
+    let Some(pane) = session.active_pane() else {
+        return crate::protocol::ActiveTerminalModes::default();
+    };
+    let terminal = pane.terminal.lock().unwrap();
     crate::protocol::ActiveTerminalModes {
-        bracketed_paste: session
-            .active_pane()
-            .map(|pane| pane.terminal.lock().unwrap().bracketed_paste_enabled())
-            .unwrap_or(false),
+        bracketed_paste: terminal.bracketed_paste_enabled(),
+        focus_reporting: terminal.focus_reporting_enabled(),
     }
 }
 
@@ -8161,6 +8163,7 @@ mod tests {
 
         let modes = crate::protocol::ActiveTerminalModes {
             bracketed_paste: true,
+            focus_reporting: true,
         };
         let body = String::from_utf8(format_attach_layout_snapshot_body(&snapshot, modes)).unwrap();
 
@@ -8169,7 +8172,7 @@ mod tests {
             "REGIONS\t2\n\
 REGION\t0\t0\t1\t0\t4\n\
 REGION\t1\t0\t1\t7\t12\n\
-ACTIVE_MODES\tbracketed_paste=1\n\
+ACTIVE_MODES\tbracketed_paste=1\tfocus=1\n\
 SNAPSHOT\t14\n\
 left | right\r\n"
         );
