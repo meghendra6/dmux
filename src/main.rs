@@ -387,6 +387,16 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
             )?;
             Ok(())
         }
+        cli::Command::MoveWindow { session, src, dst } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            send_request(
+                &socket,
+                &protocol::encode_move_window(&session, src, dst),
+                false,
+            )?;
+            Ok(())
+        }
         cli::Command::RenameWindow {
             session,
             target,

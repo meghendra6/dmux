@@ -251,6 +251,11 @@ pub enum Request {
         session: String,
         target: WindowTarget,
     },
+    MoveWindow {
+        session: String,
+        src: usize,
+        dst: usize,
+    },
     RenameWindow {
         session: String,
         target: WindowTarget,
@@ -818,6 +823,10 @@ pub fn encode_list_windows(session: &str, format: Option<&str>) -> String {
 
 pub fn encode_select_window(session: &str, window: usize) -> String {
     format!("SELECT_WINDOW\t{session}\t{window}\n")
+}
+
+pub fn encode_move_window(session: &str, src: usize, dst: usize) -> String {
+    format!("MOVE_WINDOW\t{session}\t{src}\t{dst}\n")
 }
 
 pub fn encode_select_window_target(session: &str, target: WindowTarget) -> String {
@@ -1663,6 +1672,15 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
         ["SELECT_WINDOW_ACTIVE", session] => Ok(Request::SelectWindow {
             session: (*session).to_string(),
             target: WindowTarget::Active,
+        }),
+        ["MOVE_WINDOW", session, src, dst] => Ok(Request::MoveWindow {
+            session: (*session).to_string(),
+            src: src
+                .parse::<usize>()
+                .map_err(|_| "MOVE_WINDOW has invalid source index".to_string())?,
+            dst: dst
+                .parse::<usize>()
+                .map_err(|_| "MOVE_WINDOW has invalid destination index".to_string())?,
         }),
         ["RENAME_WINDOW", session, target, name] => Ok(Request::RenameWindow {
             session: (*session).to_string(),

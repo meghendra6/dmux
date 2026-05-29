@@ -1179,6 +1179,55 @@ fn spawned_pane_advertises_dmux_env_vars() {
 }
 
 #[test]
+fn move_window_reorders_windows_preserving_names() {
+    let socket = unique_socket("move-window");
+    let session = format!("move-window-{}", std::process::id());
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "sleep 30"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["new-window", "-t", &session, "--", "sh", "-lc", "sleep 30"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["new-window", "-t", &session, "--", "sh", "-lc", "sleep 30"],
+    ));
+
+    let window_names = |sock: &std::path::Path| -> Vec<String> {
+        let out = dmux(
+            sock,
+            &["list-windows", "-t", &session, "-F", "#{window.name}"],
+        );
+        assert_success(&out);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+
+    let before = window_names(&socket);
+    assert_eq!(before.len(), 3, "{before:?}");
+
+    // Move the last window to the front.
+    assert_success(&dmux(
+        &socket,
+        &["move-window", "-t", &session, "-w", "2", "-i", "0"],
+    ));
+
+    let after = window_names(&socket);
+    assert_eq!(
+        after,
+        vec![before[2].clone(), before[0].clone(), before[1].clone()],
+        "{after:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn has_session_reports_existence_via_exit_code() {
     let socket = unique_socket("has-session");
     let session = format!("has-session-{}", std::process::id());
