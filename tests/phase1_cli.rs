@@ -4038,6 +4038,77 @@ fn workspace_popup_kill_confirmation_kills_selected_live_session() {
 }
 
 #[test]
+fn workspace_popup_new_session_creates_detached_session_without_switching() {
+    let socket = unique_socket("workspace-popup-new");
+    let registry_path = unique_temp_file("workspace-popup-new-registry");
+    let registry_env = registry_path.to_string_lossy().to_string();
+    let workspace_dir = unique_temp_file("workspace-popup-new-target");
+    std::fs::create_dir(&workspace_dir).expect("create workspace dir");
+    let workspace_path = workspace_dir.to_string_lossy().to_string();
+    // A short, stable token in the path: the full unique basename is truncated
+    // in the popup display, but this prefix is always visible and matches only
+    // the registered target row.
+    let filter_token = "workspace-popup-new-target";
+    let session = format!("workspace-popup-new-source-{}", std::process::id());
+    let new_session = format!("bg-{}", std::process::id());
+
+    assert_success(&dmux_with_env(
+        &socket,
+        &["workspace-add", &workspace_path],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+
+    let mut child = spawn_attached_dmux_with_env(
+        &socket,
+        &["attach", "-t", &session],
+        &[],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    );
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02A")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["dmux workspaces", filter_token], "workspace popup");
+
+    // Filter to the registered path, then `n` + a name + Enter to create a
+    // detached session there.
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(format!("/{filter_token}\rn{new_session}\r").as_bytes())
+        .unwrap();
+
+    let listed = poll_list_sessions_contains(
+        &socket,
+        "#{session.name}\t#{session.attached_count}",
+        &format!("{new_session}\t0"),
+    );
+    assert!(
+        listed.contains(&format!("{new_session}\t0")),
+        "new session should be created detached: {listed:?}"
+    );
+    assert!(
+        listed.contains(&format!("{session}\t1")),
+        "attach should stay on the source session, not switch: {listed:?}"
+    );
+
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &new_session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(registry_path);
+    let _ = std::fs::remove_dir(workspace_dir);
+}
+
+#[test]
 fn workspace_popup_tab_switches_to_repo_grouping() {
     let socket = unique_socket("workspace-popup-repo-grouping");
     let registry_path = unique_temp_file("workspace-popup-repo-grouping-registry");
