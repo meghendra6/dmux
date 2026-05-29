@@ -85,6 +85,9 @@ pub struct PopupState {
     pub confirm_mode: bool,
     pub confirm_prompt: String,
     pub confirm_target: Option<PopupTarget>,
+    pub new_mode: bool,
+    pub new_text: String,
+    pub new_path: Option<PathBuf>,
 }
 
 impl PopupState {
@@ -103,6 +106,9 @@ impl PopupState {
             confirm_mode: false,
             confirm_prompt: String::new(),
             confirm_target: None,
+            new_mode: false,
+            new_text: String::new(),
+            new_path: None,
         }
     }
 
@@ -123,6 +129,11 @@ impl PopupState {
             self.confirm_mode = false;
             self.confirm_prompt.clear();
             self.confirm_target = None;
+            PopupCloseResult::StayOpen
+        } else if self.new_mode {
+            self.new_mode = false;
+            self.new_text.clear();
+            self.new_path = None;
             PopupCloseResult::StayOpen
         } else if self.peek {
             self.peek = false;
@@ -383,13 +394,17 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
         lines.push(String::new());
         lines.push(format!("{} (y/N)", state.confirm_prompt));
     }
+    if state.new_mode {
+        lines.push(String::new());
+        lines.push(format!("New session: {}", state.new_text));
+    }
     lines.push(String::new());
     lines.push(match state.mode {
         PopupMode::Attention => {
             "Space: peek   r: reply   Tab: group   /: filter   Esc: close".to_string()
         }
         PopupMode::Workspace => {
-            "Enter: focus/attach   o: open/reopen   x: kill   p: pin   J/K: reorder   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
+            "Enter: focus/attach   o: open/reopen   n: new   x: kill   p: pin   J/K: reorder   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
                 .to_string()
         }
         PopupMode::Tree => {
@@ -643,6 +658,35 @@ mod tests {
 
         assert!(text.contains("kill session dev? (y/N)"), "{text}");
         assert!(text.contains("x: kill"), "{text}");
+    }
+
+    #[test]
+    fn escape_cancels_new_session_before_closing_popup() {
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.new_mode = true;
+        state.new_text = "api".to_string();
+        state.new_path = Some(PathBuf::from("/tmp/repo"));
+
+        assert_eq!(state.close_or_clear(), PopupCloseResult::StayOpen);
+        assert!(!state.new_mode);
+        assert!(state.new_text.is_empty());
+        assert!(state.new_path.is_none());
+
+        assert_eq!(state.close_or_clear(), PopupCloseResult::Close);
+    }
+
+    #[test]
+    fn render_shows_new_session_prompt_when_naming() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.selected = Some("a".to_string());
+        state.new_mode = true;
+        state.new_text = "api".to_string();
+
+        let text = render_popup_text(&state, &model, None);
+
+        assert!(text.contains("New session: api"), "{text}");
+        assert!(text.contains("n: new"), "{text}");
     }
 
     #[test]

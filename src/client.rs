@@ -1422,6 +1422,7 @@ struct PopupInputState {
     filter_mode: bool,
     reply_mode: bool,
     confirm_mode: bool,
+    new_mode: bool,
     escape_pending: Vec<u8>,
 }
 
@@ -1432,6 +1433,7 @@ impl PopupInputState {
             filter_mode: false,
             reply_mode: false,
             confirm_mode: false,
+            new_mode: false,
             escape_pending: Vec::new(),
         }
     }
@@ -1459,6 +1461,10 @@ enum PopupInputAction {
     KillStart,
     ConfirmYes,
     ConfirmNo,
+    NewStart,
+    NewPush(char),
+    NewBackspace,
+    NewSubmit,
     FilterStart,
     FilterPush(char),
     FilterBackspace,
@@ -2245,6 +2251,32 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
             }
             continue;
         }
+        if state.new_mode {
+            match bytes[index] {
+                b'\r' | b'\n' => {
+                    state.new_mode = false;
+                    actions.push(PopupInputAction::NewSubmit);
+                    index += 1;
+                }
+                b'\x1b' => {
+                    state.new_mode = false;
+                    actions.push(PopupInputAction::Escape);
+                    index += 1;
+                }
+                b'\x7f' => {
+                    actions.push(PopupInputAction::NewBackspace);
+                    index += 1;
+                }
+                byte if byte.is_ascii_graphic() || byte == b' ' => {
+                    actions.push(PopupInputAction::NewPush(byte as char));
+                    index += 1;
+                }
+                _ => {
+                    index += 1;
+                }
+            }
+            continue;
+        }
         match bytes[index] {
             b'/' if !state.filter_mode => {
                 state.filter_mode = true;
@@ -2307,6 +2339,11 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
             b'x' if !state.filter_mode => {
                 state.confirm_mode = true;
                 actions.push(PopupInputAction::KillStart);
+                index += 1;
+            }
+            b'n' if !state.filter_mode => {
+                state.new_mode = true;
+                actions.push(PopupInputAction::NewStart);
                 index += 1;
             }
             b'j' if !state.filter_mode => {
@@ -5123,6 +5160,7 @@ fn sync_popup_input_state(
     input_state.filter_mode = popup_state.filter_mode;
     input_state.reply_mode = popup_state.reply_mode;
     input_state.confirm_mode = popup_state.confirm_mode;
+    input_state.new_mode = popup_state.new_mode;
 }
 
 fn popup_reply_target(
@@ -5324,6 +5362,10 @@ fn apply_attention_popup_input_actions(
             PopupInputAction::KillStart
             | PopupInputAction::ConfirmYes
             | PopupInputAction::ConfirmNo => {}
+            PopupInputAction::NewStart
+            | PopupInputAction::NewPush(_)
+            | PopupInputAction::NewBackspace
+            | PopupInputAction::NewSubmit => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(AttentionPopupInputResult::Close);
@@ -5458,6 +5500,10 @@ fn apply_tree_popup_input_actions(
             PopupInputAction::KillStart
             | PopupInputAction::ConfirmYes
             | PopupInputAction::ConfirmNo => {}
+            PopupInputAction::NewStart
+            | PopupInputAction::NewPush(_)
+            | PopupInputAction::NewBackspace
+            | PopupInputAction::NewSubmit => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(TreePopupInputResult::Close);
@@ -5719,6 +5765,20 @@ fn apply_workspace_popup_input_actions(
                     "kill cancelled".to_string(),
                 ));
             }
+            PopupInputAction::NewStart
+            | PopupInputAction::NewPush(_)
+            | PopupInputAction::NewBackspace
+            | PopupInputAction::NewSubmit => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                    model_dirty = false;
+                }
+                if let Some(message) =
+                    apply_workspace_popup_new_session_action(socket, state, &model, action)?
+                {
+                    return Ok(WorkspacePopupInputResult::Message(message));
+                }
+            }
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(WorkspacePopupInputResult::Close);
@@ -5771,6 +5831,92 @@ fn workspace_popup_kill_target(
         .as_ref()
         .ok_or_else(|| "row has no session".to_string())?;
     Ok(target.clone())
+}
+
+/// Returns the workspace path a new background session would be rooted at, or
+/// an error message when the row is not a valid `new` target. Scoped to the
+/// same rows as `open` (registered paths and previous records); both carry a
+/// `repo_path`. Filesystem availability is checked by the caller.
+fn workspace_popup_new_session_path(row: &crate::popup::PopupRow) -> Result<PathBuf, String> {
+    if !row.id.starts_with("workspace:path:") && !row.id.starts_with("previous:") {
+        return Err("new session needs a registered path or previous session".to_string());
+    }
+    let path = row
+        .repo_path
+        .as_ref()
+        .ok_or_else(|| "row has no workspace path".to_string())?;
+    Ok(path.clone())
+}
+
+/// Drives the new-session naming sub-mode for the workspace popup. On submit it
+/// creates a detached session in the captured path and records it, but does not
+/// switch to it (background creation). Returns `Some(message)` to surface to the
+/// user, or `None` to keep collecting input.
+fn apply_workspace_popup_new_session_action(
+    socket: &Path,
+    state: &mut crate::popup::PopupState,
+    model: &crate::popup::PopupModel,
+    action: &PopupInputAction,
+) -> io::Result<Option<String>> {
+    match action {
+        PopupInputAction::NewStart => {
+            let Some(row) = state.selected_row(model) else {
+                return Ok(Some("no row selected".to_string()));
+            };
+            match workspace_popup_new_session_path(row) {
+                Ok(path) => {
+                    if !path.is_dir() {
+                        return Ok(Some("workspace path is unavailable".to_string()));
+                    }
+                    state.new_mode = true;
+                    state.new_text.clear();
+                    state.new_path = Some(path);
+                    Ok(None)
+                }
+                Err(message) => Ok(Some(message)),
+            }
+        }
+        PopupInputAction::NewPush(ch) => {
+            if state.new_mode && state.new_text.len() < 256 {
+                state.new_text.push(*ch);
+            }
+            Ok(None)
+        }
+        PopupInputAction::NewBackspace => {
+            if state.new_mode {
+                state.new_text.pop();
+            }
+            Ok(None)
+        }
+        PopupInputAction::NewSubmit => {
+            if !state.new_mode {
+                return Ok(None);
+            }
+            let typed = state.new_text.trim().to_string();
+            let path = state.new_path.clone();
+            state.new_mode = false;
+            state.new_text.clear();
+            state.new_path = None;
+            let Some(path) = path else {
+                return Ok(Some("new session target disappeared".to_string()));
+            };
+            if typed.is_empty() {
+                return Ok(Some("new session cancelled".to_string()));
+            }
+            let live_sessions = live_workspace_sessions(socket)?;
+            let base = workspace_session_name_base(&typed);
+            let session = workspace_session_name_for_base(base, &live_sessions);
+            send_control_request(socket, &protocol::encode_new_in_cwd(&session, &[], &path))?;
+            let _ = crate::registry::record_session(
+                &crate::paths::workspace_registry_path(),
+                path,
+                &session,
+                "live",
+            );
+            Ok(Some(format!("created {session}")))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn open_workspace_popup_row(
@@ -10550,6 +10696,68 @@ mod tests {
         let mut path_row = live.clone();
         path_row.id = "workspace:path:/tmp/repo".to_string();
         assert!(workspace_popup_kill_target(&path_row).is_err());
+    }
+
+    #[test]
+    fn popup_new_session_mode_collects_text_until_submit() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+
+        assert_eq!(
+            popup_actions_for_input(b"napi\x7f!\r", &mut state),
+            vec![
+                PopupInputAction::NewStart,
+                PopupInputAction::NewPush('a'),
+                PopupInputAction::NewPush('p'),
+                PopupInputAction::NewPush('i'),
+                PopupInputAction::NewBackspace,
+                PopupInputAction::NewPush('!'),
+                PopupInputAction::NewSubmit,
+            ]
+        );
+        assert!(!state.new_mode);
+
+        // Escape cancels naming instead of submitting.
+        assert_eq!(
+            popup_actions_for_input(b"n\x1b", &mut state),
+            vec![PopupInputAction::NewStart, PopupInputAction::Escape]
+        );
+        assert!(!state.new_mode);
+    }
+
+    #[test]
+    fn workspace_popup_new_session_path_scopes_to_paths_and_previous_rows() {
+        let mut path_row = crate::popup::PopupRow {
+            id: "workspace:path:/tmp/repo".to_string(),
+            kind: crate::popup::PopupRowKind::Item,
+            repo_path: Some(PathBuf::from("/tmp/repo")),
+            target: None,
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Registry,
+            title: "/tmp/repo".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: false,
+            pinned: false,
+        };
+        assert_eq!(
+            workspace_popup_new_session_path(&path_row).unwrap(),
+            PathBuf::from("/tmp/repo")
+        );
+
+        let mut previous = path_row.clone();
+        previous.id = "previous:api".to_string();
+        assert_eq!(
+            workspace_popup_new_session_path(&previous).unwrap(),
+            PathBuf::from("/tmp/repo")
+        );
+
+        let mut live = path_row.clone();
+        live.id = "live:dev".to_string();
+        assert!(workspace_popup_new_session_path(&live).is_err());
+
+        // A registered path row with no recorded path cannot host a new session.
+        path_row.repo_path = None;
+        assert!(workspace_popup_new_session_path(&path_row).is_err());
     }
 
     #[test]
