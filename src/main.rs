@@ -536,6 +536,13 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
             let _ = registry::mark_session_stopped(&paths::workspace_registry_path(), &session);
             Ok(())
         }
+        cli::Command::HasSession { session } => {
+            // tmux convention: exit 0 if the session exists, non-zero otherwise.
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            send_request(&socket, &protocol::encode_has_session(&session), false)?;
+            Ok(())
+        }
         cli::Command::KillServer => {
             let socket = paths::socket_path();
             if !socket.exists() {

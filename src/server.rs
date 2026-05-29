@@ -2824,6 +2824,7 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         }
         Request::SetOption { name, value } => handle_set_option(&state, &mut stream, &name, &value),
         Request::Kill { session } => handle_kill(&state, &mut stream, &session),
+        Request::HasSession { session } => handle_has_session(&state, &mut stream, &session),
         Request::KillServer => handle_kill_server(&state, &mut stream),
         Request::Attach { session } => handle_attach(&state, stream, &session),
         Request::AttachRawState { session } => {
@@ -4794,6 +4795,18 @@ fn handle_kill(state: &Arc<ServerState>, stream: &mut UnixStream, name: &str) ->
         terminate_pane_if_running_async(&pane);
     }
     write_ok(stream)
+}
+
+fn handle_has_session(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    if resolve_session(state, name).is_some() {
+        write_ok(stream)
+    } else {
+        write_err(stream, "can't find session")
+    }
 }
 
 fn handle_kill_server(state: &Arc<ServerState>, stream: &mut UnixStream) -> io::Result<()> {

@@ -204,6 +204,9 @@ pub enum Command {
     KillSession {
         session: String,
     },
+    HasSession {
+        session: String,
+    },
     KillServer,
     Help {
         topic: Option<HelpTopic>,
@@ -299,6 +302,7 @@ where
         "source-file" => parse_source_file(args),
         "run-shell" => parse_run_shell(args),
         "kill-session" => parse_kill_session(args),
+        "has-session" => parse_has_session(args),
         "kill-server" => Ok(Command::KillServer),
         _ => Err(format!("{program}: unknown command {subcommand:?}")),
     }
@@ -1124,6 +1128,12 @@ fn parse_kill_session(args: Vec<String>) -> Result<Command, String> {
     let session = parse_target(args, "kill-session")?
         .ok_or_else(|| "kill-session requires -t <session>".to_string())?;
     Ok(Command::KillSession { session })
+}
+
+fn parse_has_session(args: Vec<String>) -> Result<Command, String> {
+    let session = parse_target(args, "has-session")?
+        .ok_or_else(|| "has-session requires -t <session>".to_string())?;
+    Ok(Command::HasSession { session })
 }
 
 fn parse_run(args: Vec<String>) -> Result<Command, String> {

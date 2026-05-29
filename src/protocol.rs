@@ -304,6 +304,9 @@ pub enum Request {
     Kill {
         session: String,
     },
+    HasSession {
+        session: String,
+    },
     KillServer,
 }
 
@@ -963,6 +966,10 @@ pub fn encode_set_option(name: &str, value: &str) -> String {
 
 pub fn encode_kill(session: &str) -> String {
     format!("KILL\t{session}\n")
+}
+
+pub fn encode_has_session(session: &str) -> String {
+    format!("HAS_SESSION\t{session}\n")
 }
 
 pub fn encode_kill_server() -> &'static str {
@@ -1745,6 +1752,9 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             value: decode_utf8_hex(value, "SET_OPTION")?,
         }),
         ["KILL", session] => Ok(Request::Kill {
+            session: (*session).to_string(),
+        }),
+        ["HAS_SESSION", session] => Ok(Request::HasSession {
             session: (*session).to_string(),
         }),
         ["KILL_SERVER"] => Ok(Request::KillServer),
