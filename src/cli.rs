@@ -656,10 +656,11 @@ fn parse_list_sessions(args: Vec<String>, command_name: &str) -> Result<Command,
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-F" => {
+            "-F" | "--format" => {
+                let flag = &args[i];
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| format!("{command_name} requires a format after -F"))?;
+                    .ok_or_else(|| format!("{command_name} requires a format after {flag}"))?;
                 format = Some(value.clone());
                 i += 2;
             }
@@ -2517,6 +2518,12 @@ mod tests {
             parse_args(["dmux", "list-sessions", "-F", "#{session.name}"]).unwrap(),
             Command::ListSessions {
                 format: Some("#{session.name}".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "list-sessions", "--format", "json"]).unwrap(),
+            Command::ListSessions {
+                format: Some("json".to_string()),
             }
         );
         assert_eq!(
