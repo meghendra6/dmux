@@ -82,6 +82,9 @@ pub struct PopupState {
     pub reply_mode: bool,
     pub reply_text: String,
     pub reply_target: Option<PopupTarget>,
+    pub confirm_mode: bool,
+    pub confirm_prompt: String,
+    pub confirm_target: Option<PopupTarget>,
 }
 
 impl PopupState {
@@ -97,6 +100,9 @@ impl PopupState {
             reply_mode: false,
             reply_text: String::new(),
             reply_target: None,
+            confirm_mode: false,
+            confirm_prompt: String::new(),
+            confirm_target: None,
         }
     }
 
@@ -112,6 +118,11 @@ impl PopupState {
             self.reply_mode = false;
             self.reply_text.clear();
             self.reply_target = None;
+            PopupCloseResult::StayOpen
+        } else if self.confirm_mode {
+            self.confirm_mode = false;
+            self.confirm_prompt.clear();
+            self.confirm_target = None;
             PopupCloseResult::StayOpen
         } else if self.peek {
             self.peek = false;
@@ -368,13 +379,17 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
         lines.push(String::new());
         lines.push(format!("Reply: {}", state.reply_text));
     }
+    if state.confirm_mode {
+        lines.push(String::new());
+        lines.push(format!("{} (y/N)", state.confirm_prompt));
+    }
     lines.push(String::new());
     lines.push(match state.mode {
         PopupMode::Attention => {
             "Space: peek   r: reply   Tab: group   /: filter   Esc: close".to_string()
         }
         PopupMode::Workspace => {
-            "Enter: focus/attach   o: open/reopen   p: pin   J/K: reorder   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
+            "Enter: focus/attach   o: open/reopen   x: kill   p: pin   J/K: reorder   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
                 .to_string()
         }
         PopupMode::Tree => {
@@ -593,6 +608,41 @@ mod tests {
 
         assert_eq!(state.close_or_clear(), PopupCloseResult::StayOpen);
         assert!(!state.peek);
+    }
+
+    #[test]
+    fn escape_cancels_confirm_before_closing_popup() {
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.confirm_mode = true;
+        state.confirm_prompt = "kill session dev?".to_string();
+        state.confirm_target = Some(PopupTarget {
+            session: "dev".to_string(),
+            window_index: None,
+            window_id: None,
+            pane_index: None,
+            pane_id: None,
+        });
+
+        assert_eq!(state.close_or_clear(), PopupCloseResult::StayOpen);
+        assert!(!state.confirm_mode);
+        assert!(state.confirm_prompt.is_empty());
+        assert!(state.confirm_target.is_none());
+
+        assert_eq!(state.close_or_clear(), PopupCloseResult::Close);
+    }
+
+    #[test]
+    fn render_shows_confirm_prompt_when_confirming() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.selected = Some("a".to_string());
+        state.confirm_mode = true;
+        state.confirm_prompt = "kill session dev?".to_string();
+
+        let text = render_popup_text(&state, &model, None);
+
+        assert!(text.contains("kill session dev? (y/N)"), "{text}");
+        assert!(text.contains("x: kill"), "{text}");
     }
 
     #[test]

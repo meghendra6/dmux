@@ -1421,6 +1421,7 @@ struct PopupInputState {
     mode: crate::popup::PopupMode,
     filter_mode: bool,
     reply_mode: bool,
+    confirm_mode: bool,
     escape_pending: Vec<u8>,
 }
 
@@ -1430,6 +1431,7 @@ impl PopupInputState {
             mode,
             filter_mode: false,
             reply_mode: false,
+            confirm_mode: false,
             escape_pending: Vec::new(),
         }
     }
@@ -1454,6 +1456,9 @@ enum PopupInputAction {
     ReplyPush(char),
     ReplyBackspace,
     ReplySubmit,
+    KillStart,
+    ConfirmYes,
+    ConfirmNo,
     FilterStart,
     FilterPush(char),
     FilterBackspace,
@@ -2220,6 +2225,26 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
             }
             continue;
         }
+        if state.confirm_mode {
+            match bytes[index] {
+                b'y' | b'Y' => {
+                    state.confirm_mode = false;
+                    actions.push(PopupInputAction::ConfirmYes);
+                    index += 1;
+                }
+                b'\x1b' => {
+                    state.confirm_mode = false;
+                    actions.push(PopupInputAction::Escape);
+                    index += 1;
+                }
+                _ => {
+                    state.confirm_mode = false;
+                    actions.push(PopupInputAction::ConfirmNo);
+                    index += 1;
+                }
+            }
+            continue;
+        }
         match bytes[index] {
             b'/' if !state.filter_mode => {
                 state.filter_mode = true;
@@ -2277,6 +2302,11 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
             b'r' if !state.filter_mode => {
                 state.reply_mode = true;
                 actions.push(PopupInputAction::ReplyStart);
+                index += 1;
+            }
+            b'x' if !state.filter_mode => {
+                state.confirm_mode = true;
+                actions.push(PopupInputAction::KillStart);
                 index += 1;
             }
             b'j' if !state.filter_mode => {
@@ -5092,6 +5122,7 @@ fn sync_popup_input_state(
 ) {
     input_state.filter_mode = popup_state.filter_mode;
     input_state.reply_mode = popup_state.reply_mode;
+    input_state.confirm_mode = popup_state.confirm_mode;
 }
 
 fn popup_reply_target(
@@ -5290,6 +5321,9 @@ fn apply_attention_popup_input_actions(
             PopupInputAction::Open => {}
             PopupInputAction::Pin => {}
             PopupInputAction::MovePinUp | PopupInputAction::MovePinDown => {}
+            PopupInputAction::KillStart
+            | PopupInputAction::ConfirmYes
+            | PopupInputAction::ConfirmNo => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(AttentionPopupInputResult::Close);
@@ -5421,6 +5455,9 @@ fn apply_tree_popup_input_actions(
             PopupInputAction::Open => {}
             PopupInputAction::Pin => {}
             PopupInputAction::MovePinUp | PopupInputAction::MovePinDown => {}
+            PopupInputAction::KillStart
+            | PopupInputAction::ConfirmYes
+            | PopupInputAction::ConfirmNo => {}
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(TreePopupInputResult::Close);
@@ -5641,6 +5678,47 @@ fn apply_workspace_popup_input_actions(
                 // The pin order changed on disk; refresh on the next render.
                 model_dirty = true;
             }
+            PopupInputAction::KillStart => {
+                if model_dirty {
+                    model = workspace_popup_visible_model(socket, state)?;
+                    model_dirty = false;
+                }
+                let Some(row) = state.selected_row(&model) else {
+                    return Ok(WorkspacePopupInputResult::Message(
+                        "no row selected".to_string(),
+                    ));
+                };
+                match workspace_popup_kill_target(row) {
+                    Ok(target) => {
+                        state.confirm_prompt = format!("kill session {}?", target.session);
+                        state.confirm_target = Some(target);
+                        state.confirm_mode = true;
+                    }
+                    Err(message) => return Ok(WorkspacePopupInputResult::Message(message)),
+                }
+            }
+            PopupInputAction::ConfirmYes => {
+                let Some(target) = state.confirm_target.take() else {
+                    state.confirm_mode = false;
+                    state.confirm_prompt.clear();
+                    continue;
+                };
+                state.confirm_mode = false;
+                state.confirm_prompt.clear();
+                send_control_request(socket, &protocol::encode_kill(&target.session))?;
+                return Ok(WorkspacePopupInputResult::Message(format!(
+                    "killed {}",
+                    target.session
+                )));
+            }
+            PopupInputAction::ConfirmNo => {
+                state.confirm_mode = false;
+                state.confirm_prompt.clear();
+                state.confirm_target = None;
+                return Ok(WorkspacePopupInputResult::Message(
+                    "kill cancelled".to_string(),
+                ));
+            }
             PopupInputAction::Escape => {
                 if state.close_or_clear() == crate::popup::PopupCloseResult::Close {
                     return Ok(WorkspacePopupInputResult::Close);
@@ -5677,6 +5755,22 @@ fn apply_workspace_popup_input_actions(
         }
     }
     Ok(WorkspacePopupInputResult::StayOpen)
+}
+
+/// Returns the kill target for the selected workspace row, or an error message
+/// when the row cannot be killed. Scoped to live session rows: previous records
+/// have no running session, and registered paths are not sessions.
+fn workspace_popup_kill_target(
+    row: &crate::popup::PopupRow,
+) -> Result<crate::popup::PopupTarget, String> {
+    if !row.id.starts_with("live:") {
+        return Err("only live sessions can be killed".to_string());
+    }
+    let target = row
+        .target
+        .as_ref()
+        .ok_or_else(|| "row has no session".to_string())?;
+    Ok(target.clone())
 }
 
 fn open_workspace_popup_row(
@@ -10386,6 +10480,76 @@ mod tests {
                 PopupInputAction::ReplySubmit,
             ]
         );
+    }
+
+    #[test]
+    fn popup_confirm_mode_consumes_yes_no_and_escape() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+
+        // `x` starts the confirm sub-mode; the next byte is the answer.
+        assert_eq!(
+            popup_actions_for_input(b"xy", &mut state),
+            vec![PopupInputAction::KillStart, PopupInputAction::ConfirmYes]
+        );
+        assert!(!state.confirm_mode);
+
+        assert_eq!(
+            popup_actions_for_input(b"xn", &mut state),
+            vec![PopupInputAction::KillStart, PopupInputAction::ConfirmNo]
+        );
+        assert!(!state.confirm_mode);
+
+        // Escape cancels the confirmation rather than killing.
+        assert_eq!(
+            popup_actions_for_input(b"x\x1b", &mut state),
+            vec![PopupInputAction::KillStart, PopupInputAction::Escape]
+        );
+        assert!(!state.confirm_mode);
+    }
+
+    #[test]
+    fn popup_kill_key_is_filter_text_in_filter_mode() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+        assert_eq!(
+            popup_actions_for_input(b"/x", &mut state),
+            vec![
+                PopupInputAction::FilterStart,
+                PopupInputAction::FilterPush('x'),
+            ]
+        );
+        assert!(!state.confirm_mode);
+    }
+
+    #[test]
+    fn workspace_popup_kill_target_scopes_to_live_sessions() {
+        let live = crate::popup::PopupRow {
+            id: "live:dev".to_string(),
+            kind: crate::popup::PopupRowKind::Item,
+            repo_path: None,
+            target: Some(crate::popup::PopupTarget {
+                session: "dev".to_string(),
+                window_index: None,
+                window_id: None,
+                pane_index: None,
+                pane_id: None,
+            }),
+            state: crate::popup::PopupStateKind::Idle,
+            source: crate::popup::PopupRowSource::Mux,
+            title: "dev".to_string(),
+            summary: String::new(),
+            last_changed: None,
+            attachable: true,
+            pinned: false,
+        };
+        assert_eq!(workspace_popup_kill_target(&live).unwrap().session, "dev");
+
+        let mut previous = live.clone();
+        previous.id = "previous:dev".to_string();
+        assert!(workspace_popup_kill_target(&previous).is_err());
+
+        let mut path_row = live.clone();
+        path_row.id = "workspace:path:/tmp/repo".to_string();
+        assert!(workspace_popup_kill_target(&path_row).is_err());
     }
 
     #[test]

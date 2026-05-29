@@ -2039,6 +2039,23 @@ fn poll_list_sessions_contains(socket: &std::path::Path, format: &str, needle: &
     last
 }
 
+fn poll_list_sessions_absent(socket: &std::path::Path, format: &str, absent: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut last = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let output = dmux(socket, &["list-sessions", "-F", format]);
+        assert_success(&output);
+        last = String::from_utf8_lossy(&output.stdout).to_string();
+        if !last.lines().any(|line| line == absent) {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    last
+}
+
 fn active_pane_index_and_id(socket: &std::path::Path, session: &str) -> (usize, usize) {
     let output = dmux(
         socket,
@@ -3962,6 +3979,62 @@ fn workspace_popup_pin_persists_registered_path_to_registry() {
     assert_success(&dmux(&socket, &["kill-server"]));
     let _ = std::fs::remove_file(registry_path);
     let _ = std::fs::remove_dir(workspace_dir);
+}
+
+#[test]
+fn workspace_popup_kill_confirmation_kills_selected_live_session() {
+    let socket = unique_socket("workspace-popup-kill");
+    let registry_path = unique_temp_file("workspace-popup-kill-registry");
+    let registry_env = registry_path.to_string_lossy().to_string();
+    let session_a = format!("workspace-popup-kill-a-{}", std::process::id());
+    let session_b = format!("workspace-popup-kill-b-{}", std::process::id());
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &session_a, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+    assert_success(&dmux_with_env(
+        &socket,
+        &["new", "-d", "-s", &session_b, "--", "sh", "-lc", "cat"],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    ));
+
+    let mut child = spawn_attached_dmux_with_env(
+        &socket,
+        &["attach", "-t", &session_a],
+        &[],
+        &[("DEVMUX_WORKSPACE_REGISTRY", registry_env.as_str())],
+    );
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02A")
+        .unwrap();
+    child.wait_for_stdout_contains_all(&["dmux workspaces", &session_b], "workspace popup");
+
+    // Filter to session B, then confirm a kill with `x` followed by `y`.
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(format!("/{session_b}\rxy").as_bytes())
+        .unwrap();
+
+    let remaining = poll_list_sessions_absent(&socket, "#{session.name}", &session_b);
+    assert!(
+        !remaining.lines().any(|line| line == session_b),
+        "session B should be killed: {remaining:?}"
+    );
+    assert!(
+        remaining.lines().any(|line| line == session_a),
+        "session A should survive: {remaining:?}"
+    );
+
+    child
+        .stdin_mut("workspace popup stdin")
+        .write_all(b"\x02d")
+        .unwrap();
+    assert_success(&wait_for_child_exit(child));
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session_a]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+    let _ = std::fs::remove_file(registry_path);
 }
 
 #[test]
