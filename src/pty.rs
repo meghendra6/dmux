@@ -251,7 +251,16 @@ pub fn resize(master: &File, size: PtySize) -> io::Result<()> {
 }
 
 fn child_exec(spec: &SpawnSpec) -> ! {
-    let _ = std::env::set_current_dir(&spec.cwd);
+    if let Err(err) = std::env::set_current_dir(&spec.cwd) {
+        // Post-fork, pre-exec: we cannot return a Result, and silently starting
+        // in the server's directory hides why the shell is in the wrong place.
+        // Surface it on the pane (stderr is the PTY slave here) and continue so
+        // the shell still starts in the inherited directory.
+        let message = cwd_error_message(&spec.cwd, &err);
+        unsafe {
+            write(STDERR_FILENO, message.as_ptr().cast(), message.len());
+        }
+    }
     configure_child_terminal_environment(spec);
 
     let args = spec
@@ -276,6 +285,13 @@ fn child_exec(spec: &SpawnSpec) -> ! {
         execvp(args[0].as_ptr(), argv.as_ptr());
         _exit(127);
     }
+}
+
+/// The warning shown in a pane when its requested working directory cannot be
+/// entered. Pure so it can be unit-tested without a fork. `\r\n` because the
+/// destination is a raw PTY, not cooked stdout.
+fn cwd_error_message(cwd: &Path, err: &io::Error) -> String {
+    format!("dmux: unable to start in {}: {err}\r\n", cwd.display())
 }
 
 fn configure_child_terminal_environment(spec: &SpawnSpec) {
@@ -325,6 +341,7 @@ const SIGTERM: c_int = 15;
 const WNOHANG: c_int = 1;
 const ECHILD: i32 = 10;
 const ESRCH: i32 = 3;
+const STDERR_FILENO: c_int = 2;
 
 #[cfg_attr(target_os = "linux", link(name = "util"))]
 unsafe extern "C" {
@@ -339,6 +356,7 @@ unsafe extern "C" {
     fn kill(pid: c_int, sig: c_int) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn ioctl(fd: c_int, request: CULong, ...) -> c_int;
+    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
 }
 
 #[cfg(test)]
@@ -353,6 +371,14 @@ mod tests {
             std::path::PathBuf::from("/tmp"),
         );
         assert!(!spec.command.is_empty());
+    }
+
+    #[test]
+    fn cwd_error_message_names_directory_and_reason() {
+        let err = io::Error::from_raw_os_error(2); // ENOENT
+        let message = cwd_error_message(Path::new("/tmp/gone"), &err);
+        assert!(message.starts_with("dmux: unable to start in /tmp/gone: "));
+        assert!(message.ends_with("\r\n"));
     }
 
     #[test]
