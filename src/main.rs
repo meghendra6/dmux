@@ -20,6 +20,8 @@ const JSON_FORMAT_SELECTOR: &str = "json";
 /// Internal field-separated format requested from the server for JSON output;
 /// the unit separator keeps fields unambiguous across names with whitespace.
 const LIST_SESSIONS_JSON_FORMAT: &str = "#{session.name}\u{1f}#{session.window_count}\u{1f}#{session.attached_count}\u{1f}#{session.created_at}";
+const LIST_PANES_JSON_FORMAT: &str = "#{pane.index}\u{1f}#{pane.id}\u{1f}#{pane.active}\u{1f}#{pane.zoomed}\u{1f}#{pane.state}\u{1f}#{pane.pid}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.title}\u{1f}#{pane.cwd}\u{1f}#{pane.bell}\u{1f}#{pane.activity}";
+const LIST_WINDOWS_JSON_FORMAT: &str = "#{window.index}\u{1f}#{window.id}\u{1f}#{window.name}\u{1f}#{window.active}\u{1f}#{window.panes}";
 const MAX_RUN_SHELL_OUTPUT_BYTES: usize = 64 * 1024;
 
 fn main() {
@@ -277,6 +279,19 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
         } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
+            if format.as_deref() == Some(JSON_FORMAT_SELECTOR) {
+                let body = send_request(
+                    &socket,
+                    &protocol::encode_list_panes_target(
+                        &session,
+                        window,
+                        Some(LIST_PANES_JSON_FORMAT),
+                    ),
+                    true,
+                )?;
+                println!("{}", list_panes_json(&String::from_utf8_lossy(&body)));
+                return Ok(());
+            }
             let body = send_request(
                 &socket,
                 &protocol::encode_list_panes_target(&session, window, format.as_deref()),
@@ -381,6 +396,15 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
         cli::Command::ListWindows { session, format } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;
+            if format.as_deref() == Some(JSON_FORMAT_SELECTOR) {
+                let body = send_request(
+                    &socket,
+                    &protocol::encode_list_windows(&session, Some(LIST_WINDOWS_JSON_FORMAT)),
+                    true,
+                )?;
+                println!("{}", list_windows_json(&String::from_utf8_lossy(&body)));
+                return Ok(());
+            }
             let format = format.as_deref().unwrap_or(DEFAULT_LIST_WINDOWS_FORMAT);
             let body = send_request(
                 &socket,
@@ -968,6 +992,80 @@ fn list_sessions_json(body: &str) -> String {
     }
 }
 
+/// Render the field-separated `LIST_PANES_JSON_FORMAT` body as a JSON array of
+/// pane objects. Boolean flags become JSON booleans; counts/ids stay numeric.
+fn list_panes_json(body: &str) -> String {
+    let objects = body
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split('\u{1f}');
+            let index = fields.next().unwrap_or_default();
+            let id = fields.next().unwrap_or_default();
+            let active = fields.next().unwrap_or_default();
+            let zoomed = fields.next().unwrap_or_default();
+            let state = fields.next().unwrap_or_default();
+            let pid = fields.next().unwrap_or_default();
+            let exit_status = fields.next().unwrap_or_default();
+            let exit_signal = fields.next().unwrap_or_default();
+            let title = fields.next().unwrap_or_default();
+            let cwd = fields.next().unwrap_or_default();
+            let bell = fields.next().unwrap_or_default();
+            let activity = fields.next().unwrap_or_default();
+            format!(
+                "  {{\"index\": {}, \"id\": {}, \"active\": {}, \"zoomed\": {}, \"state\": {}, \"pid\": {}, \"exit_status\": {}, \"exit_signal\": {}, \"title\": {}, \"cwd\": {}, \"bell\": {}, \"activity\": {}}}",
+                json::json_u64_or_string(index),
+                json::json_u64_or_string(id),
+                json::json_bool(active),
+                json::json_bool(zoomed),
+                json::json_string(state),
+                json::json_u64_or_string(pid),
+                json::json_u64_or_string(exit_status),
+                json::json_u64_or_string(exit_signal),
+                json::json_string(title),
+                json::json_string(cwd),
+                json::json_bool(bell),
+                json::json_bool(activity),
+            )
+        })
+        .collect::<Vec<_>>();
+    if objects.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[\n{}\n]", objects.join(",\n"))
+    }
+}
+
+/// Render the field-separated `LIST_WINDOWS_JSON_FORMAT` body as a JSON array
+/// of window objects.
+fn list_windows_json(body: &str) -> String {
+    let objects = body
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.split('\u{1f}');
+            let index = fields.next().unwrap_or_default();
+            let id = fields.next().unwrap_or_default();
+            let name = fields.next().unwrap_or_default();
+            let active = fields.next().unwrap_or_default();
+            let panes = fields.next().unwrap_or_default();
+            format!(
+                "  {{\"index\": {}, \"id\": {}, \"name\": {}, \"active\": {}, \"panes\": {}}}",
+                json::json_u64_or_string(index),
+                json::json_u64_or_string(id),
+                json::json_string(name),
+                json::json_bool(active),
+                json::json_u64_or_string(panes),
+            )
+        })
+        .collect::<Vec<_>>();
+    if objects.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[\n{}\n]", objects.join(",\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,6 +1089,28 @@ mod tests {
             "{}",
             list_sessions_json(body)
         );
+    }
+
+    #[test]
+    fn list_panes_json_renders_flags_as_booleans() {
+        let body = "0\u{1f}2\u{1f}1\u{1f}0\u{1f}running\u{1f}123\u{1f}\u{1f}\u{1f}vim\u{1f}/tmp\u{1f}0\u{1f}1\n";
+        let json = list_panes_json(body);
+        assert_eq!(
+            json,
+            "[\n  {\"index\": 0, \"id\": 2, \"active\": true, \"zoomed\": false, \"state\": \"running\", \"pid\": 123, \"exit_status\": \"\", \"exit_signal\": \"\", \"title\": \"vim\", \"cwd\": \"/tmp\", \"bell\": false, \"activity\": true}\n]"
+        );
+        assert_eq!(list_panes_json(""), "[]");
+    }
+
+    #[test]
+    fn list_windows_json_renders_objects() {
+        let body = "0\u{1f}5\u{1f}main\u{1f}1\u{1f}3\n";
+        let json = list_windows_json(body);
+        assert_eq!(
+            json,
+            "[\n  {\"index\": 0, \"id\": 5, \"name\": \"main\", \"active\": true, \"panes\": 3}\n]"
+        );
+        assert_eq!(list_windows_json(""), "[]");
     }
 
     #[test]
