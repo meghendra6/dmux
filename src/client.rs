@@ -37,6 +37,7 @@ const CLEAR_SCREEN: &[u8] = b"\x1b[2J\x1b[H";
 const CURSOR_HOME: &[u8] = b"\x1b[H";
 const CLEAR_LINE: &[u8] = b"\x1b[2K";
 const RESET_STYLE: &[u8] = b"\x1b[0m";
+const REVERSE_STYLE: &[u8] = b"\x1b[7m";
 const SAVE_CURSOR: &[u8] = b"\x1b7";
 const RESTORE_CURSOR: &[u8] = b"\x1b8";
 const ATTACH_RENDER_RESPONSE: &str = "OK\tRENDER_OUTPUT_META\n";
@@ -731,11 +732,20 @@ fn write_live_frame_to_stdout(
         let rows = usize::from(size.rows);
         if rows > 1 { rows - 1 } else { rows }
     });
+    // Render a transient message (pane numbers, action results) as a bottom
+    // status overlay so showing/hiding it never shifts the pane rows up and
+    // down. This needs a known terminal size to place it on the last row; the
+    // command prompt always stays a header line (it needs a visible cursor),
+    // and when the size is unknown we fall back to a header line so the message
+    // is still shown.
+    let use_status_overlay = !prioritize_message && attach_size.is_some();
+    let header_message = if use_status_overlay { None } else { message };
+    let status_overlay_message = if use_status_overlay { message } else { None };
     let header_lines = cap_live_header_lines(
-        live_header_lines(status, message, width),
+        live_header_lines(status, header_message, width),
         max_header_rows,
         width,
-        prioritize_message && message.is_some(),
+        prioritize_message && header_message.is_some(),
     );
     let header_rows = header_lines.len();
     let snapshot_rows = attach_size
@@ -758,6 +768,9 @@ fn write_live_frame_to_stdout(
     }
     if let (Some(overlay), Some(size)) = (overlay, attach_size) {
         append_popup_overlay(&mut stdout, overlay, size, header_rows)?;
+    }
+    if let (Some(message), Some(size)) = (status_overlay_message, attach_size) {
+        append_status_message_overlay(&mut stdout, message, size)?;
     }
     stdout.flush()?;
 
@@ -937,6 +950,35 @@ fn append_popup_overlay(
         size,
         header_rows,
     );
+    stdout.write_all(&output)
+}
+
+/// Draw a transient status message as a reverse-video bar on the last terminal
+/// row, bracketed by SAVE/RESTORE_CURSOR so it overlays pane content without
+/// reserving a row. Unlike a header line, this does not shift the pane layout
+/// when the message appears or expires.
+fn append_status_message_overlay(
+    stdout: &mut impl Write,
+    message: &str,
+    size: PtySize,
+) -> io::Result<()> {
+    let rows = usize::from(size.rows);
+    let cols = usize::from(size.cols);
+    if rows == 0 || cols == 0 {
+        return Ok(());
+    }
+    let mut text = truncate_header_line(message.lines().next().unwrap_or(""), Some(cols));
+    let pad = cols.saturating_sub(display_cell_width(&text));
+    text.push_str(&" ".repeat(pad));
+
+    let mut output = Vec::new();
+    output.extend_from_slice(SAVE_CURSOR);
+    write_absolute_cursor_position(&mut output, rows, 1);
+    output.extend_from_slice(RESET_STYLE);
+    output.extend_from_slice(REVERSE_STYLE);
+    output.extend_from_slice(text.as_bytes());
+    output.extend_from_slice(RESET_STYLE);
+    output.extend_from_slice(RESTORE_CURSOR);
     stdout.write_all(&output)
 }
 
@@ -12808,6 +12850,78 @@ mod tests {
 
         assert_eq!(message, None);
         assert_eq!(header_lines, vec!["tabs: [0:0*]", "pane 0"]);
+    }
+
+    #[test]
+    fn status_message_overlay_draws_reverse_video_last_row_without_shift() {
+        let mut output = Vec::new();
+        append_status_message_overlay(
+            &mut output,
+            "panes: 0 [1] 2",
+            PtySize { cols: 20, rows: 10 },
+        )
+        .unwrap();
+
+        // SAVE/RESTORE bracket the write (no cursor move leaks → no layout
+        // shift), the message lands on the last row, and it is reverse-video.
+        assert!(output.starts_with(SAVE_CURSOR), "{output:?}");
+        assert!(output.ends_with(RESTORE_CURSOR), "{output:?}");
+        assert!(
+            output
+                .windows(b"\x1b[10;1H".len())
+                .any(|w| w == b"\x1b[10;1H"),
+            "{output:?}"
+        );
+        assert!(
+            output
+                .windows(REVERSE_STYLE.len())
+                .any(|w| w == REVERSE_STYLE),
+            "{output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("panes: 0 [1] 2"),
+            "{output:?}"
+        );
+    }
+
+    #[test]
+    fn live_frame_routes_transient_message_to_overlay_not_a_header_row() {
+        let snapshot = AttachLayoutSnapshotResponse {
+            snapshot: Vec::new(),
+            regions: Vec::new(),
+            active_modes: protocol::ActiveTerminalModes::default(),
+        };
+        // Pass an overlay so the terminal size is known (default) even without a
+        // tty in the test; the status overlay only engages with a known size.
+        let overlay = PopupOverlay {
+            title: "dmux help",
+            content: "C-b ? close",
+        };
+
+        // A transient (non-prioritized) message must not add a header row, so the
+        // pane layout does not shift when it shows/hides.
+        let frame = write_live_frame_to_stdout(
+            "",
+            Some("panes: 0 [1] 2"),
+            Some(overlay),
+            &snapshot,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(frame.header_rows, 0);
+
+        // The command prompt is prioritized and still anchored as a header line.
+        let frame = write_live_frame_to_stdout(
+            "",
+            Some(":rename-window api"),
+            Some(overlay),
+            &snapshot,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(frame.header_rows, 1);
     }
 
     #[test]
