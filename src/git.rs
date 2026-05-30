@@ -1,11 +1,22 @@
 //! Lightweight, read-only git inspection for status-line tokens.
 //!
-//! This intentionally never shells out: the branch is derived by parsing
-//! `.git/HEAD`, walking up the directory tree to find the repository. `.git`
-//! is normally a directory, but in worktrees and submodules it is a file
-//! containing `gitdir: <path>`.
+//! The branch is derived by parsing `.git/HEAD` without shelling out, walking
+//! up the directory tree to find the repository. `.git` is normally a
+//! directory, but in worktrees and submodules it is a file containing
+//! `gitdir: <path>`.
+//!
+//! Working-tree dirtiness needs a real `git status --porcelain`, which is
+//! cached per repository with a short TTL so it never runs on every status
+//! render.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// How long a cached dirty result is reused before `git status` runs again.
+const DIRTY_TTL: Duration = Duration::from_secs(2);
 
 /// Returns the current branch for `cwd`: the branch name for a normal checkout,
 /// a short commit hash for a detached HEAD, or `None` when `cwd` is not inside
@@ -50,6 +61,62 @@ fn find_git_dir(start: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Returns whether the working tree containing `cwd` has uncommitted changes,
+/// or `None` when `cwd` is not inside a git repository. The result is cached
+/// per repository for `DIRTY_TTL`, so repeated status renders do not spawn a
+/// `git` process each time.
+pub fn is_dirty(cwd: &Path) -> Option<bool> {
+    let root = repo_root(cwd)?;
+    let now = Instant::now();
+    {
+        let cache = dirty_cache().lock().unwrap();
+        if let Some((checked_at, dirty)) = cache.get(&root)
+            && now.duration_since(*checked_at) < DIRTY_TTL
+        {
+            return Some(*dirty);
+        }
+    }
+    let dirty = compute_dirty(&root)?;
+    dirty_cache().lock().unwrap().insert(root, (now, dirty));
+    Some(dirty)
+}
+
+/// Walk up from `start` to the work-tree root (the directory that holds `.git`).
+fn repo_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// Run `git status --porcelain` in `root` and report whether the tree is dirty.
+/// Returns `None` if git is unavailable or the command fails.
+fn compute_dirty(root: &Path) -> Option<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(dirty_from_porcelain(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// A `git status --porcelain` output is dirty when it lists any entry. Empty or
+/// whitespace-only output means a clean tree.
+fn dirty_from_porcelain(output: &str) -> bool {
+    !output.trim().is_empty()
+}
+
+fn dirty_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, bool)>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Instant, bool)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[cfg(test)]
@@ -124,5 +191,55 @@ mod tests {
         let plain = unique_dir("plain");
         assert_eq!(branch(&plain), None);
         let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn dirty_from_porcelain_detects_changes() {
+        assert!(!dirty_from_porcelain(""));
+        assert!(!dirty_from_porcelain("   \n  \n"));
+        assert!(dirty_from_porcelain(" M src/main.rs\n"));
+        assert!(dirty_from_porcelain("?? new.txt\n"));
+    }
+
+    #[test]
+    fn repo_root_finds_worktree_root() {
+        let repo = unique_dir("root");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let nested = repo.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(repo_root(&nested), Some(repo.clone()));
+
+        let plain = unique_dir("root-none");
+        assert_eq!(repo_root(&plain), None);
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn compute_dirty_reports_clean_and_dirty_trees() {
+        let clean = unique_dir("clean");
+        assert!(git_init(&clean), "git must be available for this test");
+        assert_eq!(compute_dirty(&clean), Some(false));
+        // The cached entry point agrees on the first (cache-miss) lookup.
+        assert_eq!(is_dirty(&clean), Some(false));
+
+        let dirty = unique_dir("dirty");
+        assert!(git_init(&dirty), "git must be available for this test");
+        std::fs::write(dirty.join("change.txt"), "x").unwrap();
+        assert_eq!(compute_dirty(&dirty), Some(true));
+
+        let _ = std::fs::remove_dir_all(&clean);
+        let _ = std::fs::remove_dir_all(&dirty);
+    }
+
+    fn git_init(dir: &Path) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .arg("init")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 }
