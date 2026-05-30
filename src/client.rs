@@ -2140,8 +2140,13 @@ fn translate_attach_input_with_state_with_controls(
                         }
                         continue;
                     }
-                    output.push(controls.prefix);
-                    output.extend_from_slice(&bytes[offset..offset + consumed]);
+                    // No binding for this prefix key. If it is the prefix key
+                    // itself, send a single prefix byte to the pane (send-prefix);
+                    // otherwise ignore it instead of leaking the prefix byte plus
+                    // the key into the pane (which showed up as garbled input).
+                    if consumed == 1 && byte == controls.prefix {
+                        output.push(controls.prefix);
+                    }
                     offset += consumed;
                     continue;
                 }
@@ -2641,8 +2646,13 @@ fn translate_live_snapshot_input_with_mouse_and_controls(
                         }
                         continue;
                     }
-                    output.push(controls.prefix);
-                    output.extend_from_slice(&bytes[offset..offset + consumed]);
+                    // No binding for this prefix key. If it is the prefix key
+                    // itself, send a single prefix byte to the pane (send-prefix);
+                    // otherwise ignore it instead of leaking the prefix byte plus
+                    // the key into the pane (which showed up as garbled input).
+                    if consumed == 1 && byte == controls.prefix {
+                        output.push(controls.prefix);
+                    }
                     offset += consumed;
                     continue;
                 }
@@ -9971,10 +9981,9 @@ mod tests {
         let mut state = LiveSnapshotInputState::default();
 
         assert!(translate_live_snapshot_input(b"\x02", &mut state).is_empty());
-        assert_eq!(
-            translate_live_snapshot_input(b"\x1b", &mut state),
-            vec![LiveSnapshotInputAction::Forward(b"\x02\x1b".to_vec())]
-        );
+        // C-b followed by ESC is an unbound prefix key: a no-op that does not
+        // leak the prefix byte to the pane.
+        assert!(translate_live_snapshot_input(b"\x1b", &mut state).is_empty());
         assert_eq!(
             translate_live_snapshot_input(b"x", &mut state),
             vec![LiveSnapshotInputAction::Forward(b"x".to_vec())]
@@ -10089,25 +10098,23 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_input_forwards_literal_prefix_with_regular_key() {
-        let mut state = LiveSnapshotInputState::default();
-
-        let actions = translate_live_snapshot_input(b"\x02a", &mut state);
-
-        assert_eq!(
-            actions,
-            vec![LiveSnapshotInputAction::Forward(b"\x02a".to_vec())]
-        );
-        assert!(!state.saw_prefix);
-    }
-
-    #[test]
     fn live_snapshot_input_forwards_single_literal_prefix_on_double_prefix() {
         let mut state = LiveSnapshotInputState::default();
 
         let actions = translate_live_snapshot_input(b"\x02\x02", &mut state);
 
         assert_eq!(actions, vec![LiveSnapshotInputAction::Forward(vec![0x02])]);
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn live_snapshot_input_ignores_unbound_prefix_key() {
+        let mut state = LiveSnapshotInputState::default();
+
+        // C-b a is unbound: a no-op that leaks neither the prefix nor the key.
+        let actions = translate_live_snapshot_input(b"\x02a", &mut state);
+
+        assert!(actions.is_empty(), "{actions:?}");
         assert!(!state.saw_prefix);
     }
 
@@ -10166,12 +10173,14 @@ mod tests {
         let mut state = LiveSnapshotInputState::default();
         let controls = LiveControls::from_entries("C-b", Vec::new());
 
-        assert_eq!(
+        // An unbound prefix key is now a no-op (it does not leak prefix+key).
+        assert!(
             translate_live_snapshot_input_with_mouse_and_controls(
                 b"\x02d", &mut state, true, false, &controls
-            ),
-            vec![LiveSnapshotInputAction::Forward(b"\x02d".to_vec())]
+            )
+            .is_empty()
         );
+        // Prefix twice still sends a single literal prefix byte (send-prefix).
         assert_eq!(
             translate_live_snapshot_input_with_mouse_and_controls(
                 b"\x02\x02",
@@ -10180,7 +10189,7 @@ mod tests {
                 false,
                 &controls
             ),
-            vec![LiveSnapshotInputAction::Forward(b"\x02\x02".to_vec())]
+            vec![LiveSnapshotInputAction::Forward(b"\x02".to_vec())]
         );
     }
 
@@ -11789,17 +11798,29 @@ mod tests {
     }
 
     #[test]
-    fn attach_input_unbound_prefix_key_forwards_prefix_and_key() {
+    fn attach_input_double_prefix_sends_single_prefix() {
         let mut state = RawAttachInputState::default();
         let controls = LiveControls::from_entries("C-b", Vec::new());
 
+        // Prefix twice = send-prefix: one literal prefix byte reaches the pane.
         let actions =
             translate_attach_input_with_state_with_controls(b"\x02\x02", &mut state, &controls);
 
-        assert_eq!(
-            actions,
-            vec![AttachInputAction::Forward(b"\x02\x02".to_vec())]
-        );
+        assert_eq!(actions, vec![AttachInputAction::Forward(b"\x02".to_vec())]);
+        assert!(!state.saw_prefix);
+    }
+
+    #[test]
+    fn attach_input_unbound_prefix_key_is_ignored() {
+        let mut state = RawAttachInputState::default();
+        let controls = LiveControls::from_entries("C-b", Vec::new());
+
+        // An unbound prefix key (e.g. C-b a) is a no-op: neither the prefix byte
+        // nor the key is leaked to the pane.
+        let actions =
+            translate_attach_input_with_state_with_controls(b"\x02a", &mut state, &controls);
+
+        assert!(actions.is_empty(), "{actions:?}");
         assert!(!state.saw_prefix);
     }
 
