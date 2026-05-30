@@ -2593,6 +2593,10 @@ impl Pane {
         });
     }
 
+    fn clear_agent_event(&self) {
+        *self.agent_event.lock().unwrap() = None;
+    }
+
     fn agent_event_snapshot(&self) -> PaneAgentEventSnapshot {
         self.agent_event
             .lock()
@@ -2849,6 +2853,12 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
             source,
             changed_at,
         ),
+        Request::Notify {
+            pane_id,
+            state: event_state,
+            label,
+        } => handle_notify(&state, &mut stream, pane_id, event_state, label),
+        Request::NotifyClear { pane_id } => handle_notify_clear(&state, &mut stream, pane_id),
         Request::ListKeys { format } => handle_list_keys(&state, &mut stream, format.as_deref()),
         Request::BindKey { key, command } => handle_bind_key(&state, &mut stream, &key, &command),
         Request::UnbindKey { key } => handle_unbind_key(&state, &mut stream, &key),
@@ -3955,6 +3965,63 @@ fn handle_agent_event(
         }
     };
     pane.set_agent_event(event_state, label, source, changed_at);
+    session.notify_attach_redraw_immediate();
+    write_ok(stream)
+}
+
+/// Find a pane by its global id across every session, returning the pane and
+/// its owning session. Pane ids are unique server-wide, so a bare id (e.g. from
+/// the `$DMUX_PANE` env var a pane child sees) is enough to address it.
+fn find_pane_with_session(
+    state: &Arc<ServerState>,
+    pane_id: usize,
+) -> Option<(Arc<Session>, Arc<Pane>)> {
+    let sessions: Vec<Arc<Session>> = state.sessions.lock().unwrap().values().cloned().collect();
+    for session in sessions {
+        if let Some(pane) = session
+            .panes()
+            .into_iter()
+            .find(|pane| pane.id == PaneId::new(pane_id))
+        {
+            return Some((session, pane));
+        }
+    }
+    None
+}
+
+fn handle_notify(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    pane_id: usize,
+    event_state: String,
+    label: String,
+) -> io::Result<()> {
+    if event_state.trim().is_empty()
+        || event_state.chars().any(char::is_control)
+        || label.chars().any(char::is_control)
+    {
+        write_err(stream, "invalid notify event")?;
+        return Ok(());
+    }
+    let Some((session, pane)) = find_pane_with_session(state, pane_id) else {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    };
+    pane.set_agent_event(event_state, label, None, None);
+    session.notify_attach_redraw_immediate();
+    write_ok(stream)
+}
+
+fn handle_notify_clear(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    pane_id: usize,
+) -> io::Result<()> {
+    let Some((session, pane)) = find_pane_with_session(state, pane_id) else {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    };
+    pane.clear_agent_event();
     session.notify_attach_redraw_immediate();
     write_ok(stream)
 }

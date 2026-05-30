@@ -289,6 +289,14 @@ pub enum Request {
         source: Option<String>,
         changed_at: Option<u64>,
     },
+    Notify {
+        pane_id: usize,
+        state: String,
+        label: String,
+    },
+    NotifyClear {
+        pane_id: usize,
+    },
     ListKeys {
         format: Option<String>,
     },
@@ -933,6 +941,18 @@ pub fn encode_agent_event(
             .map(|value| value.to_string())
             .unwrap_or_default()
     )
+}
+
+pub fn encode_notify(pane_id: usize, state: &str, label: &str) -> String {
+    format!(
+        "NOTIFY\t{pane_id}\t{}\t{}\n",
+        encode_hex(state.as_bytes()),
+        encode_hex(label.as_bytes())
+    )
+}
+
+pub fn encode_notify_clear(pane_id: usize) -> String {
+    format!("NOTIFY_CLEAR\t{pane_id}\n")
 }
 
 pub fn encode_list_keys(format: Option<&str>) -> String {
@@ -1751,6 +1771,18 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             label: decode_utf8_hex(label, "AGENT_EVENT")?,
             source: decode_optional_text(source, "AGENT_EVENT")?,
             changed_at: decode_optional_u64(changed_at, "AGENT_EVENT changed_at")?,
+        }),
+        ["NOTIFY", pane_id, state, label] => Ok(Request::Notify {
+            pane_id: pane_id
+                .parse::<usize>()
+                .map_err(|_| "NOTIFY has invalid pane id".to_string())?,
+            state: decode_utf8_hex(state, "NOTIFY")?,
+            label: decode_utf8_hex(label, "NOTIFY")?,
+        }),
+        ["NOTIFY_CLEAR", pane_id] => Ok(Request::NotifyClear {
+            pane_id: pane_id
+                .parse::<usize>()
+                .map_err(|_| "NOTIFY_CLEAR has invalid pane id".to_string())?,
         }),
         ["LIST_KEYS", format] => Ok(Request::ListKeys {
             format: decode_optional_text(format, "LIST_KEYS")?,
@@ -2838,6 +2870,25 @@ mod tests {
                 source: Some("codex".to_string()),
                 changed_at: Some(123),
             }
+        );
+    }
+
+    #[test]
+    fn round_trips_notify_requests() {
+        let line = encode_notify(7, "needs_input", "build done");
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::Notify {
+                pane_id: 7,
+                state: "needs_input".to_string(),
+                label: "build done".to_string(),
+            }
+        );
+
+        let line = encode_notify_clear(7);
+        assert_eq!(
+            decode_request(&line).unwrap(),
+            Request::NotifyClear { pane_id: 7 }
         );
     }
 

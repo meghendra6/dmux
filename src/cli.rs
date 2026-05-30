@@ -180,6 +180,11 @@ pub enum Command {
         source: Option<String>,
         changed_at: Option<u64>,
     },
+    Notify {
+        message: Option<String>,
+        state: Option<String>,
+        clear: bool,
+    },
     ListKeys {
         format: Option<String>,
     },
@@ -299,6 +304,7 @@ where
         "workspace-add" | "register-workspace" => parse_workspace_add(args),
         "workspace-list" | "list-workspaces" => parse_workspace_list(args),
         "agent-event" => parse_agent_event(args),
+        "notify" => parse_notify(args),
         "list-keys" => parse_list_keys(args),
         "bind-key" => parse_bind_key(args),
         "unbind-key" => parse_unbind_key(args),
@@ -568,6 +574,7 @@ Commands:\n\
   workspace-add <path>                   register a repo/workspace path locally\n\
   workspace-list                         list registered workspace paths\n\
   agent-event -t <target> --state <state> [--label <text>] [--source <text>] [--changed-at <unix-seconds>]\n\
+  notify [<message>] [--state <state>] [--clear]  flag the calling pane (via $DMUX_PANE) for attention\n\
   list-keys [-F <format>]                list runtime key bindings\n\
   bind-key <key> <action>                bind a key to a supported live action\n\
   unbind-key <key>                       remove a key binding\n\
@@ -2354,6 +2361,62 @@ fn validate_agent_event_field(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_notify(args: Vec<String>) -> Result<Command, String> {
+    let mut message = None;
+    let mut state = None;
+    let mut clear = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--clear" => {
+                clear = true;
+                i += 1;
+            }
+            "--state" => {
+                let value = args
+                    .get(i + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| "notify requires a state after --state".to_string())?;
+                state = Some(value.clone());
+                i += 2;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("notify does not support option {value:?}"));
+            }
+            value => {
+                if message.replace(value.to_string()).is_some() {
+                    return Err("notify accepts at most one message".to_string());
+                }
+                i += 1;
+            }
+        }
+    }
+    if let Some(message) = &message {
+        validate_notify_field("message", message)?;
+    }
+    if let Some(state) = &state {
+        validate_notify_field("state", state)?;
+        if state.trim().is_empty() {
+            return Err("notify --state cannot be empty".to_string());
+        }
+    }
+    Ok(Command::Notify {
+        message,
+        state,
+        clear,
+    })
+}
+
+fn validate_notify_field(name: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!("notify {name} cannot contain control characters"));
+    }
+    if value.len() > 120 {
+        return Err(format!("notify {name} is too long"));
+    }
+    Ok(())
+}
+
 fn set_split_direction(
     direction: &mut Option<SplitDirection>,
     value: SplitDirection,
@@ -2591,6 +2654,36 @@ mod tests {
                 changed_at: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_notify_command() {
+        assert_eq!(
+            parse_args(["dmux", "notify", "build done"]).unwrap(),
+            Command::Notify {
+                message: Some("build done".to_string()),
+                state: None,
+                clear: false,
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "notify", "--state", "alert", "look here"]).unwrap(),
+            Command::Notify {
+                message: Some("look here".to_string()),
+                state: Some("alert".to_string()),
+                clear: false,
+            }
+        );
+        assert_eq!(
+            parse_args(["dmux", "notify", "--clear"]).unwrap(),
+            Command::Notify {
+                message: None,
+                state: None,
+                clear: true,
+            }
+        );
+        // At most one positional message.
+        assert!(parse_args(["dmux", "notify", "one", "two"]).is_err());
     }
 
     #[test]

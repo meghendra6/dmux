@@ -534,6 +534,26 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
             )?;
             Ok(())
         }
+        cli::Command::Notify {
+            message,
+            state,
+            clear,
+        } => {
+            let pane_id = current_pane_id()?;
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            let request = if clear {
+                protocol::encode_notify_clear(pane_id)
+            } else {
+                protocol::encode_notify(
+                    pane_id,
+                    state.as_deref().unwrap_or("needs_input"),
+                    message.as_deref().unwrap_or(""),
+                )
+            };
+            send_request(&socket, &request, false)?;
+            Ok(())
+        }
         cli::Command::ListKeys { format } => {
             let socket = paths::socket_path();
             require_running_server(&socket)?;
@@ -802,6 +822,18 @@ fn format_exit_status(status: std::process::ExitStatus) -> String {
         }
         "unknown status".to_string()
     }
+}
+
+/// Resolve the calling pane's global id from the `$DMUX_PANE` env var that pane
+/// children inherit (formatted `%<id>`). Returns a user-facing error when not
+/// running inside a dmux pane.
+fn current_pane_id() -> Result<usize, String> {
+    let raw = std::env::var("DMUX_PANE").map_err(|_| {
+        "dmux notify must run inside a dmux pane (DMUX_PANE is not set)".to_string()
+    })?;
+    raw.strip_prefix('%')
+        .and_then(|id| id.parse::<usize>().ok())
+        .ok_or_else(|| format!("dmux notify found a malformed DMUX_PANE value: {raw:?}"))
 }
 
 fn require_running_server(socket: &std::path::Path) -> Result<(), String> {
