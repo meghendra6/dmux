@@ -4190,6 +4190,7 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
     let pane_zoomed = if context.pane_zoomed { "1" } else { "0" };
     let window_zoomed = if context.window_zoomed { "1" } else { "0" };
     let pane_cwd = context.pane_cwd.to_string_lossy();
+    let git_branch = crate::git::branch(&context.pane_cwd).unwrap_or_default();
     let pane_pid = context.pane_process.pid().to_string();
     let pane_bell = if context.pane_bell { "1" } else { "0" };
     let pane_activity = if context.pane_activity { "1" } else { "0" };
@@ -4258,6 +4259,7 @@ fn format_status_line(format: &str, context: &StatusContext) -> String {
         ("#{pane.exit_status}", pane_exit_status.as_str()),
         ("#{pane.exit_signal}", pane_exit_signal.as_str()),
         ("#{pane.cwd}", pane_cwd.as_ref()),
+        ("#{git.branch}", git_branch.as_str()),
         ("#{pane.title}", context.pane_title.as_str()),
         ("#{pane.bell}", pane_bell),
         ("#{pane.activity}", pane_activity),

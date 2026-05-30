@@ -10400,6 +10400,47 @@ fn window_bell_aggregates_pane_bell_in_list_windows() {
 }
 
 #[test]
+fn git_branch_status_token_reports_repository_branch() {
+    let socket = unique_socket("git-branch");
+    let session = format!("git-branch-{}", std::process::id());
+
+    // The pane inherits this test's working directory, which is the crate's git
+    // worktree, so #{git.branch} should resolve to the checked-out branch
+    // (exercising the worktree `.git`-file resolution end-to-end).
+    let expected = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .expect("run git rev-parse");
+    let expected_branch = String::from_utf8_lossy(&expected.stdout)
+        .trim_end()
+        .to_string();
+    assert!(
+        !expected_branch.is_empty(),
+        "this test must run inside a git checkout"
+    );
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let out = dmux(
+        &socket,
+        &["status-line", "-t", &session, "-F", "#{git.branch}"],
+    );
+    assert_success(&out);
+    let branch = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        branch.trim_end(),
+        expected_branch,
+        "git.branch token should match the repository branch"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn osc52_clipboard_writes_are_blocked_and_reported() {
     let socket = unique_socket("osc52-clipboard-policy");
     let session = format!("osc52-clipboard-policy-{}", std::process::id());
