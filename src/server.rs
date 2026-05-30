@@ -5011,7 +5011,10 @@ fn handle_attach(state: &Arc<ServerState>, mut stream: UnixStream, name: &str) -
         write_err(&mut stream, "missing session")?;
         return Ok(());
     };
-    if session.active_pane().is_none() {
+    // Reject attaching to a session with no running pane (e.g. a brief window
+    // where the last pane has exited but the session has not yet been removed),
+    // rather than entering snapshot mode and spinning "pane is not running".
+    if !session.panes().iter().any(|pane| pane.is_running()) {
         write_err(&mut stream, "missing pane")?;
         return Ok(());
     }

@@ -6446,6 +6446,42 @@ fn active_attach_exits_when_last_pane_exits_naturally() {
 }
 
 #[test]
+fn attaching_to_a_session_with_no_running_pane_errors_instead_of_hanging() {
+    let socket = unique_socket("attach-dead-session");
+    let session = format!("attach-dead-session-{}", std::process::id());
+
+    // The pane prints, lingers briefly (so the session is fully set up), then
+    // exits. The session persists with a dead pane (it remains respawnable).
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf ready; sleep 1; exit 0",
+        ],
+    ));
+    let panes = poll_list_panes_contains(&socket, &session, "#{pane.state}", "exited");
+    assert!(panes.contains("exited"), "{panes:?}");
+
+    // Attaching to a session with no running pane must return a clean error and
+    // exit, not spin forever writing "pane is not running".
+    let child = spawn_attached_to_session(&socket, &session, &[]);
+    let output = assert_child_exits_within(child, "attach to a session with no running pane");
+    assert!(
+        !output.status.success(),
+        "attach to a dead session should fail, not hang: {output:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn active_multi_pane_attach_exits_when_kill_session_runs_from_another_process() {
     let socket = unique_socket("active-multi-attach-kill-session");
     let session = format!("active-multi-attach-kill-session-{}", std::process::id());
