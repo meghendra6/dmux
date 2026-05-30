@@ -909,6 +909,10 @@ fn write_live_render_output(
             size,
             frame.header_rows,
         );
+        // The overlay hid the cursor; forget the last-emitted cursor so the next
+        // popup-free frame re-emits the pane's cursor sequence (which re-shows
+        // it) even if the pane cursor itself did not move.
+        state.cursor.clear();
     }
     let mut stdout = io::stdout().lock();
     stdout.write_all(&output)?;
@@ -972,6 +976,12 @@ fn append_centered_popup_overlay(
     let top = header_rows + ((available_rows.saturating_sub(popup_height) + 1) / 2) + 1;
     let left = ((cols.saturating_sub(popup_width) + 1) / 2) + 1;
 
+    // Hide the cursor while the popup is on screen: SAVE/RESTORE_CURSOR (DECSC/
+    // DECRC) preserve position but not the `?25` visibility mode, so without
+    // this the pane's cursor stays visibly blinking at its old spot under the
+    // popup. Visibility is re-established when the popup is dismissed (the
+    // snapshot path fully redraws; the render-stream path clears state.cursor).
+    output.extend_from_slice(HIDE_CURSOR);
     output.extend_from_slice(SAVE_CURSOR);
     for (index, line) in popup_lines.iter().enumerate() {
         write_absolute_cursor_position(output, top + index, left);
@@ -12811,7 +12821,35 @@ mod tests {
                 .windows("┌ dmux help ".as_bytes().len())
                 .any(|window| { window == "┌ dmux help ".as_bytes() })
         );
+        // The cursor is hidden immediately before being saved, so it does not
+        // stay visible at the pane's position underneath the popup.
+        assert!(
+            output
+                .windows(b"\x1b[?25l\x1b7".len())
+                .any(|window| window == b"\x1b[?25l\x1b7"),
+            "{output:?}"
+        );
         assert!(output.ends_with(b"\x1b8"), "{output:?}");
+    }
+
+    #[test]
+    fn live_render_output_with_overlay_invalidates_cursor_for_redraw() {
+        let frame = b"\x1b[H\x1b[2Kstatus\r\n\x1b[2Kold\x1b[?25h\x1b[2;4H";
+        let mut state = LiveRenderOutputState::default();
+        let _ = diff_live_render_output(&render_frame(frame), &mut state);
+        assert!(!state.cursor.is_empty());
+
+        // Drawing a popup overlay hides the cursor and must invalidate the
+        // remembered cursor so the next popup-free frame re-emits (re-shows) it.
+        let overlay = PopupOverlay {
+            title: "dmux help",
+            content: "C-b ? close",
+        };
+        write_live_render_output(&render_frame(frame), &mut state, Some(overlay)).unwrap();
+        assert!(
+            state.cursor.is_empty(),
+            "overlay should invalidate the cursor state so it re-shows on dismiss"
+        );
     }
 
     #[test]
