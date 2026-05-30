@@ -137,9 +137,10 @@ impl TerminalState {
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
-        self.screen.resize(width, height);
+        self.screen
+            .resize(width, height, Some(&mut self.scrollback));
         if let Some(screen) = &mut self.alternate_screen {
-            screen.resize(width, height);
+            screen.resize(width, height, None);
         }
     }
 
@@ -707,7 +708,7 @@ impl TerminalScreen {
         }
     }
 
-    fn resize(&mut self, width: usize, height: usize) {
+    fn resize(&mut self, width: usize, height: usize, scrollback: Option<&mut Scrollback>) {
         let width = width.max(1);
         let height = height.max(1);
         let old_cursor_col = self.cursor_col;
@@ -720,6 +721,13 @@ impl TerminalScreen {
         } else {
             0
         };
+        // Rows scrolled off the top by a shrink are kept in scrollback (primary
+        // screen only; the alternate screen has none), so history is not lost.
+        if let Some(scrollback) = scrollback {
+            for row in 0..source_row_start {
+                scrollback.push(self.row_to_string(row));
+            }
+        }
         let mut rows = vec![vec![Cell::blank(); width]; height];
 
         for (row_index, row) in rows.iter_mut().enumerate().take(copy_rows) {
@@ -1406,16 +1414,16 @@ mod tests {
         assert_eq!((screen.scroll_top, screen.scroll_bottom), (2, 19));
 
         // Growing keeps the custom region intact.
-        screen.resize(80, 40);
+        screen.resize(80, 40, None);
         assert_eq!((screen.scroll_top, screen.scroll_bottom), (2, 19));
 
         // Shrinking below the region clamps the bottom (top stays <= bottom).
-        screen.resize(80, 10);
+        screen.resize(80, 10, None);
         assert_eq!((screen.scroll_top, screen.scroll_bottom), (2, 9));
 
         // A full-screen (default) region just tracks the new height.
         let mut plain = TerminalScreen::new(80, 24);
-        plain.resize(80, 50);
+        plain.resize(80, 50, None);
         assert_eq!((plain.scroll_top, plain.scroll_bottom), (0, 49));
     }
 
@@ -1929,6 +1937,27 @@ mod tests {
         let captured = state.capture_text();
         assert!(captured.contains("1"), "{captured:?}");
         assert!(captured.contains("4"), "{captured:?}");
+    }
+
+    #[test]
+    fn shrinking_height_preserves_scrolled_off_rows_in_scrollback() {
+        let mut state = TerminalState::new(10, 6, 100);
+        state.apply_bytes(b"1\r\n2\r\n3\r\n4\r\n5\r\n6");
+
+        // Shrink so the cursor's bottom rows are kept and the top three rows
+        // scroll off the screen.
+        state.resize(10, 3);
+
+        let visible = state.capture_screen_text();
+        assert!(
+            !visible.contains('1'),
+            "row 1 should have left the visible screen: {visible:?}"
+        );
+        let full = state.capture_text();
+        assert!(
+            full.contains('1') && full.contains('2') && full.contains('3'),
+            "rows scrolled off by the shrink must remain in scrollback: {full:?}"
+        );
     }
 
     #[test]
