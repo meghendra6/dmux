@@ -6204,7 +6204,7 @@ fn fit_screen_lines_to_region(screen: &str, width: usize, height: usize) -> Vec<
 }
 
 fn fit_line_to_width(line: &str, width: usize) -> String {
-    let truncated = line.chars().take(width).collect::<String>();
+    let truncated = take_cells(line, width);
     pad_to_width(&truncated, width)
 }
 
@@ -6256,14 +6256,14 @@ fn join_vertical_with_separator_height(
 fn max_line_width(lines: &[String]) -> usize {
     lines
         .iter()
-        .map(|line| line.chars().count())
+        .map(|line| display_cell_width(line))
         .max()
         .unwrap_or(0)
 }
 
 fn pad_to_width(line: &str, width: usize) -> String {
     let mut padded = line.to_string();
-    let len = line.chars().count();
+    let len = display_cell_width(line);
     if len < width {
         padded.push_str(&" ".repeat(width - len));
     }
@@ -6680,6 +6680,30 @@ fn write_err(stream: &mut UnixStream, message: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_width_helpers_count_display_cells_for_wide_chars() {
+        // "한국" is two double-width cells = 4 columns, not 2 chars.
+        assert_eq!(max_line_width(&["한국".to_string()]), 4);
+        assert_eq!(pad_to_width("한국", 6), "한국  ");
+        // Truncation stops on a cell boundary: "한" fits in 2 cells, the next
+        // wide char would overflow width 3, so it is dropped and space-padded.
+        assert_eq!(fit_line_to_width("한국", 3), "한 ");
+        assert_eq!(fit_line_to_width("한국", 4), "한국");
+    }
+
+    #[test]
+    fn horizontal_join_aligns_wide_left_pane() {
+        // The left column must be padded by display width so the separator and
+        // right pane line up regardless of CJK content.
+        let joined = join_horizontal(
+            vec!["한".to_string(), "ab".to_string()],
+            vec!["R1".to_string(), "R2".to_string()],
+        );
+        // max left width is 2 cells ("한"); separator " │ " is 3 cells.
+        assert_eq!(joined[0], "한 │ R1");
+        assert_eq!(joined[1], "ab │ R2");
+    }
 
     fn read_socket_line(stream: &mut UnixStream) -> String {
         let mut bytes = Vec::new();
