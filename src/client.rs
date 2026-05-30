@@ -1534,6 +1534,9 @@ enum PopupInputAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PopupEscapeDecode {
     Complete(PopupInputAction, usize),
+    /// A recognized but unbound escape sequence: consume the bytes and do
+    /// nothing (e.g. Left arrow), rather than treating it as an Esc keypress.
+    Consume(usize),
     Incomplete,
     Escape,
 }
@@ -2386,6 +2389,9 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
                     actions.push(action);
                     index += consumed;
                 }
+                PopupEscapeDecode::Consume(consumed) => {
+                    index += consumed;
+                }
                 PopupEscapeDecode::Incomplete => {
                     state.escape_pending.extend_from_slice(&bytes[index..]);
                     break;
@@ -2478,6 +2484,11 @@ fn decode_popup_escape(input: &[u8]) -> PopupEscapeDecode {
         }
         if input.get(..3) == Some(b"\x1b[C") {
             return PopupEscapeDecode::Complete(PopupInputAction::Enter, 3);
+        }
+        if input.get(..3) == Some(b"\x1b[D") {
+            // Left arrow: unbound in the popup. Absorb it instead of letting it
+            // fall through to Escape, which would close the popup.
+            return PopupEscapeDecode::Consume(3);
         }
         if input.get(..3) == Some(b"\x1b[H") {
             return PopupEscapeDecode::Complete(PopupInputAction::Home, 3);
@@ -10964,6 +10975,20 @@ mod tests {
         assert_eq!(
             popup_actions_for_input(b"A", &mut state),
             vec![PopupInputAction::MoveUp]
+        );
+    }
+
+    #[test]
+    fn popup_left_arrow_is_absorbed_not_treated_as_close() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Attention);
+
+        // Left arrow is unbound in the popup; it must be absorbed (no action),
+        // not fall through to Escape and close the popup.
+        assert!(popup_actions_for_input(b"\x1b[D", &mut state).is_empty());
+        // The rest of the arrow set is unaffected.
+        assert_eq!(
+            popup_actions_for_input(b"\x1b[C", &mut state),
+            vec![PopupInputAction::Enter]
         );
     }
 
