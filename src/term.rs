@@ -721,7 +721,16 @@ impl TerminalScreen {
         self.width = width;
         self.height = height;
         self.rows = rows;
-        self.reset_scroll_region();
+        // Preserve a custom scroll region (DECSTBM, e.g. set by less/man/ncurses)
+        // across the resize, clamping it to the new height; only a full-screen
+        // default region is reset. Resetting a custom region unconditionally
+        // breaks those applications' scrolling after a resize.
+        if self.scroll_top != 0 || self.scroll_bottom != old_height - 1 {
+            self.scroll_bottom = self.scroll_bottom.min(height - 1);
+            self.scroll_top = self.scroll_top.min(self.scroll_bottom);
+        } else {
+            self.reset_scroll_region();
+        }
         self.cursor_row = self
             .cursor_row
             .saturating_sub(source_row_start)
@@ -1376,6 +1385,27 @@ fn normalize_wide_cells(row: &mut [Cell], style: CellStyle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_preserves_custom_scroll_region_and_resets_default() {
+        let mut screen = TerminalScreen::new(80, 24);
+        // Custom DECSTBM region rows 3..20 (1-based) => 2..19 (0-based).
+        screen.set_scroll_region(3, 20);
+        assert_eq!((screen.scroll_top, screen.scroll_bottom), (2, 19));
+
+        // Growing keeps the custom region intact.
+        screen.resize(80, 40);
+        assert_eq!((screen.scroll_top, screen.scroll_bottom), (2, 19));
+
+        // Shrinking below the region clamps the bottom (top stays <= bottom).
+        screen.resize(80, 10);
+        assert_eq!((screen.scroll_top, screen.scroll_bottom), (2, 9));
+
+        // A full-screen (default) region just tracks the new height.
+        let mut plain = TerminalScreen::new(80, 24);
+        plain.resize(80, 50);
+        assert_eq!((plain.scroll_top, plain.scroll_bottom), (0, 49));
+    }
 
     #[test]
     fn carriage_return_rewrites_current_line() {
