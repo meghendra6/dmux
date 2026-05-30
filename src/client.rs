@@ -4627,6 +4627,45 @@ fn parse_bool_flag(value: &str, message: &str) -> io::Result<bool> {
     }
 }
 
+/// Produce a headless listing of panes needing attention, one per line as
+/// `<session>:<window>.<pane>\t<reasons>\t<label>`. With `session` set only that
+/// session is scanned; otherwise every live session is. This is the
+/// non-interactive counterpart of the `C-b !` attention popup.
+pub fn list_attention(socket: &Path, session: Option<&str>) -> io::Result<String> {
+    let sessions = match session {
+        Some(name) => vec![name.to_string()],
+        None => {
+            let body = send_control_request(
+                socket,
+                &protocol::encode_list_sessions(Some("#{session.name}")),
+            )?;
+            String::from_utf8_lossy(&body)
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+    };
+    let mut lines = Vec::new();
+    for session in sessions {
+        for entry in pane_attention_entries(socket, &session)? {
+            let reasons = pane_attention_reasons(&entry).collect::<Vec<_>>();
+            if reasons.is_empty() {
+                continue;
+            }
+            lines.push(format!(
+                "{}:{}.{}\t{}\t{}",
+                session,
+                entry.window_index,
+                entry.index,
+                reasons.join(", "),
+                pane_attention_label(&entry),
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
 fn attach_attention_popup_model(
     socket: &Path,
     session: &str,
