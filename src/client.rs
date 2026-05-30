@@ -2131,7 +2131,7 @@ fn translate_attach_input_with_state_with_controls(
                     actions.push(AttachInputAction::CommandPromptCancel);
                 }
                 0x7f | 0x08 => {
-                    command.pop();
+                    pop_utf8_char(command);
                     actions.push(AttachInputAction::CommandPromptUpdate(
                         String::from_utf8_lossy(command).to_string(),
                     ));
@@ -2260,6 +2260,91 @@ fn translate_attach_input_with_state_with_controls(
     actions
 }
 
+/// Result of decoding one UTF-8 scalar at the front of a byte slice whose first
+/// byte is a non-ASCII lead byte (>= 0x80).
+enum Utf8Decode {
+    /// A complete scalar and its byte length.
+    Char(char, usize),
+    /// A valid-so-far multi-byte sequence truncated at the end of the buffer.
+    Incomplete,
+    /// A malformed or overlong sequence; skip one byte and resynchronize.
+    Invalid,
+}
+
+fn decode_utf8_char(bytes: &[u8]) -> Utf8Decode {
+    let len = match bytes[0] {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => return Utf8Decode::Invalid, // continuation or invalid lead byte
+    };
+    let available = bytes.len().min(len);
+    if bytes[1..available]
+        .iter()
+        .any(|b| !(0x80..=0xbf).contains(b))
+    {
+        return Utf8Decode::Invalid;
+    }
+    if bytes.len() < len {
+        return Utf8Decode::Incomplete;
+    }
+    match std::str::from_utf8(&bytes[..len]) {
+        Ok(text) => Utf8Decode::Char(text.chars().next().unwrap(), len),
+        Err(_) => Utf8Decode::Invalid,
+    }
+}
+
+/// Outcome of consuming one printable character from popup text input.
+enum TextCharStep {
+    /// A printable character to insert; `index` has been advanced past it.
+    Push(char),
+    /// A control or malformed byte was consumed; nothing to insert.
+    Skip,
+    /// A multi-byte char was truncated; its bytes were buffered for the next
+    /// read and processing of this buffer should stop.
+    Break,
+}
+
+/// Consume one character of popup text input at `bytes[*index]`, advancing
+/// `*index`. ASCII printables map directly; multi-byte UTF-8 is decoded so
+/// non-ASCII text (CJK, accented Latin, …) can be typed into popup prompts.
+fn take_text_char(bytes: &[u8], index: &mut usize, escape_pending: &mut Vec<u8>) -> TextCharStep {
+    let byte = bytes[*index];
+    if byte.is_ascii_graphic() || byte == b' ' {
+        *index += 1;
+        TextCharStep::Push(byte as char)
+    } else if byte < 0x80 {
+        *index += 1; // ASCII control byte with no explicit binding: ignore.
+        TextCharStep::Skip
+    } else {
+        match decode_utf8_char(&bytes[*index..]) {
+            Utf8Decode::Char(ch, len) => {
+                *index += len;
+                TextCharStep::Push(ch)
+            }
+            Utf8Decode::Incomplete => {
+                escape_pending.extend_from_slice(&bytes[*index..]);
+                TextCharStep::Break
+            }
+            Utf8Decode::Invalid => {
+                *index += 1;
+                TextCharStep::Skip
+            }
+        }
+    }
+}
+
+/// Remove the last whole UTF-8 character from a byte buffer (trailing
+/// continuation bytes plus the lead byte), so backspace deletes one glyph
+/// rather than one byte.
+fn pop_utf8_char(buffer: &mut Vec<u8>) {
+    while let Some(byte) = buffer.pop() {
+        if !(0x80..=0xbf).contains(&byte) {
+            break;
+        }
+    }
+}
+
 fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<PopupInputAction> {
     let mut bytes = Vec::new();
     if !state.escape_pending.is_empty() {
@@ -2287,13 +2372,11 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
                     actions.push(PopupInputAction::ReplyBackspace);
                     index += 1;
                 }
-                byte if byte.is_ascii_graphic() || byte == b' ' => {
-                    actions.push(PopupInputAction::ReplyPush(byte as char));
-                    index += 1;
-                }
-                _ => {
-                    index += 1;
-                }
+                _ => match take_text_char(&bytes, &mut index, &mut state.escape_pending) {
+                    TextCharStep::Push(ch) => actions.push(PopupInputAction::ReplyPush(ch)),
+                    TextCharStep::Skip => {}
+                    TextCharStep::Break => break,
+                },
             }
             continue;
         }
@@ -2333,13 +2416,11 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
                     actions.push(PopupInputAction::NewBackspace);
                     index += 1;
                 }
-                byte if byte.is_ascii_graphic() || byte == b' ' => {
-                    actions.push(PopupInputAction::NewPush(byte as char));
-                    index += 1;
-                }
-                _ => {
-                    index += 1;
-                }
+                _ => match take_text_char(&bytes, &mut index, &mut state.escape_pending) {
+                    TextCharStep::Push(ch) => actions.push(PopupInputAction::NewPush(ch)),
+                    TextCharStep::Skip => {}
+                    TextCharStep::Break => break,
+                },
             }
             continue;
         }
@@ -2359,13 +2440,11 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
                     actions.push(PopupInputAction::RenameBackspace);
                     index += 1;
                 }
-                byte if byte.is_ascii_graphic() || byte == b' ' => {
-                    actions.push(PopupInputAction::RenamePush(byte as char));
-                    index += 1;
-                }
-                _ => {
-                    index += 1;
-                }
+                _ => match take_text_char(&bytes, &mut index, &mut state.escape_pending) {
+                    TextCharStep::Push(ch) => actions.push(PopupInputAction::RenamePush(ch)),
+                    TextCharStep::Skip => {}
+                    TextCharStep::Break => break,
+                },
             }
             continue;
         }
@@ -2462,9 +2541,12 @@ fn popup_actions_for_input(input: &[u8], state: &mut PopupInputState) -> Vec<Pop
                 actions.push(PopupInputAction::FilterBackspace);
                 index += 1;
             }
-            byte if state.filter_mode && (byte.is_ascii_graphic() || byte == b' ') => {
-                actions.push(PopupInputAction::FilterPush(byte as char));
-                index += 1;
+            _ if state.filter_mode => {
+                match take_text_char(&bytes, &mut index, &mut state.escape_pending) {
+                    TextCharStep::Push(ch) => actions.push(PopupInputAction::FilterPush(ch)),
+                    TextCharStep::Skip => {}
+                    TextCharStep::Break => break,
+                }
             }
             _ => {
                 index += 1;
@@ -2610,7 +2692,7 @@ fn translate_live_snapshot_input_with_mouse_and_controls(
                     actions.push(LiveSnapshotInputAction::CommandPromptCancel);
                 }
                 0x7f | 0x08 => {
-                    command.pop();
+                    pop_utf8_char(command);
                     actions.push(LiveSnapshotInputAction::CommandPromptUpdate(
                         String::from_utf8_lossy(command).to_string(),
                     ));
@@ -11231,6 +11313,61 @@ mod tests {
     }
 
     #[test]
+    fn popup_text_modes_accept_multibyte_utf8_input() {
+        // Rename: a CJK glyph ("한", 3 bytes) is collected as one char.
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+        assert_eq!(
+            popup_actions_for_input("R한b\r".as_bytes(), &mut state),
+            vec![
+                PopupInputAction::RenameStart,
+                PopupInputAction::RenamePush('한'),
+                PopupInputAction::RenamePush('b'),
+                PopupInputAction::RenameSubmit,
+            ]
+        );
+
+        // Filter mode accepts accented Latin ("é", 2 bytes).
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+        assert_eq!(
+            popup_actions_for_input("/é".as_bytes(), &mut state),
+            vec![
+                PopupInputAction::FilterStart,
+                PopupInputAction::FilterPush('é')
+            ]
+        );
+    }
+
+    #[test]
+    fn popup_text_input_buffers_split_utf8_across_reads() {
+        let mut state = PopupInputState::new(crate::popup::PopupMode::Workspace);
+        let glyph = "中".as_bytes(); // 3 bytes: 0xe4 0xb8 0xad
+        // First read carries the rename trigger plus only the first two bytes
+        // of the glyph; the partial char must be buffered, not dropped.
+        assert_eq!(
+            popup_actions_for_input(&[b'R', glyph[0], glyph[1]], &mut state),
+            vec![PopupInputAction::RenameStart]
+        );
+        assert!(state.rename_mode);
+        // The remaining byte completes the glyph on the next read.
+        assert_eq!(
+            popup_actions_for_input(&[glyph[2]], &mut state),
+            vec![PopupInputAction::RenamePush('中')]
+        );
+        assert!(state.escape_pending.is_empty());
+    }
+
+    #[test]
+    fn pop_utf8_char_removes_one_whole_glyph() {
+        let mut buffer = "a한".as_bytes().to_vec(); // 'a' + 3-byte glyph
+        pop_utf8_char(&mut buffer);
+        assert_eq!(buffer, b"a");
+        pop_utf8_char(&mut buffer);
+        assert!(buffer.is_empty());
+        pop_utf8_char(&mut buffer); // empty buffer is a no-op
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
     fn workspace_popup_new_session_path_scopes_to_paths_and_previous_rows() {
         let mut path_row = crate::popup::PopupRow {
             id: "workspace:path:/tmp/repo".to_string(),
@@ -11473,6 +11610,21 @@ mod tests {
             })
         );
         assert!(state.command_prompt.is_none());
+    }
+
+    #[test]
+    fn attach_command_prompt_backspace_deletes_whole_utf8_char() {
+        let mut state = RawAttachInputState::default();
+        // Type a 3-byte CJK glyph into the prompt, then backspace once.
+        let actions = translate_attach_input_with_state("\x02:한\x7f".as_bytes(), &mut state);
+
+        // The glyph registers as a single typed char...
+        assert!(actions.contains(&AttachInputAction::CommandPromptUpdate("한".to_string())));
+        // ...and one backspace clears it entirely (not a dangling partial byte).
+        assert_eq!(
+            actions.last(),
+            Some(&AttachInputAction::CommandPromptUpdate(String::new()))
+        );
     }
 
     #[test]
