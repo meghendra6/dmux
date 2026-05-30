@@ -10361,6 +10361,45 @@ fn active_pane_bell_is_exposed_in_status_format() {
 }
 
 #[test]
+fn window_bell_aggregates_pane_bell_in_list_windows() {
+    let socket = unique_socket("window-bell");
+    let session = format!("window-bell-{}", std::process::id());
+
+    // The window's only pane emits BEL, so the window-level bell aggregates to 1.
+    assert_success(&dmux(
+        &socket,
+        &[
+            "new",
+            "-d",
+            "-s",
+            &session,
+            "--",
+            "sh",
+            "-c",
+            "printf '\\007bell-ready'; sleep 30",
+        ],
+    ));
+
+    let windows =
+        poll_list_windows_contains(&socket, &session, "#{window.index}:#{window.bell}", "0:1");
+    assert!(
+        windows.lines().any(|line| line == "0:1"),
+        "window bell should aggregate from its pane: {windows:?}"
+    );
+
+    let json_out = dmux(
+        &socket,
+        &["list-windows", "-t", &session, "--format", "json"],
+    );
+    assert_success(&json_out);
+    let json = String::from_utf8_lossy(&json_out.stdout);
+    assert!(json.contains("\"bell\": true"), "{json:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn osc52_clipboard_writes_are_blocked_and_reported() {
     let socket = unique_socket("osc52-clipboard-policy");
     let session = format!("osc52-clipboard-policy-{}", std::process::id());

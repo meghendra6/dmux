@@ -1959,6 +1959,9 @@ impl WindowSet {
                 name: window.name.clone(),
                 active: index == self.active,
                 panes: window.panes.len(),
+                // Window-level bell/activity aggregate the window's panes.
+                bell: window.panes.panes.iter().any(|pane| pane.bell()),
+                activity: window.panes.panes.iter().any(|pane| pane.activity()),
             })
             .collect()
     }
@@ -2360,6 +2363,8 @@ struct WindowDescription {
     name: String,
     active: bool,
     panes: usize,
+    bell: bool,
+    activity: bool,
 }
 
 struct PaneSet<T> {
@@ -4279,6 +4284,8 @@ fn format_attach_ui_tabs(context: &StatusContext) -> String {
                 name: index.to_string(),
                 active: index == context.window_index,
                 panes: 0,
+                bell: false,
+                activity: false,
             })
             .collect::<Vec<_>>()
     } else {
@@ -4666,17 +4673,23 @@ fn format_window_line(format: &str, window: &WindowDescription) -> String {
     let id = window.id.as_usize().to_string();
     let active = if window.active { "1" } else { "0" };
     let panes = window.panes.to_string();
+    let bell = if window.bell { "1" } else { "0" };
+    let activity = if window.activity { "1" } else { "0" };
     let replacements = [
         ("#{window.index}", index.as_str()),
         ("#{window.id}", id.as_str()),
         ("#{window.name}", window.name.as_str()),
         ("#{window.active}", active),
         ("#{window.panes}", panes.as_str()),
+        ("#{window.bell}", bell),
+        ("#{window.activity}", activity),
         ("#{tab.index}", index.as_str()),
         ("#{tab.id}", id.as_str()),
         ("#{tab.name}", window.name.as_str()),
         ("#{tab.active}", active),
         ("#{tab.panes}", panes.as_str()),
+        ("#{tab.bell}", bell),
+        ("#{tab.activity}", activity),
     ];
     apply_replacements(format, &replacements)
 }
@@ -8332,6 +8345,24 @@ left | right\r\n"
     }
 
     #[test]
+    fn format_window_line_renders_bell_and_activity_tokens() {
+        let window = WindowDescription {
+            index: 2,
+            id: TabId::new(3),
+            name: "logs".to_string(),
+            active: true,
+            panes: 4,
+            bell: true,
+            activity: false,
+        };
+        let line = format_window_line(
+            "#{window.index}:#{window.bell}:#{window.activity}:#{tab.bell}:#{tab.activity}",
+            &window,
+        );
+        assert_eq!(line, "2:1:0:1:0");
+    }
+
+    #[test]
     fn format_status_line_exposes_attach_ui_tabs_and_info() {
         let context = StatusContext {
             session_name: "dev".to_string(),
@@ -8348,6 +8379,8 @@ left | right\r\n"
                     name: "shell".to_string(),
                     active: false,
                     panes: 1,
+                    bell: false,
+                    activity: false,
                 },
                 WindowDescription {
                     index: 1,
@@ -8355,6 +8388,8 @@ left | right\r\n"
                     name: "api".to_string(),
                     active: true,
                     panes: 3,
+                    bell: false,
+                    activity: false,
                 },
             ],
             pane_index: 2,

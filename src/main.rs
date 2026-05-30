@@ -21,7 +21,7 @@ const JSON_FORMAT_SELECTOR: &str = "json";
 /// the unit separator keeps fields unambiguous across names with whitespace.
 const LIST_SESSIONS_JSON_FORMAT: &str = "#{session.name}\u{1f}#{session.window_count}\u{1f}#{session.attached_count}\u{1f}#{session.created_at}";
 const LIST_PANES_JSON_FORMAT: &str = "#{pane.index}\u{1f}#{pane.id}\u{1f}#{pane.active}\u{1f}#{pane.zoomed}\u{1f}#{pane.state}\u{1f}#{pane.pid}\u{1f}#{pane.exit_status}\u{1f}#{pane.exit_signal}\u{1f}#{pane.title}\u{1f}#{pane.cwd}\u{1f}#{pane.bell}\u{1f}#{pane.activity}";
-const LIST_WINDOWS_JSON_FORMAT: &str = "#{window.index}\u{1f}#{window.id}\u{1f}#{window.name}\u{1f}#{window.active}\u{1f}#{window.panes}";
+const LIST_WINDOWS_JSON_FORMAT: &str = "#{window.index}\u{1f}#{window.id}\u{1f}#{window.name}\u{1f}#{window.active}\u{1f}#{window.panes}\u{1f}#{window.bell}\u{1f}#{window.activity}";
 const MAX_RUN_SHELL_OUTPUT_BYTES: usize = 64 * 1024;
 
 fn main() {
@@ -1049,13 +1049,17 @@ fn list_windows_json(body: &str) -> String {
             let name = fields.next().unwrap_or_default();
             let active = fields.next().unwrap_or_default();
             let panes = fields.next().unwrap_or_default();
+            let bell = fields.next().unwrap_or_default();
+            let activity = fields.next().unwrap_or_default();
             format!(
-                "  {{\"index\": {}, \"id\": {}, \"name\": {}, \"active\": {}, \"panes\": {}}}",
+                "  {{\"index\": {}, \"id\": {}, \"name\": {}, \"active\": {}, \"panes\": {}, \"bell\": {}, \"activity\": {}}}",
                 json::json_u64_or_string(index),
                 json::json_u64_or_string(id),
                 json::json_string(name),
                 json::json_bool(active),
                 json::json_u64_or_string(panes),
+                json::json_bool(bell),
+                json::json_bool(activity),
             )
         })
         .collect::<Vec<_>>();
@@ -1104,11 +1108,11 @@ mod tests {
 
     #[test]
     fn list_windows_json_renders_objects() {
-        let body = "0\u{1f}5\u{1f}main\u{1f}1\u{1f}3\n";
+        let body = "0\u{1f}5\u{1f}main\u{1f}1\u{1f}3\u{1f}1\u{1f}0\n";
         let json = list_windows_json(body);
         assert_eq!(
             json,
-            "[\n  {\"index\": 0, \"id\": 5, \"name\": \"main\", \"active\": true, \"panes\": 3}\n]"
+            "[\n  {\"index\": 0, \"id\": 5, \"name\": \"main\", \"active\": true, \"panes\": 3, \"bell\": true, \"activity\": false}\n]"
         );
         assert_eq!(list_windows_json(""), "[]");
     }
