@@ -10441,6 +10441,36 @@ fn git_branch_status_token_reports_repository_branch() {
 }
 
 #[test]
+fn git_dirty_status_token_reports_zero_or_one() {
+    let socket = unique_socket("git-dirty");
+    let session = format!("git-dirty-{}", std::process::id());
+
+    // The pane runs inside the crate's git worktree, so #{git.dirty} resolves to
+    // a real boolean. We don't assert clean-vs-dirty (the working tree state is
+    // not deterministic here); the deterministic clean/dirty logic is covered by
+    // git.rs unit tests. This checks the token expands end-to-end.
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let out = dmux(
+        &socket,
+        &["status-line", "-t", &session, "-F", "#{git.dirty}"],
+    );
+    assert_success(&out);
+    let dirty = String::from_utf8_lossy(&out.stdout);
+    let dirty = dirty.trim_end();
+    assert!(
+        dirty == "0" || dirty == "1",
+        "git.dirty token should expand to 0 or 1 inside a repo, got {dirty:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn osc52_clipboard_writes_are_blocked_and_reported() {
     let socket = unique_socket("osc52-clipboard-policy");
     let session = format!("osc52-clipboard-policy-{}", std::process::id());
