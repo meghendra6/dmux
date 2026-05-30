@@ -6408,10 +6408,11 @@ fn active_attach_exits_when_kill_server_runs_from_another_process() {
 }
 
 #[test]
-fn active_attach_redraws_when_pane_process_exits() {
-    let socket = unique_socket("active-attach-pane-exit");
-    let session = format!("active-attach-pane-exit-{}", std::process::id());
+fn active_attach_exits_when_last_pane_exits_naturally() {
+    let socket = unique_socket("active-attach-pane-natural-exit");
+    let session = format!("active-attach-pane-natural-exit-{}", std::process::id());
 
+    // The pane runs an interactive `cat`, so it stays alive until it gets EOF.
     assert_success(&dmux(
         &socket,
         &[
@@ -6422,7 +6423,7 @@ fn active_attach_redraws_when_pane_process_exits() {
             "--",
             "sh",
             "-c",
-            "printf base-ready; sleep 1",
+            "printf base-ready; cat",
         ],
     ));
     let base = poll_capture(&socket, &session, "base-ready");
@@ -6430,23 +6431,17 @@ fn active_attach_redraws_when_pane_process_exits() {
 
     let mut child = spawn_attached_to_session(&socket, &session, &["base-ready"]);
 
-    let panes = poll_list_panes_contains(
-        &socket,
-        &session,
-        "#{pane.index}:#{pane.state}:#{pane.exit_status}",
-        "0:exited:0",
-    );
-    assert_eq!(panes.trim_end(), "0:exited:0");
-    child.assert_running("raw attach after pane process exit");
+    // Ctrl-D sends EOF: cat exits, the shell exits, the session's last pane
+    // exits, and the attached client should detach and exit on its own rather
+    // than hanging on a session with no running pane.
     {
         let stdin = child.stdin_mut("attach stdin");
-        stdin.write_all(b"\x02d").expect("write detach input");
-        stdin.flush().expect("flush detach input");
+        stdin.write_all(b"\x04").expect("write ctrl-d");
+        stdin.flush().expect("flush ctrl-d");
     }
 
-    let output = wait_for_child_exit(child);
+    let output = assert_child_exits_within(child, "attach after Ctrl-D on the last pane");
     assert_success(&output);
-    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
 
@@ -6697,7 +6692,7 @@ fn attach_prefix_percent_applies_coalesced_raw_focus_after_split() {
 }
 
 #[test]
-fn active_live_attach_stays_open_when_remaining_pane_process_exits_after_collapse() {
+fn active_live_attach_exits_when_remaining_pane_exits_after_collapse() {
     let socket = unique_socket("active-live-attach-pane-exit-after-collapse");
     let session = format!(
         "active-live-attach-pane-exit-after-collapse-{}",
@@ -6752,22 +6747,12 @@ fn active_live_attach_stays_open_when_remaining_pane_process_exits_after_collaps
         "{remaining:?}"
     );
 
-    let panes = poll_list_panes_contains(
-        &socket,
-        &session,
-        "#{pane.index}:#{pane.state}:#{pane.exit_status}",
-        "0:exited:0",
-    );
-    assert_eq!(panes.trim_end(), "0:exited:0");
-    child.assert_running("live attach after remaining pane process exits after collapse");
-    {
-        let stdin = child.stdin_mut("attach stdin");
-        stdin.write_all(b"\x02d").expect("write detach input");
-        stdin.flush().expect("flush detach input");
-    }
-    let output = wait_for_child_exit(child);
+    // The collapsed-to-one pane now exits (it echoed, sleeps briefly, then
+    // returns); as the session's last running pane, the attach should detach
+    // and exit on its own.
+    let output =
+        assert_child_exits_within(child, "live attach after the last pane exits post-collapse");
     assert_success(&output);
-    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
     assert_success(&dmux(&socket, &["kill-server"]));
 }
 
