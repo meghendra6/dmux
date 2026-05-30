@@ -5132,6 +5132,9 @@ fn split_window_starts_child_pty_with_horizontal_layout_region_size() {
         &["resize-pane", "-t", &session, "-x", "83", "-y", "24"],
     ));
 
+    // Re-emit the size on a loop rather than once at startup: the child's first
+    // `stty size` can race the PTY's resize to the layout region, so poll until
+    // the settled size is observed instead of asserting the one-shot value.
     assert_success(&dmux(
         &socket,
         &[
@@ -5142,11 +5145,11 @@ fn split_window_starts_child_pty_with_horizontal_layout_region_size() {
             "--",
             "sh",
             "-c",
-            "printf 'initial-split-size:'; stty size; sleep 30",
+            "while :; do printf 'initial-split-size:'; stty size; sleep 0.2; done",
         ],
     ));
 
-    let split = poll_capture(&socket, &session, "initial-split-size:");
+    let split = poll_capture(&socket, &session, "initial-split-size:24 40");
     assert!(split.contains("initial-split-size:24 40"), "{split:?}");
 
     assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
