@@ -554,6 +554,16 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
             send_request(&socket, &request, false)?;
             Ok(())
         }
+        cli::Command::ListAttention { session } => {
+            let socket = paths::socket_path();
+            require_running_server(&socket)?;
+            let text = client::list_attention(&socket, session.as_deref())
+                .map_err(|err| err.to_string())?;
+            if !text.is_empty() {
+                println!("{text}");
+            }
+            Ok(())
+        }
         cli::Command::ListKeys { format } => {
             let socket = paths::socket_path();
             require_running_server(&socket)?;

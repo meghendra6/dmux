@@ -10529,6 +10529,51 @@ fn notify_flags_and_clears_calling_pane_attention() {
 }
 
 #[test]
+fn list_attention_lists_panes_needing_attention() {
+    let socket = unique_socket("list-attention");
+    let session = format!("list-attention-{}", std::process::id());
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    // Nothing needs attention yet.
+    let empty = dmux(&socket, &["list-attention"]);
+    assert_success(&empty);
+    assert_eq!(String::from_utf8_lossy(&empty.stdout).trim_end(), "");
+
+    // Flag the pane via notify, then it should appear in list-attention.
+    let pane_id_out = dmux(&socket, &["list-panes", "-t", &session, "-F", "#{pane.id}"]);
+    assert_success(&pane_id_out);
+    let pane_id = String::from_utf8_lossy(&pane_id_out.stdout)
+        .trim_end()
+        .to_string();
+    assert_success(&dmux_with_env(
+        &socket,
+        &["notify", "needs you", "--state", "needs_input"],
+        &[("DMUX_PANE", format!("%{pane_id}").as_str())],
+    ));
+
+    let listed = dmux(&socket, &["list-attention"]);
+    assert_success(&listed);
+    let out = String::from_utf8_lossy(&listed.stdout);
+    assert!(out.contains(&format!("{session}:0.0")), "{out:?}");
+    assert!(out.contains("agent needs_input"), "{out:?}");
+    assert!(out.contains("needs you"), "{out:?}");
+
+    // -t scopes to one session.
+    let scoped = dmux(&socket, &["list-attention", "-t", &session]);
+    assert_success(&scoped);
+    assert!(
+        String::from_utf8_lossy(&scoped.stdout).contains(&format!("{session}:0.0")),
+        "{scoped:?}"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn osc52_clipboard_writes_are_blocked_and_reported() {
     let socket = unique_socket("osc52-clipboard-policy");
     let session = format!("osc52-clipboard-policy-{}", std::process::id());

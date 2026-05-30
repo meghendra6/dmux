@@ -185,6 +185,9 @@ pub enum Command {
         state: Option<String>,
         clear: bool,
     },
+    ListAttention {
+        session: Option<String>,
+    },
     ListKeys {
         format: Option<String>,
     },
@@ -305,6 +308,7 @@ where
         "workspace-list" | "list-workspaces" => parse_workspace_list(args),
         "agent-event" => parse_agent_event(args),
         "notify" => parse_notify(args),
+        "list-attention" => parse_list_attention(args),
         "list-keys" => parse_list_keys(args),
         "bind-key" => parse_bind_key(args),
         "unbind-key" => parse_unbind_key(args),
@@ -575,6 +579,7 @@ Commands:\n\
   workspace-list                         list registered workspace paths\n\
   agent-event -t <target> --state <state> [--label <text>] [--source <text>] [--changed-at <unix-seconds>]\n\
   notify [<message>] [--state <state>] [--clear]  flag the calling pane (via $DMUX_PANE) for attention\n\
+  list-attention [-t <session>]          list panes needing attention (all sessions by default)\n\
   list-keys [-F <format>]                list runtime key bindings\n\
   bind-key <key> <action>                bind a key to a supported live action\n\
   unbind-key <key>                       remove a key binding\n\
@@ -2417,6 +2422,28 @@ fn validate_notify_field(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_list_attention(args: Vec<String>) -> Result<Command, String> {
+    let mut session = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "list-attention requires a session name after -t".to_string())?;
+                session = Some(value.clone());
+                i += 2;
+            }
+            value => {
+                return Err(format!(
+                    "list-attention does not support argument {value:?}"
+                ));
+            }
+        }
+    }
+    Ok(Command::ListAttention { session })
+}
+
 fn set_split_direction(
     direction: &mut Option<SplitDirection>,
     value: SplitDirection,
@@ -2684,6 +2711,20 @@ mod tests {
         );
         // At most one positional message.
         assert!(parse_args(["dmux", "notify", "one", "two"]).is_err());
+    }
+
+    #[test]
+    fn parses_list_attention_command() {
+        assert_eq!(
+            parse_args(["dmux", "list-attention"]).unwrap(),
+            Command::ListAttention { session: None }
+        );
+        assert_eq!(
+            parse_args(["dmux", "list-attention", "-t", "dev"]).unwrap(),
+            Command::ListAttention {
+                session: Some("dev".to_string()),
+            }
+        );
     }
 
     #[test]
