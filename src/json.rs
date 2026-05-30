@@ -35,6 +35,12 @@ pub fn json_u64_or_string(value: &str) -> String {
     }
 }
 
+/// Serialize a server-provided `0`/`1` flag field as a JSON boolean. Any value
+/// other than `"1"` is treated as `false`.
+pub fn json_bool(value: &str) -> &'static str {
+    if value == "1" { "true" } else { "false" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +60,12 @@ mod tests {
         // Non-integer or signed values fall back to a quoted string.
         assert_eq!(json_u64_or_string("-1"), "\"-1\"");
         assert_eq!(json_u64_or_string("n/a"), "\"n/a\"");
+    }
+
+    #[test]
+    fn json_bool_maps_one_to_true() {
+        assert_eq!(json_bool("1"), "true");
+        assert_eq!(json_bool("0"), "false");
+        assert_eq!(json_bool(""), "false");
     }
 }

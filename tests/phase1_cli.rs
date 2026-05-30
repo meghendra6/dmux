@@ -2850,6 +2850,59 @@ fn list_sessions_json_format_emits_session_objects() {
 }
 
 #[test]
+fn list_panes_json_format_emits_pane_objects() {
+    let socket = unique_socket("list-panes-json");
+    let session = format!("list-panes-json-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let output = dmux(&socket, &["list-panes", "-t", &session, "--format", "json"]);
+    assert_success(&output);
+    let json = String::from_utf8_lossy(&output.stdout);
+    assert!(json.trim_start().starts_with('['), "{json:?}");
+    assert!(json.contains("\"index\": 0"), "{json:?}");
+    assert!(json.contains("\"active\": true"), "{json:?}");
+    assert!(json.contains("\"bell\": false"), "{json:?}");
+    assert!(json.contains("\"state\":"), "{json:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
+fn list_windows_json_format_emits_window_objects() {
+    let socket = unique_socket("list-windows-json");
+    let session = format!("list-windows-json-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["new-window", "-t", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let output = dmux(
+        &socket,
+        &["list-windows", "-t", &session, "--format", "json"],
+    );
+    assert_success(&output);
+    let json = String::from_utf8_lossy(&output.stdout);
+    assert!(json.trim_start().starts_with('['), "{json:?}");
+    assert!(json.contains("\"index\": 0"), "{json:?}");
+    assert!(json.contains("\"index\": 1"), "{json:?}");
+    assert!(json.contains("\"active\": true"), "{json:?}");
+    assert!(json.contains("\"panes\":"), "{json:?}");
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn dmux_without_args_creates_default_and_detaches() {
     let socket = unique_socket("open-default");
 

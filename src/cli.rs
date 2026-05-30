@@ -1455,10 +1455,11 @@ fn parse_list_panes(args: Vec<String>) -> Result<Command, String> {
                 window = target.window;
                 i += 2;
             }
-            "-F" => {
+            "-F" | "--format" => {
+                let flag = &args[i];
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| "list-panes requires a format after -F".to_string())?;
+                    .ok_or_else(|| format!("list-panes requires a format after {flag}"))?;
                 format = Some(value.clone());
                 i += 2;
             }
@@ -1821,10 +1822,11 @@ fn parse_list_windows(args: Vec<String>, command_name: &str) -> Result<Command, 
                 session = Some(value.clone());
                 i += 2;
             }
-            "-F" => {
+            "-F" | "--format" => {
+                let flag = &args[i];
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| format!("{command_name} requires a format after -F"))?;
+                    .ok_or_else(|| format!("{command_name} requires a format after {flag}"))?;
                 format = Some(value.clone());
                 i += 2;
             }
