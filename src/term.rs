@@ -593,6 +593,12 @@ impl TerminalScreen {
     }
 
     fn put_char(&mut self, ch: char, style: CellStyle, scrollback: &mut Scrollback) {
+        if char_cell_width(ch) == 0 {
+            // Zero-width (combining marks, ZWSP, …). This grid stores one char
+            // per cell and cannot attach a mark to the preceding glyph, so
+            // dropping it keeps the line aligned instead of stealing a column.
+            return;
+        }
         let width = char_cell_width(ch).min(self.width);
         if self.cursor_col + width > self.width {
             self.cursor_col = 0;
@@ -607,6 +613,9 @@ impl TerminalScreen {
     }
 
     fn put_char_without_scrollback(&mut self, ch: char, style: CellStyle) {
+        if char_cell_width(ch) == 0 {
+            return; // Zero-width; see put_char.
+        }
         let width = char_cell_width(ch).min(self.width);
         if self.cursor_col + width > self.width {
             self.cursor_col = 0;
@@ -1354,7 +1363,10 @@ fn trim_trailing_spaces(mut value: String) -> String {
 }
 
 fn char_cell_width(ch: char) -> usize {
-    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
+    // Combining marks and other zero-width scalars report Some(0); preserve that
+    // so put_char can drop them rather than letting each steal a column. A char
+    // with no East Asian width (control-ish, None) still defaults to one cell.
+    UnicodeWidthChar::width(ch).unwrap_or(1)
 }
 
 fn normalize_wide_cells(row: &mut [Cell], style: CellStyle) {
@@ -1899,6 +1911,15 @@ mod tests {
         assert_eq!(state.render_screen_ansi_lines(4, 1), vec!["한글"]);
         assert_eq!(state.render_screen_ansi_lines(3, 1), vec!["한 "]);
         assert_eq!(state.render_screen_ansi_lines(5, 1), vec!["한글 "]);
+    }
+
+    #[test]
+    fn combining_mark_does_not_consume_a_column() {
+        let mut state = TerminalState::new(10, 1, 100);
+        state.apply_bytes("a\u{0301}b".as_bytes()); // 'a' + combining acute + 'b'
+        // The zero-width mark is dropped, so only "a" and "b" take cells and the
+        // line stays two columns wide rather than being shifted by the accent.
+        assert_eq!(state.render_screen_ansi_lines(4, 1), vec!["ab  "]);
     }
 
     #[test]
