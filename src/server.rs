@@ -793,6 +793,17 @@ impl Session {
 
     fn mark_pane_exited(self: &Arc<Self>, pane: &Arc<Pane>) {
         let changed = self.windows.lock().unwrap().mark_pane_exited(pane);
+        // When the last pane in the session exits (e.g. the shell exits on
+        // Ctrl-D), close every attach stream so attached clients receive EOF and
+        // detach cleanly. Do this *instead* of reconnecting: a reconnect would
+        // bump the raw-attach epoch and make the client re-attach (in snapshot
+        // mode) onto a session with no running pane, where it would block.
+        // Closing the streams without an epoch bump makes the client exit, the
+        // same way handle_kill does on kill-session.
+        if !self.panes().iter().any(|pane| pane.is_running()) {
+            self.close_attach_streams();
+            return;
+        }
         if changed {
             let _ = self.resize_current_visible_panes();
             self.notify_attach_redraw_immediate();
