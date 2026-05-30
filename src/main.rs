@@ -1,6 +1,7 @@
 mod cli;
 mod client;
 mod config;
+mod git;
 mod ids;
 mod json;
 mod layout;
