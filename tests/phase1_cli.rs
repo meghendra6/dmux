@@ -10474,6 +10474,61 @@ fn git_dirty_status_token_reports_zero_or_one() {
 }
 
 #[test]
+fn notify_flags_and_clears_calling_pane_attention() {
+    let socket = unique_socket("notify");
+    let session = format!("notify-{}", std::process::id());
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+
+    let pane_id_out = dmux(&socket, &["list-panes", "-t", &session, "-F", "#{pane.id}"]);
+    assert_success(&pane_id_out);
+    let pane_id = String::from_utf8_lossy(&pane_id_out.stdout)
+        .trim_end()
+        .to_string();
+    let dmux_pane = format!("%{pane_id}");
+
+    // notify resolves the calling pane from $DMUX_PANE and flags it for attention.
+    assert_success(&dmux_with_env(
+        &socket,
+        &["notify", "build done", "--state", "alert"],
+        &[("DMUX_PANE", dmux_pane.as_str())],
+    ));
+
+    let flagged = poll_list_panes_contains(
+        &socket,
+        &session,
+        "#{pane.agent_state}:#{pane.agent_label}",
+        "alert:build done",
+    );
+    assert!(
+        flagged.lines().any(|line| line == "alert:build done"),
+        "notify should flag the calling pane: {flagged:?}"
+    );
+
+    // notify --clear removes it (the request is synchronous, so check directly).
+    assert_success(&dmux_with_env(
+        &socket,
+        &["notify", "--clear"],
+        &[("DMUX_PANE", dmux_pane.as_str())],
+    ));
+    let after = dmux(
+        &socket,
+        &["list-panes", "-t", &session, "-F", "#{pane.agent_state}"],
+    );
+    assert_success(&after);
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout).trim_end(),
+        "",
+        "notify --clear should clear the pane's attention"
+    );
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn osc52_clipboard_writes_are_blocked_and_reported() {
     let socket = unique_socket("osc52-clipboard-policy");
     let session = format!("osc52-clipboard-policy-{}", std::process::id());
