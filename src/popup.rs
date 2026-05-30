@@ -232,43 +232,55 @@ pub fn filter_rows(rows: &[PopupRow], filter: &str) -> Vec<PopupRow> {
         return rows.to_vec();
     }
 
-    rows.iter()
-        .filter(|row| {
-            if row.kind == PopupRowKind::Header {
-                return true;
+    // Defer each header until a matching item under it is found, so a group
+    // whose items are all filtered out does not leave an orphan header behind.
+    let mut result = Vec::new();
+    let mut pending_header: Option<&PopupRow> = None;
+    for row in rows {
+        if row.kind == PopupRowKind::Header {
+            pending_header = Some(row);
+            continue;
+        }
+        if row_matches_filter(row, &needle) {
+            if let Some(header) = pending_header.take() {
+                result.push(header.clone());
             }
-            let repo = row
-                .repo_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default();
-            let target = row
-                .target
-                .as_ref()
-                .map(|target| {
-                    format!(
-                        "{} {} {}",
-                        target.session,
-                        target
-                            .window_index
-                            .map(|index| index.to_string())
-                            .unwrap_or_default(),
-                        target
-                            .pane_index
-                            .map(|index| index.to_string())
-                            .unwrap_or_default()
-                    )
-                })
-                .unwrap_or_default();
+            result.push(row.clone());
+        }
+    }
+    result
+}
+
+fn row_matches_filter(row: &PopupRow, needle: &str) -> bool {
+    let repo = row
+        .repo_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let target = row
+        .target
+        .as_ref()
+        .map(|target| {
             format!(
-                "{} {} {} {} {:?}",
-                repo, target, row.title, row.summary, row.state
+                "{} {} {}",
+                target.session,
+                target
+                    .window_index
+                    .map(|index| index.to_string())
+                    .unwrap_or_default(),
+                target
+                    .pane_index
+                    .map(|index| index.to_string())
+                    .unwrap_or_default()
             )
-            .to_ascii_lowercase()
-            .contains(&needle)
         })
-        .cloned()
-        .collect()
+        .unwrap_or_default();
+    format!(
+        "{} {} {} {} {:?}",
+        repo, target, row.title, row.summary, row.state
+    )
+    .to_ascii_lowercase()
+    .contains(needle)
 }
 
 pub fn group_rows(rows: Vec<PopupRow>, grouping: PopupGrouping) -> PopupModel {
@@ -533,6 +545,27 @@ mod tests {
                 .map(|row| row.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["h", "a"]
+        );
+    }
+
+    #[test]
+    fn filtering_drops_headers_with_no_matching_items() {
+        let rows = vec![
+            row("h1", "Working", PopupRowKind::Header),
+            row("a", "alpha api", PopupRowKind::Item),
+            row("h2", "Needs input", PopupRowKind::Header),
+            row("b", "beta ui", PopupRowKind::Item),
+        ];
+
+        // "api" matches only the item under "Working"; the "Needs input" header
+        // must not survive as an orphan with no rows beneath it.
+        let filtered = filter_rows(&rows, "api");
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["h1", "a"]
         );
     }
 
