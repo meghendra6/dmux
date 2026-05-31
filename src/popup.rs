@@ -429,10 +429,11 @@ pub fn render_popup_view(state: &PopupState, model: &PopupModel, peek: Option<&s
         match row.kind {
             PopupRowKind::Header => {
                 // Skip empty headers: the draw path drops blank lines, which
-                // would otherwise shift focus_line off the selected row.
+                // would otherwise shift focus_line off the selected row. Rule the
+                // title so groups read as separators, not as list rows.
                 let title = row.title.trim_end();
                 if !title.is_empty() {
-                    list.push(title.to_string());
+                    list.push(format!("── {title} ──"));
                 }
             }
             PopupRowKind::Item | PopupRowKind::DisabledItem => {
@@ -747,6 +748,22 @@ mod tests {
         // pinned tail = "Peek" + 2 capture lines + "Reply: hi" + footer = 5.
         assert_eq!(view.pinned_tail, 5);
         assert_eq!(view.focus_line, Some(0));
+    }
+
+    #[test]
+    fn render_popup_view_rules_group_headers() {
+        let model = PopupModel::new(vec![
+            row("h", "Needs input", PopupRowKind::Header),
+            row("a", "alpha", PopupRowKind::Item),
+        ]);
+        let mut state = PopupState::new(PopupMode::Attention);
+        state.selected = Some("a".to_string());
+
+        let view = render_popup_view(&state, &model, None);
+
+        assert_eq!(view.lines[0], "── Needs input ──");
+        // The item sits on the line after the ruled header.
+        assert_eq!(view.focus_line, Some(1));
     }
 
     #[test]
