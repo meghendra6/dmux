@@ -113,6 +113,8 @@ struct PopupOverlayText {
     focus_line: Option<usize>,
     /// Count of trailing chrome lines (peek/prompt/footer) pinned on screen.
     pinned_tail: usize,
+    /// (1-based selection position, total selectable) for the title's N/M.
+    count: Option<(usize, usize)>,
 }
 
 impl PopupOverlayText {
@@ -123,6 +125,7 @@ impl PopupOverlayText {
             content,
             focus_line: None,
             pinned_tail: 0,
+            count: None,
         }
     }
 
@@ -133,8 +136,20 @@ impl PopupOverlayText {
             content: view.lines.join("\n"),
             focus_line: view.focus_line,
             pinned_tail: view.pinned_tail,
+            count: view.count,
         }
     }
+}
+
+/// How the box layer should window and annotate a popup body: which row is
+/// selected (`focus_line`), how many trailing chrome rows to pin (`pinned_tail`),
+/// and the `N/M` selection count for the title. Defaults to a non-scrolling,
+/// un-annotated body.
+#[derive(Debug, Clone, Copy, Default)]
+struct PopupBodySpec {
+    focus_line: Option<usize>,
+    pinned_tail: usize,
+    count: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,6 +158,17 @@ struct PopupOverlay<'a> {
     content: &'a str,
     focus_line: Option<usize>,
     pinned_tail: usize,
+    count: Option<(usize, usize)>,
+}
+
+impl PopupOverlay<'_> {
+    fn body_spec(&self) -> PopupBodySpec {
+        PopupBodySpec {
+            focus_line: self.focus_line,
+            pinned_tail: self.pinned_tail,
+            count: self.count,
+        }
+    }
 }
 
 impl PopupOverlayText {
@@ -152,6 +178,7 @@ impl PopupOverlayText {
             content: &self.content,
             focus_line: self.focus_line,
             pinned_tail: self.pinned_tail,
+            count: self.count,
         }
     }
 }
@@ -952,8 +979,7 @@ fn write_live_render_output(
             &popup_content_lines(overlay.content),
             size,
             frame.header_rows,
-            overlay.focus_line,
-            overlay.pinned_tail,
+            overlay.body_spec(),
         );
         // The overlay hid the cursor; forget the last-emitted cursor so the next
         // popup-free frame re-emits the pane's cursor sequence (which re-shows
@@ -982,8 +1008,7 @@ fn append_popup_overlay(
         &popup_content_lines(overlay.content),
         size,
         header_rows,
-        overlay.focus_line,
-        overlay.pinned_tail,
+        overlay.body_spec(),
     );
     stdout.write_all(&output)
 }
@@ -1023,8 +1048,7 @@ fn append_centered_popup_overlay(
     content: &[String],
     size: PtySize,
     header_rows: usize,
-    focus_line: Option<usize>,
-    pinned_tail: usize,
+    spec: PopupBodySpec,
 ) {
     let rows = usize::from(size.rows);
     let cols = usize::from(size.cols);
@@ -1037,14 +1061,7 @@ fn append_centered_popup_overlay(
         return;
     }
 
-    let popup_lines = boxed_popup_lines(
-        title,
-        content,
-        Some(cols),
-        Some(available_rows),
-        focus_line,
-        pinned_tail,
-    );
+    let popup_lines = boxed_popup_lines(title, content, Some(cols), Some(available_rows), spec);
     if popup_lines.is_empty() {
         return;
     }
@@ -1090,21 +1107,37 @@ fn popup_content_lines(text: &str) -> Vec<String> {
 /// screen. Returns at most `max_rows` lines. The list occupies everything
 /// before the pinned tail; the viewport over it is centered on `focus` and
 /// clamped to the list bounds.
+/// A windowed popup body plus whether list rows are scrolled off above/below
+/// (so the box can draw ▲/▼ overflow arrows).
+struct PopupWindow {
+    lines: Vec<String>,
+    more_above: bool,
+    more_below: bool,
+}
+
 fn window_popup_content(
     content: &[String],
     max_rows: usize,
     focus: usize,
     pinned_tail: usize,
-) -> Vec<String> {
+) -> PopupWindow {
     if content.len() <= max_rows {
-        return content.to_vec();
+        return PopupWindow {
+            lines: content.to_vec(),
+            more_above: false,
+            more_below: false,
+        };
     }
     let pinned = pinned_tail.min(content.len());
     let list_len = content.len() - pinned;
     let list_capacity = max_rows.saturating_sub(pinned);
     if list_capacity == 0 {
         // No room for the list; the pinned chrome wins — keep the last rows.
-        return content[content.len() - max_rows..].to_vec();
+        return PopupWindow {
+            lines: content[content.len() - max_rows..].to_vec(),
+            more_above: list_len > 0,
+            more_below: false,
+        };
     }
     let focus = focus.min(list_len.saturating_sub(1));
     let start = if list_len <= list_capacity {
@@ -1117,7 +1150,11 @@ fn window_popup_content(
     let end = (start + list_capacity).min(list_len);
     let mut windowed = content[start..end].to_vec();
     windowed.extend_from_slice(&content[list_len..]);
-    windowed
+    PopupWindow {
+        lines: windowed,
+        more_above: start > 0,
+        more_below: end < list_len,
+    }
 }
 
 fn boxed_popup_lines(
@@ -1125,9 +1162,13 @@ fn boxed_popup_lines(
     content: &[String],
     max_total_width: Option<usize>,
     max_rows: Option<usize>,
-    focus_line: Option<usize>,
-    pinned_tail: usize,
+    spec: PopupBodySpec,
 ) -> Vec<String> {
+    let PopupBodySpec {
+        focus_line,
+        pinned_tail,
+        count,
+    } = spec;
     if max_total_width.is_some_and(|width| width < 4) {
         return Vec::new();
     }
@@ -1139,10 +1180,13 @@ fn boxed_popup_lines(
         return Vec::new();
     }
 
-    let visible_content = match focus_line {
+    let (visible_content, more_above, more_below) = match focus_line {
         // Scrollable list: window it so the selected row stays visible while the
         // trailing chrome (footer/prompt/peek) stays pinned on screen.
-        Some(focus) => window_popup_content(content, max_content_rows, focus, pinned_tail),
+        Some(focus) => {
+            let window = window_popup_content(content, max_content_rows, focus, pinned_tail);
+            (window.lines, window.more_above, window.more_below)
+        }
         // Non-scrolling popup (help/detail): take the top rows, flagging overflow.
         None => {
             let mut visible = content
@@ -1160,7 +1204,7 @@ fn boxed_popup_lines(
                     *last = replacement;
                 }
             }
-            visible
+            (visible, false, false)
         }
     };
 
@@ -1174,7 +1218,10 @@ fn boxed_popup_lines(
         .max()
         .unwrap_or(0)
         .min(max_content_width);
-    let title_text = format!(" {title} ");
+    let title_text = match count {
+        Some((position, total)) => format!(" {title}  {position}/{total} "),
+        None => format!(" {title} "),
+    };
     let mut border_width = (content_width + 2).max(display_cell_width(&title_text));
     border_width = border_width.min(max_inner_width);
     if border_width == 0 {
@@ -1185,13 +1232,26 @@ fn boxed_popup_lines(
     let trailing = border_width.saturating_sub(display_cell_width(&title_segment));
     let inner_width = border_width.saturating_sub(2);
     let mut lines = Vec::with_capacity(visible_content.len() + 2);
-    lines.push(format!("┌{title_segment}{}┐", "─".repeat(trailing)));
+    // ▲/▼ on the right of the top/bottom border mark list rows scrolled off
+    // screen; each replaces one dash, so the border width is unchanged.
+    let top_fill = border_fill_with_marker(trailing, more_above.then_some('▲'));
+    lines.push(format!("┌{title_segment}{top_fill}┐"));
     for line in visible_content {
         let line = truncate_header_line(&line, Some(inner_width));
         lines.push(format!("│ {line}{} │", cell_padding(&line, inner_width)));
     }
-    lines.push(format!("└{}┘", "─".repeat(border_width)));
+    let bottom_fill = border_fill_with_marker(border_width, more_below.then_some('▼'));
+    lines.push(format!("└{bottom_fill}┘"));
     lines
+}
+
+/// A run of `width` horizontal box-drawing dashes, with `marker` (if any)
+/// replacing the rightmost dash.
+fn border_fill_with_marker(width: usize, marker: Option<char>) -> String {
+    match marker {
+        Some(marker) if width >= 1 => format!("{}{marker}", "─".repeat(width - 1)),
+        _ => "─".repeat(width),
+    }
 }
 
 fn reset_live_render_output_state(state: &mut LiveRenderOutputState) {
@@ -8225,8 +8285,7 @@ fn attach_help_popup_message() -> String {
         &attach_help_popup_content(),
         None,
         None,
-        None,
-        0,
+        PopupBodySpec::default(),
     )
     .join("\n")
 }
@@ -8245,8 +8304,7 @@ fn write_attach_popup_message(overlay: PopupOverlay<'_>) -> io::Result<()> {
         &popup_content_lines(overlay.content),
         size,
         0,
-        overlay.focus_line,
-        overlay.pinned_tail,
+        overlay.body_spec(),
     );
     stdout.write_all(&output)?;
     stdout.flush()
@@ -13263,6 +13321,7 @@ mod tests {
             content: "C-b ? close",
             focus_line: None,
             pinned_tail: 0,
+            count: None,
         };
 
         // A transient (non-prioritized) message must not add a header row, so the
@@ -13299,7 +13358,7 @@ mod tests {
         let max_rows = 8;
 
         for focus in 0..20 {
-            let view = window_popup_content(&content, max_rows, focus, pinned_tail);
+            let view = window_popup_content(&content, max_rows, focus, pinned_tail).lines;
             assert!(view.len() <= max_rows, "focus {focus}: {} rows", view.len());
             assert!(
                 view.iter().any(|line| line == "FOOTER"),
@@ -13315,7 +13374,50 @@ mod tests {
     #[test]
     fn window_popup_content_returns_all_rows_when_they_fit() {
         let content: Vec<String> = (0..5).map(|index| format!("r{index}")).collect();
-        assert_eq!(window_popup_content(&content, 10, 2, 1), content);
+        let window = window_popup_content(&content, 10, 2, 1);
+        assert_eq!(window.lines, content);
+        assert!(!window.more_above && !window.more_below);
+    }
+
+    #[test]
+    fn window_popup_content_flags_overflow_above_and_below() {
+        let content: Vec<String> = (0..20).map(|index| format!("item{index}")).collect();
+        // Focus in the middle of a long list: rows scrolled off both ends.
+        let window = window_popup_content(&content, 6, 10, 0);
+        assert!(
+            window.more_above,
+            "rows above the window: {:?}",
+            window.lines
+        );
+        assert!(
+            window.more_below,
+            "rows below the window: {:?}",
+            window.lines
+        );
+    }
+
+    #[test]
+    fn boxed_popup_lines_shows_count_and_overflow_arrows() {
+        let content: Vec<String> = (0..20)
+            .map(|index| format!("session-name-{index:02}"))
+            .collect();
+        let spec = PopupBodySpec {
+            focus_line: Some(10),
+            pinned_tail: 0,
+            count: Some((11, 20)),
+        };
+        let lines = boxed_popup_lines("nav", &content, Some(40), Some(6), spec);
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("11/20"), "count in title: {joined}");
+        assert!(
+            lines.first().unwrap().contains('▲'),
+            "top overflow arrow: {joined}"
+        );
+        assert!(
+            lines.last().unwrap().contains('▼'),
+            "bottom overflow arrow: {joined}"
+        );
     }
 
     #[test]
@@ -13328,8 +13430,7 @@ mod tests {
             &["C-b ? close".to_string(), "Prompt examples:".to_string()],
             PtySize { cols: 40, rows: 10 },
             1,
-            None,
-            0,
+            PopupBodySpec::default(),
         );
 
         assert!(
@@ -13377,6 +13478,7 @@ mod tests {
             content: "C-b ? close",
             focus_line: None,
             pinned_tail: 0,
+            count: None,
         };
         write_live_render_output(&render_frame(frame), &mut state, Some(overlay)).unwrap();
         assert!(

@@ -414,6 +414,9 @@ pub struct PopupView {
     pub lines: Vec<String>,
     pub focus_line: Option<usize>,
     pub pinned_tail: usize,
+    /// (1-based position of the selection, total selectable rows) for the title
+    /// bar's `N/M` indicator. None when nothing is selectable.
+    pub count: Option<(usize, usize)>,
 }
 
 /// Convenience wrapper used by tests to assert on the flat rendered text.
@@ -423,6 +426,19 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
 }
 
 pub fn render_popup_view(state: &PopupState, model: &PopupModel, peek: Option<&str>) -> PopupView {
+    let selectable = model.selectable_row_ids();
+    let count = if selectable.is_empty() {
+        None
+    } else {
+        let position = state
+            .selected
+            .as_deref()
+            .and_then(|selected| selectable.iter().position(|id| id == selected))
+            .map(|index| index + 1)
+            .unwrap_or(1);
+        Some((position, selectable.len()))
+    };
+
     let mut list = Vec::new();
     let mut focus_line = None;
     for row in &model.rows {
@@ -514,6 +530,7 @@ pub fn render_popup_view(state: &PopupState, model: &PopupModel, peek: Option<&s
         lines,
         focus_line,
         pinned_tail,
+        count,
     }
 }
 
