@@ -1,4 +1,26 @@
 use std::path::PathBuf;
+use unicode_width::UnicodeWidthChar;
+
+/// Minimum display width of the item title column, so short titles pad out and
+/// summaries line up into a table for the common case.
+const TITLE_WIDTH: usize = 18;
+
+fn char_cells(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0).max(1)
+}
+
+/// Pad `text` with spaces to at least `min` display cells so the following
+/// column aligns. Cell-aware so CJK titles pad correctly. Titles longer than
+/// `min` are left intact (no information lost — the box truncates the row at its
+/// edge if it overflows the popup width).
+fn pad_title(text: &str, min: usize) -> String {
+    let width: usize = text.chars().map(char_cells).sum();
+    let mut out = text.to_string();
+    if width < min {
+        out.push_str(&" ".repeat(min - width));
+    }
+    out
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PopupMode {
@@ -420,16 +442,25 @@ pub fn render_popup_view(state: &PopupState, model: &PopupModel, peek: Option<&s
                 }
                 let marker = if selected { ">" } else { " " };
                 let state_marker = state_marker(row.state);
-                let disabled = if row.kind == PopupRowKind::DisabledItem {
-                    " disabled"
-                } else {
-                    ""
-                };
-                let pinned = if row.pinned { " pinned" } else { "" };
+                // Compact 2-cell flag column: p=pinned, d=disabled (left-aligned).
+                let mut flags = String::new();
+                if row.pinned {
+                    flags.push('p');
+                }
+                if row.kind == PopupRowKind::DisabledItem {
+                    flags.push('d');
+                }
+                while flags.chars().count() < 2 {
+                    flags.push(' ');
+                }
                 list.push(
                     format!(
-                        "{} {} {:<10} {}{}{}",
-                        marker, state_marker, row.title, row.summary, pinned, disabled
+                        "{} {} {} {} {}",
+                        marker,
+                        state_marker,
+                        flags,
+                        pad_title(&row.title, TITLE_WIDTH),
+                        row.summary
                     )
                     .trim_end()
                     .to_string(),
@@ -648,8 +679,37 @@ mod tests {
         let text = render_popup_text(&state, &model, None);
 
         assert!(text.contains("Working"));
-        assert!(text.contains("> * alpha"));
+        assert!(
+            text.contains("> *"),
+            "selected marker + state glyph: {text}"
+        );
+        assert!(text.contains("alpha"), "{text}");
         assert!(text.contains("Enter: focus/attach"));
+    }
+
+    #[test]
+    fn pad_title_aligns_short_titles_and_preserves_long_ones() {
+        assert_eq!(pad_title("abc", 6), "abc   ");
+        assert_eq!(pad_title("abcdef", 6), "abcdef");
+        // Longer than the column: left intact, never truncated.
+        assert_eq!(pad_title("abcdefgh", 6), "abcdefgh");
+        // CJK glyphs are two cells wide.
+        assert_eq!(pad_title("한국", 6), "한국  ");
+    }
+
+    #[test]
+    fn render_disabled_item_shows_flag_column() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::DisabledItem)]);
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.selected = Some("a".to_string());
+
+        let text = render_popup_text(&state, &model, None);
+
+        assert!(
+            text.contains("> * d"),
+            "disabled flag in the flag column: {text}"
+        );
+        assert!(!text.contains("disabled"), "no English flag words: {text}");
     }
 
     #[test]
@@ -700,7 +760,11 @@ mod tests {
         let text = render_popup_text(&state, &model, None);
 
         assert!(text.contains("alpha"), "{text}");
-        assert!(text.contains("pinned"), "{text}");
+        assert!(
+            text.contains("> * p"),
+            "pinned flag in the flag column: {text}"
+        );
+        assert!(!text.contains("pinned"), "no English flag words: {text}");
     }
 
     #[test]
