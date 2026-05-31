@@ -620,7 +620,7 @@ Session:\n\
   C-b ! attention navigator   C-b w tree navigator   C-b i detail popup   C-b A workspaces\n\
   popup: j/k move   Enter focus   o open/reopen   Space peek   r reply   Tab group   / filter   Esc close\n\
 Windows:\n\
-  C-b c new window        C-b n/p next/previous window    C-b Tab last window\n\
+  C-b c new window   C-b n/p next/prev   C-b Tab last   C-b 0-9 by index\n\
 Panes:\n\
   C-b % split right       C-b \" split down       C-b o next pane       C-b ; last pane\n\
   C-b h/j/k/l or arrows focus    Alt-h/j/k/l or Alt-arrows focus\n\
@@ -650,7 +650,7 @@ pub fn attach_help_overlay() -> &'static str {
   C-b ! attention navigator   C-b w tree navigator   C-b i detail popup   C-b A workspaces\n\
   popup: j/k move   Enter focus   o open/reopen   Space peek   r reply   Tab group   / filter   Esc close\n\
 Windows:\n\
-  C-b c new window        C-b n/p next/previous window    C-b Tab last window\n\
+  C-b c new window   C-b n/p next/prev   C-b Tab last   C-b 0-9 by index\n\
 Panes:\n\
   C-b % split right       C-b \" split down       C-b o next pane       C-b ; last pane\n\
   C-b h/j/k/l or arrows focus    Alt-h/j/k/l or Alt-arrows focus\n\
@@ -3046,6 +3046,7 @@ mod tests {
 
         assert!(help.contains("Session:"), "{help}");
         assert!(help.contains("Windows:"), "{help}");
+        assert!(help.contains("C-b 0-9 by index"), "{help}");
         assert!(help.contains("Panes:"), "{help}");
         assert!(help.contains("attention navigator"), "{help}");
         assert!(help.contains("tree navigator"), "{help}");

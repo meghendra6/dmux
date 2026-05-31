@@ -110,6 +110,11 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         key: key.to_string(),
         command: command.to_string(),
     })
+    // C-b 0..9 jump straight to the window with that index (tmux's digit keys).
+    .chain((0..=9).map(|index| KeyBinding {
+        key: index.to_string(),
+        command: format!("select-window {index}"),
+    }))
     .collect()
 }
 
@@ -254,8 +259,14 @@ pub fn validate_binding_command(command: &str) -> Result<String, String> {
             return Ok(normalized);
         }
     }
+    // `select-window <index>` jumps to a window by index (e.g. the digit keys).
+    if let Some(index) = normalized.strip_prefix("select-window ")
+        && index.parse::<usize>().is_ok()
+    {
+        return Ok(normalized);
+    }
     Err(format!(
-        "unsupported binding command {command:?}; supported live actions include send-prefix, detach-client, copy-mode, command-prompt, split-window -h|-v, select-pane -L|-D|-U|-R, resize-pane -L|-D|-U|-R [amount], next-pane, new-window, next-window, previous-window, last-window, last-pane, kill-pane, and zoom-pane"
+        "unsupported binding command {command:?}; supported live actions include send-prefix, detach-client, copy-mode, command-prompt, split-window -h|-v, select-pane -L|-D|-U|-R, select-window <index>, resize-pane -L|-D|-U|-R [amount], next-pane, new-window, next-window, previous-window, last-window, last-pane, kill-pane, and zoom-pane"
     ))
 }
 
@@ -301,5 +312,27 @@ mod tests {
             "resize-pane -L 1"
         );
         assert!(validate_binding_command("resize-pane -L 0").is_err());
+    }
+
+    #[test]
+    fn binding_command_accepts_select_window_index() {
+        assert_eq!(
+            validate_binding_command("select-window 3").unwrap(),
+            "select-window 3"
+        );
+        assert!(validate_binding_command("select-window").is_err());
+        assert!(validate_binding_command("select-window x").is_err());
+    }
+
+    #[test]
+    fn default_bindings_jump_to_windows_by_digit() {
+        let bindings = default_key_bindings();
+        for index in 0..=9 {
+            let binding = bindings
+                .iter()
+                .find(|binding| binding.key == index.to_string())
+                .unwrap_or_else(|| panic!("missing digit binding for {index}"));
+            assert_eq!(binding.command, format!("select-window {index}"));
+        }
     }
 }

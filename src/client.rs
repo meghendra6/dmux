@@ -1387,6 +1387,7 @@ enum PaneCommand {
     PreviousWindow,
     LastWindow,
     LastPane,
+    SelectWindow(usize),
     SplitRight,
     SplitDown,
     FocusLeft,
@@ -1613,6 +1614,9 @@ fn live_key_action(command: &str) -> Option<LiveKeyAction> {
     if let Some(action) = resize_live_key_action(command) {
         return Some(action);
     }
+    if let Some(action) = select_window_live_key_action(command) {
+        return Some(action);
+    }
 
     match command {
         "send-prefix" => Some(LiveKeyAction::SendPrefix),
@@ -1668,6 +1672,14 @@ fn resize_live_key_action(command: &str) -> Option<LiveKeyAction> {
         direction,
         amount,
     }))
+}
+
+/// Parse a `select-window <index>` binding (e.g. the `C-b 0`..`C-b 9` digit
+/// keys) into a jump to that window index.
+fn select_window_live_key_action(command: &str) -> Option<LiveKeyAction> {
+    let index = command.strip_prefix("select-window ")?;
+    let index = index.parse::<usize>().ok()?;
+    Some(LiveKeyAction::PaneCommand(PaneCommand::SelectWindow(index)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7036,6 +7048,10 @@ fn apply_live_pane_command(
             let _ = send_control_request(socket, &protocol::encode_last_pane(session))?;
             Ok(())
         }
+        PaneCommand::SelectWindow(index) => {
+            let _ = send_control_request(socket, &protocol::encode_select_window(session, index))?;
+            Ok(())
+        }
         PaneCommand::SplitRight => {
             split_pane(socket, session, protocol::SplitDirection::Horizontal)
         }
@@ -7616,6 +7632,23 @@ where
                     if let Err(error) =
                         send_control_request(socket, &protocol::encode_last_pane(session))
                     {
+                        write_attach_transient_message(&error.to_string())?;
+                    } else {
+                        return Ok(RawAttachExit::Reconnect {
+                            pending_input: raw_pending_input(
+                                &actions[index + 1..],
+                                input_state.saw_prefix,
+                                RawPendingFocus::Preserve,
+                                &controls,
+                            ),
+                        });
+                    }
+                }
+                AttachInputAction::PaneCommand(PaneCommand::SelectWindow(target)) => {
+                    if let Err(error) = send_control_request(
+                        socket,
+                        &protocol::encode_select_window(session, *target),
+                    ) {
                         write_attach_transient_message(&error.to_string())?;
                     } else {
                         return Ok(RawAttachExit::Reconnect {
@@ -11573,6 +11606,18 @@ mod tests {
     }
 
     #[test]
+    fn select_window_live_key_action_parses_index_and_rejects_garbage() {
+        assert_eq!(
+            select_window_live_key_action("select-window 7"),
+            Some(LiveKeyAction::PaneCommand(PaneCommand::SelectWindow(7)))
+        );
+        assert!(select_window_live_key_action("select-window").is_none());
+        assert!(select_window_live_key_action("select-window x").is_none());
+        assert!(select_window_live_key_action("select-window -1").is_none());
+        assert!(select_window_live_key_action("select-windowfoo").is_none());
+    }
+
+    #[test]
     fn attach_input_translates_pane_commands() {
         let cases = [
             (b'c', PaneCommand::NewWindow),
@@ -11580,6 +11625,9 @@ mod tests {
             (b'p', PaneCommand::PreviousWindow),
             (b';', PaneCommand::LastPane),
             (b'\t', PaneCommand::LastWindow),
+            (b'0', PaneCommand::SelectWindow(0)),
+            (b'3', PaneCommand::SelectWindow(3)),
+            (b'9', PaneCommand::SelectWindow(9)),
             (b'%', PaneCommand::SplitRight),
             (b'"', PaneCommand::SplitDown),
             (b'h', PaneCommand::FocusLeft),
