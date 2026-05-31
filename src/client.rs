@@ -1067,11 +1067,9 @@ fn append_centered_popup_overlay(
     }
 
     let popup_height = popup_lines.len();
-    let popup_width = popup_lines
-        .iter()
-        .map(|line| display_cell_width(line))
-        .max()
-        .unwrap_or(0);
+    // The box is rectangular, so the (plain) top border row gives the true width;
+    // measuring content rows would miscount any SGR escapes in the selection bar.
+    let popup_width = display_cell_width(&popup_lines[0]);
     if popup_height > available_rows || popup_width > cols {
         return;
     }
@@ -1113,6 +1111,9 @@ struct PopupWindow {
     lines: Vec<String>,
     more_above: bool,
     more_below: bool,
+    /// Index of the focused row within `lines` (for the selection highlight),
+    /// or None if it could not be shown.
+    focus_in_window: Option<usize>,
 }
 
 fn window_popup_content(
@@ -1126,6 +1127,7 @@ fn window_popup_content(
             lines: content.to_vec(),
             more_above: false,
             more_below: false,
+            focus_in_window: (focus < content.len()).then_some(focus),
         };
     }
     let pinned = pinned_tail.min(content.len());
@@ -1137,6 +1139,7 @@ fn window_popup_content(
             lines: content[content.len() - max_rows..].to_vec(),
             more_above: list_len > 0,
             more_below: false,
+            focus_in_window: None,
         };
     }
     let focus = focus.min(list_len.saturating_sub(1));
@@ -1154,6 +1157,7 @@ fn window_popup_content(
         lines: windowed,
         more_above: start > 0,
         more_below: end < list_len,
+        focus_in_window: Some(focus - start),
     }
 }
 
@@ -1180,12 +1184,17 @@ fn boxed_popup_lines(
         return Vec::new();
     }
 
-    let (visible_content, more_above, more_below) = match focus_line {
+    let (visible_content, more_above, more_below, focus_in_window) = match focus_line {
         // Scrollable list: window it so the selected row stays visible while the
         // trailing chrome (footer/prompt/peek) stays pinned on screen.
         Some(focus) => {
             let window = window_popup_content(content, max_content_rows, focus, pinned_tail);
-            (window.lines, window.more_above, window.more_below)
+            (
+                window.lines,
+                window.more_above,
+                window.more_below,
+                window.focus_in_window,
+            )
         }
         // Non-scrolling popup (help/detail): take the top rows, flagging overflow.
         None => {
@@ -1204,7 +1213,7 @@ fn boxed_popup_lines(
                     *last = replacement;
                 }
             }
-            (visible, false, false)
+            (visible, false, false, None)
         }
     };
 
@@ -1236,9 +1245,17 @@ fn boxed_popup_lines(
     // screen; each replaces one dash, so the border width is unchanged.
     let top_fill = border_fill_with_marker(trailing, more_above.then_some('▲'));
     lines.push(format!("┌{title_segment}{top_fill}┐"));
-    for line in visible_content {
-        let line = truncate_header_line(&line, Some(inner_width));
-        lines.push(format!("│ {line}{} │", cell_padding(&line, inner_width)));
+    for (index, line) in visible_content.iter().enumerate() {
+        let line = truncate_header_line(line, Some(inner_width));
+        let body = format!("{line}{}", cell_padding(&line, inner_width));
+        // The selected row is a full-width reverse-video bar. The escapes wrap an
+        // already-padded plain string, so width math (above) stays correct, and
+        // each drawn row is reset before the next.
+        if Some(index) == focus_in_window {
+            lines.push(format!("│ \x1b[7m{body}\x1b[0m │"));
+        } else {
+            lines.push(format!("│ {body} │"));
+        }
     }
     let bottom_fill = border_fill_with_marker(border_width, more_below.then_some('▼'));
     lines.push(format!("└{bottom_fill}┘"));
@@ -13393,6 +13410,28 @@ mod tests {
             window.more_below,
             "rows below the window: {:?}",
             window.lines
+        );
+    }
+
+    #[test]
+    fn boxed_popup_lines_highlights_the_focused_row() {
+        let content: Vec<String> = (0..3).map(|index| format!("row{index}")).collect();
+        let spec = PopupBodySpec {
+            focus_line: Some(1),
+            pinned_tail: 0,
+            count: None,
+        };
+        let lines = boxed_popup_lines("nav", &content, Some(20), Some(10), spec);
+
+        let focus_row = lines.iter().find(|line| line.contains("row1")).unwrap();
+        assert!(
+            focus_row.contains("\x1b[7m") && focus_row.contains("\x1b[0m"),
+            "focused row is a reverse-video bar: {focus_row:?}"
+        );
+        let other = lines.iter().find(|line| line.contains("row0")).unwrap();
+        assert!(
+            !other.contains("\x1b[7m"),
+            "unfocused row is plain: {other:?}"
         );
     }
 
