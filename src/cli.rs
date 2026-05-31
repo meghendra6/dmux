@@ -154,6 +154,12 @@ pub enum Command {
     PreviousWindow {
         session: String,
     },
+    LastWindow {
+        session: String,
+    },
+    LastPane {
+        session: String,
+    },
     KillWindow {
         session: String,
         target: WindowTarget,
@@ -299,6 +305,9 @@ where
         "next-tab" => parse_cycle_window(args, "next-tab", true),
         "previous-window" => parse_cycle_window(args, "previous-window", false),
         "previous-tab" => parse_cycle_window(args, "previous-tab", false),
+        "last-window" => parse_last_window(args, "last-window"),
+        "last-tab" => parse_last_window(args, "last-tab"),
+        "last-pane" => parse_last_pane(args, "last-pane"),
         "kill-window" => parse_kill_window(args, "kill-window", &["-w"]),
         "kill-tab" => parse_kill_window(args, "kill-tab", &["-i", "--index"]),
         "zoom-pane" => parse_zoom_pane(args),
@@ -566,6 +575,8 @@ Commands:\n\
   rename-window -t <name> [-w <index>|--window-id <id>|-n <old-name>] <new-name>\n\
   next-window -t <name>                  cycle to next window\n\
   previous-window -t <name>              cycle to previous window\n\
+  last-window -t <name>                  switch to the most-recently-active window\n\
+  last-pane -t <name>                    switch to the most-recently-active pane\n\
   new-tab -t <name> [-- command...]      alias for new-window\n\
   list-tabs -t <name> [-F <format>]      alias for list-windows\n\
   select-tab -t <name> -i <index>|--tab-id <id>|-n <name>\n\
@@ -609,9 +620,9 @@ Session:\n\
   C-b ! attention navigator   C-b w tree navigator   C-b i detail popup   C-b A workspaces\n\
   popup: j/k move   Enter focus   o open/reopen   Space peek   r reply   Tab group   / filter   Esc close\n\
 Windows:\n\
-  C-b c new window        C-b n/p next/previous window\n\
+  C-b c new window        C-b n/p next/previous window    C-b Tab last window\n\
 Panes:\n\
-  C-b % split right       C-b \" split down       C-b o next pane\n\
+  C-b % split right       C-b \" split down       C-b o next pane       C-b ; last pane\n\
   C-b h/j/k/l or arrows focus    Alt-h/j/k/l or Alt-arrows focus\n\
   C-b H/J/K/L resize by 5        C-b Ctrl-arrows resize by 1\n\
   C-b q pane numbers      C-b x close pane       C-b z zoom pane\n\
@@ -639,9 +650,9 @@ pub fn attach_help_overlay() -> &'static str {
   C-b ! attention navigator   C-b w tree navigator   C-b i detail popup   C-b A workspaces\n\
   popup: j/k move   Enter focus   o open/reopen   Space peek   r reply   Tab group   / filter   Esc close\n\
 Windows:\n\
-  C-b c new window        C-b n/p next/previous window\n\
+  C-b c new window        C-b n/p next/previous window    C-b Tab last window\n\
 Panes:\n\
-  C-b % split right       C-b \" split down       C-b o next pane\n\
+  C-b % split right       C-b \" split down       C-b o next pane       C-b ; last pane\n\
   C-b h/j/k/l or arrows focus    Alt-h/j/k/l or Alt-arrows focus\n\
   C-b H/J/K/L resize by 5        C-b Ctrl-arrows resize by 1\n\
   C-b q pane numbers      C-b x close pane       C-b z zoom pane\n\
@@ -2067,6 +2078,18 @@ fn parse_cycle_window(
     } else {
         Ok(Command::PreviousWindow { session })
     }
+}
+
+fn parse_last_window(args: Vec<String>, command_name: &str) -> Result<Command, String> {
+    let session = parse_target(args, command_name)?
+        .ok_or_else(|| format!("{command_name} requires -t <session>"))?;
+    Ok(Command::LastWindow { session })
+}
+
+fn parse_last_pane(args: Vec<String>, command_name: &str) -> Result<Command, String> {
+    let session = parse_target(args, command_name)?
+        .ok_or_else(|| format!("{command_name} requires -t <session>"))?;
+    Ok(Command::LastPane { session })
 }
 
 fn set_window_target(

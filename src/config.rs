@@ -41,6 +41,8 @@ const SUPPORTED_BINDING_COMMANDS: &[&str] = &[
     "new-window",
     "next-window",
     "previous-window",
+    "last-window",
+    "last-pane",
     "split-window -h",
     "split-window -v",
     "select-pane -L",
@@ -62,6 +64,8 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         ("D", "detach-client"),
         ("[", "copy-mode"),
         ("o", "next-pane"),
+        (";", "last-pane"),
+        ("Tab", "last-window"),
         ("q", "display-panes"),
         ("!", "show-attention"),
         ("w", "show-tree"),
@@ -251,7 +255,7 @@ pub fn validate_binding_command(command: &str) -> Result<String, String> {
         }
     }
     Err(format!(
-        "unsupported binding command {command:?}; supported live actions include send-prefix, detach-client, copy-mode, command-prompt, split-window -h|-v, select-pane -L|-D|-U|-R, resize-pane -L|-D|-U|-R [amount], next-pane, new-window, next-window, previous-window, kill-pane, and zoom-pane"
+        "unsupported binding command {command:?}; supported live actions include send-prefix, detach-client, copy-mode, command-prompt, split-window -h|-v, select-pane -L|-D|-U|-R, resize-pane -L|-D|-U|-R [amount], next-pane, new-window, next-window, previous-window, last-window, last-pane, kill-pane, and zoom-pane"
     ))
 }
 

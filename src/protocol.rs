@@ -267,6 +267,12 @@ pub enum Request {
     PreviousWindow {
         session: String,
     },
+    LastWindow {
+        session: String,
+    },
+    LastPane {
+        session: String,
+    },
     KillWindow {
         session: String,
         target: WindowTarget,
@@ -872,6 +878,14 @@ pub fn encode_next_window(session: &str) -> String {
 
 pub fn encode_previous_window(session: &str) -> String {
     format!("PREVIOUS_WINDOW\t{session}\n")
+}
+
+pub fn encode_last_window(session: &str) -> String {
+    format!("LAST_WINDOW\t{session}\n")
+}
+
+pub fn encode_last_pane(session: &str) -> String {
+    format!("LAST_PANE\t{session}\n")
 }
 
 #[allow(dead_code)]
@@ -1724,6 +1738,12 @@ pub fn decode_request(line: &str) -> Result<Request, String> {
             session: (*session).to_string(),
         }),
         ["PREVIOUS_WINDOW", session] => Ok(Request::PreviousWindow {
+            session: (*session).to_string(),
+        }),
+        ["LAST_WINDOW", session] => Ok(Request::LastWindow {
+            session: (*session).to_string(),
+        }),
+        ["LAST_PANE", session] => Ok(Request::LastPane {
             session: (*session).to_string(),
         }),
         ["KILL_WINDOW", session, window] => Ok(Request::KillWindow {
@@ -2742,6 +2762,18 @@ mod tests {
         assert_eq!(
             decode_request(&encode_previous_window("dev")).unwrap(),
             Request::PreviousWindow {
+                session: "dev".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_last_window("dev")).unwrap(),
+            Request::LastWindow {
+                session: "dev".to_string(),
+            }
+        );
+        assert_eq!(
+            decode_request(&encode_last_pane("dev")).unwrap(),
+            Request::LastPane {
                 session: "dev".to_string(),
             }
         );
