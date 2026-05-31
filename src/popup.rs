@@ -518,19 +518,29 @@ pub fn render_popup_view(state: &PopupState, model: &PopupModel, peek: Option<&s
     } else if !state.filter.is_empty() {
         chrome.push(format!("Filter: {}   (Esc to clear)", state.filter));
     }
-    chrome.push(match state.mode {
+    // Footer hints. Long footers are split across two lines so the box does not
+    // have to grow to ~150 cols and then truncate the hints mid-word (which cut
+    // off "Esc: close" on an 80-column terminal).
+    match state.mode {
         PopupMode::Attention => {
-            "Space: peek   r: reply   Tab: group   /: filter   Esc: close".to_string()
+            chrome.push("Space: peek   r: reply   Tab: group   /: filter   Esc: close".to_string());
         }
         PopupMode::Workspace => {
-            "Enter: focus/attach   o: open/reopen   n: new   R: rename   x: kill   p: pin   J/K: reorder   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
-                .to_string()
+            chrome.push(
+                "Enter: focus/attach   o: open/reopen   n: new   R: rename   x: kill   p: pin"
+                    .to_string(),
+            );
+            chrome.push(
+                "J/K: reorder   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
+                    .to_string(),
+            );
         }
         PopupMode::Tree => {
-            "Enter: focus/attach   R: rename window   x: kill   Space: peek   r: reply   Tab: group   /: filter   Esc: close"
-                .to_string()
+            chrome
+                .push("Enter: focus/attach   R: rename window   x: kill   Space: peek".to_string());
+            chrome.push("r: reply   Tab: group   /: filter   Esc: close".to_string());
         }
-    });
+    }
 
     let pinned_tail = chrome.len();
     let mut lines = list;
@@ -864,6 +874,27 @@ mod tests {
 
         assert!(text.contains("Enter: focus/attach"), "{text}");
         assert!(text.contains("o: open"), "{text}");
+    }
+
+    #[test]
+    fn workspace_footer_splits_across_two_lines_without_truncation() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.selected = Some("a".to_string());
+
+        let view = render_popup_view(&state, &model, None);
+
+        // The footer wraps to two lines that each fit a typical popup width, with
+        // the always-important Esc hint on the final line (never truncated).
+        assert!(view.pinned_tail >= 2, "{view:?}");
+        assert!(
+            view.lines.last().unwrap().contains("Esc: close"),
+            "{view:?}"
+        );
+        assert!(
+            view.lines.iter().all(|line| line.chars().count() <= 78),
+            "footer lines must fit a typical popup width: {view:?}"
+        );
     }
 
     #[test]
