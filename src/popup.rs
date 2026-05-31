@@ -497,17 +497,26 @@ pub fn render_popup_view(state: &PopupState, model: &PopupModel, peek: Option<&s
                 .map(str::to_string),
         );
     }
+    // Text-input sub-modes carry a synthetic '|' caret: the hardware cursor is
+    // hidden while the popup is up, so without it an empty field looks frozen.
     if state.reply_mode {
-        chrome.push(format!("Reply: {}", state.reply_text));
+        chrome.push(format!("Reply: {}|", state.reply_text));
     }
     if state.confirm_mode {
         chrome.push(format!("{} (y/N)", state.confirm_prompt));
     }
     if state.new_mode {
-        chrome.push(format!("New session: {}", state.new_text));
+        chrome.push(format!("New session: {}|", state.new_text));
     }
     if state.rename_mode {
-        chrome.push(format!("Rename: {}", state.rename_text));
+        chrome.push(format!("Rename: {}|", state.rename_text));
+    }
+    // Make the filter query visible — the footer advertises "/: filter" but the
+    // typed text was previously shown nowhere.
+    if state.filter_mode {
+        chrome.push(format!("Filter: {}|", state.filter));
+    } else if !state.filter.is_empty() {
+        chrome.push(format!("Filter: {}   (Esc to clear)", state.filter));
     }
     chrome.push(match state.mode {
         PopupMode::Attention => {
@@ -765,6 +774,38 @@ mod tests {
         // pinned tail = "Peek" + 2 capture lines + "Reply: hi" + footer = 5.
         assert_eq!(view.pinned_tail, 5);
         assert_eq!(view.focus_line, Some(0));
+    }
+
+    #[test]
+    fn render_popup_view_shows_filter_prompt_with_caret() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Attention);
+        state.selected = Some("a".to_string());
+        state.filter_mode = true;
+        state.filter = "ap".to_string();
+
+        let view = render_popup_view(&state, &model, None);
+
+        assert!(
+            view.lines.iter().any(|line| line == "Filter: ap|"),
+            "filter prompt with caret: {view:?}"
+        );
+    }
+
+    #[test]
+    fn render_popup_view_text_inputs_show_caret() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Workspace);
+        state.selected = Some("a".to_string());
+        state.rename_mode = true;
+        state.rename_text = "new-name".to_string();
+
+        let view = render_popup_view(&state, &model, None);
+
+        assert!(
+            view.lines.iter().any(|line| line == "Rename: new-name|"),
+            "rename field with caret: {view:?}"
+        );
     }
 
     #[test]
