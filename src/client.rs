@@ -108,12 +108,41 @@ impl AttachPopup {
 struct PopupOverlayText {
     title: &'static str,
     content: String,
+    /// Index, within the non-empty content lines, of the selected list row; the
+    /// viewport scrolls to keep it visible. None for chrome-only popups.
+    focus_line: Option<usize>,
+    /// Count of trailing chrome lines (peek/prompt/footer) pinned on screen.
+    pinned_tail: usize,
+}
+
+impl PopupOverlayText {
+    /// A popup whose content does not scroll (help, detail) — no focus row.
+    fn chrome(title: &'static str, content: String) -> Self {
+        Self {
+            title,
+            content,
+            focus_line: None,
+            pinned_tail: 0,
+        }
+    }
+
+    /// A scrollable navigator popup built from a rendered list view.
+    fn from_view(title: &'static str, view: crate::popup::PopupView) -> Self {
+        Self {
+            title,
+            content: view.lines.join("\n"),
+            focus_line: view.focus_line,
+            pinned_tail: view.pinned_tail,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PopupOverlay<'a> {
     title: &'static str,
     content: &'a str,
+    focus_line: Option<usize>,
+    pinned_tail: usize,
 }
 
 impl PopupOverlayText {
@@ -121,6 +150,8 @@ impl PopupOverlayText {
         PopupOverlay {
             title: self.title,
             content: &self.content,
+            focus_line: self.focus_line,
+            pinned_tail: self.pinned_tail,
         }
     }
 }
@@ -921,6 +952,8 @@ fn write_live_render_output(
             &popup_content_lines(overlay.content),
             size,
             frame.header_rows,
+            overlay.focus_line,
+            overlay.pinned_tail,
         );
         // The overlay hid the cursor; forget the last-emitted cursor so the next
         // popup-free frame re-emits the pane's cursor sequence (which re-shows
@@ -949,6 +982,8 @@ fn append_popup_overlay(
         &popup_content_lines(overlay.content),
         size,
         header_rows,
+        overlay.focus_line,
+        overlay.pinned_tail,
     );
     stdout.write_all(&output)
 }
@@ -988,6 +1023,8 @@ fn append_centered_popup_overlay(
     content: &[String],
     size: PtySize,
     header_rows: usize,
+    focus_line: Option<usize>,
+    pinned_tail: usize,
 ) {
     let rows = usize::from(size.rows);
     let cols = usize::from(size.cols);
@@ -1000,7 +1037,14 @@ fn append_centered_popup_overlay(
         return;
     }
 
-    let popup_lines = boxed_popup_lines(title, content, Some(cols), Some(available_rows));
+    let popup_lines = boxed_popup_lines(
+        title,
+        content,
+        Some(cols),
+        Some(available_rows),
+        focus_line,
+        pinned_tail,
+    );
     if popup_lines.is_empty() {
         return;
     }
@@ -1041,11 +1085,48 @@ fn popup_content_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Window a popup's content so the focused (selected) list row stays visible
+/// while the trailing `pinned_tail` chrome rows (footer/prompt/peek) remain on
+/// screen. Returns at most `max_rows` lines. The list occupies everything
+/// before the pinned tail; the viewport over it is centered on `focus` and
+/// clamped to the list bounds.
+fn window_popup_content(
+    content: &[String],
+    max_rows: usize,
+    focus: usize,
+    pinned_tail: usize,
+) -> Vec<String> {
+    if content.len() <= max_rows {
+        return content.to_vec();
+    }
+    let pinned = pinned_tail.min(content.len());
+    let list_len = content.len() - pinned;
+    let list_capacity = max_rows.saturating_sub(pinned);
+    if list_capacity == 0 {
+        // No room for the list; the pinned chrome wins — keep the last rows.
+        return content[content.len() - max_rows..].to_vec();
+    }
+    let focus = focus.min(list_len.saturating_sub(1));
+    let start = if list_len <= list_capacity {
+        0
+    } else {
+        focus
+            .saturating_sub(list_capacity / 2)
+            .min(list_len - list_capacity)
+    };
+    let end = (start + list_capacity).min(list_len);
+    let mut windowed = content[start..end].to_vec();
+    windowed.extend_from_slice(&content[list_len..]);
+    windowed
+}
+
 fn boxed_popup_lines(
     title: &str,
     content: &[String],
     max_total_width: Option<usize>,
     max_rows: Option<usize>,
+    focus_line: Option<usize>,
+    pinned_tail: usize,
 ) -> Vec<String> {
     if max_total_width.is_some_and(|width| width < 4) {
         return Vec::new();
@@ -1058,21 +1139,30 @@ fn boxed_popup_lines(
         return Vec::new();
     }
 
-    let mut visible_content = content
-        .iter()
-        .take(max_content_rows)
-        .cloned()
-        .collect::<Vec<_>>();
-    if content.len() > max_content_rows {
-        let replacement = if max_content_rows == 1 {
-            "...".to_string()
-        } else {
-            "... more".to_string()
-        };
-        if let Some(last) = visible_content.last_mut() {
-            *last = replacement;
+    let visible_content = match focus_line {
+        // Scrollable list: window it so the selected row stays visible while the
+        // trailing chrome (footer/prompt/peek) stays pinned on screen.
+        Some(focus) => window_popup_content(content, max_content_rows, focus, pinned_tail),
+        // Non-scrolling popup (help/detail): take the top rows, flagging overflow.
+        None => {
+            let mut visible = content
+                .iter()
+                .take(max_content_rows)
+                .cloned()
+                .collect::<Vec<_>>();
+            if content.len() > max_content_rows {
+                let replacement = if max_content_rows == 1 {
+                    "...".to_string()
+                } else {
+                    "... more".to_string()
+                };
+                if let Some(last) = visible.last_mut() {
+                    *last = replacement;
+                }
+            }
+            visible
         }
-    }
+    };
 
     let max_inner_width = max_total_width
         .map(|width| width.saturating_sub(2))
@@ -5304,10 +5394,8 @@ fn render_tree_popup_overlay_text(
 ) -> io::Result<PopupOverlayText> {
     let model = tree_popup_visible_model(socket, session, state)?;
     let peek = popup_selected_peek_text(socket, state, &model);
-    Ok(PopupOverlayText {
-        title: "dmux tree",
-        content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
-    })
+    let view = crate::popup::render_popup_view(state, &model, peek.as_deref());
+    Ok(PopupOverlayText::from_view("dmux tree", view))
 }
 
 fn render_attention_popup_overlay_text(
@@ -5317,10 +5405,8 @@ fn render_attention_popup_overlay_text(
 ) -> io::Result<PopupOverlayText> {
     let model = attention_popup_visible_model(socket, session, state)?;
     let peek = popup_selected_peek_text(socket, state, &model);
-    Ok(PopupOverlayText {
-        title: "dmux attention",
-        content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
-    })
+    let view = crate::popup::render_popup_view(state, &model, peek.as_deref());
+    Ok(PopupOverlayText::from_view("dmux attention", view))
 }
 
 fn popup_selected_peek_text(
@@ -5989,10 +6075,8 @@ fn render_workspace_popup_overlay_text(
 ) -> io::Result<PopupOverlayText> {
     let model = workspace_popup_visible_model(socket, state)?;
     let peek = popup_selected_peek_text(socket, state, &model);
-    Ok(PopupOverlayText {
-        title: "dmux workspaces",
-        content: crate::popup::render_popup_text(state, &model, peek.as_deref()),
-    })
+    let view = crate::popup::render_popup_view(state, &model, peek.as_deref());
+    Ok(PopupOverlayText::from_view("dmux workspaces", view))
 }
 
 fn apply_workspace_popup_input_actions(
@@ -6972,10 +7056,10 @@ fn attach_popup_overlay_text_with_state(
 ) -> io::Result<Option<PopupOverlayText>> {
     match popup {
         AttachPopup::None => Ok(None),
-        AttachPopup::Help => Ok(Some(PopupOverlayText {
-            title: "dmux help",
-            content: attach_help_overlay_text(),
-        })),
+        AttachPopup::Help => Ok(Some(PopupOverlayText::chrome(
+            "dmux help",
+            attach_help_overlay_text(),
+        ))),
         AttachPopup::Attention => {
             if let Some(state) = popup_state {
                 Ok(Some(render_attention_popup_overlay_text(
@@ -7000,10 +7084,10 @@ fn attach_popup_overlay_text_with_state(
                 )?))
             }
         }
-        AttachPopup::Detail => Ok(Some(PopupOverlayText {
-            title: "dmux detail",
-            content: attach_detail_overlay_text(socket, session)?,
-        })),
+        AttachPopup::Detail => Ok(Some(PopupOverlayText::chrome(
+            "dmux detail",
+            attach_detail_overlay_text(socket, session)?,
+        ))),
         AttachPopup::WorkspaceRegistry => {
             if let Some(state) = popup_state {
                 Ok(Some(render_workspace_popup_overlay_text(socket, state)?))
@@ -8136,7 +8220,15 @@ fn attach_help_overlay_text() -> String {
 
 #[cfg(test)]
 fn attach_help_popup_message() -> String {
-    boxed_popup_lines("dmux help", &attach_help_popup_content(), None, None).join("\n")
+    boxed_popup_lines(
+        "dmux help",
+        &attach_help_popup_content(),
+        None,
+        None,
+        None,
+        0,
+    )
+    .join("\n")
 }
 
 fn cell_padding(line: &str, target_width: usize) -> String {
@@ -8153,6 +8245,8 @@ fn write_attach_popup_message(overlay: PopupOverlay<'_>) -> io::Result<()> {
         &popup_content_lines(overlay.content),
         size,
         0,
+        overlay.focus_line,
+        overlay.pinned_tail,
     );
     stdout.write_all(&output)?;
     stdout.flush()
@@ -13167,6 +13261,8 @@ mod tests {
         let overlay = PopupOverlay {
             title: "dmux help",
             content: "C-b ? close",
+            focus_line: None,
+            pinned_tail: 0,
         };
 
         // A transient (non-prioritized) message must not add a header row, so the
@@ -13196,6 +13292,33 @@ mod tests {
     }
 
     #[test]
+    fn window_popup_content_keeps_focus_visible_and_pins_tail() {
+        let mut content: Vec<String> = (0..20).map(|index| format!("item{index}")).collect();
+        content.push("FOOTER".to_string()); // one pinned chrome line
+        let pinned_tail = 1;
+        let max_rows = 8;
+
+        for focus in 0..20 {
+            let view = window_popup_content(&content, max_rows, focus, pinned_tail);
+            assert!(view.len() <= max_rows, "focus {focus}: {} rows", view.len());
+            assert!(
+                view.iter().any(|line| line == "FOOTER"),
+                "focus {focus}: footer must stay pinned: {view:?}"
+            );
+            assert!(
+                view.contains(&format!("item{focus}")),
+                "focus {focus}: selected row must stay visible: {view:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_popup_content_returns_all_rows_when_they_fit() {
+        let content: Vec<String> = (0..5).map(|index| format!("r{index}")).collect();
+        assert_eq!(window_popup_content(&content, 10, 2, 1), content);
+    }
+
+    #[test]
     fn popup_overlay_uses_absolute_position_and_restores_cursor() {
         let mut output = b"\x1b[0m\x1b[H\x1b[2Ktabs\r\n\x1b[2Kpane\x1b[?25h\x1b[2;5H".to_vec();
 
@@ -13205,6 +13328,8 @@ mod tests {
             &["C-b ? close".to_string(), "Prompt examples:".to_string()],
             PtySize { cols: 40, rows: 10 },
             1,
+            None,
+            0,
         );
 
         assert!(
@@ -13250,6 +13375,8 @@ mod tests {
         let overlay = PopupOverlay {
             title: "dmux help",
             content: "C-b ? close",
+            focus_line: None,
+            pinned_tail: 0,
         };
         write_live_render_output(&render_frame(frame), &mut state, Some(overlay)).unwrap();
         assert!(

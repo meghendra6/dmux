@@ -382,13 +382,42 @@ fn header_row(
     }
 }
 
+/// A rendered popup split into final on-screen lines plus the metadata the
+/// client needs to keep the selection visible (and, later, to highlight it):
+/// `focus_line` is the index of the selected item's line, and `pinned_tail` is
+/// the number of trailing chrome lines (peek/prompt/footer) that must stay on
+/// screen rather than scroll with the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopupView {
+    pub lines: Vec<String>,
+    pub focus_line: Option<usize>,
+    pub pinned_tail: usize,
+}
+
+/// Convenience wrapper used by tests to assert on the flat rendered text.
+#[cfg(test)]
 pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&str>) -> String {
-    let mut lines = Vec::new();
+    render_popup_view(state, model, peek).lines.join("\n")
+}
+
+pub fn render_popup_view(state: &PopupState, model: &PopupModel, peek: Option<&str>) -> PopupView {
+    let mut list = Vec::new();
+    let mut focus_line = None;
     for row in &model.rows {
         match row.kind {
-            PopupRowKind::Header => lines.push(row.title.clone()),
+            PopupRowKind::Header => {
+                // Skip empty headers: the draw path drops blank lines, which
+                // would otherwise shift focus_line off the selected row.
+                let title = row.title.trim_end();
+                if !title.is_empty() {
+                    list.push(title.to_string());
+                }
+            }
             PopupRowKind::Item | PopupRowKind::DisabledItem => {
                 let selected = state.selected.as_deref() == Some(row.id.as_str());
+                if selected {
+                    focus_line = Some(list.len());
+                }
                 let marker = if selected { ">" } else { " " };
                 let state_marker = state_marker(row.state);
                 let disabled = if row.kind == PopupRowKind::DisabledItem {
@@ -397,36 +426,42 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
                     ""
                 };
                 let pinned = if row.pinned { " pinned" } else { "" };
-                lines.push(format!(
-                    "{} {} {:<10} {}{}{}",
-                    marker, state_marker, row.title, row.summary, pinned, disabled
-                ));
+                list.push(
+                    format!(
+                        "{} {} {:<10} {}{}{}",
+                        marker, state_marker, row.title, row.summary, pinned, disabled
+                    )
+                    .trim_end()
+                    .to_string(),
+                );
             }
         }
     }
+
+    // Trailing chrome: kept on screen (pinned) while the list scrolls under it.
+    let mut chrome = Vec::new();
     if let Some(peek) = peek {
-        lines.push(String::new());
-        lines.push("Peek".to_string());
-        lines.extend(peek.lines().map(str::to_string));
+        chrome.push("Peek".to_string());
+        chrome.extend(
+            peek.lines()
+                .map(str::trim_end)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string),
+        );
     }
     if state.reply_mode {
-        lines.push(String::new());
-        lines.push(format!("Reply: {}", state.reply_text));
+        chrome.push(format!("Reply: {}", state.reply_text));
     }
     if state.confirm_mode {
-        lines.push(String::new());
-        lines.push(format!("{} (y/N)", state.confirm_prompt));
+        chrome.push(format!("{} (y/N)", state.confirm_prompt));
     }
     if state.new_mode {
-        lines.push(String::new());
-        lines.push(format!("New session: {}", state.new_text));
+        chrome.push(format!("New session: {}", state.new_text));
     }
     if state.rename_mode {
-        lines.push(String::new());
-        lines.push(format!("Rename: {}", state.rename_text));
+        chrome.push(format!("Rename: {}", state.rename_text));
     }
-    lines.push(String::new());
-    lines.push(match state.mode {
+    chrome.push(match state.mode {
         PopupMode::Attention => {
             "Space: peek   r: reply   Tab: group   /: filter   Esc: close".to_string()
         }
@@ -439,7 +474,15 @@ pub fn render_popup_text(state: &PopupState, model: &PopupModel, peek: Option<&s
                 .to_string()
         }
     });
-    lines.join("\n")
+
+    let pinned_tail = chrome.len();
+    let mut lines = list;
+    lines.extend(chrome);
+    PopupView {
+        lines,
+        focus_line,
+        pinned_tail,
+    }
 }
 
 pub fn render_peek_text(
@@ -607,6 +650,43 @@ mod tests {
         assert!(text.contains("Working"));
         assert!(text.contains("> * alpha"));
         assert!(text.contains("Enter: focus/attach"));
+    }
+
+    #[test]
+    fn render_popup_view_reports_focus_line_and_pinned_tail() {
+        let model = PopupModel::new(vec![
+            row("h", "Working", PopupRowKind::Header),
+            row("a", "alpha", PopupRowKind::Item),
+            row("b", "beta", PopupRowKind::Item),
+        ]);
+        let mut state = PopupState::new(PopupMode::Attention);
+        state.selected = Some("b".to_string());
+
+        let view = render_popup_view(&state, &model, None);
+
+        // lines: [header, alpha, beta, footer]; "beta" is the 3rd line (index 2).
+        assert_eq!(view.focus_line, Some(2));
+        // Only the footer is pinned when there is no peek or sub-mode prompt.
+        assert_eq!(view.pinned_tail, 1);
+        assert!(
+            view.lines.last().unwrap().contains("Esc: close"),
+            "{view:?}"
+        );
+    }
+
+    #[test]
+    fn render_popup_view_pins_peek_and_prompt_chrome() {
+        let model = PopupModel::new(vec![row("a", "alpha", PopupRowKind::Item)]);
+        let mut state = PopupState::new(PopupMode::Attention);
+        state.selected = Some("a".to_string());
+        state.reply_mode = true;
+        state.reply_text = "hi".to_string();
+
+        let view = render_popup_view(&state, &model, Some("line1\nline2"));
+
+        // pinned tail = "Peek" + 2 capture lines + "Reply: hi" + footer = 5.
+        assert_eq!(view.pinned_tail, 5);
+        assert_eq!(view.focus_line, Some(0));
     }
 
     #[test]
