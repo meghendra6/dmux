@@ -582,17 +582,20 @@ pub fn render_peek_text(
 }
 
 pub fn state_marker(state: PopupStateKind) -> &'static str {
+    // Each state gets a distinct glyph. Previously 10 states shared 6 glyphs
+    // (NeedsInput/Alert "!", Ready/Completed "+", Failed/Stale "x",
+    // Detached/Previous "."), so you could not tell those states apart.
     match state {
         PopupStateKind::NeedsInput => "!",
-        PopupStateKind::Alert => "!",
+        PopupStateKind::Alert => "?",
         PopupStateKind::Ready => "+",
-        PopupStateKind::Failed => "x",
+        PopupStateKind::Failed => "✗",
         PopupStateKind::Working => "*",
-        PopupStateKind::Completed => "+",
+        PopupStateKind::Completed => "✓",
         PopupStateKind::Idle => "-",
         PopupStateKind::Detached => ".",
-        PopupStateKind::Previous => ".",
-        PopupStateKind::Stale => "x",
+        PopupStateKind::Previous => "<",
+        PopupStateKind::Stale => "~",
     }
 }
 
@@ -722,6 +725,29 @@ mod tests {
         );
         assert!(text.contains("alpha"), "{text}");
         assert!(text.contains("Enter: focus/attach"));
+    }
+
+    #[test]
+    fn state_markers_are_all_distinct() {
+        use std::collections::HashSet;
+        let states = [
+            PopupStateKind::NeedsInput,
+            PopupStateKind::Alert,
+            PopupStateKind::Ready,
+            PopupStateKind::Failed,
+            PopupStateKind::Working,
+            PopupStateKind::Completed,
+            PopupStateKind::Idle,
+            PopupStateKind::Detached,
+            PopupStateKind::Previous,
+            PopupStateKind::Stale,
+        ];
+        let markers: HashSet<&str> = states.iter().map(|state| state_marker(*state)).collect();
+        assert_eq!(
+            markers.len(),
+            states.len(),
+            "every popup state must have a unique glyph"
+        );
     }
 
     #[test]
