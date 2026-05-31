@@ -9,6 +9,55 @@ fn char_cells(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0).max(1)
 }
 
+/// Strip ANSI escape sequences (and stray carriage returns) from text. Pane
+/// captures shown in the peek pane carry SGR colour escapes that the popup box
+/// can't render and that inflate the measured line width, misaligning the box.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    // CSI: consume params/intermediates up to a final byte.
+                    while let Some(&next) = chars.peek() {
+                        chars.next();
+                        if ('\x40'..='\x7e').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    // OSC: consume up to BEL or the ST terminator (ESC \).
+                    while let Some(&next) = chars.peek() {
+                        if next == '\x07' {
+                            chars.next();
+                            break;
+                        }
+                        if next == '\x1b' {
+                            chars.next();
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                Some(_) => {
+                    chars.next(); // two-byte escape: drop the following byte too
+                }
+                None => {}
+            },
+            '\r' => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Pad `text` with spaces to at least `min` display cells so the following
 /// column aligns. Cell-aware so CJK titles pad correctly. Titles longer than
 /// `min` are left intact (no information lost — the box truncates the row at its
@@ -570,7 +619,7 @@ pub fn render_peek_text(
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .map(str::to_string)
+        .map(strip_ansi)
         .collect::<Vec<_>>();
 
     let mut lines = metadata.lines().map(str::to_string).collect::<Vec<_>>();
@@ -725,6 +774,24 @@ mod tests {
         );
         assert!(text.contains("alpha"), "{text}");
         assert!(text.contains("Enter: focus/attach"));
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr_and_carriage_returns() {
+        assert_eq!(strip_ansi("\x1b[1;31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi("a\rb"), "ab");
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    #[test]
+    fn render_peek_text_strips_ansi_from_capture() {
+        let capture = "plain \x1b[31mred\x1b[0m text";
+        let text = render_peek_text("session=dev", capture, 10, 1000);
+        assert!(
+            !text.contains('\x1b'),
+            "no escapes survive in peek: {text:?}"
+        );
+        assert!(text.contains("plain red text"), "{text:?}");
     }
 
     #[test]
