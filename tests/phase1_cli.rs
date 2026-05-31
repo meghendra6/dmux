@@ -468,6 +468,56 @@ fn run_sequence_executes_commands_in_order() {
 }
 
 #[test]
+fn last_window_and_last_pane_toggle_the_active_selection() {
+    let socket = unique_project_socket("last-window-pane");
+    let session = format!("last-window-pane-{}", std::process::id());
+
+    assert_success(&dmux(
+        &socket,
+        &["new", "-d", "-s", &session, "--", "sh", "-c", "sleep 30"],
+    ));
+    assert_success(&dmux(
+        &socket,
+        &["new-window", "-t", &session, "--", "sh", "-c", "sleep 30"],
+    )); // window 1
+    assert_success(&dmux(
+        &socket,
+        &["new-window", "-t", &session, "--", "sh", "-c", "sleep 30"],
+    )); // window 2, now active
+
+    assert_eq!(active_window_index(&socket, &session), 2);
+    // last-window returns to the window active before window 2 was created.
+    assert_success(&dmux(&socket, &["last-window", "-t", &session]));
+    assert_eq!(active_window_index(&socket, &session), 1);
+    // calling it again toggles straight back to window 2.
+    assert_success(&dmux(&socket, &["last-window", "-t", &session]));
+    assert_eq!(active_window_index(&socket, &session), 2);
+
+    // last-pane toggles within the active window. Split (pane 1 becomes active),
+    // then select pane 0 so pane 1 is the last pane.
+    assert_success(&dmux(
+        &socket,
+        &[
+            "split-window",
+            "-t",
+            &session,
+            "-v",
+            "--",
+            "sh",
+            "-c",
+            "sleep 30",
+        ],
+    ));
+    assert_success(&dmux(&socket, &["select-pane", "-t", &session, "-p", "0"]));
+    assert_eq!(active_pane_index_and_id(&socket, &session).0, 0);
+    assert_success(&dmux(&socket, &["last-pane", "-t", &session]));
+    assert_eq!(active_pane_index_and_id(&socket, &session).0, 1);
+
+    assert_success(&dmux(&socket, &["kill-session", "-t", &session]));
+    assert_success(&dmux(&socket, &["kill-server"]));
+}
+
+#[test]
 fn source_file_executes_commands_and_reports_line_errors() {
     let socket = unique_project_socket("source-file");
     let session = format!("source-file-{}", std::process::id());
@@ -2076,6 +2126,30 @@ fn poll_list_sessions_absent(socket: &std::path::Path, format: &str, absent: &st
     }
 
     last
+}
+
+fn active_window_index(socket: &std::path::Path, session: &str) -> usize {
+    let output = dmux(
+        socket,
+        &[
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window.index}:#{window.active}",
+        ],
+    );
+    assert_success(&output);
+    let listed = String::from_utf8_lossy(&output.stdout);
+    listed
+        .lines()
+        .find_map(
+            |line| match line.split(':').collect::<Vec<_>>().as_slice() {
+                [index, "1"] => Some(index.parse::<usize>().expect("window index")),
+                _ => None,
+            },
+        )
+        .unwrap_or_else(|| panic!("missing active window in {listed:?}"))
 }
 
 fn active_pane_index_and_id(socket: &std::path::Path, session: &str) -> (usize, usize) {

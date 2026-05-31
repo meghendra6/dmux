@@ -461,6 +461,18 @@ fn execute_command(command: cli::Command) -> Result<(), String> {
             send_request(&socket, &protocol::encode_previous_window(&session), true)?;
             Ok(())
         }
+        cli::Command::LastWindow { session } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(&socket, &protocol::encode_last_window(&session), true)?;
+            Ok(())
+        }
+        cli::Command::LastPane { session } => {
+            let socket = paths::socket_path();
+            ensure_server(&socket)?;
+            send_request(&socket, &protocol::encode_last_pane(&session), true)?;
+            Ok(())
+        }
         cli::Command::KillWindow { session, target } => {
             let socket = paths::socket_path();
             ensure_server(&socket)?;

@@ -685,6 +685,12 @@ impl Session {
         Ok(changed)
     }
 
+    fn select_last_pane(&self) -> Result<(), String> {
+        self.windows.lock().unwrap().select_last_pane()?;
+        self.clear_active_pane_alerts();
+        Ok(())
+    }
+
     fn kill_pane(&self, target: &Target) -> Result<Arc<Pane>, String> {
         self.windows
             .lock()
@@ -860,6 +866,12 @@ impl Session {
 
     fn select_previous_window(&self) -> Result<(), String> {
         self.windows.lock().unwrap().select_previous()?;
+        self.clear_active_pane_alerts();
+        Ok(())
+    }
+
+    fn select_last_window(&self) -> Result<(), String> {
+        self.windows.lock().unwrap().select_last()?;
         self.clear_active_pane_alerts();
         Ok(())
     }
@@ -1260,6 +1272,12 @@ impl Window {
         }
     }
 
+    fn select_previous_pane(&mut self) {
+        if self.panes.select_previous() && self.zoomed.is_some() {
+            self.zoomed = Some(self.panes.active_index());
+        }
+    }
+
     fn resolve_pane_select_target(&self, target: PaneSelectTarget) -> Result<usize, String> {
         match target {
             PaneSelectTarget::Index(index) => {
@@ -1600,6 +1618,9 @@ impl Window {
 struct WindowSet {
     windows: Vec<Window>,
     active: usize,
+    /// Id of the most-recently-active window, for `last-window` (`C-b Tab`).
+    /// Stored by id (not index) so it survives window removal/reordering.
+    previous_active_id: Option<TabId>,
 }
 
 impl WindowSet {
@@ -1607,7 +1628,21 @@ impl WindowSet {
         Self {
             windows: vec![window],
             active: 0,
+            previous_active_id: None,
         }
+    }
+
+    /// Switch the active window to `index`, remembering the previously-active
+    /// window's id (so `last-window` can toggle back). A no-op when already
+    /// active, which also leaves the previous-window history untouched.
+    fn set_active(&mut self, index: usize) {
+        if index == self.active {
+            return;
+        }
+        if let Some(current) = self.windows.get(self.active) {
+            self.previous_active_id = Some(current.id);
+        }
+        self.active = index;
     }
 
     fn add(&mut self, mut window: Window) {
@@ -1619,7 +1654,7 @@ impl WindowSet {
             window.name = self.next_default_window_name(window.id.as_usize());
         }
         self.windows.push(window);
-        self.active = self.windows.len() - 1;
+        self.set_active(self.windows.len() - 1);
     }
 
     fn next_default_window_name(&self, start: usize) -> String {
@@ -1635,7 +1670,7 @@ impl WindowSet {
 
     fn select(&mut self, target: WindowTarget) -> Result<(), String> {
         let index = self.resolve_target(target)?;
-        self.active = index;
+        self.set_active(index);
         Ok(())
     }
 
@@ -1643,7 +1678,19 @@ impl WindowSet {
         if self.windows.is_empty() {
             return Err("missing window".to_string());
         }
-        self.active = (self.active + 1) % self.windows.len();
+        self.set_active((self.active + 1) % self.windows.len());
+        Ok(())
+    }
+
+    /// Switch to the most-recently-active window (`last-window`). A no-op when
+    /// there is no remembered window or it has since been closed.
+    fn select_last(&mut self) -> Result<(), String> {
+        let Some(previous_id) = self.previous_active_id else {
+            return Ok(());
+        };
+        if let Some(index) = self.windows.iter().position(|w| w.id == previous_id) {
+            self.set_active(index);
+        }
         Ok(())
     }
 
@@ -1672,11 +1719,12 @@ impl WindowSet {
         if self.windows.is_empty() {
             return Err("missing window".to_string());
         }
-        self.active = if self.active == 0 {
+        let index = if self.active == 0 {
             self.windows.len() - 1
         } else {
             self.active - 1
         };
+        self.set_active(index);
         Ok(())
     }
 
@@ -1777,9 +1825,20 @@ impl WindowSet {
         let active_before = self.active;
         let window_index = self.resolve_target(window)?;
         let pane_index = self.windows[window_index].resolve_pane_select_target(target)?;
-        self.active = window_index;
+        self.set_active(window_index);
         self.windows[window_index].select_pane_index(pane_index);
         Ok(active_before != window_index)
+    }
+
+    /// Switch the active window's active pane to its most-recently-active pane
+    /// (`last-pane`). A no-op when there is no remembered pane.
+    fn select_last_pane(&mut self) -> Result<(), String> {
+        let window = self
+            .windows
+            .get_mut(self.active)
+            .ok_or_else(|| "missing window".to_string())?;
+        window.select_previous_pane();
+        Ok(())
     }
 
     fn kill_pane(&mut self, window: WindowTarget, target: PaneTarget) -> Result<Arc<Pane>, String> {
@@ -2381,6 +2440,8 @@ struct WindowDescription {
 struct PaneSet<T> {
     panes: Vec<T>,
     active: usize,
+    /// Index of the most-recently-active pane, for `last-pane` (`C-b ;`).
+    previous_active: Option<usize>,
 }
 
 impl<T> PaneSet<T> {
@@ -2388,19 +2449,42 @@ impl<T> PaneSet<T> {
         Self {
             panes: vec![pane],
             active: 0,
+            previous_active: None,
+        }
+    }
+
+    /// Make `index` active, remembering the previously-active index so
+    /// `last-pane` can toggle back. A no-op when already active.
+    fn set_active(&mut self, index: usize) {
+        if index != self.active {
+            self.previous_active = Some(self.active);
+            self.active = index;
         }
     }
 
     fn add(&mut self, pane: T) {
         self.panes.push(pane);
-        self.active = self.panes.len() - 1;
+        self.set_active(self.panes.len() - 1);
     }
 
     fn select(&mut self, index: usize) -> bool {
         if index >= self.panes.len() {
             return false;
         }
-        self.active = index;
+        self.set_active(index);
+        true
+    }
+
+    /// Switch to the most-recently-active pane (`last-pane`). Returns false
+    /// when there is no remembered pane or it has since been closed.
+    fn select_previous(&mut self) -> bool {
+        let Some(previous) = self.previous_active else {
+            return false;
+        };
+        if previous >= self.panes.len() {
+            return false;
+        }
+        self.set_active(previous);
         true
     }
 
@@ -2433,6 +2517,13 @@ impl<T> PaneSet<T> {
         } else if self.active > index {
             self.active -= 1;
         }
+        // Keep the last-pane target pointing at the same pane after the shift,
+        // dropping it if that pane was the one removed.
+        self.previous_active = match self.previous_active {
+            Some(previous) if previous == index => None,
+            Some(previous) if previous > index => Some(previous - 1),
+            other => other,
+        };
         pane
     }
 
@@ -2839,6 +2930,8 @@ fn handle_connection(state: Arc<ServerState>, mut stream: UnixStream) -> io::Res
         Request::PreviousWindow { session } => {
             handle_cycle_window(&state, &mut stream, &session, WindowCycle::Previous)
         }
+        Request::LastWindow { session } => handle_last_window(&state, &mut stream, &session),
+        Request::LastPane { session } => handle_last_pane(&state, &mut stream, &session),
         Request::KillWindow { session, target } => {
             handle_kill_window(&state, &mut stream, &session, target)
         }
@@ -4503,6 +4596,31 @@ fn handle_select_pane(
     result
 }
 
+fn handle_last_pane(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = resolve_session(state, name);
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    if let Err(error) = session.select_last_pane() {
+        write_err(stream, &error)?;
+        return Ok(());
+    }
+    session.resize_current_visible_panes()?;
+
+    session.sync_active_pane_focus();
+    session.notify_attach_redraw_immediate();
+    let result = write_ok(stream);
+    session.reconnect_live_raw_pane_streams();
+    result
+}
+
 fn handle_kill_pane(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
@@ -4879,6 +4997,34 @@ fn handle_cycle_window(
         WindowCycle::Previous => session.select_previous_window(),
     };
     if let Err(message) = result {
+        write_err(stream, &message)?;
+        return Ok(());
+    }
+    if !session.resize_current_visible_panes()? {
+        write_err(stream, "missing pane")?;
+        return Ok(());
+    }
+
+    session.sync_active_pane_focus();
+    session.notify_attach_redraw_immediate();
+    let result = write_ok(stream);
+    session.reconnect_raw_attach_streams();
+    result
+}
+
+fn handle_last_window(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+) -> io::Result<()> {
+    let session = resolve_session(state, name);
+
+    let Some(session) = session else {
+        write_err(stream, "missing session")?;
+        return Ok(());
+    };
+
+    if let Err(message) = session.select_last_window() {
         write_err(stream, &message)?;
         return Ok(());
     }
@@ -7427,6 +7573,50 @@ mod tests {
     }
 
     #[test]
+    fn pane_set_last_pane_toggles_between_two_panes() {
+        let mut panes = PaneSet::new("a");
+        panes.add("b"); // active b, previous a
+        panes.add("c"); // active c, previous b
+        assert!(panes.select(0)); // active a, previous c
+
+        assert!(panes.select_previous()); // last-pane -> c
+        assert_eq!(panes.active(), Some("c"));
+        assert!(panes.select_previous()); // toggles back -> a
+        assert_eq!(panes.active(), Some("a"));
+    }
+
+    #[test]
+    fn pane_set_last_pane_is_noop_without_history() {
+        let mut panes = PaneSet::new("only");
+        assert!(!panes.select_previous());
+        assert_eq!(panes.active(), Some("only"));
+    }
+
+    #[test]
+    fn pane_set_last_pane_target_tracks_index_shift_on_kill() {
+        let mut panes = PaneSet::new("x"); // index 0
+        panes.add("y"); // index 1, previous x
+        panes.add("z"); // index 2 active, previous y(1)
+
+        // Removing the pane before the last-pane target shifts its index down.
+        let _ = panes.kill_at(0); // [y, z]; active z(1), previous y now at 0
+        assert_eq!(panes.active(), Some("z"));
+        assert!(panes.select_previous());
+        assert_eq!(panes.active(), Some("y"));
+    }
+
+    #[test]
+    fn pane_set_last_pane_dropped_when_target_is_killed() {
+        let mut panes = PaneSet::new("x"); // 0
+        panes.add("y"); // 1, previous x
+        panes.add("z"); // 2 active, previous y(1)
+
+        let _ = panes.kill_at(1); // remove the last-pane target itself
+        assert_eq!(panes.active(), Some("z"));
+        assert!(!panes.select_previous());
+    }
+
+    #[test]
     fn directional_target_selects_adjacent_in_simple_geometry() {
         let regions = vec![
             PaneRegion {
@@ -7699,6 +7889,38 @@ mod tests {
         let _ = std::fs::remove_file(path0);
         let _ = std::fs::remove_file(path1);
         let _ = std::fs::remove_file(path2);
+    }
+
+    #[test]
+    fn window_set_last_window_toggles_between_two_windows() {
+        let (pane0, path0) = test_pane_with_id(0);
+        let (pane1, path1) = test_pane_with_id(1);
+        let (pane2, path2) = test_pane_with_id(2);
+        let mut windows = WindowSet::new(Window::new(TabId::new(10), "a".to_string(), pane0));
+        windows.add(Window::new(TabId::new(11), "b".to_string(), pane1));
+        windows.add(Window::new(TabId::new(12), "c".to_string(), pane2));
+
+        // After creating c, the previously-active window (b) is the last window.
+        windows.select_last().unwrap();
+        assert_eq!(windows.status_context("dev").unwrap().window_name, "b");
+        // last-window toggles straight back to c.
+        windows.select_last().unwrap();
+        assert_eq!(windows.status_context("dev").unwrap().window_name, "c");
+
+        let _ = std::fs::remove_file(path0);
+        let _ = std::fs::remove_file(path1);
+        let _ = std::fs::remove_file(path2);
+    }
+
+    #[test]
+    fn window_set_last_window_is_noop_without_history() {
+        let (pane0, path0) = test_pane_with_id(0);
+        let mut windows = WindowSet::new(Window::new(TabId::new(10), "solo".to_string(), pane0));
+
+        windows.select_last().unwrap();
+        assert_eq!(windows.status_context("dev").unwrap().window_index, 0);
+
+        let _ = std::fs::remove_file(path0);
     }
 
     #[test]
